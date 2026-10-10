@@ -1845,6 +1845,9 @@ def _contract_case(**overrides):
             # 机器可判的标志：契约按这个布尔量判断分区是否权威，不按上面的说明文字
             # 做子串匹配（"not from volume fraction" 里也含 "volume fraction"）。
             "material_partition_is_volume_fraction_based": True,
+            # 标志之外还要有**结构化来源记录**：只有一个是/否标志时，那个 True
+            # 是谁写的、依据是什么都无从核对。
+            "material_partition_source_recorded": "ALE material volume fraction (columns 1..7)",
             "energy_source": "reconstructed from JWL",
         },
         # 契约要求的两个分项记录，形状与真实导出一致
@@ -1854,6 +1857,7 @@ def _contract_case(**overrides):
         },
         front_supervision_eligibility={
             "source": "per-frame supervision eligibility arrays (§9/§10)",
+            "level": "arrays",
             "contact_eligible": np.array([True, True, False]),
             "shock_eligible": np.array([True, False, False]),
         },

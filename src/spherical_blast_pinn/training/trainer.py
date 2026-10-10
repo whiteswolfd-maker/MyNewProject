@@ -239,6 +239,10 @@ class Trainer:
         self.stage_history: list[dict[str, Any]] = []
         self._current_stage: str | None = None
         self._stage_window = float(self.schedule[0].time_window_fraction)
+        #: 上一阶段"更新跑完了、判据没过、因此不允许推进"的中间状态。见
+        #: :meth:`_evaluate_stage_criteria` 与 :meth:`load`。
+        self._pending_stage: str | None = None
+        self._stage_blocked = False
         # 训练采样器从**第一阶段**的窗口开始。构造时它默认是完整时段，若不在
         # 这里对齐，第一阶段就会在完整时段上采样，"初值预训练"名存实亡。
         self.sampler.set_time_window(float(self.schedule[0].time_window_fraction))
@@ -404,6 +408,9 @@ class Trainer:
         self.sampler.set_time_window(float(stage.time_window_fraction))
         self._stage_window = float(stage.time_window_fraction)
         self._current_stage = stage.name
+        # 切换成功：上一阶段没有悬而未决的判据
+        self._stage_blocked = False
+        self._pending_stage = None
         self.stage_history.append({
             "event": "enter",
             "stage": stage.name,
@@ -464,6 +471,13 @@ class Trainer:
             print(f"[stage] {stage_name} criteria: {verdict}")
 
         if failures and fatal:
+            # **把"已完成更新、但判据未过、尚不允许推进"这件事记在实例上。**
+            # 只抛异常的话，状态只活在调用栈里：同一个实例再跑一次能拦住（因为
+            # ``_current_stage`` 还停在失败的阶段），但**换个实例从这个检查点恢复
+            # 就拦不住了**——恢复只能从步数推算阶段，推算出来的正是"已经进入下一
+            # 阶段"。所以这个中间状态必须被显式保存。
+            self._stage_blocked = True
+            self._pending_stage = stage_name
             raise StageNotPassed(stage_name, failures)
         if failures:
             print(
@@ -484,6 +498,20 @@ class Trainer:
         total = schedule_total
         if max_updates is not None:
             total = min(total, int(max_updates))
+
+        # 悬而未决的阶段判据：**先重新评价，再谈继续训练**。
+        #
+        # 这一条覆盖"从这样一个检查点恢复"的情形：上一次运行跑完了某阶段的更新、
+        # 判据没过、于是不允许推进。恢复出来的 ``self.step`` 正好在那个阶段的结束
+        # 步上，若只是照常进循环，步数已经等于 total 时循环体一次都不执行，那道
+        # 闸门就永远不会被重新评价。
+        if self._stage_blocked and self._pending_stage is not None:
+            self._evaluate_stage_criteria(
+                self._pending_stage,
+                window_fraction=self._stage_window,
+                fatal=True,
+                verbose=verbose,
+            )
 
         started = time.time()
         # **从实例状态起手，而不是从空字符串起手。**
@@ -693,6 +721,11 @@ class Trainer:
             "stage": {
                 "current": self._current_stage,
                 "window_fraction": float(self._stage_window),
+                # "更新跑完了、判据没过"是一个**合法的中间状态**，必须能存下来：
+                # 不存的话，恢复只能从步数推算阶段，推算出来的正是"已经进入下一
+                # 阶段"，于是同一个检查点会被自己的恢复函数判成日程不一致。
+                "pending": self._pending_stage,
+                "blocked": bool(self._stage_blocked),
                 "history": self.stage_history,
             },
             "provenance": self.provenance,
@@ -742,32 +775,52 @@ class Trainer:
                 "step N' would not reproduce 'run N steps'. Retrain from a checkpoint "
                 "written by this version."
             )
+
+        # -- 阶段与时间窗口：**先把所有的核对做完，再动这个对象** --------------
+        #
+        # 以前这一段排在 ``load_state_dict`` 之后：窗口对不上时抛错，但模型、
+        # 优化器、步数与随机状态**已经装进去了**。调用者收到"恢复失败"，手里的
+        # 对象却已经不是加载前的那个——一个静静发生的半加载状态：它既不是原来的
+        # 训练，也不是检查点里的训练，而任何后续操作都会把它当成前者。
+        stage_payload = payload.get("stage") or {}
+        stored_step = int(payload["step"])
+        stored_window = stage_payload.get("window_fraction")
+        blocked = bool(stage_payload.get("blocked", False))
+        # 允许的窗口：按步数推算的那个，**以及**检查点自己记的那个阶段窗口。
+        # 后者覆盖"更新跑完了、判据没过、还没允许推进"这一档——那时步数已经在
+        # 边界上，按步数推算得到的是下一阶段，而实际用的还是上一阶段的窗口。
+        allowed = {time_window_fraction_at(stored_step, self.schedule)}
+        recorded_stage = stage_payload.get("current")
+        for stage in self.schedule:
+            if stage.name == recorded_stage:
+                allowed.add(float(stage.time_window_fraction))
+        if stored_window is not None and not any(
+            abs(float(stored_window) - value) <= 1.0e-12 for value in allowed
+        ):
+            raise TrainingError(
+                f"the checkpoint was written in a stage whose time window is "
+                f"{stored_window}, but step {stored_step} of this schedule allows "
+                f"{sorted(allowed)}; the two schedules are not the same"
+            )
+
+        # 校验全部通过，从这里开始才改对象
         self.model.load_state_dict(payload["model"])
         self.optimizer.load_state_dict(payload["optimizer"])
-        self.step = int(payload["step"])
+        self.step = stored_step
         self.history = list(payload.get("history", []))
         self.check_history = list(payload.get("checks", []))
         self.best = payload.get("best_check")
         _restore_rng(payload.get("rng"))
         self.sampler.set_rng_state(payload.get("sampler_rng"))
 
-        # 阶段、时间窗口、自适应权重统计（§14）。窗口按**检查点记的步数**应当
-        # 是多少来核对：若两者不一致，说明检查点是在一份不同的日程下跑的，继续
-        # 恢复会让采样区间与步数对不上，而损失曲线看起来完全正常。
-        stage_payload = payload.get("stage") or {}
-        expected_window = time_window_fraction_at(self.step, self.schedule)
-        stored_window = stage_payload.get("window_fraction")
-        if stored_window is not None and abs(
-            float(stored_window) - expected_window
-        ) > 1.0e-12:
-            raise TrainingError(
-                f"the checkpoint was written in a stage whose time window is "
-                f"{stored_window}, but step {self.step} of this schedule needs "
-                f"{expected_window}; the two schedules are not the same"
-            )
-        self.sampler.set_time_window(float(expected_window))
-        self._stage_window = float(expected_window)
-        self._current_stage = stage_payload.get("current")
+        # 恢复**当时实际在用**的窗口，而不是按步数另算一个。两者在正常路径上
+        # 相等（上面的核对保证了这一点），在"判据未过、尚未推进"那一档上前者
+        # 才是对的：那时步数已在边界上，实际用的还是上一阶段的窗口。
+        self.sampler.set_time_window(float(stored_window))
+        self._stage_window = float(stored_window)
+        self._current_stage = recorded_stage
+        self._pending_stage = stage_payload.get("pending")
+        self._stage_blocked = blocked
         self.stage_history = list(stage_payload.get("history", []))
         self.balancer.load_state_dict(payload.get("balancing"))
 

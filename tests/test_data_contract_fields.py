@@ -285,7 +285,7 @@ def test_a_length_mismatch_in_the_companion_is_refused_not_downgraded(tmp_path):
     payload = dict(np.load(directory / "material.npz", allow_pickle=True))
     payload["contact_has_supervision"] = np.array([True, True])
     np.savez(directory / "material.npz", **payload)
-    with pytest.raises(Exception, match="do not belong together"):
+    with pytest.raises(Exception, match="one boolean per frame"):
         _load(directory)
 
 

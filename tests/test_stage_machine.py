@@ -578,28 +578,43 @@ def test_the_real_loop_transitions_stages_correctly(tmp_path, monkeypatch):
     monkeypatch.setattr(trainer_module, "criteria_for", lambda name: ())
 
     tiny = _tiny_schedule(3)
+    total = sum(stage.updates for stage in tiny)
     trainer = base._tiny_trainer(tmp_path / "w", tmp_path / "out_w")
     trainer.schedule = tiny
     trainer.checkpoint_every = 1
     trainer.check_every = 0
-    trainer.run(max_updates=sum(stage.updates for stage in tiny), verbose=False)
 
-    # 走到过三个阶段，且每一个阶段边界上存下的检查点都能被读回、窗口自洽
+    original_save = trainer._save
+    saved: list[tuple[int, Path]] = []
+
+    def _save(path):
+        target = Path(path).with_name(f"step{trainer.step}.pt")
+        original_save(target)
+        saved.append((trainer.step, target))
+        return target
+
+    trainer._save = _save  # type: ignore[method-assign]
+    trainer.run(max_updates=total, verbose=False)
+
     entered = [row["stage"] for row in trainer.stage_history if row["event"] == "enter"]
     assert entered == [stage.name for stage in tiny], entered
+    # 收尾还会再存一次同一个步数（覆盖），所以按**集合**核对：每一步都留下过
+    # 一个独立的检查点，且没有跳步。
+    assert sorted({step for step, _ in saved}) == list(range(1, total + 1)), (
+        "没有做到每一步都留下一个检查点，逐点核对的循环检查的会是同一个文件"
+    )
 
-    for step in range(1, sum(stage.updates for stage in tiny) + 1):
-        path = trainer.output_dir / f"last.pt"
-        assert path.exists()
-    payload = torch.load(
-        trainer.output_dir / "last.pt", map_location="cpu", weights_only=False
-    )
-    assert payload["stage"]["window_fraction"] == pytest.approx(
-        time_window_fraction_at(trainer.step, tiny)
-    )
-    assert trainer.sampler.samplers[0].window_fraction == pytest.approx(
-        time_window_fraction_at(trainer.step, tiny)
-    )
+    # 逐个检查点核对：窗口与步数自洽，且**每一个**都能被自己的恢复函数读回。
+    for step, path in saved:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        assert payload["step"] == step
+        assert payload["stage"]["window_fraction"] == pytest.approx(
+            time_window_fraction_at(step, tiny)
+        ), f"第 {step} 步存下的窗口与按步数推算的不一致"
+        reader = base._tiny_trainer(tmp_path / f"r{step}", tmp_path / f"o{step}")
+        reader.schedule = tiny
+        reader.load(path)
+        assert reader.step == step
 
 
 def test_a_failed_stage_check_is_not_skipped_by_calling_run_again(tmp_path):
@@ -633,6 +648,103 @@ def test_a_failed_stage_check_is_not_skipped_by_calling_run_again(tmp_path):
     # 同一个实例再跑一次：必须再次被拦下，而不是跳过闸门继续更新
     with pytest.raises(StageNotPassed):
         trainer.run(verbose=False)
+
+
+def test_a_checkpoint_saved_after_a_failed_stage_check_can_be_resumed(tmp_path):
+    """判据未过时写下的检查点，必须能被**另一个实例**恢复，且恢复后仍被拦住。
+
+    "更新跑完了、判据没过、因此不允许推进"是一个合法的中间状态。不把它存下来，
+    恢复只能从步数推算阶段——而推算出来的正是"已经进入下一阶段"，于是同一份检查点
+    会被自己的恢复函数判成日程不一致。**同一个实例**能拦住（``_current_stage`` 还
+    停在失败的那一阶段），换一个实例就拦不住了。
+    """
+    import test_review_regressions as base
+
+    from spherical_blast_pinn.training.trainer import StageNotPassed
+
+    tiny = _tiny_schedule(2)
+    writer = base._tiny_trainer(tmp_path / "w", tmp_path / "out_w")
+    writer.schedule = tiny
+    writer.check_every = 0
+    writer.checkpoint_every = 10_000
+    writer.tolerances = {"initial_relative_l2": 0.0, "initial_gap_relative": 0.0}
+
+    with pytest.raises(StageNotPassed):
+        writer.run(verbose=False)
+    # 失败状态被记在实例上，并且**存进了检查点**
+    assert writer._stage_blocked is True
+    assert writer._pending_stage == tiny[0].name
+    writer._save(writer.output_dir / "blocked.pt")
+
+    payload = torch.load(
+        writer.output_dir / "blocked.pt", map_location="cpu", weights_only=False
+    )
+    assert payload["stage"]["blocked"] is True
+    assert payload["stage"]["pending"] == tiny[0].name
+    assert payload["stage"]["window_fraction"] == pytest.approx(
+        tiny[0].time_window_fraction
+    )
+
+    # 换一个**全新实例**：恢复必须成功（不再报"日程不一致"），然后继续跑时被拦下
+    reader = base._tiny_trainer(tmp_path / "r", tmp_path / "out_r")
+    reader.schedule = tiny
+    reader.check_every = 0
+    reader.checkpoint_every = 10_000
+    reader.tolerances = {"initial_relative_l2": 0.0, "initial_gap_relative": 0.0}
+    reader.load(writer.output_dir / "blocked.pt")
+    assert reader._stage_blocked is True
+    assert reader._stage_window == pytest.approx(tiny[0].time_window_fraction)
+
+    with pytest.raises(StageNotPassed):
+        reader.run(verbose=False)
+
+
+def test_a_rejected_checkpoint_does_not_half_load_the_target(tmp_path):
+    """恢复被拒绝时，目标对象必须**原封不动**。
+
+    以前 ``load()`` 先装模型、优化器、步数与随机状态，再核对窗口并抛错。调用者
+    收到"恢复失败"，手里的对象却已经不是加载前的那个——一个静静发生的半加载状态：
+    它既不是原来的训练，也不是检查点里的训练，而后续每一步都会把它当成前者。
+    """
+    import test_review_regressions as base
+
+    from spherical_blast_pinn.training.trainer import TrainingError
+
+    tiny = _tiny_schedule(2)
+    writer = base._tiny_trainer(tmp_path / "w", tmp_path / "out_w")
+    writer.schedule = tiny
+    writer.check_every = 0
+    writer.checkpoint_every = 10_000
+    writer._update()
+    writer.step += 1
+    writer._save(writer.output_dir / "one.pt")
+
+    reader = base._tiny_trainer(tmp_path / "r", tmp_path / "out_r")
+    reader.schedule = tiny
+    reader.check_every = 0
+    # 篡改保存的窗口，制造一个"日程不一致"的检查点
+    payload = torch.load(
+        writer.output_dir / "one.pt", map_location="cpu", weights_only=False
+    )
+    payload["stage"]["window_fraction"] = 0.999
+    payload["stage"]["current"] = "no-such-stage"
+    torch.save(payload, writer.output_dir / "broken.pt")
+
+    before = {
+        name: value.clone() for name, value in reader.model.state_dict().items()
+    }
+    before_step = reader.step
+    before_window = reader.sampler.samplers[0].window_fraction
+
+    with pytest.raises(TrainingError, match="schedules are not the same"):
+        reader.load(writer.output_dir / "broken.pt")
+
+    assert reader.step == before_step, "步数在恢复失败时已经被改掉了"
+    assert reader.sampler.samplers[0].window_fraction == pytest.approx(before_window)
+    for name, value in before.items():
+        assert torch.equal(value, reader.model.state_dict()[name]), (
+            f"{name} 在恢复失败时已经被改掉了——调用者收到失败，对象却是半加载的"
+        )
 
 
 def test_a_truncated_run_does_not_evaluate_a_stage_that_never_ran(tmp_path, monkeypatch):

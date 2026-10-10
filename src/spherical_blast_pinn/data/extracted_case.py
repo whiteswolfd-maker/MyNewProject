@@ -611,6 +611,130 @@ def _cell_width(radius: np.ndarray) -> float:
 # --------------------------------------------------------------------------
 
 
+#: 前沿三态码的取值域。**0/1/2 之外的码不是"另一档无效"，是格式错误**：
+#: 读取器不认识它，说明这份导出与当前约定不是同一套。把它当成普通无效帧处理，
+#: 会把"我们对不上这份数据"说成"这一帧没测到"。
+FRONT_STATE_CODES = (0, 1, 2)
+
+
+def _check_axis(values, *, name: str, path) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 1:
+        raise DataError(f"{path}: {name} must be 1-D, got shape {array.shape}")
+    if array.size == 0:
+        raise DataError(f"{path}: {name} is empty")
+    if not np.all(np.isfinite(array)):
+        raise DataError(f"{path}: {name} contains non-finite values")
+    return array
+
+
+def validate_case_arrays(
+    *,
+    times,
+    radius,
+    profiles: Mapping[str, Any],
+    fronts: Mapping[str, Any] | None = None,
+    states: Mapping[str, Any] | None = None,
+    eligibility: Mapping[str, Any] | None = None,
+    path: Any = "<memory>",
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """**所有数组与两条坐标轴的关系，一次核完。**
+
+    以前这件事是分散的：启发式路径核了 ``density`` 的形状与两条轴的单调性，
+    体积分数路径两条都没核，而两条路径都没核 ``velocity`` / ``pressure`` /
+    ``energy`` 的形状、状态码的取值域、以及资格数组的**维度**。分散的后果不是
+    "少查了一项"，而是**两份数据用两套规则**：同一份导出换条路径读，一个报错、
+    一个放行。
+
+    具体的漏法（都实际复现过）：
+
+    * ``density (2, 3)`` 配 ``velocity (1, 3)``、时间两帧 —— 读取成功，然后查
+      第二帧抛 ``IndexError``。也就是说**被判就绪的数据在正常消费时会崩**。
+    * 时间轴倒序或重复 —— 直接读取成功。排序、``searchsorted``、分层取帧全都
+      建立在"时间严格递增"上，而它们一个都不报错。
+    * 资格数组形状 ``(1, 2)`` —— 被 ``reshape(-1)`` 展平成 ``(2,)`` 通过。
+      长度相同不代表格式正确。
+    * 状态码 ``999`` —— 当成普通无效帧放行。不认识的码是**格式**问题。
+
+    全部在这里一次性拦下，两条读取路径共用。
+    """
+    times = _check_axis(times, name="the time axis", path=path)
+    radius = _check_axis(radius, name="the radial axis", path=path)
+    if times.size < 1:
+        raise DataError(f"{path}: the time axis needs at least one frame")
+    if radius.size < 2:
+        raise DataError(f"{path}: the radial axis needs at least two points")
+    if not np.all(np.diff(times) > 0.0):
+        # 严格递增：相等与倒序都不行。相等会让"第几帧"失去意义，倒序会让所有
+        # 基于顺序的切片取反。
+        raise DataError(
+            f"{path}: the time axis must be strictly increasing; got "
+            f"{times[:4].tolist()}{'...' if times.size > 4 else ''}"
+        )
+    if not np.all(np.diff(radius) > 0.0):
+        raise DataError(f"{path}: the radial axis must be strictly increasing")
+
+    expected = (times.size, radius.size)
+    normalised: dict[str, np.ndarray] = {}
+    for name, values in profiles.items():
+        array = np.asarray(values, dtype=np.float64)
+        if array.ndim == 1 and array.size == radius.size and times.size == 1:
+            array = array.reshape(1, -1)
+        if array.shape != expected:
+            raise DataError(
+                f"{path}: {name} has shape {array.shape}, expected {expected} "
+                f"(frames, radial points). Every profile must share one grid; a "
+                "field whose frame count differs from the time axis will fail later, "
+                "at a query, where the reason is no longer visible"
+            )
+        normalised[name] = array
+
+    for name, values in (fronts or {}).items():
+        array = np.asarray(values, dtype=np.float64).reshape(-1)
+        if array.size != times.size:
+            raise DataError(
+                f"{path}: front {name!r} has {array.size} entries but the time axis "
+                f"has {times.size} frames"
+            )
+        if np.any(np.isinf(array)):
+            raise DataError(f"{path}: front {name!r} contains infinite values")
+        normalised[name] = array
+
+    for name, values in (states or {}).items():
+        array = np.asarray(values).reshape(-1)
+        if array.size != times.size:
+            raise DataError(
+                f"{path}: state code {name!r} has {array.size} entries but the time "
+                f"axis has {times.size} frames"
+            )
+        unknown = sorted(set(np.unique(array).tolist()) - set(FRONT_STATE_CODES))
+        if unknown:
+            raise DataError(
+                f"{path}: state code {name!r} contains {unknown}, which this reader "
+                f"does not define (known: {list(FRONT_STATE_CODES)}). An unrecognised "
+                "code is a format mismatch, not an unusable frame"
+            )
+        normalised[name] = array.astype(np.int64)
+
+    for name, values in (eligibility or {}).items():
+        array = np.asarray(values)
+        if array.dtype != np.bool_:
+            raise DataError(
+                f"{path}: eligibility {name!r} has dtype {array.dtype}, not bool"
+            )
+        if array.ndim != 1 or array.shape != (times.size,):
+            # 这里**不能** ``reshape(-1)``：``(1, 2)`` 会被展平成 ``(2,)`` 然后
+            # 长度检查通过。长度相同不代表格式正确——一个二维的资格表说明它本来
+            # 不是逐帧的量。
+            raise DataError(
+                f"{path}: eligibility {name!r} has shape {array.shape}, expected "
+                f"{(times.size,)} (one boolean per frame)"
+            )
+        normalised[name] = array
+
+    return times, radius, normalised
+
+
 def load_extracted_case(
     directory: Path | str,
     *,
@@ -656,15 +780,17 @@ def load_extracted_case(
     velocity = np.atleast_2d(np.asarray(data[mapping.key("velocity")], dtype=np.float64))
     pressure = np.atleast_2d(np.asarray(data[mapping.key("pressure")], dtype=np.float64))
 
-    if density.shape != (times.size, radius.size):
-        raise DataError(
-            f"density has shape {density.shape}, expected {(times.size, radius.size)}; "
-            "the time/radius axes are probably transposed"
-        )
-    if not np.all(np.diff(times) > 0.0):
-        raise DataError("time axis must be strictly increasing")
-    if not np.all(np.diff(radius) > 0.0):
-        raise DataError("radius axis must be strictly increasing")
+    # 统一的形状 / 坐标轴校验（两条读取路径共用同一套规则）。
+    times, radius, checked = validate_case_arrays(
+        times=times, radius=radius,
+        profiles={
+            "density": density, "velocity": velocity, "pressure": pressure,
+        },
+        path=npz_path,
+    )
+    density, velocity, pressure = (
+        checked["density"], checked["velocity"], checked["pressure"]
+    )
 
     charge_radius = float(metadata.get("R_0", np.nan))
     if not np.isfinite(charge_radius) or charge_radius <= 0.0:
@@ -786,6 +912,17 @@ def _load_with_volume_fraction_partition(
     if not np.isfinite(charge_radius) or charge_radius <= 0.0:
         raise DataError(f"{meta_path} does not declare a usable R_0")
 
+    # 统一的形状 / 坐标轴校验。**与启发式路径同一套规则**——以前这条路径既没核
+    # 时间轴的单调性，也没核 velocity/pressure 的形状。
+    times, radius, checked = validate_case_arrays(
+        times=times, radius=radius,
+        profiles={"density": density, "velocity": velocity, "pressure": pressure},
+        path=npz_path,
+    )
+    density, velocity, pressure = (
+        checked["density"], checked["velocity"], checked["pressure"]
+    )
+
     material = np.atleast_2d(np.asarray(block["material"], dtype=np.int64))
     valid = np.atleast_2d(np.asarray(block["valid"], dtype=bool))
     if material.shape != density.shape or valid.shape != density.shape:
@@ -816,38 +953,41 @@ def _load_with_volume_fraction_partition(
         & (shock_radius > contact_radius)
     )
 
-    def _frame_array(key: str, *, require_bool: bool = False):
+    def _frame_array(key: str):
         value = block.get(key) if hasattr(block, "get") else None
-        if value is None:
-            return None
-        array = np.asarray(value)
-        if require_bool and array.dtype != np.bool_:
-            # 与逐字段掩码同一条理由：``np.asarray(x, dtype=bool)`` 会把 ``nan``
-            # 变成 ``True``（``bool(nan)`` 为真），于是一张**全是 NaN** 的资格表
-            # 读进来是"全具资格"。资格数组是布尔声明，不是数值。
-            raise DataError(
-                f"{companion} carries {key!r} with dtype {array.dtype}, not bool. "
-                "Converting a float array with `dtype=bool` would turn every NaN into "
-                "True, i.e. an all-NaN eligibility table would read back as "
-                "'every frame eligible'"
-            )
-        array = array.reshape(-1)
-        if array.size != contact_radius.size:
-            # **长度不对就抛错，不能"忽略它、退回更弱的判据"。** 退回等于把一个
-            # 长度都对不上的导出当成一份可信证据更少的导出，而实际上它是一份
-            # **对不上**的导出——两份数据不是同一批。此时任何"更弱但仍然有效"
-            # 的标签都是无中生有。
-            raise DataError(
-                f"{companion} carries {key!r} with {array.size} entries but the profiles "
-                f"have {contact_radius.size} frames; the companion and the profiles do not "
-                "belong together"
-            )
-        return array
+        return None if value is None else np.asarray(value)
 
-    contact_eligibility = _frame_array("contact_has_supervision", require_bool=True)
-    shock_eligibility = _frame_array("shock_has_supervision", require_bool=True)
-    contact_state = _frame_array("contact_state")
-    shock_state = _frame_array("shock_state")
+    # 前沿、状态码、资格数组**一起**交给统一的校验：它们的维度、长度、取值域
+    # 与两条坐标轴的关系在那里一次核完。以前每个数组各查各的，于是"资格数组被
+    # ``reshape(-1)`` 展平"和"状态码 999 被当成普通无效帧"都能溜过去。
+    _, _, checked_fronts = validate_case_arrays(
+        times=times, radius=radius,
+        profiles={
+            "density": density, "velocity": velocity, "pressure": pressure,
+        },
+        fronts={
+            "contact_radius": contact_radius, "shock_radius": shock_radius,
+        },
+        states={
+            key: array for key, array in (
+                ("contact_state", _frame_array("contact_state")),
+                ("shock_state", _frame_array("shock_state")),
+            ) if array is not None
+        },
+        eligibility={
+            key: array for key, array in (
+                ("contact_has_supervision", _frame_array("contact_has_supervision")),
+                ("shock_has_supervision", _frame_array("shock_has_supervision")),
+            ) if array is not None
+        },
+        path=companion,
+    )
+    contact_radius = checked_fronts["contact_radius"]
+    shock_radius = checked_fronts["shock_radius"]
+    contact_state = checked_fronts.get("contact_state")
+    shock_state = checked_fronts.get("shock_state")
+    contact_eligibility = checked_fronts.get("contact_has_supervision")
+    shock_eligibility = checked_fronts.get("shock_has_supervision")
 
     # **每条前沿各自决定用什么来源。**
     #
@@ -855,33 +995,55 @@ def _load_with_volume_fraction_partition(
     # 接触侧的资格数组**明确写着 False**、激波侧的数组缺失时，接触侧会跟着退回
     # 三态码——一个被显式记录下来的否决，被**另一侧字段的缺失**覆盖掉。这既违反
     # "资格优先"，也违反"两条前沿独立"：A 的缺失改变了 B 的判据。
+    #: 资格证据的档位。**分档而不是只分"有/没有"**：三态码是真的证据，但它不是
+    #: 当前契约要求的那一档（§10 的逐帧资格），两者混在一起会让"旧格式"读起来像
+    #: "已就绪"。
+    LEVEL_ARRAYS = "arrays"
+    LEVEL_LEGACY_CODE = "legacy_state_code"
+    LEVEL_NONE = "none"
+
     def _front(eligibility, state, geometric, name: str):
         if eligibility is not None:
             return geometric & np.asarray(eligibility, dtype=bool), (
                 f"per-frame supervision eligibility array ({name}_has_supervision)"
-            )
+            ), LEVEL_ARRAYS
         if state is not None:
             # 三态码是**较弱的**证据：它只说"分辨得出吗"，不说"够不够格当标签"。
-            # 但比"半径有限即可"强，所以在这一侧单独采用它。
+            # 比"半径有限即可"强，所以这一侧单独用它——但它**不是**当前契约要的
+            # 那一档，所以档位记成 legacy，契约会据此判未就绪（可诊断、不可训练）。
             return geometric & (state == 2), (
                 f"three-state detection code ({name}_state == 2; no eligibility array)"
-            )
-        return geometric, f"none recorded for {name} — UNVERIFIED"
+            ), LEVEL_LEGACY_CODE
+        return geometric, f"none recorded for {name} — UNVERIFIED", LEVEL_NONE
 
-    contact_valid, contact_source = _front(
+    contact_valid, contact_source, contact_level = _front(
         contact_eligibility, contact_state, geometric_contact, "contact"
     )
-    shock_valid, shock_source = _front(
+    shock_valid, shock_source, shock_level = _front(
         shock_eligibility, shock_state, geometric_shock, "shock"
     )
     front_eligibility = {"contact": contact_source, "shock": shock_source}
+    contact_eligibility_level = contact_level
+    shock_eligibility_level = shock_level
+    # 整体档位取两侧里**最弱**的那一档：一侧是数组、另一侧只有三态码时，后者仍然
+    # 是正式训练的缺口，不能被前者的强度盖住。
+    _order = {LEVEL_ARRAYS: 2, LEVEL_LEGACY_CODE: 1, LEVEL_NONE: 0}
+    eligibility_level = min(
+        (contact_level, shock_level), key=lambda value: _order[value]
+    )
     front_resolution = (
         "each front uses its own strongest available source, independently: "
         f"contact -> {contact_source}; shock -> {shock_source}. A missing record on one "
         "side never changes the other side's verdict, and an explicitly recorded False is "
         "never overridden by a fallback"
     )
-    if "UNVERIFIED" in contact_source or "UNVERIFIED" in shock_source:
+    if eligibility_level == LEVEL_LEGACY_CODE:
+        front_resolution += (
+            ". At least one front falls back to the legacy three-state code, which is "
+            "weaker evidence than the per-frame eligibility arrays the current contract "
+            "requires; the data contract refuses it for formal training"
+        )
+    elif eligibility_level == LEVEL_NONE:
         front_resolution += (
             ". At least one front has no eligibility evidence at all, so every finite "
             "radius is being treated as a label — the data contract refuses this"
@@ -973,8 +1135,11 @@ def _load_with_volume_fraction_partition(
         field_validity=_field_validity_from_companion(block, density.shape),
         front_supervision_eligibility={
             "source": front_eligibility,
+            "level": eligibility_level,
             "contact_source": contact_source,
             "shock_source": shock_source,
+            "contact_level": contact_eligibility_level,
+            "shock_level": shock_eligibility_level,
             "contact_status": contact_state,
             "shock_status": shock_state,
             "contact_eligible": (

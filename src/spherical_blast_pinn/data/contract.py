@@ -215,6 +215,11 @@ def evaluate_case_contract(case: Any) -> ContractVerdict:
     declared = source.get("material_partition_is_volume_fraction_based")
     authoritative = declared is True
     detail["material_partition_is_volume_fraction_based"] = declared
+    # **标志之外还要有来源记录。** 只有一个布尔量时，那个 True 是谁写的、依据是什么
+    # 都无从核对——上一轮的教训正是"判据从信任说明文字换成信任读取器"。标志与来源
+    # 记录必须同时存在，且各说各的：标志说"是不是"，来源记录说"从哪来的"。
+    recorded_source = str(source.get("material_partition_source_recorded") or "").strip()
+    detail["material_partition_source_recorded"] = recorded_source or None
     if not authoritative:
         recorded = (
             "提取器没有留下这个标志（未核实）" if declared is None
@@ -225,6 +230,12 @@ def evaluate_case_contract(case: Any) -> ContractVerdict:
             f"（{recorded}；说明文字：{material_source or '未记录'}）：启发式探测器"
             "给出的接触面位置有量化跳变、大量帧落在装药半径以内（物理上不可能）。"
             "契约上判为未就绪——权威分区必须重新提取"
+        )
+    elif not recorded_source:
+        reasons.append(
+            "材料分区声明为体积分数来源，但**没有留下结构化来源记录**"
+            "（material_partition_source）：只有一个是/否标志时，那个 True 是谁写的、"
+            "依据是什么都无从核对"
         )
 
     # -- 每个场量各自的有效性（§11.1）-------------------------------------
@@ -282,18 +293,27 @@ def evaluate_case_contract(case: Any) -> ContractVerdict:
                 or (eligibility.get("source") if isinstance(eligibility.get("source"), str) else "")
                 or ""
             )
+            side_level = str(eligibility.get(f"{side}_level") or eligibility.get("level") or "")
             per_side[side] = side_source or "未记录"
-            if UNVERIFIED_ELIGIBILITY in side_source or "UNVERIFIED" in side_source:
+            if side_level == "none" or UNVERIFIED_ELIGIBILITY in side_source or "UNVERIFIED" in side_source:
                 reasons.append(
                     f"{side} 前沿的监督资格是**未核实**档（既没有资格数组也没有"
                     "三态码，只有『半径有限即可』）：那是最弱的一档判据，不能拿来"
                     "当训练标签"
                 )
+            elif side_level == "legacy_state_code":
+                # **旧格式可以诊断，不可以训练。** 三态码只说"分辨得出吗"，不说
+                # "够不够格当标签"；把这一档判成 ready，等于把"数据还没迁移"读成
+                # "数据已经就绪"。
+                reasons.append(
+                    f"{side} 前沿只有**旧的三态码**，没有当前契约要求的逐帧资格"
+                    "数组（§10）：这一档可以说'检测到了什么'，说不了'够不够格当"
+                    "标签'。可以读来诊断，不能当正式训练数据"
+                )
             elif not side_source:
                 reasons.append(f"{side} 前沿既没有资格数组，也没有说明来源")
-            if eligibility.get(f"{side}_eligible") is None and side_source:
-                pass  # 三态码这一档没有逐帧资格数组，但来源是明确的
         detail["front_eligibility_source"] = per_side
+        detail["front_eligibility_level"] = eligibility.get("level")
         detail["front_supervision_eligibility"] = (
             (eligibility.get("metadata") or {}).get("contact", {}).get("status_counts")
             if isinstance(eligibility.get("metadata"), Mapping) else None
