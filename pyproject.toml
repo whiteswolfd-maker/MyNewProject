@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spherical-blast-pinn"
+version = "0.1.0"
+description = "1D spherically symmetric post-detonation TNT/air two-medium PINN"
+readme = "README.md"
+# The task specification asked for Python 3.11.  The verified interpreter on
+# this machine is 3.10.8 (the only one with a working PyTorch); 3.11+ is
+# supported by the code itself.
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=2.0",
+    "h5py>=3.8",
+    "PyYAML>=6.0",
+    "matplotlib>=3.7",
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=14.0"]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+spherical_blast_pinn = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

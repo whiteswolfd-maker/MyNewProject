@@ -1,0 +1,45 @@
+# 小规模联检配置：接的是**按当前提取器重新提取过**的 50 mm 数据（含 §9 的逐帧
+# 几何重构、逐字段有效性与球对称份额）。用途只有两个：
+#
+#   1. 验证整条链路（读取 → 采样 → 观测算子 → 损失 → 检查 → 检查点 → 恢复）能跑通；
+#   2. 验证 §15 的数据契约与 §16 的验证隔离两道闸门在真实数据上确实放行。
+#
+# **它不构成任何精度证据。** 更新次数是分钟级的，采样点数是基线配置的零头。
+inherits: ../base.yaml
+
+data:
+  cases:
+    - case_id: tnt_50mm
+      charge_radius_m: 0.050
+      directory: F:/2/extracted_geom/50mm_c
+      split: train
+  # 这份配置只跑一个算例，没有盲测对象，所以**不**声明严格盲测——声明了却
+  # 没有对象，验证隔离那一关会（正确地）拒绝开始。
+  allow_unverified_cases: true
+
+splits:
+  strict_blind_test: false
+
+reference_field:
+  detonation_cells: 400
+  cells_inside: 400
+  sample_count: 11
+
+sampling:
+  n_pde_product: 64
+  n_pde_air: 64
+  n_ic_product: 16
+  n_ic_air: 16
+  n_contact: 8
+  n_shock: 8
+  n_data_product: 32
+  n_data_air: 32
+  n_data_front: 8
+
+training:
+  output_dir: outputs/geom_smoke
+  log_every: 5
+  checkpoint_every: 10
+  check_every: 10
+  max_updates: 12
+  seeds: [20260920]

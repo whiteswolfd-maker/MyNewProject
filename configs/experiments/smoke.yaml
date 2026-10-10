@@ -1,0 +1,37 @@
+# 冒烟配置：把参考场网格与更新次数都缩到分钟级，只用来验证整条链路能跑通。
+# **它不是物理结果**，任何用它得到的数都不能当作训练完成或精度证据。
+inherits: ../base.yaml
+
+reference_field:
+  # 产物场（爆轰阶段）自己的网格数。它与下面的 cells_inside 是两套网格：
+  # 前者在 [0, R_0] 上均匀、用于构造波前到达时的产物场，后者是两介质前置的网格。
+  detonation_cells: 2000
+  cells_inside: 600
+  growth: 1.01
+  sample_count: 21
+
+sampling:
+  n_pde_product: 256
+  n_pde_air: 256
+  n_ic_product: 64
+  n_ic_air: 64
+  n_contact: 32
+  n_shock: 32
+  n_data_product: 64
+  n_data_air: 64
+  n_data_front: 16
+
+data:
+  # 本配置连的是真实算例，但**兼容性审查还没按方案 B 重跑**（旧的审查报告是按
+  # 方案 A 的判据写的）。冒烟检查的用途是"整条链路能跑通"，不是物理训练，所以
+  # 这里显式越过兼容性闸门。越过的后果会被记录：运行清单与检查点都会带上
+  # ``data_compatibility = unverified``，任何由它得到的数都不能当作精度证据。
+  allow_unverified_cases: true
+
+training:
+  output_dir: outputs/smoke
+  log_every: 5
+  checkpoint_every: 20
+  check_every: 20
+  max_updates: 40
+  seeds: [20260920]

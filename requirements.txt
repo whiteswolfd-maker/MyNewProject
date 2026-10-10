@@ -1,0 +1,6 @@
+numpy>=1.26
+scipy>=1.11
+PyYAML>=6.0
+torch>=2.2
+pytest>=8.0
+lasso-python>=1.7

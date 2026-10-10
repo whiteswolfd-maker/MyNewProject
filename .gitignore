@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Generated coupled-pipeline outputs
+runs/
+logs/
+*.log
+extracted_*_handoff/
+predictions/
+
+# 模型权重
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# 大型数据格式
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.mat
+
+# LS-DYNA / ANSYS结果
+d3plot
+d3plot[0-9]*
+d3dump*
+d3thdt*
+binout*
+glstat*
+matsum*
+nodout*
+elout*
+*.rst
+*_files/
+
+# 压缩包与视频
+*.zip
+*.rar
+*.7z
+*.mp4
+*.avi

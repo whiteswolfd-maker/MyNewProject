@@ -1,0 +1,5 @@
+# 完整配置：提示词 §13 的 20000 次更新基线预算。训练需要显式发起。
+inherits: ../base.yaml
+
+training:
+  output_dir: outputs/full

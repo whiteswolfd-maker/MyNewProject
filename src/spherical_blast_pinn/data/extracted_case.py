@@ -1,0 +1,941 @@
+"""已提取算例的读取适配器与材料分区识别。
+
+数据来源
+--------
+
+三个半径都来自真实的 LS-DYNA 求解，以「沿半径线的时空剖面」形式保存：
+
+* ``raw_line.npz`` —— 键 ``t``、``x``、``rho``、``u``、``P``，形状
+  ``t(N_t,)``、``x(N_x,)``、其余 ``(N_t, N_x)``，SI 单位；
+* ``metadata.json`` —— ``R_0``、``x_end``、``t_end``、网格数等。
+
+字段映射**不写死**：:class:`FieldMapping` 把逻辑字段名映射到 npz 的键，
+默认值只是本数据集的当前约定。换一份导出不需要改代码。
+
+**没有输出比内能。** 算例卡片不写 ``specific_internal_energy``，所以它由
+``(rho, p)`` 按材料各自的状态方程反解：
+
+* 空气： ``e = p / [(gamma - 1) rho]``；
+* 产物： ``e = (p - p_cold(V)) / (omega rho)``，``V = rho_0/rho``。
+
+反解出的非物理值保持 ``nan``，**不做截断**——用一个"保护"后的值冒充有效状态，
+会让下游的 EOS 一致性检查全部失去意义。
+
+材料分区
+--------
+
+提示词 §11 要求"监督样本的材料归属与有效掩码来自数据预处理"，并且"不根据
+当前预测前沿随意删除难拟合样本"。所以分区在这里一次性确定，并随算例一起
+保存，训练时只读不改。
+
+本适配器用**密度最陡下降**定位接触面：接触面两侧压力与速度连续、密度间断，
+因此它是内侧剖面上密度下降最快的位置。主激波用压力超出环境态的比例定位。
+
+这两条都是**启发式**判据，不是从算例的体积分数直接读出来的。它们的不确定
+性由 :meth:`ExtractedCase.quality_report` 给出，验收表里也据此标注哪些帧
+"参考数据不足以判断"。
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+import numpy as np
+
+from ..physics import material as mat
+from ..physics.eos import jwl_pressure_numpy
+from ..physics.similitude import handover_time
+
+#: 逻辑字段 -> ``raw_line.npz`` 的键。
+DEFAULT_FIELD_MAP: dict[str, str] = {
+    "time": "t",
+    "radius": "x",
+    "density": "rho",
+    "velocity": "u",
+    "pressure": "P",
+}
+
+#: 反解比内能所需的最少字段。
+REQUIRED_FIELDS = ("time", "radius", "density", "velocity", "pressure")
+
+
+class DataError(RuntimeError):
+    """数据不可用或字段缺失。"""
+
+
+def specific_energy_from_pressure(
+    density: np.ndarray,
+    pressure: np.ndarray,
+    material: np.ndarray,
+    *,
+    jwl=None,
+    gamma_air: float = mat.AIR_GAMMA,
+) -> np.ndarray:
+    """由 ``(rho, p)`` 按材料各自的状态方程反解比内能。
+
+    产物走一般 JWL 的逆：``p = p_cold(V) + omega rho e`` 解出 ``e``；空气走理想气体。
+    两条都是**除法**，不是求根：有限输入、``rho > 0``、``omega > 0`` 时结果必然是
+    有限实数。所以这里没有"解不出来"的分支。
+
+    ``nan`` 只来自两个地方，且都不是数学上的无解：
+
+    * 输入本身无效（``omega <= 0``、密度非正、压力非有限）；
+    * 反解出**非正**比内能，被下面的有效性判据当成"不是该 EOS 的合法状态"剔除。
+      产物上这等价于 ``p < p_cold(V)``，即该单元的化学能还没放出来（未起爆、或正
+      被爆轰波扫过的装药），套产物 JWL 本来就不成立。
+
+    **这是最后手段。** 正常情况下比内能随剖面一起写出（``raw_line.npz`` 的 ``e``），
+    由提取器在**单元级**先反解再加权平均，比拿壳层平均后的 ``(rho, p)`` 再解一次准。
+    只有旧的、没有 ``e`` 的导出才会走到这条路径。
+    """
+    params = jwl or mat.product_jwl()
+    density = np.asarray(density, dtype=np.float64)
+    pressure = np.asarray(pressure, dtype=np.float64)
+    material = np.asarray(material)
+
+    out = np.full(density.shape, np.nan, dtype=np.float64)
+    air = material == 1
+    if np.any(air):
+        rho = density[air]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            value = pressure[air] / ((gamma_air - 1.0) * rho)
+        out[air] = np.where(np.isfinite(value) & (value > 0.0), value, np.nan)
+
+    product = material == 0
+    if np.any(product):
+        rho = density[product]
+        rho_safe = np.maximum(rho, 1.0e-30)
+        v = params.rho0 / rho_safe
+        p_cold = jwl_pressure_numpy(rho, np.zeros_like(rho), params)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            value = (pressure[product] - p_cold) / (params.omega * rho_safe)
+        out[product] = np.where(np.isfinite(value) & (value > 0.0), value, np.nan)
+    return out
+
+
+@dataclass
+class FieldMapping:
+    """逻辑字段名到数据键的映射。"""
+
+    mapping: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_FIELD_MAP))
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any] | None) -> "FieldMapping":
+        if not payload:
+            return cls()
+        merged = dict(DEFAULT_FIELD_MAP)
+        merged.update({str(k): str(v) for k, v in payload.items()})
+        return cls(mapping=merged)
+
+    def key(self, logical: str) -> str:
+        try:
+            return self.mapping[logical]
+        except KeyError as exc:  # pragma: no cover - guarded by validation
+            raise DataError(f"no data key mapped for logical field {logical!r}") from exc
+
+
+@dataclass
+class DetectorSettings:
+    """前沿识别参数。每个都在质量报告里回报，便于事后审查。"""
+
+    #: 主激波判据：压力超过环境态的比例。
+    shock_pressure_ratio: float = 1.0e-3
+    #: 接触面判据：在内侧剖面上密度最陡下降位置；越过主激波即停止搜索。
+    contact_smoothing_cells: int = 5
+    #: 产物密度必须至少是环境密度的这个倍数，否则该帧的接触面判为不可靠。
+    contact_density_ratio_floor: float = 1.02
+    #: 需要的最少纯材料单元数。
+    minimum_cells_per_medium: int = 3
+
+    def as_dict(self) -> dict[str, float]:
+        return {
+            "shock_pressure_ratio": self.shock_pressure_ratio,
+            "contact_smoothing_cells": self.contact_smoothing_cells,
+            "contact_density_ratio_floor": self.contact_density_ratio_floor,
+            "minimum_cells_per_medium": self.minimum_cells_per_medium,
+        }
+
+
+@dataclass
+class ExtractedCase:
+    """一个半径的时空剖面，附带识别出的前沿与有效掩码。"""
+
+    case_id: str
+    charge_radius: float
+    times: np.ndarray               # 物理时间，s
+    radius: np.ndarray              # 固定的径向网格，m
+    density: np.ndarray             # (N_t, N_r)
+    velocity: np.ndarray
+    pressure: np.ndarray
+    specific_energy: np.ndarray
+    contact_radius: np.ndarray      # (N_t,)
+    shock_radius: np.ndarray
+    contact_valid: np.ndarray       # (N_t,) bool
+    shock_valid: np.ndarray
+    material: np.ndarray            # (N_t, N_r) int：0 产物、1 空气、2 未受扰动
+    valid: np.ndarray               # (N_t, N_r) bool
+    source: dict[str, Any] = field(default_factory=dict)
+    detector: DetectorSettings = field(default_factory=DetectorSettings)
+
+    #: 逐字段有效性（§11.1）。键是 ``density`` / ``velocity`` / ``specific_energy``
+    #: / ``pressure``，值是 ``(N_t, N_r)`` 的布尔掩码。
+    #:
+    #: ``None`` 表示**这份导出没有记录**，不表示"都有效"。两者必须能分开：一个
+    #: 缺字段的旧导出会让采样器退回联合掩码，而那是要显式告诉调用方的退化。
+    field_validity: dict[str, np.ndarray] | None = None
+
+    #: 前沿监督资格（§10）：检测状态与"够不够格当标签"分开，两条前沿各一份。
+    #: 同样是 ``None`` 表示未记录，而不是"都够格"。
+    front_supervision_eligibility: dict[str, Any] | None = None
+
+    # -- 时间（方案 B）----------------------------------------------------
+    @property
+    def detonation_velocity(self) -> float:
+        """卡片上的爆速 ``D``，m/s，来自提取元数据。
+
+        **没有它就不能算时间原点。** 方案 B 的原点是 ``T_h = R_0/D + epsilon``，
+        缺少 ``D`` 时唯一"能用"的做法是退回只有 ``epsilon`` 的方案 A 时间轴——而两条
+        时间轴都只有秒的量纲，退回去不会报错，只会把整条轨迹平移一个 ``T_b``。
+        所以这里直接失败，而不是给一个默认值。
+        """
+        velocity = float(self.source.get("detonation_velocity_m_s") or 0.0)
+        if not (velocity > 0.0):
+            raise DataError(
+                f"{self.case_id}: the extraction metadata carries no usable detonation "
+                "velocity, so the scheme-B time origin T_h = R_0/D + epsilon cannot be "
+                "formed. A cache written before the scheme-B migration must be "
+                "re-extracted, not silently read with the scheme-A clock."
+            )
+        return velocity
+
+    @property
+    def pinn_times(self) -> np.ndarray:
+        """``tau = T - T_h``，``T_h = R_0/D + epsilon``。"""
+        return self.times - self.start_time
+
+    @property
+    def start_time(self) -> float:
+        """``T_h``，s：PINN 的启动时刻（方案 B）。"""
+        return handover_time(
+            self.charge_radius, detonation_velocity=self.detonation_velocity
+        )
+
+    def _after_start(self) -> np.ndarray:
+        """时间落在 PINN 启动时刻之后的帧。"""
+        return self.pinn_times >= 0.0
+
+    # -- 位置不确定性（§11.2）--------------------------------------------
+    @property
+    def grid_spacing(self) -> float:
+        """径向网格间距，m。探测器的分辨率下限。"""
+        if self.radius.size < 2:
+            return float("nan")
+        return float(np.median(np.diff(self.radius)))
+
+    def contact_position_uncertainty(self) -> float:
+        """接触面位置的冻结不确定性，m。
+
+        接触面是"内侧剖面上密度最陡下降"定位的，用的是
+        ``detector.contact_smoothing_cells`` 个单元的平滑窗口——所以它自己的
+        分辨率就是那条窗口，不是单个单元。**这个值由数据与探测器设置决定，
+        训练过程中不更新**：位置约束的 delta 一旦随训练自动扩大，就会把错误预测
+        一起包容进去，约束就失去意义了。
+        """
+        return float(self.detector.contact_smoothing_cells) * self.grid_spacing
+
+    def shock_position_uncertainty(self) -> float:
+        """主激波位置的冻结不确定性，m。
+
+        激波是压力越过阈值的位置，落在网格上，所以不确定性是一个单元。真实数据
+        若记录了跃迁带宽度，应按那个宽度取——这里用分辨率下界，不夸大。
+        """
+        return self.grid_spacing
+
+    def _air_gap_cells(self) -> np.ndarray:
+        """``Rs`` 与 ``Rc`` 之间的单元数。任一侧前沿不可用时为 0。"""
+        gap = np.zeros(self.times.size, dtype=np.int64)
+        both = self.contact_valid & self.shock_valid
+        for index in np.flatnonzero(both):
+            gap[index] = int(
+                np.count_nonzero(
+                    (self.radius > self.contact_radius[index])
+                    & (self.radius < self.shock_radius[index])
+                )
+            )
+        return gap
+
+    def supervisable_frames(self, *, minimum_air_cells: int = 1) -> np.ndarray:
+        """可以用于监督的帧：时间在启动之后、且**至少一个前沿**识别可靠。
+
+        提示词 §11.1 要求两套前沿**独立**。这里以前写的是
+        ``contact_valid & shock_valid``：只要激波那一天没识别出来，整帧就从训练
+        窗口里消失——**接触面明明可靠，也被一起丢掉**，而且丢得完全无声（表现为
+        有效时间范围莫名其妙地短）。
+
+        现在改成"至少一侧可靠"。空气间隙要求只在**两侧都可用**时才施加：只有
+        单侧前沿时算不出间隙，用"算不出"去否决整帧就是拿缺失当不合格。
+
+        提示词要求**每个训练半径取自己的最后有效仿真帧作为终止时间**，不要求
+        三个半径的终止时间同比例缩放。这里给出的就是这个集合，终止时间由
+        :meth:`last_valid_pinn_time` 给出。
+        """
+        front_ok = self.contact_valid | self.shock_valid
+        gap_ok = (self._air_gap_cells() >= int(minimum_air_cells)) | ~(
+            self.contact_valid & self.shock_valid
+        )
+        return self._after_start() & front_ok & gap_ok
+
+    def contact_supervisable_frames(self) -> np.ndarray:
+        """接触面**单独**可监督的帧（§11.1）。不要求激波有效。"""
+        return self._after_start() & self.contact_valid
+
+    def shock_supervisable_frames(self, *, minimum_air_cells: int = 1) -> np.ndarray:
+        """激波**单独**可监督的帧（§11.1）。不要求接触面有效。"""
+        return self._after_start() & self.shock_valid
+
+    def air_supervisable_frames(self, *, minimum_air_cells: int = 1) -> np.ndarray:
+        """空气区（``Rc`` 与 ``Rs`` 之间）可监督的帧。
+
+        这一项**必须**两侧前沿都可靠——空气间隙是两套前沿共同定义的。它单独成
+        一个方法，而不是混进 :meth:`supervisable_frames` 去否决整帧。
+        """
+        return (
+            self._after_start()
+            & self.contact_valid
+            & self.shock_valid
+            & (self._air_gap_cells() >= int(minimum_air_cells))
+        )
+
+    def frame_split(
+        self,
+        *,
+        holdout_fraction: float = 0.1,
+        seed: int = 0,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """把可监督帧按**连续帧组**划分成 ``(train, development)``。
+
+        提示词 §11 要求"优先按完整时间段/帧组留出，而非将同一帧相邻网格点随机
+        拆分后宣称独立验证"。同一帧相邻网格点高度相关，随机拆分会让两个集合
+        互相看得见对方，于是开发集误差只是训练误差的一个更贵的写法。
+
+        这里按位置把可用帧切成 ``round(1/holdout_fraction)`` 个连续块，整块留一
+        块作开发检查；留哪一块由 ``seed`` 决定，因此同一份数据在同一个种子上
+        永远给出同一个划分（划分本身要可复现，才谈得上"在看最终结果之前固定"）。
+
+        返回值是**真实帧号**，不是位置——见 :meth:`ExtractedCase.sample_at`
+        的调用约定。
+        """
+        if not (0.0 < float(holdout_fraction) < 0.5):
+            raise DataError(
+                f"holdout_fraction must lie in (0, 0.5), got {holdout_fraction}"
+            )
+        usable = np.flatnonzero(self.supervisable_frames())
+        if usable.size < 2:
+            return usable, np.zeros(0, dtype=np.int64)
+
+        blocks = max(2, int(round(1.0 / float(holdout_fraction))))
+        blocks = min(blocks, usable.size)
+        edges = np.linspace(0, usable.size, blocks + 1).astype(int)
+        held = int(seed) % blocks
+        # 避开第一块：它承载启动时刻附近最陡的一段，也是 IC 之外唯一能看到早期
+        # 演化的监督；把它整个留出去会让开发集与训练集的时间分布差得太远。
+        if blocks > 1 and held == 0:
+            held = 1
+        positions = np.arange(usable.size)
+        development = usable[(positions >= edges[held]) & (positions < edges[held + 1])]
+        train = usable[(positions < edges[held]) | (positions >= edges[held + 1])]
+        return train, development
+
+    def last_valid_pinn_time(self) -> float:
+        usable = self.supervisable_frames()
+        if not np.any(usable):
+            raise DataError(
+                f"case {self.case_id!r} has no supervisable frame: the front detectors "
+                "never produced a reliable contact/shock pair after the start time"
+            )
+        return float(self.pinn_times[usable].max())
+
+    def last_valid_physical_time(self) -> float:
+        return self.last_valid_pinn_time() + self.start_time
+
+    # -- 查询 -------------------------------------------------------------
+    def frame_index(self, physical_time: float) -> int:
+        return int(np.argmin(np.abs(self.times - float(physical_time))))
+
+    def sample_at(self, frame: int, radii: np.ndarray) -> dict[str, np.ndarray]:
+        """在一帧的给定半径上取值；**线性插值，不跨间断**。
+
+        调用方负责只在同一材料的区间内查询。``nan`` 保持 ``nan``：插值到无效
+        单元不会得到一个看起来合理的数。
+        """
+        radii = np.asarray(radii, dtype=np.float64)
+        clipped = np.clip(radii, self.radius[0], self.radius[-1])
+        index = np.searchsorted(self.radius, clipped, side="right") - 1
+        index = np.clip(index, 0, self.radius.size - 2)
+        left = self.radius[index]
+        right = self.radius[index + 1]
+        weight = np.where(right > left, (clipped - left) / np.maximum(right - left, 1e-300), 0.0)
+
+        def blend(field: np.ndarray) -> np.ndarray:
+            row = field[frame]
+            return row[index] * (1.0 - weight) + row[index + 1] * weight
+
+        return {
+            "density": blend(self.density),
+            "velocity": blend(self.velocity),
+            "specific_energy": blend(self.specific_energy),
+            "pressure": blend(self.pressure),
+        }
+
+    # -- 质量报告 ---------------------------------------------------------
+    def quality_report(self) -> dict[str, Any]:
+        usable = self.supervisable_frames()
+        air_cells = np.zeros(self.times.size, dtype=np.int64)
+        for index in range(self.times.size):
+            if self.contact_valid[index] and self.shock_valid[index]:
+                air_cells[index] = int(
+                    np.count_nonzero(
+                        (self.radius > self.contact_radius[index])
+                        & (self.radius < self.shock_radius[index])
+                    )
+                )
+        gaps = np.where(
+            self.contact_valid & self.shock_valid,
+            self.shock_radius - self.contact_radius,
+            np.nan,
+        )
+        return {
+            "case_id": self.case_id,
+            "charge_radius_m": self.charge_radius,
+            "n_frames": int(self.times.size),
+            "n_frames_supervisable": int(np.count_nonzero(usable)),
+            "time_start_s": self.start_time,
+            "t_phys_first_s": float(self.times[0]),
+            "t_phys_last_s": float(self.times[-1]),
+            "t_pinn_last_valid_s": (
+                float(self.pinn_times[usable].max()) if np.any(usable) else None
+            ),
+            "contact_valid_fraction": float(np.mean(self.contact_valid)),
+            "shock_valid_fraction": float(np.mean(self.shock_valid)),
+            "min_air_cells": int(air_cells[usable].min()) if np.any(usable) else 0,
+            "min_gap_m": float(np.nanmin(gaps)) if np.any(np.isfinite(gaps)) else None,
+            "energy_source": self.source.get(
+                "energy_source", "unknown — this object was not built from a directory"
+            ),
+            "front_resolution": self.source.get(
+                "front_resolution", "not recorded by this extraction"
+            ),
+            "material_masks_from": "density-steepest-descent contact detector (heuristic)",
+            "detector": self.detector.as_dict(),
+            "frames_rejected_contact_below_charge_radius": int(
+                self.source.get("frames_rejected_contact_below_charge_radius", 0)
+            ),
+            "detector_reliability": (
+                "该判据是启发式的，不是从材料体积分数读出来的。本数据集上它给出的"
+                "接触面位置存在量化跳变，且大量帧落在装药半径以内（物理上不可能）；"
+                "这些帧已按物理约束剔除，但**探测器本身仍不可靠**——用它做的前沿监督"
+                "只能作为弱标签，权威的材料分区需要从 d3plot 的材料体积分数重新提取。"
+            ),
+            **{k: v for k, v in self.source.items() if k != "raw"},
+        }
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "case_id": self.case_id,
+            "charge_radius": self.charge_radius,
+            "n_frames": int(self.times.size),
+            "n_radii": int(self.radius.size),
+            "radius_min": float(self.radius[0]),
+            "radius_max": float(self.radius[-1]),
+            "time_min": float(self.times[0]),
+            "time_max": float(self.times[-1]),
+        }
+
+
+# --------------------------------------------------------------------------
+# 前沿识别
+# --------------------------------------------------------------------------
+
+
+def detect_shock_radius(
+    radius: np.ndarray,
+    pressure: np.ndarray,
+    *,
+    ambient_pressure: float = mat.AIR_PRESSURE,
+    settings: DetectorSettings | None = None,
+) -> float:
+    """主激波半径：压力仍明显高于环境态的最外侧位置。"""
+    settings = settings or DetectorSettings()
+    excess = np.asarray(pressure) - float(ambient_pressure)
+    reference = float(np.max(np.abs(excess))) if excess.size else 0.0
+    if reference <= 0.0:
+        return float("nan")
+    active = np.flatnonzero(excess > settings.shock_pressure_ratio * reference)
+    if active.size == 0:
+        return float("nan")
+    index = int(active[-1])
+    if index + 1 >= radius.size:
+        return float("nan")
+    return float(radius[index + 1])
+
+
+def detect_contact_radius(
+    radius: np.ndarray,
+    density: np.ndarray,
+    shock_radius: float,
+    *,
+    ambient_density: float = mat.AIR_DENSITY,
+    settings: DetectorSettings | None = None,
+) -> tuple[float, float]:
+    """接触面半径：内侧剖面上密度最陡下降的位置。
+
+    返回 ``(R_c, 判据余量)``。余量是接触面两侧的密度对比度，用来判断这一帧
+    是否可靠；低于 :attr:`DetectorSettings.contact_density_ratio_floor` 时
+    调用方应把该帧标为无效。
+    """
+    settings = settings or DetectorSettings()
+    radius = np.asarray(radius, dtype=np.float64)
+    density = np.asarray(density, dtype=np.float64)
+    if not np.isfinite(shock_radius):
+        return float("nan"), 0.0
+
+    inside = radius <= shock_radius
+    if np.count_nonzero(inside) < 2 * settings.minimum_cells_per_medium:
+        return float("nan"), 0.0
+
+    indices = np.flatnonzero(inside)
+    row = density[indices]
+    if not np.all(np.isfinite(row)):
+        return float("nan"), 0.0
+
+    window = max(1, int(settings.contact_smoothing_cells))
+    if window > 1:
+        kernel = np.ones(window) / window
+        smoothed = np.convolve(row, kernel, mode="same")
+    else:
+        smoothed = row
+
+    gradient = np.gradient(smoothed, radius[indices])
+    drop_index = int(np.argmin(gradient))
+    position = int(indices[drop_index])
+    if position + 1 >= radius.size:
+        position = radius.size - 2
+
+    outer_density = float(density[position + 1])
+    inner_density = float(density[position])
+    contrast = inner_density / max(outer_density, 1.0e-30)
+    if contrast < settings.contact_density_ratio_floor:
+        return float(radius[position + 1]), contrast
+    return float(radius[position + 1]), contrast
+
+
+def partition_materials(
+    radius: np.ndarray,
+    density: np.ndarray,
+    pressure: np.ndarray,
+    contact_radius: float,
+    shock_radius: float,
+    *,
+    settings: DetectorSettings | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """按识别出的前沿把剖面分成产物 / 空气 / 未受扰动三区。
+
+    返回 ``(material, valid)``。``material`` 用 ``0/1/2`` 编码，``valid`` 标记
+    哪些点可以作为监督标签。紧邻接触面与主激波的一个单元被判为混合或展宽带，
+    标为无效——提示词要求"剔除数值激波展宽区和无法可靠区分材料的单元标签"。
+    """
+    settings = settings or DetectorSettings()
+    radius = np.asarray(radius, dtype=np.float64)
+    n = radius.size
+    material = np.full(n, 2, dtype=np.int64)
+    valid = np.zeros(n, dtype=bool)
+
+    if not (np.isfinite(contact_radius) and np.isfinite(shock_radius)):
+        return material, valid
+    if shock_radius <= contact_radius:
+        return material, valid
+
+    product = radius < contact_radius
+    air = (radius >= contact_radius) & (radius < shock_radius)
+    material[product] = 0
+    material[air] = 1
+
+    valid[product] = True
+    valid[air] = True
+
+    # 接触面与主激波附近各剔除一个单元。
+    buffer = max(1, int(settings.minimum_cells_per_medium) // 2)
+    near_contact = np.abs(radius - contact_radius) <= buffer * _cell_width(radius)
+    near_shock = np.abs(radius - shock_radius) <= buffer * _cell_width(radius)
+    valid &= ~(near_contact | near_shock)
+
+    # 非有限值一律无效。
+    for field in (density, pressure):
+        valid &= np.isfinite(np.asarray(field, dtype=np.float64))
+    return material, valid
+
+
+def _cell_width(radius: np.ndarray) -> float:
+    if radius.size < 2:
+        return 1.0
+    return float(np.median(np.diff(radius)))
+
+
+# --------------------------------------------------------------------------
+# 读取
+# --------------------------------------------------------------------------
+
+
+def load_extracted_case(
+    directory: Path | str,
+    *,
+    case_id: str | None = None,
+    field_mapping: FieldMapping | None = None,
+    settings: DetectorSettings | None = None,
+    gamma_air: float = mat.AIR_GAMMA,
+) -> ExtractedCase:
+    """读取 ``raw_line.npz`` + ``metadata.json``，识别前沿并分区。"""
+    directory = Path(directory)
+    npz_path = directory / "raw_line.npz"
+    meta_path = directory / "metadata.json"
+    if not npz_path.exists():
+        raise DataError(f"missing {npz_path}")
+    if not meta_path.exists():
+        raise DataError(f"missing {meta_path}")
+
+    mapping = field_mapping or FieldMapping()
+    metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    data = np.load(npz_path, allow_pickle=True)
+
+    # 如果有配套的 ``material.npz``（由 ``cli.extract_profiles`` 从 d3plot 的 ALE
+    # 材料体积分数写出），材料分区就是**读数**而不是启发式判据。两条路径在这里
+    # 分岔，并且把用的是哪一条如实记进 ``source``。
+    companion = directory / "material.npz"
+    if companion.exists():
+        return _load_with_volume_fraction_partition(
+            directory, npz_path, meta_path, companion, metadata, data, mapping,
+            case_id=case_id, gamma_air=gamma_air,
+        )
+
+    for logical in REQUIRED_FIELDS:
+        key = mapping.key(logical)
+        if key not in data:
+            raise DataError(
+                f"{npz_path} has no key {key!r} for logical field {logical!r}; "
+                f"available keys are {sorted(data.files)}"
+            )
+
+    times = np.asarray(data[mapping.key("time")], dtype=np.float64).reshape(-1)
+    radius = np.asarray(data[mapping.key("radius")], dtype=np.float64).reshape(-1)
+    density = np.atleast_2d(np.asarray(data[mapping.key("density")], dtype=np.float64))
+    velocity = np.atleast_2d(np.asarray(data[mapping.key("velocity")], dtype=np.float64))
+    pressure = np.atleast_2d(np.asarray(data[mapping.key("pressure")], dtype=np.float64))
+
+    if density.shape != (times.size, radius.size):
+        raise DataError(
+            f"density has shape {density.shape}, expected {(times.size, radius.size)}; "
+            "the time/radius axes are probably transposed"
+        )
+    if not np.all(np.diff(times) > 0.0):
+        raise DataError("time axis must be strictly increasing")
+    if not np.all(np.diff(radius) > 0.0):
+        raise DataError("radius axis must be strictly increasing")
+
+    charge_radius = float(metadata.get("R_0", np.nan))
+    if not np.isfinite(charge_radius) or charge_radius <= 0.0:
+        raise DataError(f"{meta_path} does not declare a usable R_0")
+
+    settings = settings or DetectorSettings()
+    n_t = times.size
+    contact = np.full(n_t, np.nan)
+    shock = np.full(n_t, np.nan)
+    contact_contrast = np.zeros(n_t)
+    material = np.full((n_t, radius.size), 2, dtype=np.int64)
+    valid = np.zeros((n_t, radius.size), dtype=bool)
+
+    for frame in range(n_t):
+        shock[frame] = detect_shock_radius(
+            radius, pressure[frame], settings=settings
+        )
+        contact[frame], contact_contrast[frame] = detect_contact_radius(
+            radius, density[frame], shock[frame], settings=settings
+        )
+        material[frame], valid[frame] = partition_materials(
+            radius,
+            density[frame],
+            pressure[frame],
+            contact[frame],
+            shock[frame],
+            settings=settings,
+        )
+
+    # 接触面**不可能**跑到装药半径以内。这不是启发式过滤，而是一条物理约束：
+    # 接触面就是原装药表面所在的那个物质界面，它只能随产物向外走。一条 R_c < R_0
+    # 的标签一定会把前沿网络往内拉，最后把一个本来合法的移动域变成非法域。
+    #
+    # 沿用阈值形式的启发式判据而不加这条约束，会让 50 mm 的 101 个"有效"帧里
+    # 有 86 个带着 R_c < R_0——被剔除的帧数因此也写进质量报告，剔除原因不隐藏。
+    below_charge = np.isfinite(contact) & (contact < charge_radius)
+    contact_valid = (
+        np.isfinite(contact)
+        & (contact_contrast >= settings.contact_density_ratio_floor)
+        & np.isfinite(shock)
+        & (shock > contact)
+        & ~below_charge
+    )
+    shock_valid = np.isfinite(shock)
+
+    # 比内能由 (rho, p) 按材料反解，逐帧进行。
+    energy = np.full_like(density, np.nan)
+    for frame in range(n_t):
+        energy[frame] = specific_energy_from_pressure(
+            density[frame], pressure[frame], material[frame], gamma_air=gamma_air
+        )
+
+    return ExtractedCase(
+        case_id=case_id or str(metadata.get("case_id", directory.name)),
+        charge_radius=charge_radius,
+        times=times,
+        radius=radius,
+        density=density,
+        velocity=velocity,
+        pressure=pressure,
+        specific_energy=energy,
+        contact_radius=contact,
+        shock_radius=shock,
+        contact_valid=contact_valid,
+        shock_valid=shock_valid,
+        material=material,
+        valid=valid,
+        source={
+            "directory": str(directory),
+            "npz": str(npz_path),
+            "metadata": str(meta_path),
+            "field_map": mapping.mapping,
+            "metadata_raw": metadata,
+            "contact_contrast_median": float(np.median(contact_contrast)),
+            "frames_rejected_contact_below_charge_radius": int(np.count_nonzero(below_charge)),
+            "frames_with_detected_contact_below_charge_radius": int(
+                np.count_nonzero(below_charge)
+            ),
+            "detonation_velocity_m_s": metadata.get("detonation_velocity_m_s"),
+        },
+        detector=settings,
+    )
+
+
+def _load_with_volume_fraction_partition(
+    directory: Path,
+    npz_path: Path,
+    meta_path: Path,
+    companion: Path,
+    metadata: Mapping[str, Any],
+    data,
+    mapping: FieldMapping,
+    *,
+    case_id: str | None,
+    gamma_air: float,
+):
+    """由 ALE 材料体积分数直接给出材料分区的那条路径。
+
+    与启发式路径的区别不是精度，是**依据**：这里的材料归属来自求解器自己写出的
+    体积分数，不需要从密度梯度上猜接触面在哪。所以 ``material_partition`` 这一项
+    可以按"已核实"处理。
+    """
+    for logical in REQUIRED_FIELDS:
+        key = mapping.key(logical)
+        if key not in data:
+            raise DataError(
+                f"{npz_path} has no key {key!r} for logical field {logical!r}; "
+                f"available keys are {sorted(data.files)}"
+            )
+    block = np.load(companion, allow_pickle=True)
+
+    times = np.asarray(data[mapping.key("time")], dtype=np.float64).reshape(-1)
+    radius = np.asarray(data[mapping.key("radius")], dtype=np.float64).reshape(-1)
+    density = np.atleast_2d(np.asarray(data[mapping.key("density")], dtype=np.float64))
+    velocity = np.atleast_2d(np.asarray(data[mapping.key("velocity")], dtype=np.float64))
+    pressure = np.atleast_2d(np.asarray(data[mapping.key("pressure")], dtype=np.float64))
+
+    charge_radius = float(metadata.get("R_0", np.nan))
+    if not np.isfinite(charge_radius) or charge_radius <= 0.0:
+        raise DataError(f"{meta_path} does not declare a usable R_0")
+
+    material = np.atleast_2d(np.asarray(block["material"], dtype=np.int64))
+    valid = np.atleast_2d(np.asarray(block["valid"], dtype=bool))
+    if material.shape != density.shape or valid.shape != density.shape:
+        raise DataError(
+            f"{companion} has material {material.shape} / valid {valid.shape}, but the "
+            f"profiles are {density.shape}; the companion file belongs to another extraction"
+        )
+
+    contact_radius = np.asarray(block["contact_radius"], dtype=np.float64).reshape(-1)
+    shock_radius = np.asarray(block["shock_radius"], dtype=np.float64).reshape(-1)
+    # 前沿的有效性判据在这里是"数出来了"，不是"猜出来了"：只要落在网格内、次序
+    # 正确，就成立。混合带的比例单独报告。
+    contact_valid = (
+        np.isfinite(contact_radius)
+        & (contact_radius > 0.0)
+        & np.isfinite(shock_radius)
+        & (shock_radius > contact_radius)
+        & (contact_radius >= charge_radius - 1.0e-9)
+    )
+    shock_valid = np.isfinite(shock_radius)
+
+    # **提取器报的"分辨得出吗"必须在这里生效，不能只是元数据里的一行字。**
+    #
+    # 前沿位置是一个监督标签。一个半径如果是跨着一段没有单元的壳层插出来的
+    # （`contact_state == 1`），它就不是一个被测量出来的量——80/100/500 mm 三个算例
+    # 的接触面因此被插到 131.97 / 164.96 / 824.80 mm，而装药半径是 80 / 100 / 500 mm。
+    # 把这种数当标签用，等于让网络去拟合一个网格根本没分辨的界面。激波同理
+    # （`shock_state`：0 没测到、1 亚单元、2 分辨得出）。
+    #
+    # 没有这两个数组的旧导出（在提取器写出它们之前生成的）保持原判据，并记下来：
+    # 旧导出没有这项证据，不能默认它没问题。
+    front_resolution = "not recorded by this extraction"
+    contact_state = block.get("contact_state") if hasattr(block, "get") else None
+    shock_state = block.get("shock_state") if hasattr(block, "get") else None
+    if contact_state is not None and shock_state is not None:
+        contact_state = np.asarray(contact_state, dtype=np.int64).reshape(-1)
+        shock_state = np.asarray(shock_state, dtype=np.int64).reshape(-1)
+        if contact_state.size == contact_valid.size and shock_state.size == shock_valid.size:
+            contact_valid = contact_valid & (contact_state == 2)
+            shock_valid = shock_valid & (shock_state == 2)
+            front_resolution = (
+                "contact_state == 2 and shock_state == 2 required; frames whose front was "
+                "interpolated across empty shells (1) or not found (0) carry no front label"
+            )
+        else:
+            front_resolution = (
+                "the recorded state arrays have the wrong length; they are ignored and the "
+                "front labels keep the weaker criterion — treat them as unverified"
+            )
+    elif "contact_state" in getattr(block, "files", ()) or "shock_state" in getattr(block, "files", ()):
+        front_resolution = "partially recorded; ignored"
+
+    # 比内能优先用提取时写下的那一列。它是**单元级**反解之后再按体积加权的，比拿
+    # 壳层平均的 ``(rho, p)`` 再解一次准；而且产物膨胀到低密度、压力转负之后那个
+    # 反解没有实数解，重新解会给一批已被标为有效的壳层填上 ``nan``。
+    if "e" in data.files:
+        energy = np.atleast_2d(np.asarray(data["e"], dtype=np.float64))
+        if energy.shape != density.shape:
+            raise DataError(
+                f"{npz_path} carries 'e' with shape {energy.shape}, expected {density.shape}"
+            )
+        energy_source = "written by the extractor from the per-cell EOS inverse"
+    else:
+        energy = np.full_like(density, np.nan)
+        for frame in range(times.size):
+            energy[frame] = specific_energy_from_pressure(
+                density[frame], pressure[frame], material[frame], gamma_air=gamma_air
+            )
+        energy_source = "reconstructed from (rho, p) via the material EOS"
+
+    mixed = (
+        np.asarray(block["mixed_cell_fraction"], dtype=np.float64)
+        if "mixed_cell_fraction" in block.files
+        else np.zeros(times.size)
+    )
+    return ExtractedCase(
+        case_id=case_id or str(metadata.get("case_id", directory.name)),
+        charge_radius=charge_radius,
+        times=times,
+        radius=radius,
+        density=density,
+        velocity=velocity,
+        pressure=pressure,
+        specific_energy=energy,
+        contact_radius=contact_radius,
+        shock_radius=shock_radius,
+        contact_valid=contact_valid,
+        shock_valid=shock_valid,
+        material=material,
+        valid=valid,
+        source={
+            "directory": str(directory),
+            "npz": str(npz_path),
+            "metadata": str(meta_path),
+            "material_companion": str(companion),
+            "field_map": mapping.mapping,
+            "metadata_raw": dict(metadata),
+            "material_masks_from": (
+                "ALE material volume fraction (d3plot history variables 1..7); "
+                "pure product alpha >= 0.95, pure air alpha <= 0.05, "
+                "mixed band excluded from every label"
+            ),
+            "mixed_cell_fraction_max": float(np.max(mixed)) if mixed.size else 0.0,
+            "energy_source": energy_source,
+            "front_resolution": front_resolution,
+            # 方案 B 的时间原点 T_h = R_0/D + epsilon 需要卡片爆速。
+            "detonation_velocity_m_s": metadata.get("detonation_velocity_m_s"),
+            "frames_rejected_contact_below_charge_radius": int(
+                np.count_nonzero(np.isfinite(contact_radius) & (contact_radius < charge_radius))
+            ),
+            # §8：球对称份额。写不出来就是写不出来——契约会因此判未就绪，而不是
+            # 让下游自己猜一个 8。
+            "symmetry_factor": metadata.get("symmetry_factor"),
+            "symmetry_share": metadata.get("symmetry_share"),
+        },
+        detector=DetectorSettings(),
+        field_validity=_field_validity_from_companion(block, density.shape),
+        front_supervision_eligibility=metadata.get("front_supervision_eligibility"),
+    )
+
+
+def _field_validity_from_companion(block, shape) -> dict[str, np.ndarray] | None:
+    """从配套文件里读逐字段有效性（§11.1）。
+
+    缺任何一项就整体返回 ``None``：只给一半的字段有效性，会让调用方以为另一半
+    也各自独立，而实际上它又要退回联合掩码——两种语义混在一起比完全没有更糟。
+    """
+    names = {
+        "density": "field_valid_density",
+        "velocity": "field_valid_velocity",
+        "specific_energy": "field_valid_energy",
+        "pressure": "field_valid_pressure",
+    }
+    available = set(getattr(block, "files", ()))
+    if not set(names.values()) <= available:
+        return None
+    out: dict[str, np.ndarray] = {}
+    for logical, key in names.items():
+        mask = np.atleast_2d(np.asarray(block[key], dtype=bool))
+        if mask.shape != tuple(shape):
+            raise DataError(
+                f"the companion file carries {key} with shape {mask.shape}, expected "
+                f"{tuple(shape)}; the per-field validity does not belong to these profiles"
+            )
+        out[logical] = mask
+    return out
+
+
+def load_cases(specifications: Sequence[Mapping[str, Any]], **kwargs) -> list[ExtractedCase]:
+    """按 ``[{case_id, directory, split}, ...]`` 批量读取。"""
+    cases: list[ExtractedCase] = []
+    for specification in specifications:
+        case = load_extracted_case(
+            specification["directory"],
+            case_id=specification.get("case_id"),
+            **kwargs,
+        )
+        case.source["split"] = specification.get("split")
+        cases.append(case)
+    return cases
+
+
+__all__ = [
+    "DEFAULT_FIELD_MAP",
+    "DataError",
+    "DetectorSettings",
+    "ExtractedCase",
+    "FieldMapping",
+    "REQUIRED_FIELDS",
+    "detect_contact_radius",
+    "detect_shock_radius",
+    "load_cases",
+    "load_extracted_case",
+    "partition_materials",
+    "specific_energy_from_pressure",
+]
