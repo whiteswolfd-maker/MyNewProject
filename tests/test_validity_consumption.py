@@ -128,52 +128,111 @@ def _finite_fraction(values) -> float:
 # ==========================================================================
 
 
+def _medium_masks(case) -> tuple[np.ndarray, np.ndarray]:
+    """产物的网格点与空气的网格点（按算例自己的材料数组）。"""
+    product = case.material[0] == 0
+    air = case.material[0] == 1
+    return product, air
+
+
 def test_a_field_valid_where_the_joint_mask_says_invalid_is_kept():
     """联合掩码说不可用、该字段自己的掩码说可用 ⇒ **保留**。
 
-    这是"逐字段"与"联合"给出不同答案的第一个方向。旧实现取的是联合掩码，所以
-    这里的密度标签会被整片丢掉。
+    掩码覆盖**整个产物区**，所以断言直接落在被改动的那些位置上——不是"别处还有
+    一些有限值"这种碰巧也能通过的检查。
     """
     case = _two_medium_case()
+    product, _ = _medium_masks(case)
     validity = {name: np.ones((1, 40), dtype=bool) for name in
                 ("density", "velocity", "specific_energy", "pressure")}
-    # 位置 10..19 上联合掩码为假，但密度自己的掩码为真
+    # 产物区：联合掩码整片为假，密度自己的掩码为真，其余字段为假
     case.valid = case.valid.copy()
-    case.valid[0, 10:20] = False
-    validity["density"][0, 10:20] = True
-    validity["velocity"][0, 10:20] = False
-    validity["specific_energy"][0, 10:20] = False
+    case.valid[0, product] = False
+    validity["density"][0, product] = True
+    validity["velocity"][0, product] = False
+    validity["specific_energy"][0, product] = False
     case.field_validity = validity
 
-    batch = _sampler(case, count=200).batch()
-    # 密度标签必须还在（联合掩码为假的那些点上也有）
-    assert _finite_fraction(batch.rho_data_product) > 0.0, (
-        "密度在这个位置上自己的掩码是有效的，标签却被联合掩码丢掉了"
+    batch = _sampler(case, count=400).batch()
+    assert batch.rho_data_product.numel() > 0
+    assert _finite_fraction(batch.rho_data_product) == pytest.approx(1.0), (
+        "产物区里密度自己的掩码全是有效的，标签却仍然被联合掩码丢掉了"
     )
-    assert batch.diagnostics["data_validity_source"].startswith("per-field"), (
-        "取数用的是联合掩码，逐字段记录没有生效"
+    assert _finite_fraction(batch.u_data_product) == pytest.approx(0.0), (
+        "速度自己的掩码在产物区是无效的，标签却留着"
     )
+    assert _finite_fraction(batch.e_data_product) == pytest.approx(0.0)
 
 
 def test_a_field_invalid_where_the_joint_mask_says_valid_is_dropped():
     """联合掩码说可用、该字段自己的掩码说不可用 ⇒ **丢掉**。
 
-    反方向。旧实现同样取联合掩码，所以这里的标签会被当成可用——而它明明被标为
-    不可用，且数值恰好有限（有限不等于有效）。
+    反方向。旧实现取联合掩码，所以这里的密度标签会被当成可用——它被明确标为
+    不可用，而数值恰好有限（有限不等于有效）。
     """
     case = _two_medium_case()
+    product, _ = _medium_masks(case)
     validity = {name: np.ones((1, 40), dtype=bool) for name in
                 ("density", "velocity", "specific_energy", "pressure")}
-    validity["density"][0, 5:15] = False
+    validity["density"][0, product] = False
     case.field_validity = validity
 
     batch = _sampler(case, count=400).batch()
-    assert _finite_fraction(batch.rho_data_product) < 1.0, (
+    assert _finite_fraction(batch.rho_data_product) == pytest.approx(0.0), (
         "密度被标为不可用的位置上，标签仍然全是有限值——逐字段掩码被忽略了"
     )
     # 其他字段不受影响（§11.1：一个字段缺失不丢掉其他字段）
     assert _finite_fraction(batch.u_data_product) == pytest.approx(1.0)
     assert _finite_fraction(batch.e_data_product) == pytest.approx(1.0)
+
+
+def test_an_exact_grid_query_is_not_poisoned_by_a_nan_neighbour():
+    """**恰好落在网格点上时必须返回该点的值。**
+
+    ``a * (1 - w) + b * w`` 在 ``w = 0`` 处不等于 ``a``：``nan * 0`` 仍然是
+    ``nan``。采样器查的正是单元中心，也就是网格点本身，所以只要相邻单元有一个
+    ``nan``，那个位置上的有效标签就会被这一项污染——掩码选对了位置，取值又把它
+    毁了。
+    """
+    case = _two_medium_case()
+    radius = case.radius
+    case.density = case.density.copy()
+    case.density[0, 12] = np.nan              # 一个无效单元
+
+    values = case.sample_at(0, radius[11:13])
+    assert np.isfinite(values["density"][0]), (
+        "查询点就是网格点 11、它的邻居 12 是 nan，结果却成了 nan"
+    )
+    assert values["density"][0] == pytest.approx(case.density[0, 11])
+
+
+def test_an_interior_query_still_reports_nan_when_a_side_is_missing():
+    """区间**内部**的查询仍然要求两侧都有效——不拿单侧去编一个值出来。"""
+    case = _two_medium_case()
+    radius = case.radius
+    case.density = case.density.copy()
+    case.density[0, 12] = np.nan
+
+    midpoint = np.asarray([0.5 * (radius[11] + radius[12])])
+    values = case.sample_at(0, midpoint)
+    assert not np.isfinite(values["density"][0]), (
+        "一侧缺失时仍然插出了一个值；那是一个无中生有的标签"
+    )
+
+
+def test_an_exact_grid_query_survives_a_nan_neighbour_end_to_end():
+    """上面那条走完整条采样链路：有效位置必须真的带出有限标签。"""
+    case = _two_medium_case()
+    # 产物区的偶数号单元置 NaN，奇数号保持有效
+    case.density = case.density.copy()
+    product, _ = _medium_masks(case)
+    indices = np.flatnonzero(product)
+    case.density[0, indices[::2]] = np.nan
+
+    batch = _sampler(case, count=400).batch()
+    assert _finite_fraction(batch.rho_data_product) > 0.0, (
+        "有效网格点的密度标签被相邻的 nan 污染光了"
+    )
 
 
 def test_the_sampler_records_which_validity_mask_it_used():
@@ -272,4 +331,88 @@ def test_the_eligibility_arrays_win_over_the_detection_code(tmp_path):
         "三态码压过了资格数组；§10 要求以资格为准"
     )
     assert case.shock_valid.tolist() == [True, False, False]
-    assert "eligibility arrays" in case.source["front_eligibility_source"]
+    sources = case.source["front_eligibility_source"]
+    assert set(sources) == {"contact", "shock"}
+    assert all("eligibility array" in value for value in sources.values())
+
+
+def test_a_missing_eligibility_array_on_one_side_does_not_overwrite_the_other(tmp_path):
+    """一侧明确写着 False、另一侧**没有**资格数组时，前者不得被回退覆盖。
+
+    以前的实现是"两侧数组都在才用数组，否则两侧一起退回三态码"。于是接触侧被
+    显式否决的记录，会因为**激波侧字段的缺失**而被丢掉——A 的缺失改变了 B 的
+    判据，既违反"资格优先"，也违反"两条前沿独立"。
+    """
+    import json
+
+    from spherical_blast_pinn.data.extracted_case import load_extracted_case
+
+    n_t, n_x = 3, 60
+    radius = np.linspace(0.004, 0.30, n_x)
+    directory = Path(tmp_path) / "onesided"
+    directory.mkdir(parents=True, exist_ok=True)
+    times = np.linspace(2.0e-5, 2.0e-4, n_t)
+    density = np.where(radius < 0.05, 1600.0, 6.0 * mat.AIR_DENSITY)
+    density = density[None, :].repeat(n_t, axis=0)
+    np.savez(
+        directory / "raw_line.npz",
+        t=times, x=radius, rho=density, u=np.zeros_like(density), P=np.full_like(density, 1.0e5),
+    )
+    (directory / "metadata.json").write_text(
+        json.dumps({"R_0": 0.05, "detonation_velocity_m_s": 6930.0}), encoding="utf-8"
+    )
+    material = np.where(radius < 0.05, 0, 1)[None, :].repeat(n_t, axis=0)
+    np.savez(
+        directory / "material.npz",
+        material=material,
+        valid=material != 2,
+        contact_radius=np.full(n_t, 0.05),
+        shock_radius=np.full(n_t, 0.10),
+        # 旧三态码说"两个都分辨得出"
+        contact_state=np.full(n_t, 2, dtype=np.int64),
+        shock_state=np.full(n_t, 2, dtype=np.int64),
+        # 接触侧**明确否决**；激波侧没有资格数组
+        contact_has_supervision=np.zeros(n_t, dtype=bool),
+    )
+    case = load_extracted_case(directory, case_id="onesided")
+    assert not case.contact_valid.any(), (
+        "接触侧被明确记录的 False 被另一侧字段的缺失触发的回退覆盖了"
+    )
+    assert case.shock_valid.all(), "激波侧应当按它自己那一档（三态码）判定"
+    sources = case.source["front_eligibility_source"]
+    assert "eligibility array" in sources["contact"]
+    assert "three-state" in sources["shock"]
+
+
+def test_an_all_nan_eligibility_array_is_refused(tmp_path):
+    """全是 NaN 的资格表不得被读成"全具资格"。"""
+    import json
+
+    from spherical_blast_pinn.data.extracted_case import load_extracted_case
+
+    n_t, n_x = 3, 60
+    radius = np.linspace(0.004, 0.30, n_x)
+    directory = Path(tmp_path) / "nanelig"
+    directory.mkdir(parents=True, exist_ok=True)
+    times = np.linspace(2.0e-5, 2.0e-4, n_t)
+    density = np.where(radius < 0.05, 1600.0, 6.0 * mat.AIR_DENSITY)
+    density = density[None, :].repeat(n_t, axis=0)
+    np.savez(
+        directory / "raw_line.npz",
+        t=times, x=radius, rho=density, u=np.zeros_like(density), P=np.full_like(density, 1.0e5),
+    )
+    (directory / "metadata.json").write_text(
+        json.dumps({"R_0": 0.05, "detonation_velocity_m_s": 6930.0}), encoding="utf-8"
+    )
+    material = np.where(radius < 0.05, 0, 1)[None, :].repeat(n_t, axis=0)
+    np.savez(
+        directory / "material.npz",
+        material=material,
+        valid=material != 2,
+        contact_radius=np.full(n_t, 0.05),
+        shock_radius=np.full(n_t, 0.10),
+        contact_has_supervision=np.full(n_t, np.nan),
+        shock_has_supervision=np.full(n_t, np.nan),
+    )
+    with pytest.raises(Exception, match="dtype"):
+        load_extracted_case(directory, case_id="nanelig")

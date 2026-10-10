@@ -74,7 +74,9 @@ def test_the_reextracted_case_satisfies_the_data_contract(real_case):
     assert detail["field_validity_fields"] == [
         "density", "pressure", "specific_energy", "velocity"
     ]
-    assert "eligibility arrays" in detail["front_eligibility_source"]
+    sources = detail["front_eligibility_source"]
+    assert set(sources) == {"contact", "shock"}
+    assert all("eligibility array" in value for value in sources.values())
     assert set(detail["front_eligibility_counts"]) == {"contact", "shock"}
     assert detail["n_frames_supervisable"] > 0
 

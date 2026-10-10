@@ -58,6 +58,11 @@ def _write_export(
         "x_end": float(grid[-1]),
         "detonation_velocity_m_s": 6930.0,
     }
+    if with_companion:
+        # 提取器把"分区是不是从体积分数读的"写在元数据里。读取器**照读**，
+        # 不自己盖章——否则判据只是从"信任说明文字"换成"信任读取器"。
+        metadata["material_partition_is_volume_fraction_based"] = True
+        metadata["material_partition_source"] = "ALE material volume fraction (d3plot)"
     if with_symmetry:
         metadata["symmetry_factor"] = 8.0
         metadata["symmetry_share"] = 0.125
@@ -185,6 +190,77 @@ def test_a_denial_in_the_source_text_is_not_read_as_a_confirmation(tmp_path):
     )
 
 
+def test_the_reader_does_not_stamp_the_partition_flag_itself(tmp_path):
+    """来源标志必须**照读**提取器的元数据，不能由读取器自己盖。
+
+    判据从"信任说明文字"换成"信任读取器"并没有解决来源证据的问题：读取器只是
+    照着"有这个文件"推了一句。元数据明确写着 False 时，读出来必须还是 False。
+    """
+    directory = _write_export(tmp_path / "flagfalse")
+    metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+    metadata["material_partition_is_volume_fraction_based"] = False
+    (directory / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
+    )
+    case = _load(directory)
+    assert case.source["material_partition_is_volume_fraction_based"] is False, (
+        "读取器把提取器明确写下的 False 覆盖成了 True"
+    )
+    verdict = evaluate_case_contract(case)
+    assert not verdict.ready
+    assert any("体积分数" in reason for reason in verdict.reasons)
+
+    # 元数据里根本没有这个标志 ⇒ 未核实，同样拒绝
+    metadata.pop("material_partition_is_volume_fraction_based")
+    (directory / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
+    )
+    case = _load(directory)
+    assert case.source["material_partition_is_volume_fraction_based"] is None
+    assert not evaluate_case_contract(case).ready
+
+
+@pytest.mark.parametrize(
+    "symmetry, needle",
+    [
+        ({"symmetry_factor": 8.0, "full_sphere_factor": 4.0}, "互相矛盾"),
+        ({"symmetry_factor": "eight"}, "不是数字"),
+        ({"symmetry_share": "1/8"}, "不是数字"),
+    ],
+)
+def test_alias_conflicts_and_non_numeric_symmetry_are_reported(
+    tmp_path, symmetry, needle
+):
+    """别名必须互相核对；非数字要被**报告**，不能抛裸异常。
+
+    以前是"找到第一个别名就 break"：同时写着 8 与 4 时，读第一个的人算出 8、
+    读第二个的人算出 4，而契约只说"有"。字符串形式的份额则会让 ``float()`` 抛出
+    一个裸 ``ValueError``——契约是报告工具，崩掉就什么都看不到。
+    """
+    directory = _write_export(tmp_path / "alias", with_symmetry=False)
+    metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+    metadata.update(symmetry)
+    (directory / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
+    )
+    verdict = evaluate_case_contract(_load(directory))
+    assert not verdict.ready
+    assert any(needle in reason for reason in verdict.reasons), verdict.reasons
+
+
+def test_a_non_finite_time_axis_blocks_the_contract(tmp_path):
+    """时间轴含非有限值时不能放行。
+
+    ``nan`` 会让排序、``searchsorted`` 与时间窗口判断全部给出无意义的结果，
+    而它们一个都不报错。
+    """
+    case = _load(_write_export(tmp_path / "time"))
+    case.times = np.array([0.0, np.nan, 2.0e-4])
+    verdict = evaluate_case_contract(case)
+    assert not verdict.ready
+    assert any("非有限" in reason for reason in verdict.reasons), verdict.reasons
+
+
 def test_an_all_nan_validity_mask_cannot_read_back_as_all_true(tmp_path):
     """全是 NaN 的掩码不得被读成全 True。
 
@@ -266,7 +342,9 @@ def test_the_verdict_records_what_it_looked_at(tmp_path):
     assert detail["field_validity_fields"] == [
         "density", "pressure", "specific_energy", "velocity"
     ]
-    assert "eligibility arrays" in detail["front_eligibility_source"]
+    sources = detail["front_eligibility_source"]
+    assert set(sources) == {"contact", "shock"}
+    assert all("eligibility array" in value for value in sources.values())
     # 最后一帧不具资格，所以资格计数比帧数少一 —— 这正是"资格"与"半径有限"分开了
     assert detail["front_eligibility_counts"] == {"contact": 5, "shock": 5}
     assert detail["n_frames"] == 6

@@ -479,12 +479,20 @@ class Trainer:
     # -- 主循环 -----------------------------------------------------------
     def run(self, *, max_updates: int | None = None, verbose: bool = False) -> TrainingResult:
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        total = sum(stage.updates for stage in self.schedule)
+        # 完整日程的长度。收尾判断必须用它，**不能**用截断后的 ``total``。
+        schedule_total = sum(stage.updates for stage in self.schedule)
+        total = schedule_total
         if max_updates is not None:
             total = min(total, int(max_updates))
 
         started = time.time()
-        stage_name = ""
+        # **从实例状态起手，而不是从空字符串起手。**
+        #
+        # ``stage_name`` 初值写成 ``""`` 时，任何一次"重新调用 run()"都会被当成
+        # 第一次进循环：``current.name != ""`` 成立，而 ``previous`` 是 ``None``，
+        # 于是**阶段判据不会被重新评价**。如果上一次 run() 正是在阶段边界上被判据
+        # 拦下的，第二次调用就会直接跳过那道闸门继续训练——失败状态没有被保留。
+        stage_name = self._current_stage or ""
         # 每个阶段**跑完**时应当落在哪一步。只有真的落在那里才推进。
         #
         # 用步数区间来判断"该不该切阶段"是不行的：``--max-steps`` 截断的联检停在
@@ -554,11 +562,14 @@ class Trainer:
         ):
             self.verify(verbose=verbose, total_loss_value=final)
 
-        # 最后一个阶段的判据：只有在它的预算**真的跑完**时才评价。用
-        # ``--max-steps`` 截断的小规模联检没有跑完任何阶段，此时报"阶段未通过"
-        # 是把"没跑完"说成"没通过"。
+        # 最后一个阶段的判据：只有在它的预算**真的跑完**时才评价。
+        #
+        # 判据是 ``self.step >= schedule_total``，**不是** ``>= total``。后者是
+        # 截断后的长度：三段各两步、``--max-steps 4`` 时，前两段刚好跑完、第三段
+        # **一步没跑**，而 ``self.step (4) >= total (4)`` 成立，于是会拿一个完全
+        # 没训练过的模型去评价第三段的最终判据。用完整日程的长度就不会。
         stage_verdict: dict[str, Any] | None = None
-        if self._current_stage is not None and self.step >= total:
+        if self._current_stage is not None and self.step >= schedule_total:
             last_stage = self.schedule[-1]
             if last_stage.name == self._current_stage:
                 stage_verdict = self._evaluate_stage_criteria(

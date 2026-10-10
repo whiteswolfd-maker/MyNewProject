@@ -841,5 +841,7 @@ def test_front_labels_require_a_resolved_front(tmp_path):
     assert not case.contact_valid.any(), "跨着空壳层插出来的接触面不能当标签"
     assert not case.shock_valid.any()
     # 这一份导出只有三态码、没有资格数组，走的是中间那一档来源
-    assert "three-state detection code" in case.source["front_eligibility_source"]
-    assert "carry no contact label" in case.source["front_resolution"]
+    sources = case.source["front_eligibility_source"]
+    assert all("three-state detection code" in value for value in sources.values())
+    # 每一侧各自说明用了哪一档证据
+    assert "never changes the other side" in case.source["front_resolution"]

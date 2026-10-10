@@ -367,8 +367,16 @@ class ExtractedCase:
     def sample_at(self, frame: int, radii: np.ndarray) -> dict[str, np.ndarray]:
         """在一帧的给定半径上取值；**线性插值，不跨间断**。
 
-        调用方负责只在同一材料的区间内查询。``nan`` 保持 ``nan``：插值到无效
-        单元不会得到一个看起来合理的数。
+        调用方负责只在同一材料的区间内查询。落在两个单元之间时，只要有一侧是
+        ``nan``，结果就是 ``nan``——插值到无效单元不会得到一个看起来合理的数。
+
+        **恰好落在网格点上时必须返回该点的值本身。** ``a * (1 - w) + b * w`` 在
+        ``w = 0`` 处并不等于 ``a``：``nan * 0`` 仍然是 ``nan``。采样器查的正是
+        单元中心，也就是**网格点本身**，所以只要相邻单元有一个 ``nan``，那个位置
+        上的有效标签就会被这一项污染成 ``nan``——位置选对了，取值又把它毁了。
+
+        所以这里对 ``w = 0`` 与 ``w = 1`` 各走一条短路：权重为零的一侧**不参与
+        运算**，而不是"参与运算但乘 0"。
         """
         radii = np.asarray(radii, dtype=np.float64)
         clipped = np.clip(radii, self.radius[0], self.radius[-1])
@@ -377,10 +385,25 @@ class ExtractedCase:
         left = self.radius[index]
         right = self.radius[index + 1]
         weight = np.where(right > left, (clipped - left) / np.maximum(right - left, 1e-300), 0.0)
+        on_left = weight <= 0.0
+        on_right = weight >= 1.0
+        mixed = ~(on_left | on_right)
 
         def blend(field: np.ndarray) -> np.ndarray:
             row = field[frame]
-            return row[index] * (1.0 - weight) + row[index + 1] * weight
+            left_value = row[index]
+            right_value = row[index + 1]
+            out = np.full(left_value.shape, np.nan, dtype=np.float64)
+            # 恰好命中左/右网格点：直接取该点的值，另一侧完全不参与
+            out[on_left] = left_value[on_left]
+            out[on_right] = right_value[on_right]
+            # 真正的区间内查询：两侧都得有效，否则结果无定义
+            if np.any(mixed):
+                w = weight[mixed]
+                out[mixed] = (
+                    left_value[mixed] * (1.0 - w) + right_value[mixed] * w
+                )
+            return out
 
         return {
             "density": blend(self.density),
@@ -793,11 +816,22 @@ def _load_with_volume_fraction_partition(
         & (shock_radius > contact_radius)
     )
 
-    def _frame_array(key: str):
+    def _frame_array(key: str, *, require_bool: bool = False):
         value = block.get(key) if hasattr(block, "get") else None
         if value is None:
             return None
-        array = np.asarray(value).reshape(-1)
+        array = np.asarray(value)
+        if require_bool and array.dtype != np.bool_:
+            # 与逐字段掩码同一条理由：``np.asarray(x, dtype=bool)`` 会把 ``nan``
+            # 变成 ``True``（``bool(nan)`` 为真），于是一张**全是 NaN** 的资格表
+            # 读进来是"全具资格"。资格数组是布尔声明，不是数值。
+            raise DataError(
+                f"{companion} carries {key!r} with dtype {array.dtype}, not bool. "
+                "Converting a float array with `dtype=bool` would turn every NaN into "
+                "True, i.e. an all-NaN eligibility table would read back as "
+                "'every frame eligible'"
+            )
+        array = array.reshape(-1)
         if array.size != contact_radius.size:
             # **长度不对就抛错，不能"忽略它、退回更弱的判据"。** 退回等于把一个
             # 长度都对不上的导出当成一份可信证据更少的导出，而实际上它是一份
@@ -810,41 +844,47 @@ def _load_with_volume_fraction_partition(
             )
         return array
 
-    contact_eligibility = _frame_array("contact_has_supervision")
-    shock_eligibility = _frame_array("shock_has_supervision")
+    contact_eligibility = _frame_array("contact_has_supervision", require_bool=True)
+    shock_eligibility = _frame_array("shock_has_supervision", require_bool=True)
     contact_state = _frame_array("contact_state")
     shock_state = _frame_array("shock_state")
 
-    # 三种来源，从强到弱。**用的是哪一种要记下来**——它们是三档不同的证据，
-    # 在报表上不能长得一样。
-    if contact_eligibility is not None and shock_eligibility is not None:
-        contact_valid = geometric_contact & np.asarray(contact_eligibility, dtype=bool)
-        shock_valid = geometric_shock & np.asarray(shock_eligibility, dtype=bool)
-        front_eligibility = "per-frame supervision eligibility arrays (§9/§10)"
-        front_resolution = (
-            "contact_has_supervision / shock_has_supervision written by the extractor: "
-            "the contact side carries the geometric reconstruction verdict (located with "
-            "both phases bracketing the mixing band, no empty shell inside it), the shock "
-            "side carries the confirmed-candidate verdict"
-        )
-    elif contact_state is not None and shock_state is not None:
-        contact_valid = geometric_contact & (contact_state == 2)
-        shock_valid = geometric_shock & (shock_state == 2)
-        front_eligibility = "three-state detection code (no eligibility arrays)"
-        front_resolution = (
-            "the export predates the eligibility arrays; frames whose contact was "
-            "interpolated across empty shells (1) or not found (0) carry no contact label, "
-            "and only shock_state 2 is a shock label"
-        )
-    else:
-        # 两个前沿都退到"半径有限即可"。这是**未核实**，不是"通过"。
-        contact_valid = geometric_contact
-        shock_valid = geometric_shock
-        front_eligibility = "none recorded — UNVERIFIED"
-        front_resolution = (
-            "this export records neither eligibility nor detection state, so every finite "
-            "radius is being treated as a label. That is the weakest possible criterion and "
-            "the data contract refuses it; re-extract rather than train on it"
+    # **每条前沿各自决定用什么来源。**
+    #
+    # 以前这里是"两侧资格数组都在，才用资格数组；否则两侧一起退回三态码"。于是
+    # 接触侧的资格数组**明确写着 False**、激波侧的数组缺失时，接触侧会跟着退回
+    # 三态码——一个被显式记录下来的否决，被**另一侧字段的缺失**覆盖掉。这既违反
+    # "资格优先"，也违反"两条前沿独立"：A 的缺失改变了 B 的判据。
+    def _front(eligibility, state, geometric, name: str):
+        if eligibility is not None:
+            return geometric & np.asarray(eligibility, dtype=bool), (
+                f"per-frame supervision eligibility array ({name}_has_supervision)"
+            )
+        if state is not None:
+            # 三态码是**较弱的**证据：它只说"分辨得出吗"，不说"够不够格当标签"。
+            # 但比"半径有限即可"强，所以在这一侧单独采用它。
+            return geometric & (state == 2), (
+                f"three-state detection code ({name}_state == 2; no eligibility array)"
+            )
+        return geometric, f"none recorded for {name} — UNVERIFIED"
+
+    contact_valid, contact_source = _front(
+        contact_eligibility, contact_state, geometric_contact, "contact"
+    )
+    shock_valid, shock_source = _front(
+        shock_eligibility, shock_state, geometric_shock, "shock"
+    )
+    front_eligibility = {"contact": contact_source, "shock": shock_source}
+    front_resolution = (
+        "each front uses its own strongest available source, independently: "
+        f"contact -> {contact_source}; shock -> {shock_source}. A missing record on one "
+        "side never changes the other side's verdict, and an explicitly recorded False is "
+        "never overridden by a fallback"
+    )
+    if "UNVERIFIED" in contact_source or "UNVERIFIED" in shock_source:
+        front_resolution += (
+            ". At least one front has no eligibility evidence at all, so every finite "
+            "radius is being treated as a label — the data contract refuses this"
         )
 
     # 比内能优先用提取时写下的那一列。它是**单元级**反解之后再按体积加权的，比拿
@@ -897,10 +937,18 @@ def _load_with_volume_fraction_partition(
                 "pure product alpha >= 0.95, pure air alpha <= 0.05, "
                 "mixed band excluded from every label"
             ),
-            # **机器可判的标志**，与上面那句人读的说明并列。契约按这个布尔量判断，
-            # 不按字符串匹配——"not from volume fraction" 里也含 "volume fraction"，
-            # 用子串匹配的话那句否认会被读成肯定。
-            "material_partition_is_volume_fraction_based": True,
+            # **机器可判的标志，取自提取器的元数据，不由读取器盖章。**
+            #
+            # 契约按这个布尔量判断分区是否权威（不按字符串匹配——"not from volume
+            # fraction" 里也含 "volume fraction"，子串匹配会把否认读成肯定）。但
+            # 读取器自己写一个 `True` 只是把判据从"信任说明文字"换成"信任读取器"：
+            # 它并没有核实数据是怎么来的，只是照着"有这个文件"推了一句。
+            # 提取器没留下这个标志时记 `None`，契约会因此拒绝——那是**未核实**，
+            # 不是"通过"。
+            "material_partition_is_volume_fraction_based": metadata.get(
+                "material_partition_is_volume_fraction_based"
+            ),
+            "material_partition_source_recorded": metadata.get("material_partition_source"),
             "mixed_cell_fraction_max": float(np.max(mixed)) if mixed.size else 0.0,
             "energy_source": energy_source,
             "front_resolution": front_resolution,
@@ -912,13 +960,21 @@ def _load_with_volume_fraction_partition(
             ),
             # §8：球对称份额。写不出来就是写不出来——契约会因此判未就绪，而不是
             # 让下游自己猜一个 8。
-            "symmetry_factor": metadata.get("symmetry_factor"),
-            "symmetry_share": metadata.get("symmetry_share"),
+            #
+            # 三个别名**原样带出去**，一个都不合并：契约要能看见"两个别名互相矛盾"
+            # 这件事。读取器在这里挑一个"胜出者"的话，冲突就永远到不了契约那一层。
+            **{
+                key: metadata.get(key)
+                for key in ("symmetry_factor", "symmetry_share",
+                            "symmetry_share_inverse", "full_sphere_factor")
+            },
         },
         detector=DetectorSettings(),
         field_validity=_field_validity_from_companion(block, density.shape),
         front_supervision_eligibility={
             "source": front_eligibility,
+            "contact_source": contact_source,
+            "shock_source": shock_source,
             "contact_status": contact_state,
             "shock_status": shock_state,
             "contact_eligible": (

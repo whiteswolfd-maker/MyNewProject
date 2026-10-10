@@ -68,19 +68,48 @@ def _symmetry_factor(source: Mapping[str, Any]) -> tuple[float | None, list[str]
     """
     problems: list[str] = []
     factor = None
+    share = source.get("symmetry_share")
+
+    # 别名全部收集起来，**互相核对**。以前是"找到第一个就 break"：同时写着
+    # ``symmetry_factor: 8`` 与 ``full_sphere_factor: 4`` 时，读第一个的人算出 8，
+    # 读第二个的人算出 4，而契约只说"有"。
+    aliases: dict[str, float] = {}
     for key in ("symmetry_factor", "symmetry_share_inverse", "full_sphere_factor"):
         value = source.get(key)
         if value is None:
             continue
-        factor = float(value)
-        break
-    share = source.get("symmetry_share")
-    if factor is None and share is not None:
-        reciprocal = float(share)
-        if reciprocal == 0.0:
+        try:
+            aliases[key] = float(value)
+        except (TypeError, ValueError):
+            # 非数字直接抛裸 ``ValueError`` 会让契约这个"报告工具"变成崩溃源；
+            # 契约的职责是把问题写成理由。
+            problems.append(
+                f"{key} = {value!r} 不是数字，无法解析成球对称份额"
+            )
+            return None, problems
+    if aliases:
+        distinct = sorted(set(aliases.values()))
+        if len(distinct) > 1:
+            problems.append(
+                f"球对称份额的别名互相矛盾：{aliases}。它们说的是同一件事，"
+                "不一致时读数与折算会各按自己看到的那个来"
+            )
+            return None, problems
+        factor = distinct[0]
+    if share is not None:
+        try:
+            declared_share = float(share)
+        except (TypeError, ValueError):
+            problems.append(f"symmetry_share = {share!r} 不是数字")
+            return None, problems
+    else:
+        declared_share = None
+
+    if factor is None and declared_share is not None:
+        if declared_share == 0.0:
             problems.append("symmetry_share 是 0，取倒数得不到球对称份额")
             return None, problems
-        factor = 1.0 / reciprocal
+        factor = 1.0 / declared_share
 
     if factor is None:
         return None, problems
@@ -90,8 +119,7 @@ def _symmetry_factor(source: Mapping[str, Any]) -> tuple[float | None, list[str]
             "用它，负值或 NaN 会让折算出来的每一个半径都失去意义"
         )
         return None, problems
-    if share is not None:
-        declared_share = float(share)
+    if declared_share is not None:
         if not math.isfinite(declared_share) or declared_share <= 0.0:
             problems.append(
                 f"symmetry_share 是 {declared_share!r}，不是有限正数（它与 "
@@ -148,6 +176,12 @@ def evaluate_case_contract(case: Any) -> ContractVerdict:
     times = np.asarray(getattr(case, "times", np.zeros(0)), dtype=np.float64)
     if times.size == 0:
         reasons.append("算例没有任何时间帧")
+    elif not np.all(np.isfinite(times)):
+        # 非有限的时间轴不能进任何插值或分层：``nan`` 会让排序、``searchsorted``
+        # 与时间窗口判断全部给出无意义的结果，而它们都不报错。
+        reasons.append(
+            f"时间轴含 {int(np.count_nonzero(~np.isfinite(times)))} 个非有限值"
+        )
     elif detonation_velocity is None:
         # 时间轴建不起来时 ``pinn_times`` 会抛 ``DataError``。契约检查是**报告**
         # 的工具，不能自己崩掉——把那句异常变成一条可读的理由（上面已经记过
@@ -178,13 +212,18 @@ def evaluate_case_contract(case: Any) -> ContractVerdict:
     # ``"volume fraction" in material_source.lower()``：一句"not from volume
     # fraction"里也含 "volume fraction"，于是**否认**会被读成**肯定**。说明文字
     # 是给人看的，闸门必须看布尔量。
-    authoritative = source.get("material_partition_is_volume_fraction_based") is True
-    detail["material_partition_is_volume_fraction_based"] = bool(authoritative)
+    declared = source.get("material_partition_is_volume_fraction_based")
+    authoritative = declared is True
+    detail["material_partition_is_volume_fraction_based"] = declared
     if not authoritative:
+        recorded = (
+            "提取器没有留下这个标志（未核实）" if declared is None
+            else f"提取器明确记为 {declared!r}"
+        )
         reasons.append(
             "材料分区不是从 d3plot 的材料体积分数读出来的"
-            f"（记录为 {material_source or '未记录'}）：启发式探测器给出的接触面"
-            "位置有量化跳变、大量帧落在装药半径以内（物理上不可能）。"
+            f"（{recorded}；说明文字：{material_source or '未记录'}）：启发式探测器"
+            "给出的接触面位置有量化跳变、大量帧落在装药半径以内（物理上不可能）。"
             "契约上判为未就绪——权威分区必须重新提取"
         )
 
@@ -233,16 +272,28 @@ def evaluate_case_contract(case: Any) -> ContractVerdict:
             "confirmed/doubtful 无法区分"
         )
     else:
-        source_of_eligibility = str(eligibility.get("source", "") or "")
-        detail["front_eligibility_source"] = source_of_eligibility or "未记录"
-        if UNVERIFIED_ELIGIBILITY in source_of_eligibility:
-            reasons.append(
-                "前沿的监督资格是**未核实**档（既没有资格数组也没有三态码，只有"
-                "『半径有限即可』）：那是最弱的一档判据，不能拿来当训练标签"
-            )
+        # **逐侧判断。** 两条前沿各有自己的证据来源，一侧缺失或退化不得改变另一侧
+        # 的结论——聚合起来看的话，"接触侧明确写了 False、激波侧没有记录"会被读成
+        # "整体还有记录可用"。
+        per_side: dict[str, Any] = {}
         for side in ("contact", "shock"):
-            if eligibility.get(f"{side}_eligible") is None and not source_of_eligibility:
+            side_source = str(
+                eligibility.get(f"{side}_source")
+                or (eligibility.get("source") if isinstance(eligibility.get("source"), str) else "")
+                or ""
+            )
+            per_side[side] = side_source or "未记录"
+            if UNVERIFIED_ELIGIBILITY in side_source or "UNVERIFIED" in side_source:
+                reasons.append(
+                    f"{side} 前沿的监督资格是**未核实**档（既没有资格数组也没有"
+                    "三态码，只有『半径有限即可』）：那是最弱的一档判据，不能拿来"
+                    "当训练标签"
+                )
+            elif not side_source:
                 reasons.append(f"{side} 前沿既没有资格数组，也没有说明来源")
+            if eligibility.get(f"{side}_eligible") is None and side_source:
+                pass  # 三态码这一档没有逐帧资格数组，但来源是明确的
+        detail["front_eligibility_source"] = per_side
         detail["front_supervision_eligibility"] = (
             (eligibility.get("metadata") or {}).get("contact", {}).get("status_counts")
             if isinstance(eligibility.get("metadata"), Mapping) else None

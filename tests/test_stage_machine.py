@@ -548,6 +548,167 @@ def test_the_saved_window_always_matches_the_step(tmp_path):
         reader.load(writer.output_dir / f"step{writer.step}.pt")
 
 
+def _tiny_schedule(updates: int) -> tuple[Stage, ...]:
+    return tuple(
+        Stage(
+            stage.name, updates,
+            stage.pde_weight_start, stage.pde_weight_end,
+            stage.learning_rate_start, stage.learning_rate_end,
+            time_window_fraction=stage.time_window_fraction,
+        )
+        for stage in SCHEDULE
+    )
+
+
+def test_the_real_loop_transitions_stages_correctly(tmp_path, monkeypatch):
+    """**让 ``run()`` 自己走完一次阶段切换**，不手动驱动。
+
+    上一条边界测试是手工调 ``_update()`` / ``_enter_stage()`` 拼出来的，它证明的
+    是"手工构造出正确窗口之后可以加载"，不能证明主循环的状态管理正确。
+    这一条把判据换成空集（阶段闸门本身由
+    ``test_the_trainer_refuses_to_advance_a_stage_whose_criteria_fail`` 单独守），
+    好让循环真的跑到第二个阶段。
+    """
+    import test_review_regressions as base
+
+    from spherical_blast_pinn.training import trainer as trainer_module
+    from spherical_blast_pinn.training.schedule import time_window_fraction_at
+
+    # 阶段判据换空：这条测试问的是**循环**，不是闸门。
+    monkeypatch.setattr(trainer_module, "criteria_for", lambda name: ())
+
+    tiny = _tiny_schedule(3)
+    trainer = base._tiny_trainer(tmp_path / "w", tmp_path / "out_w")
+    trainer.schedule = tiny
+    trainer.checkpoint_every = 1
+    trainer.check_every = 0
+    trainer.run(max_updates=sum(stage.updates for stage in tiny), verbose=False)
+
+    # 走到过三个阶段，且每一个阶段边界上存下的检查点都能被读回、窗口自洽
+    entered = [row["stage"] for row in trainer.stage_history if row["event"] == "enter"]
+    assert entered == [stage.name for stage in tiny], entered
+
+    for step in range(1, sum(stage.updates for stage in tiny) + 1):
+        path = trainer.output_dir / f"last.pt"
+        assert path.exists()
+    payload = torch.load(
+        trainer.output_dir / "last.pt", map_location="cpu", weights_only=False
+    )
+    assert payload["stage"]["window_fraction"] == pytest.approx(
+        time_window_fraction_at(trainer.step, tiny)
+    )
+    assert trainer.sampler.samplers[0].window_fraction == pytest.approx(
+        time_window_fraction_at(trainer.step, tiny)
+    )
+
+
+def test_a_failed_stage_check_is_not_skipped_by_calling_run_again(tmp_path):
+    """判据失败之后再次调用 ``run()``，**不能**绕过那道闸门。
+
+    以前 ``run()`` 里的 ``stage_name`` 从空字符串起手：第二次调用会把当前的阶段
+    当成"第一次进入"，``previous=None``，于是失败过的判据根本不会被重新评价，
+    训练直接继续。失败状态没有被保留。
+    """
+    import test_review_regressions as base
+
+    from spherical_blast_pinn.training.trainer import StageNotPassed
+
+    tiny = _tiny_schedule(2)
+    trainer = base._tiny_trainer(tmp_path / "w", tmp_path / "out_w")
+    trainer.schedule = tiny
+    trainer.check_every = 0
+    trainer.checkpoint_every = 10_000
+    # 初值判据的限额压到 0：随机初始化的网络不可能恰好零误差
+    trainer.tolerances = {
+        "initial_relative_l2": 0.0,
+        "initial_gap_relative": 0.0,
+    }
+
+    with pytest.raises(StageNotPassed):
+        trainer.run(verbose=False)
+    assert trainer._current_stage == tiny[0].name, (
+        "失败发生在切换之**前**，当前阶段应当还停在被判不合格的那一个"
+    )
+
+    # 同一个实例再跑一次：必须再次被拦下，而不是跳过闸门继续更新
+    with pytest.raises(StageNotPassed):
+        trainer.run(verbose=False)
+
+
+def test_a_truncated_run_does_not_evaluate_a_stage_that_never_ran(tmp_path, monkeypatch):
+    """``--max-steps`` 截断时，不许评价**一步都没跑**的那个阶段的判据。
+
+    三段各两步、``max_updates=4``：前两段刚好跑完，第三段一步没跑。收尾判断若用
+    截断后的长度，``step (4) >= total (4)`` 成立，就会拿一个完全没训练过的模型去
+    评价第三段的最终判据——把"没跑"报成"没通过"。
+    """
+    import test_review_regressions as base
+
+    from spherical_blast_pinn.training import trainer as trainer_module
+
+    monkeypatch.setattr(trainer_module, "criteria_for", lambda name: ())
+
+    tiny = _tiny_schedule(2)
+    trainer = base._tiny_trainer(tmp_path / "w", tmp_path / "out_w")
+    trainer.schedule = tiny
+    trainer.check_every = 0
+    trainer.checkpoint_every = 10_000
+    result = trainer.run(max_updates=4, verbose=False)
+
+    assert trainer.step == 4
+    verdicts = [row for row in trainer.stage_history if row["event"] == "criteria"]
+    assert not any(row["stage"] == tiny[-1].name for row in verdicts), (
+        "第三段一步没跑，却评价了它的判据"
+    )
+    assert result.metadata["final_stage_verdict"] is None
+
+
+def test_resuming_across_a_stage_boundary_matches_a_continuous_run(tmp_path, monkeypatch):
+    """跨阶段的断点续跑：采样、优化器、阶段窗口必须一起接上。
+
+    只比较最终检查指标是不够的——那只说明最后一步的模型一样。这里比较的是完整
+    权重，并且断点**正好落在阶段边界**上。
+    """
+    import test_review_regressions as base
+
+    from spherical_blast_pinn.training import trainer as trainer_module
+
+    monkeypatch.setattr(trainer_module, "criteria_for", lambda name: ())
+
+    tiny = _tiny_schedule(2)
+    total = sum(stage.updates for stage in tiny)
+
+    continuous = base._tiny_trainer(tmp_path / "a", tmp_path / "out_a")
+    continuous.schedule = tiny
+    continuous.check_every = 0
+    continuous.checkpoint_every = 10_000
+    continuous.run(max_updates=total, verbose=False)
+
+    interrupted = base._tiny_trainer(tmp_path / "b", tmp_path / "out_b")
+    interrupted.schedule = tiny
+    interrupted.check_every = 0
+    interrupted.checkpoint_every = 10_000
+    # 停在第一个阶段边界上——正是以前会被自己的恢复函数拒绝的那个位置
+    interrupted.run(max_updates=tiny[0].updates, verbose=False)
+    interrupted._save(interrupted.output_dir / "boundary.pt")
+
+    resumed = base._tiny_trainer(tmp_path / "c", tmp_path / "out_c")
+    resumed.schedule = tiny
+    resumed.check_every = 0
+    resumed.checkpoint_every = 10_000
+    resumed.load(interrupted.output_dir / "boundary.pt")
+    assert resumed._stage_window == pytest.approx(tiny[1].time_window_fraction)
+    resumed.run(max_updates=total, verbose=False)
+
+    assert resumed.step == continuous.step == total
+    for name, value in continuous.model.state_dict().items():
+        assert torch.equal(
+            value, resumed.model.state_dict()[name]
+        ), f"{name} 跨阶段续跑后与连续跑不一致"
+    # 采样轨迹也必须接上
+    assert resumed.sampler.rng_state() == continuous.sampler.rng_state()
+
+
 def test_entering_a_stage_sets_the_window_on_every_radius(tmp_path):
     """§14.2："同一套两侧网络及前沿同步扩展"——窗口要一起动。"""
     import test_review_regressions as base
