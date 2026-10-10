@@ -114,6 +114,39 @@ def test_strict_blind_test_needs_a_real_blind_counterpart():
     ).ok
 
 
+@pytest.mark.parametrize("strict_blind", [True, False])
+def test_an_empty_protected_list_makes_the_whole_check_vacuous(strict_blind):
+    """保护清单为空时，下面每一条检查都没有对象。
+
+    ``strict_blind_test: true`` 配上 ``final_validation_radii_mm: []`` 会让
+    ``is_protected`` 恒为假——**即使训练列表里就有本该隔离的算例**，判定也是
+    ``ok=True``。默认配置不会走到这里，但"严格模式"不能对自己配置的有效性不作
+    要求，否则它只防误用，不防自相矛盾。
+    """
+    config = Config.from_mapping({
+        "reference_field": {"charge_radius_m": 0.05},
+        "data": {"cases": [_case("tnt_500mm", 0.5, "train")]},
+        "splits": {"strict_blind_test": strict_blind, "final_validation_radii_mm": []},
+    })
+    verdict = evaluate_validation_isolation(config, [_stub_case("tnt_500mm", 0.5)])
+    assert not verdict.ok, (
+        "保护清单为空时整套检查静默通过；" + repr(verdict.detail)
+    )
+    assert any("空的" in reason for reason in verdict.reasons)
+
+
+def test_a_non_positive_protected_radius_is_refused():
+    """``final_validation_radii_mm: [0.0]`` 不是"保护了一个半径"，是一个错误。"""
+    config = Config.from_mapping({
+        "reference_field": {"charge_radius_m": 0.05},
+        "data": {"cases": []},
+        "splits": {"strict_blind_test": True, "final_validation_radii_mm": [0.0]},
+    })
+    verdict = evaluate_validation_isolation(config, [])
+    assert not verdict.ok
+    assert any("非正或非有限" in reason for reason in verdict.reasons)
+
+
 def test_the_declared_radii_can_be_overridden_in_the_config():
     config = Config.from_mapping({
         "reference_field": {"charge_radius_m": 0.05},

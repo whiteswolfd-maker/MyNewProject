@@ -485,6 +485,17 @@ class Trainer:
 
         started = time.time()
         stage_name = ""
+        # 每个阶段**跑完**时应当落在哪一步。只有真的落在那里才推进。
+        #
+        # 用步数区间来判断"该不该切阶段"是不行的：``--max-steps`` 截断的联检停在
+        # 半路，那时按区间会算出"已经进入下一阶段"，于是拿没训完的模型去审上一阶段
+        # 的判据——把"没跑完"报成"没通过"。
+        stage_ends: dict[str, int] = {}
+        cursor = 0
+        for stage in self.schedule:
+            cursor += stage.updates
+            stage_ends[stage.name] = cursor
+
         while self.step < total:
             stage_index, _ = _stage_index(self.step, self.schedule)
             current = self.schedule[stage_index]
@@ -494,6 +505,23 @@ class Trainer:
             self._set_learning_rate(learning_rate_at(self.step, self.schedule))
             breakdown = self._update()
             self.step += 1
+
+            # **步数一增加就切阶段**，不留到下一轮循环的开头。
+            #
+            # 留到下一轮的话，"第 2000 步的检查点"里存的是阶段 1 的窗口 0.25，而
+            # 按步数推算第 2000 步属于阶段 2（0.65）——恢复函数会拒绝自己刚写的
+            # 检查点。默认每 500 步保存一次，2000 与 5000 恰好就是两个阶段边界，
+            # 所以这不是一个罕见角落，是默认配置下的必然。
+            if stage_ends.get(stage_name) == self.step:
+                position = next(
+                    (index for index, stage in enumerate(self.schedule)
+                     if stage.name == stage_name),
+                    None,
+                )
+                if position is not None and position + 1 < len(self.schedule):
+                    following = self.schedule[position + 1]
+                    self._enter_stage(following, previous=stage_name, verbose=verbose)
+                    stage_name = following.name
 
             if self.step % self.log_every == 0 or self.step == 1:
                 record = {

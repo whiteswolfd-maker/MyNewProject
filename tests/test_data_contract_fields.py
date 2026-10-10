@@ -88,6 +88,12 @@ def _write_export(
         if with_states:
             payload["contact_state"] = np.full(n_frames, 2, dtype=np.int64)
             payload["shock_state"] = np.full(n_frames, 2, dtype=np.int64)
+            # 提取器写出的逐帧资格数组（最强的一档来源）。最后一帧不具资格，
+            # 好让"资格"与"半径有限"真的能区分开。
+            contact_ok = np.ones(n_frames, dtype=bool)
+            contact_ok[-1] = False
+            payload["contact_has_supervision"] = contact_ok
+            payload["shock_has_supervision"] = contact_ok.copy()
         if with_field_validity:
             payload["field_valid_density"] = valid
             payload["field_valid_velocity"] = valid
@@ -112,7 +118,8 @@ def test_a_complete_export_satisfies_the_contract(tmp_path):
     [
         ({"with_symmetry": False}, "对称份额"),
         ({"with_field_validity": False}, "逐字段有效性"),
-        ({"with_eligibility": False}, "前沿监督资格"),
+        # 既没有资格数组、也没有三态码 —— 只剩"半径有限即可"这一档
+        ({"with_states": False, "with_eligibility": False}, "未核实"),
         ({"with_companion": False}, "体积分数"),
     ],
 )
@@ -121,6 +128,89 @@ def test_each_missing_piece_blocks_the_contract(tmp_path, kwargs, needle):
     verdict = evaluate_case_contract(case)
     assert not verdict.ready
     assert any(needle in reason for reason in verdict.reasons), verdict.reasons
+
+
+@pytest.mark.parametrize(
+    "symmetry, needle",
+    [
+        ({"symmetry_factor": -8.0}, "有限正数"),
+        ({"symmetry_factor": float("nan")}, "有限正数"),
+        ({"symmetry_factor": 8.0, "symmetry_share": 8.0}, "互相矛盾"),
+    ],
+)
+def test_an_impossible_symmetry_factor_blocks_the_contract(tmp_path, symmetry, needle):
+    """球对称份额必须是**有限正数**，两个键同时给出时还必须自洽。
+
+    以前这里只判"真值"：``-8`` 与 ``nan`` 都是真值，于是都能通过。份额是体积等效
+    半径与覆盖率的分母，一个负的或 NaN 的分母会把折算出来的每一个半径都毁掉，
+    而报表上只会看到一个数字。
+    """
+    directory = _write_export(tmp_path / "sym", with_symmetry=False)
+    metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+    metadata.update(symmetry)
+    (directory / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
+    )
+    verdict = evaluate_case_contract(_load(directory))
+    assert not verdict.ready
+    assert any(needle in reason for reason in verdict.reasons), verdict.reasons
+
+
+def test_a_denial_in_the_source_text_is_not_read_as_a_confirmation(tmp_path):
+    """材料来源按**布尔标志**判断，不按字符串匹配。
+
+    ``"not from volume fraction"`` 里也含 ``"volume fraction"``。用子串匹配的话，
+    一句明确的**否认**会被读成**肯定**——而且读起来完全正常。
+    """
+    case = _load(_write_export(tmp_path / "denial"))
+
+    # 说明文字里写着 volume fraction、但**没有**机器可判的标志 ⇒ 不能放行。
+    # 旧实现正是只看这句话，所以它能通过。
+    case.source.pop("material_partition_is_volume_fraction_based", None)
+    case.source["material_masks_from"] = "ALE material volume fraction (looks right)"
+    verdict = evaluate_case_contract(case)
+    assert not verdict.ready, (
+        "没有机器可判的标志时放行了；闸门不能靠说明文字的子串"
+    )
+
+    # 反过来：标志为假时，一句自称权威的说明文字也翻不了案。
+    case.source["material_partition_is_volume_fraction_based"] = False
+    assert not evaluate_case_contract(case).ready
+
+    # 标志是真才算数——说明文字怎么写都不影响结论。
+    case.source["material_partition_is_volume_fraction_based"] = True
+    case.source["material_masks_from"] = "NOT from volume fraction, a heuristic detector"
+    assert evaluate_case_contract(case).ready, (
+        "闸门看的应当是布尔标志，而不是说明文字"
+    )
+
+
+def test_an_all_nan_validity_mask_cannot_read_back_as_all_true(tmp_path):
+    """全是 NaN 的掩码不得被读成全 True。
+
+    ``np.asarray(x, dtype=bool)`` 会把 ``nan`` 变成 ``True``（``bool(nan)`` 为真），
+    于是一张什么都没说的掩码读进来是"全有效"，而形状检查对此毫无办法。
+    """
+    directory = _write_export(tmp_path / "nanmask")
+    payload = dict(np.load(directory / "material.npz", allow_pickle=True))
+    payload["field_valid_density"] = np.full(payload["valid"].shape, np.nan)
+    np.savez(directory / "material.npz", **payload)
+    with pytest.raises(Exception, match="dtype"):
+        _load(directory)
+
+
+def test_a_length_mismatch_in_the_companion_is_refused_not_downgraded(tmp_path):
+    """配套文件的数组长度对不上时**抛错**，不能"忽略它、退回更弱的判据"。
+
+    退回等于把一份**对不上**的导出当成一份"证据更少"的导出，而后者仍然会被当成
+    同一批数据用。
+    """
+    directory = _write_export(tmp_path / "length")
+    payload = dict(np.load(directory / "material.npz", allow_pickle=True))
+    payload["contact_has_supervision"] = np.array([True, True])
+    np.savez(directory / "material.npz", **payload)
+    with pytest.raises(Exception, match="do not belong together"):
+        _load(directory)
 
 
 def test_the_contract_does_not_accept_a_missing_record_as_a_valid_one(tmp_path):
@@ -132,13 +222,14 @@ def test_the_contract_does_not_accept_a_missing_record_as_a_valid_one(tmp_path):
     检查永远通过。
     """
     case = _load(_write_export(tmp_path / "nofv", with_field_validity=False,
-                               with_eligibility=False))
+                               with_states=False, with_eligibility=False))
     assert case.field_validity is None, "缺字段时必须是 None，不能补一张全真掩码"
-    assert case.front_supervision_eligibility is None
+    # 资格那一项不是 None，而是"最弱的一档 + 明确写着未核实"
+    assert case.front_supervision_eligibility["contact_eligible"] is None
     verdict = evaluate_case_contract(case)
     assert not verdict.ready
     assert any("逐字段有效性" in r for r in verdict.reasons)
-    assert any("前沿监督资格" in r for r in verdict.reasons)
+    assert any("未核实" in r for r in verdict.reasons), verdict.reasons
 
 
 def test_a_malformed_field_validity_companion_is_refused(tmp_path):
@@ -167,11 +258,15 @@ def test_the_verdict_records_what_it_looked_at(tmp_path):
     """就绪与否都要留下可核对的字段，否则"就绪"只是一个字。"""
     case = _load(_write_export(tmp_path / "detail"))
     verdict = evaluate_case_contract(case)
+    assert verdict.ready, verdict.reasons
     detail = verdict.detail
     assert detail["symmetry_factor"] == 8.0
     assert detail["detonation_velocity_m_s"] == pytest.approx(6930.0)
-    assert "volume fraction" in detail["material_masks_from"].lower()
+    assert detail["material_partition_is_volume_fraction_based"] is True
     assert detail["field_validity_fields"] == [
         "density", "pressure", "specific_energy", "velocity"
     ]
-    assert set(detail["front_supervision_eligibility"]) == {"contact", "shock"}
+    assert "eligibility arrays" in detail["front_eligibility_source"]
+    # 最后一帧不具资格，所以资格计数比帧数少一 —— 这正是"资格"与"半径有限"分开了
+    assert detail["front_eligibility_counts"] == {"contact": 5, "shock": 5}
+    assert detail["n_frames"] == 6

@@ -773,47 +773,79 @@ def _load_with_volume_fraction_partition(
 
     contact_radius = np.asarray(block["contact_radius"], dtype=np.float64).reshape(-1)
     shock_radius = np.asarray(block["shock_radius"], dtype=np.float64).reshape(-1)
-    # 前沿的有效性判据在这里是"数出来了"，不是"猜出来了"：只要落在网格内、次序
-    # 正确，就成立。混合带的比例单独报告。
-    contact_valid = (
+    # 前沿的有效性判据在这里是"数出来了"，不是"猜出来了"。
+    #
+    # **两条前沿必须解耦**（§11.1）。以前 ``contact_valid`` 里带着
+    # ``isfinite(shock_radius) & (shock_radius > contact_radius)``：激波那天没识别
+    # 出来，接触面明明可靠也被一起撤标。"接触面在激波内侧"是**空气层**的要求
+    # （``h = R_s - R_c`` 要有意义），不是接触面标签的前提；把它挂在这里，等于让
+    # 一个前沿的缺失去惩罚另一个。
+    geometric_contact = (
         np.isfinite(contact_radius)
         & (contact_radius > 0.0)
-        & np.isfinite(shock_radius)
-        & (shock_radius > contact_radius)
         & (contact_radius >= charge_radius - 1.0e-9)
     )
-    shock_valid = np.isfinite(shock_radius)
+    geometric_shock = np.isfinite(shock_radius)
+    # 单独记录、单独使用：只有空气组与"两前沿都在"的判据才需要它。
+    front_ordering_ok = (
+        np.isfinite(contact_radius)
+        & np.isfinite(shock_radius)
+        & (shock_radius > contact_radius)
+    )
 
-    # **提取器报的"分辨得出吗"必须在这里生效，不能只是元数据里的一行字。**
-    #
-    # 前沿位置是一个监督标签。一个半径如果是跨着一段没有单元的壳层插出来的
-    # （`contact_state == 1`），它就不是一个被测量出来的量——80/100/500 mm 三个算例
-    # 的接触面因此被插到 131.97 / 164.96 / 824.80 mm，而装药半径是 80 / 100 / 500 mm。
-    # 把这种数当标签用，等于让网络去拟合一个网格根本没分辨的界面。激波同理
-    # （`shock_state`：0 没测到、1 亚单元、2 分辨得出）。
-    #
-    # 没有这两个数组的旧导出（在提取器写出它们之前生成的）保持原判据，并记下来：
-    # 旧导出没有这项证据，不能默认它没问题。
-    front_resolution = "not recorded by this extraction"
-    contact_state = block.get("contact_state") if hasattr(block, "get") else None
-    shock_state = block.get("shock_state") if hasattr(block, "get") else None
-    if contact_state is not None and shock_state is not None:
-        contact_state = np.asarray(contact_state, dtype=np.int64).reshape(-1)
-        shock_state = np.asarray(shock_state, dtype=np.int64).reshape(-1)
-        if contact_state.size == contact_valid.size and shock_state.size == shock_valid.size:
-            contact_valid = contact_valid & (contact_state == 2)
-            shock_valid = shock_valid & (shock_state == 2)
-            front_resolution = (
-                "contact_state == 2 and shock_state == 2 required; frames whose front was "
-                "interpolated across empty shells (1) or not found (0) carry no front label"
+    def _frame_array(key: str):
+        value = block.get(key) if hasattr(block, "get") else None
+        if value is None:
+            return None
+        array = np.asarray(value).reshape(-1)
+        if array.size != contact_radius.size:
+            # **长度不对就抛错，不能"忽略它、退回更弱的判据"。** 退回等于把一个
+            # 长度都对不上的导出当成一份可信证据更少的导出，而实际上它是一份
+            # **对不上**的导出——两份数据不是同一批。此时任何"更弱但仍然有效"
+            # 的标签都是无中生有。
+            raise DataError(
+                f"{companion} carries {key!r} with {array.size} entries but the profiles "
+                f"have {contact_radius.size} frames; the companion and the profiles do not "
+                "belong together"
             )
-        else:
-            front_resolution = (
-                "the recorded state arrays have the wrong length; they are ignored and the "
-                "front labels keep the weaker criterion — treat them as unverified"
-            )
-    elif "contact_state" in getattr(block, "files", ()) or "shock_state" in getattr(block, "files", ()):
-        front_resolution = "partially recorded; ignored"
+        return array
+
+    contact_eligibility = _frame_array("contact_has_supervision")
+    shock_eligibility = _frame_array("shock_has_supervision")
+    contact_state = _frame_array("contact_state")
+    shock_state = _frame_array("shock_state")
+
+    # 三种来源，从强到弱。**用的是哪一种要记下来**——它们是三档不同的证据，
+    # 在报表上不能长得一样。
+    if contact_eligibility is not None and shock_eligibility is not None:
+        contact_valid = geometric_contact & np.asarray(contact_eligibility, dtype=bool)
+        shock_valid = geometric_shock & np.asarray(shock_eligibility, dtype=bool)
+        front_eligibility = "per-frame supervision eligibility arrays (§9/§10)"
+        front_resolution = (
+            "contact_has_supervision / shock_has_supervision written by the extractor: "
+            "the contact side carries the geometric reconstruction verdict (located with "
+            "both phases bracketing the mixing band, no empty shell inside it), the shock "
+            "side carries the confirmed-candidate verdict"
+        )
+    elif contact_state is not None and shock_state is not None:
+        contact_valid = geometric_contact & (contact_state == 2)
+        shock_valid = geometric_shock & (shock_state == 2)
+        front_eligibility = "three-state detection code (no eligibility arrays)"
+        front_resolution = (
+            "the export predates the eligibility arrays; frames whose contact was "
+            "interpolated across empty shells (1) or not found (0) carry no contact label, "
+            "and only shock_state 2 is a shock label"
+        )
+    else:
+        # 两个前沿都退到"半径有限即可"。这是**未核实**，不是"通过"。
+        contact_valid = geometric_contact
+        shock_valid = geometric_shock
+        front_eligibility = "none recorded — UNVERIFIED"
+        front_resolution = (
+            "this export records neither eligibility nor detection state, so every finite "
+            "radius is being treated as a label. That is the weakest possible criterion and "
+            "the data contract refuses it; re-extract rather than train on it"
+        )
 
     # 比内能优先用提取时写下的那一列。它是**单元级**反解之后再按体积加权的，比拿
     # 壳层平均的 ``(rho, p)`` 再解一次准；而且产物膨胀到低密度、压力转负之后那个
@@ -865,9 +897,14 @@ def _load_with_volume_fraction_partition(
                 "pure product alpha >= 0.95, pure air alpha <= 0.05, "
                 "mixed band excluded from every label"
             ),
+            # **机器可判的标志**，与上面那句人读的说明并列。契约按这个布尔量判断，
+            # 不按字符串匹配——"not from volume fraction" 里也含 "volume fraction"，
+            # 用子串匹配的话那句否认会被读成肯定。
+            "material_partition_is_volume_fraction_based": True,
             "mixed_cell_fraction_max": float(np.max(mixed)) if mixed.size else 0.0,
             "energy_source": energy_source,
             "front_resolution": front_resolution,
+            "front_eligibility_source": front_eligibility,
             # 方案 B 的时间原点 T_h = R_0/D + epsilon 需要卡片爆速。
             "detonation_velocity_m_s": metadata.get("detonation_velocity_m_s"),
             "frames_rejected_contact_below_charge_radius": int(
@@ -880,7 +917,21 @@ def _load_with_volume_fraction_partition(
         },
         detector=DetectorSettings(),
         field_validity=_field_validity_from_companion(block, density.shape),
-        front_supervision_eligibility=metadata.get("front_supervision_eligibility"),
+        front_supervision_eligibility={
+            "source": front_eligibility,
+            "contact_status": contact_state,
+            "shock_status": shock_state,
+            "contact_eligible": (
+                None if contact_eligibility is None
+                else np.asarray(contact_eligibility, dtype=bool)
+            ),
+            "shock_eligible": (
+                None if shock_eligibility is None
+                else np.asarray(shock_eligibility, dtype=bool)
+            ),
+            "ordering_ok": front_ordering_ok,
+            "metadata": metadata.get("front_supervision_eligibility"),
+        },
     )
 
 
@@ -889,6 +940,11 @@ def _field_validity_from_companion(block, shape) -> dict[str, np.ndarray] | None
 
     缺任何一项就整体返回 ``None``：只给一半的字段有效性，会让调用方以为另一半
     也各自独立，而实际上它又要退回联合掩码——两种语义混在一起比完全没有更糟。
+
+    **掩码必须是真正的布尔量。** 以前这里写的是
+    ``np.asarray(block[key], dtype=bool)``——那一句会把 ``nan`` 变成 ``True``
+    （``bool(nan)`` 为真），于是一张**全是 NaN** 的掩码读进来是**全有效**，而
+    形状检查对此毫无办法。所以先验 dtype 与取值域，再转换。
     """
     names = {
         "density": "field_valid_density",
@@ -901,13 +957,19 @@ def _field_validity_from_companion(block, shape) -> dict[str, np.ndarray] | None
         return None
     out: dict[str, np.ndarray] = {}
     for logical, key in names.items():
-        mask = np.atleast_2d(np.asarray(block[key], dtype=bool))
-        if mask.shape != tuple(shape):
+        raw = np.atleast_2d(np.asarray(block[key]))
+        if raw.shape != tuple(shape):
             raise DataError(
-                f"the companion file carries {key} with shape {mask.shape}, expected "
+                f"the companion file carries {key} with shape {raw.shape}, expected "
                 f"{tuple(shape)}; the per-field validity does not belong to these profiles"
             )
-        out[logical] = mask
+        if raw.dtype != np.bool_:
+            raise DataError(
+                f"the companion array {key!r} has dtype {raw.dtype}, not bool. Converting "
+                "a float array with `dtype=bool` would turn every NaN into True, so an "
+                "all-NaN mask would read back as 'everything valid'"
+            )
+        out[logical] = raw
     return out
 
 

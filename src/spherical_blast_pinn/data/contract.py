@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
@@ -50,16 +51,59 @@ class ContractVerdict:
         }
 
 
-def _symmetry_factor(source: Mapping[str, Any]) -> float | None:
-    """球对称份额。**没有明确声明就不算有**（§8：覆盖率分母用实际对称份额）。"""
+#: 逐字段有效性必须覆盖的字段。缺一个就不是"逐字段"，是"部分字段"。
+REQUIRED_VALIDITY_FIELDS = ("density", "velocity", "specific_energy")
+
+#: 前沿资格来源里表示"什么都没记录"的那一档。契约必须拒绝它。
+UNVERIFIED_ELIGIBILITY = "none recorded — UNVERIFIED"
+
+
+def _symmetry_factor(source: Mapping[str, Any]) -> tuple[float | None, list[str]]:
+    """球对称份额。**没有明确声明就不算有**（§8：覆盖率分母用实际对称份额）。
+
+    返回值是 ``(份额, 问题列表)``。份额必须是**有限正数**——以前只判"真值"，
+    于是 ``-8`` 与 ``nan`` 都能通过（两者都是真值）。同时，两个键都给出来时必须
+    自洽：``symmetry_factor`` 与 ``symmetry_share`` 互为倒数，1/8 与 8 说的是同一件
+    事，而 8 与 8 说的不是。
+    """
+    problems: list[str] = []
+    factor = None
     for key in ("symmetry_factor", "symmetry_share_inverse", "full_sphere_factor"):
         value = source.get(key)
-        if value:
-            return float(value)
+        if value is None:
+            continue
+        factor = float(value)
+        break
     share = source.get("symmetry_share")
-    if share:
-        return 1.0 / float(share)
-    return None
+    if factor is None and share is not None:
+        reciprocal = float(share)
+        if reciprocal == 0.0:
+            problems.append("symmetry_share 是 0，取倒数得不到球对称份额")
+            return None, problems
+        factor = 1.0 / reciprocal
+
+    if factor is None:
+        return None, problems
+    if not math.isfinite(factor) or factor <= 0.0:
+        problems.append(
+            f"球对称份额是 {factor!r}，不是有限正数；体积等效半径与覆盖率的分母"
+            "用它，负值或 NaN 会让折算出来的每一个半径都失去意义"
+        )
+        return None, problems
+    if share is not None:
+        declared_share = float(share)
+        if not math.isfinite(declared_share) or declared_share <= 0.0:
+            problems.append(
+                f"symmetry_share 是 {declared_share!r}，不是有限正数（它与 "
+                "symmetry_factor 互为倒数）"
+            )
+        elif abs(factor * declared_share - 1.0) > 1.0e-9:
+            problems.append(
+                f"symmetry_factor = {factor:g} 与 symmetry_share = {declared_share:g} "
+                "互相矛盾：互为倒数的两个数应当相乘得 1。两个键都在时它们必须指同一"
+                "件事，否则读数的人会按先看到的那个去折算"
+            )
+    return factor, problems
 
 
 def evaluate_case_contract(case: Any) -> ContractVerdict:
@@ -76,13 +120,14 @@ def evaluate_case_contract(case: Any) -> ContractVerdict:
         reasons.append("算例缺少有效的装药半径 R_0")
     detail["charge_radius_m"] = radius
 
-    symmetry = _symmetry_factor(source)
+    symmetry, symmetry_problems = _symmetry_factor(source)
     detail["symmetry_factor"] = symmetry
-    if symmetry is None:
+    if symmetry is None and not symmetry_problems:
         reasons.append(
             "没有声明球对称份额（symmetry_factor / symmetry_share）："
             "体积等效半径与覆盖率的分母都依赖它，缺了就无从核对"
         )
+    reasons.extend(symmetry_problems)
 
     # -- 时间语义（方案 B）------------------------------------------------
     # ``T_h = R_0/D + epsilon`` 需要卡片爆速；缺了它算例本身就会抛错，这里要
@@ -129,7 +174,12 @@ def evaluate_case_contract(case: Any) -> ContractVerdict:
     # -- 材料来源：分区必须是**权威**的，不能是启发式探测器 ---------------
     material_source = str(source.get("material_masks_from", "") or "")
     detail["material_masks_from"] = material_source or "未记录"
-    authoritative = "volume fraction" in material_source.lower()
+    # **按机器可判的标志判断，不按字符串匹配。** 以前这里是
+    # ``"volume fraction" in material_source.lower()``：一句"not from volume
+    # fraction"里也含 "volume fraction"，于是**否认**会被读成**肯定**。说明文字
+    # 是给人看的，闸门必须看布尔量。
+    authoritative = source.get("material_partition_is_volume_fraction_based") is True
+    detail["material_partition_is_volume_fraction_based"] = bool(authoritative)
     if not authoritative:
         reasons.append(
             "材料分区不是从 d3plot 的材料体积分数读出来的"
@@ -153,19 +203,54 @@ def evaluate_case_contract(case: Any) -> ContractVerdict:
             "算例没有逐字段有效性（field_validity）：rho/u/e 共用一张有效掩码时，"
             "一个字段缺失会丢掉同一位置其他可靠的字段（§11.1）"
         )
+    else:
+        # ``is None`` 只堵住了"属性存在但没有值"。**空字典与半张表同样是没记录。**
+        # ``field_validity={}`` 以前直接通过——一份什么都没说的记录被读成"都有效"。
+        missing = [name for name in REQUIRED_VALIDITY_FIELDS if name not in field_validity]
+        if missing:
+            reasons.append(
+                f"逐字段有效性缺 {missing}（只有 {sorted(field_validity) or '空'}）："
+                "有键才有那一项的独立掩码，缺键的字段会悄悄退回联合掩码"
+            )
+        reference = getattr(case, "valid", None)
+        for name, mask in sorted(field_validity.items()):
+            if getattr(mask, "dtype", None) != np.bool_:
+                reasons.append(
+                    f"逐字段掩码 {name!r} 的 dtype 是 {getattr(mask, 'dtype', None)}，"
+                    "不是 bool：非布尔量读成有效性会把 0 之外的一切都当成有效"
+                )
+            elif reference is not None and np.shape(mask) != np.shape(reference):
+                reasons.append(
+                    f"逐字段掩码 {name!r} 的形状 {np.shape(mask)} 与联合掩码 "
+                    f"{np.shape(reference)} 不一致"
+                )
 
     # -- 前沿监督资格（§10）-----------------------------------------------
     eligibility = getattr(case, "front_supervision_eligibility", None)
-    if eligibility is None:
+    if eligibility is None or not eligibility:
         reasons.append(
             "算例没有前沿监督资格的分项记录（检测状态与监督资格没有分开），"
             "confirmed/doubtful 无法区分"
         )
     else:
-        detail["front_supervision_eligibility"] = {
-            side: (record or {}).get("status_counts")
-            for side, record in eligibility.items()
-            if isinstance(record, Mapping)
+        source_of_eligibility = str(eligibility.get("source", "") or "")
+        detail["front_eligibility_source"] = source_of_eligibility or "未记录"
+        if UNVERIFIED_ELIGIBILITY in source_of_eligibility:
+            reasons.append(
+                "前沿的监督资格是**未核实**档（既没有资格数组也没有三态码，只有"
+                "『半径有限即可』）：那是最弱的一档判据，不能拿来当训练标签"
+            )
+        for side in ("contact", "shock"):
+            if eligibility.get(f"{side}_eligible") is None and not source_of_eligibility:
+                reasons.append(f"{side} 前沿既没有资格数组，也没有说明来源")
+        detail["front_supervision_eligibility"] = (
+            (eligibility.get("metadata") or {}).get("contact", {}).get("status_counts")
+            if isinstance(eligibility.get("metadata"), Mapping) else None
+        )
+        detail["front_eligibility_counts"] = {
+            side: int(np.count_nonzero(eligibility[f"{side}_eligible"]))
+            for side in ("contact", "shock")
+            if eligibility.get(f"{side}_eligible") is not None
         }
 
     detail["reasons_count"] = len(reasons)

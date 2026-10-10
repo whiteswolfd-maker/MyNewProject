@@ -41,6 +41,15 @@ from .batch import SampleBatch
 PRODUCT = "product"
 AIR = "air"
 
+#: 数据监督的字段：``(采样批次里的键, 算例上的逻辑字段名)``。
+#: 逻辑字段名同时也用作 ``field_validity`` 的键，所以这一张表把"取数"、
+#: "逐字段有效性"和"损失里的标签名"三处绑在同一个来源上。
+_DATA_FIELDS: tuple[tuple[str, str], ...] = (
+    ("rho", "density"),
+    ("u", "velocity"),
+    ("e", "specific_energy"),
+)
+
 
 class SamplingError(ValueError):
     """采样配置或数据不合法。"""
@@ -122,6 +131,9 @@ class RadiusSampler:
         self.rng = np.random.default_rng(int(seed))
         self.r_min = float(r_min_fraction) * float(scales.charge_radius)
         self.use_development_frames = bool(use_development_frames)
+        #: 数据监督用的是哪一张有效性掩码。逐字段记录缺失时退回联合掩码，这件事
+        #: 必须能被读出来——"退化"和"等价"在报表上不能长得一样。
+        self.validity_source = "unknown (no data sampled yet)"
 
         if abs(float(scales.charge_radius) - float(case.charge_radius)) > 1.0e-12:
             raise SamplingError(
@@ -182,6 +194,27 @@ class RadiusSampler:
         )
         if not math.isfinite(self.hat_time_epsilon) or self.hat_time_epsilon <= 0.0:
             raise SamplingError("hat_t_epsilon must be positive")
+
+    # -- 逐字段有效性（§11.1）----------------------------------------------
+    def _field_valid(self, case, frame: int, logical: str):
+        """某个字段在第 ``frame`` 帧上可用的位置。
+
+        有逐字段记录时用它；没有时退回联合掩码，并把这件事记在
+        ``self.validity_source`` 里——退回是**退化**，不是等价。
+        """
+        validity = getattr(case, "field_validity", None)
+        if validity is None:
+            self.validity_source = "joint `valid` mask (per-field validity not recorded)"
+            return np.asarray(case.valid[frame], dtype=bool)
+        if logical not in validity:
+            # 加载器要么给全四个字段、要么给 None；只给一半的映射说明它是别处
+            # 拼出来的，此时退回联合掩码会让缺失的那一半静默变成"都有效"。
+            raise SamplingError(
+                f"case {case.case_id!r} carries per-field validity without {logical!r}; "
+                f"it has {sorted(validity)}. A partial mapping is not a usable record"
+            )
+        self.validity_source = "per-field validity (field_validity)"
+        return np.asarray(validity[logical][frame], dtype=bool)
 
     # -- 随机状态 ---------------------------------------------------------
     def rng_state(self) -> dict[str, Any]:
@@ -406,14 +439,35 @@ class RadiusSampler:
             count_values: list[float] = []
             targets: dict[str, list[float]] = {"rho": [], "u": [], "e": []}
             for frame in chosen:
-                mask = (case.material[frame] == medium) & case.valid[frame]
-                indices = np.flatnonzero(mask)
+                # **逐字段**的有效性（§11.1）。以前这里用的是
+                # ``(case.material[frame] == medium) & case.valid[frame]``——那张
+                # ``valid`` 是"四项场量联合可用"的掩码，于是"某个字段缺失不丢掉其他
+                # 字段"这句承诺在**取数的地方**根本没兑现：一个位置只要 e 不可用就
+                # 整点消失，rho 与 u 一起被丢。提取器把逐字段掩码写出来了，这里必须
+                # 真的用它，否则那几张掩码只是让契约检查变绿。
+                medium_mask = case.material[frame] == medium
+                allowed = {
+                    key: medium_mask & self._field_valid(case, frame, logical)
+                    for key, logical in _DATA_FIELDS
+                }
+                union = np.zeros_like(medium_mask)
+                for mask in allowed.values():
+                    union |= mask
+                indices = np.flatnonzero(union)
                 if indices.size == 0:
                     continue
                 take = min(per_frame, indices.size)
                 picked = rng.choice(indices, size=take, replace=False)
                 radii = case.radius[picked]
                 values = case.sample_at(int(frame), radii)
+                # 逐字段掩码：某个字段在这个位置上不可用时只把它置 NaN，位置与其余
+                # 字段照常保留。损失里的按字段掩码均值会跳过这些 NaN。
+                for key, logical in _DATA_FIELDS:
+                    here = np.asarray(allowed[key][picked], dtype=bool)
+                    if not here.all():
+                        values[logical] = np.where(
+                            here, np.asarray(values[logical], dtype=np.float64), np.nan
+                        )
                 physical_time = float(case.times[frame])
                 if physical_time < self.scales.start_time() - 1.0e-15:
                     raise SamplingError(
@@ -435,8 +489,10 @@ class RadiusSampler:
                 hi_values.extend((radii + half_width).clip(case.radius[-1]).tolist())
                 # 该观测由几个原始单元贡献。覆盖率用它，不拿"点了几个点"冒充。
                 count_values.extend([1.0] * n_here)
-                for key, field_name in (("rho", "density"), ("u", "velocity"), ("e", "specific_energy")):
-                    targets[key].extend(values[field_name].tolist())
+                for key, field_name in _DATA_FIELDS:
+                    targets[key].extend(
+                        np.asarray(values[field_name], dtype=np.float64).tolist()
+                    )
 
             if not r_values:
                 return empty
@@ -579,6 +635,7 @@ class RadiusSampler:
             "time_window_fraction": self.window_fraction,
             "n_window_frames": int(getattr(self, "_window_frame_count", 0)),
             "data_split": "development" if self.use_development_frames else "train",
+            "data_validity_source": self.validity_source,
         }
         return SampleBatch(**payload)
 

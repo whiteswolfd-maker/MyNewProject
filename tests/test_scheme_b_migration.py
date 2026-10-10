@@ -1831,19 +1831,32 @@ def _contract_case(**overrides):
 
     from spherical_blast_pinn.data.compatibility import SYNTHETIC
 
+    validity = np.ones((3, 4), dtype=bool)
     base = dict(
         case_id="c",
         charge_radius=0.05,
         times=np.array([0.0, 1.0e-6, 2.0e-6]),
+        valid=validity,
         source={
             "symmetry_factor": 8.0,
+            "symmetry_share": 0.125,
             "detonation_velocity_m_s": 6930.0,
             "material_masks_from": "ALE material volume fraction (d3plot history variables)",
+            # 机器可判的标志：契约按这个布尔量判断分区是否权威，不按上面的说明文字
+            # 做子串匹配（"not from volume fraction" 里也含 "volume fraction"）。
+            "material_partition_is_volume_fraction_based": True,
             "energy_source": "reconstructed from JWL",
         },
-        # 契约要求的两个分项记录
-        field_validity={"rho": np.array([True]), "u": np.array([True]), "e": np.array([True])},
-        front_supervision_eligibility={"contact": np.array(["confirmed"])},
+        # 契约要求的两个分项记录，形状与真实导出一致
+        field_validity={
+            "density": validity, "velocity": validity,
+            "specific_energy": validity, "pressure": validity,
+        },
+        front_supervision_eligibility={
+            "source": "per-frame supervision eligibility arrays (§9/§10)",
+            "contact_eligible": np.array([True, True, False]),
+            "shock_eligible": np.array([True, False, False]),
+        },
     )
     base.update(overrides)
     case = SimpleNamespace(**base)

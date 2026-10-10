@@ -86,6 +86,15 @@ data:
   development_holdout_fraction: 0.1
   split_seed: 20260920
 
+  # **下面这些目录还没有迁移到当前提取器。** F:/2/extracted 与两个 GitHub
+  # 目录都是**旧格式**导出：没有逐字段有效性、没有前沿监督资格数组、材料分区
+  # 来自启发式探测器。它们仍然写在这里，是因为正式训练用的就是这几个半径；
+  # 而 §15 的数据契约会**拒绝**它们（训练入口返回码 4），所以"路径还指着旧的"
+  # 不会变成"拿旧数据训练了"。
+  #
+  # 迁移需要按当前提取器重跑，命令见 IMPLEMENTATION_ROUND_2026-10-09.md 第 7 节。
+  # 目前只有 50 / 100 mm 的**代表状态**重提过（`configs/experiments/geom_smoke.yaml`
+  # 接的就是它们），那批数据帧数太少，**不能**当正式训练数据。
   cases:
     - case_id: tnt_50mm
       charge_radius_m: 0.050

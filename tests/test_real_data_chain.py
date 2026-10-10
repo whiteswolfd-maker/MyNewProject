@@ -70,12 +70,12 @@ def test_the_reextracted_case_satisfies_the_data_contract(real_case):
     detail = verdict.detail["cases"][0]
     assert detail["symmetry_factor"] == 8.0
     assert detail["detonation_velocity_m_s"] > 0.0
-    assert "volume fraction" in detail["material_masks_from"].lower()
+    assert detail["material_partition_is_volume_fraction_based"] is True
     assert detail["field_validity_fields"] == [
         "density", "pressure", "specific_energy", "velocity"
     ]
-    eligibility = detail["front_supervision_eligibility"]
-    assert set(eligibility) == {"contact", "shock"}
+    assert "eligibility arrays" in detail["front_eligibility_source"]
+    assert set(detail["front_eligibility_counts"]) == {"contact", "shock"}
     assert detail["n_frames_supervisable"] > 0
 
 
@@ -224,23 +224,35 @@ def test_a_real_data_checkpoint_resumes_reproducibly(real_case, reference, tmp_p
             allow_unverified_data=True,
         )
 
-    steps = 2
+    # **必须真的继续跑。** 只比较"加载后与连续跑"的权重，测的是保存与加载，
+    # 不是恢复——恢复要保证的是"从这里接着跑，与从头连跑得到同一条轨迹"。
+    # 少了这一步，采样序列、优化器状态、阶段窗口的错误一个都测不出来。
+    total = 4
+    half = 2
+
     continuous = make(tmp_path / "a")
-    continuous.run(max_updates=steps, verbose=False)
+    continuous.run(max_updates=total, verbose=False)
 
     interrupted = make(tmp_path / "b")
-    interrupted.run(max_updates=steps, verbose=False)
+    interrupted.run(max_updates=half, verbose=False)
     checkpoint = interrupted.output_dir / "last.pt"
     assert checkpoint.exists()
 
-    # 从一个**全新的** trainer 恢复，参数必须与连续跑一致。
     resumed = make(tmp_path / "c")
     resumed.load(checkpoint)
-    assert resumed.step == steps
+    assert resumed.step == half
+    resumed.run(max_updates=total, verbose=False)
+
+    assert resumed.step == continuous.step == total
     for name, value in continuous.model.state_dict().items():
         assert torch.equal(
             value, resumed.model.state_dict()[name]
-        ), f"{name} 在恢复后与连续跑不一致"
+        ), f"{name} 在恢复后继续跑，与连续跑不一致"
+    # 采样轨迹也必须接上：最后一帧的检查指标逐位相同
+    assert continuous.check_history[-1]["step"] == resumed.check_history[-1]["step"]
+    assert continuous.check_history[-1]["metrics"]["pde_rms_max"] == pytest.approx(
+        resumed.check_history[-1]["metrics"]["pde_rms_max"], rel=1.0e-12
+    )
 
 
 def test_the_reference_gate_still_refuses_on_real_data():

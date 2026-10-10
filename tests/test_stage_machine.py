@@ -449,6 +449,105 @@ def test_a_small_budget_run_traverses_all_three_stages(tmp_path):
     assert trainer.last_balance["weights"], "最近一次平衡记录是空的"
 
 
+def test_a_checkpoint_written_exactly_on_a_stage_boundary_can_be_resumed(tmp_path):
+    """阶段边界上写出的检查点，必须能被自己的恢复函数读回来。
+
+    这是一个**确定**的状态管理错误，不是数值问题：更新完成后先加步数、再保存，
+    而切阶段原本发生在下一轮循环的开头。于是"第 2000 步"的检查点里存的是阶段 1
+    的窗口 0.25，而按步数推算第 2000 步属于阶段 2（0.65）——恢复函数会拒绝自己
+    刚写下的文件。默认每 500 步保存一次，2000 与 5000 恰好是两个边界，所以这条
+    在默认配置下必然发生。
+
+    修法是把切换挪到"步数一增加"之后，使 ``步数 ↔ 阶段窗口`` 在任何时刻保存的
+    检查点里都成立。这条测试就是钉住那个不变式。
+    """
+    import test_review_regressions as base
+
+    from spherical_blast_pinn.training.schedule import SCHEDULE as DECLARED
+
+    # 阶段长度取 3/3/3，checkpoint_every=3 —— 恰好落在第一个边界上。
+    tiny = tuple(
+        Stage(
+            stage.name, 3,
+            stage.pde_weight_start, stage.pde_weight_end,
+            stage.learning_rate_start, stage.learning_rate_end,
+            time_window_fraction=stage.time_window_fraction,
+        )
+        for stage in DECLARED
+    )
+
+    writer = base._tiny_trainer(tmp_path / "w", tmp_path / "out_w")
+    writer.schedule = tiny
+    writer.checkpoint_every = tiny[0].updates
+    writer._enter_stage(tiny[0], previous=None, verbose=False)
+    for _ in range(tiny[0].updates):
+        writer._update()
+        writer.step += 1
+
+    # 模拟主循环在"步数一增加"之后立刻切阶段。这里跳过判据（``previous=None``）：
+    # 这条测试问的是**窗口与步数的自洽**，未训练的模型本来就过不了初值闸门，
+    # 那件事由 ``test_the_trainer_refuses_to_advance_a_stage_whose_criteria_fail``
+    # 单独守着。
+    writer._enter_stage(tiny[1], previous=None, verbose=False)
+    writer.checkpoint_every = 10_000
+    writer._save(writer.output_dir / "last.pt")
+
+    reader = base._tiny_trainer(tmp_path / "r", tmp_path / "out_r")
+    reader.schedule = tiny
+    reader.load(writer.output_dir / "last.pt")   # 以前在这里抛 TrainingError
+    assert reader.step == tiny[0].updates
+    assert reader._stage_window == pytest.approx(tiny[1].time_window_fraction)
+
+
+def test_the_saved_window_always_matches_the_step(tmp_path):
+    """检查点里存的窗口，必须与按步数推算出来的窗口一致。
+
+    这是一条**不变式**，不是一次抽查：恢复函数就是按它来决定"该用哪个窗口"的，
+    两者一旦不一致，恢复要么拒绝自己的检查点，要么悄悄换一个采样区间。
+    """
+    import test_review_regressions as base
+
+    from spherical_blast_pinn.training.schedule import SCHEDULE as DECLARED
+    from spherical_blast_pinn.training.schedule import time_window_fraction_at
+
+    tiny = tuple(
+        Stage(
+            stage.name, 2,
+            stage.pde_weight_start, stage.pde_weight_end,
+            stage.learning_rate_start, stage.learning_rate_end,
+            time_window_fraction=stage.time_window_fraction,
+        )
+        for stage in DECLARED
+    )
+    total = sum(stage.updates for stage in tiny)
+
+    # 每一步都存一次，逐点核对不变式；顺带证明每个边界上的检查点都能被读回。
+    writer = base._tiny_trainer(tmp_path / "w", tmp_path / "out_w")
+    writer.schedule = tiny
+    writer.checkpoint_every = 1
+    writer.check_every = 0
+    for index in range(total):
+        writer._update()
+        writer.step += 1
+        # 主循环在"步数一增加"之后立刻切阶段
+        boundary = 2 if index + 1 == 2 else (4 if index + 1 == 4 else None)
+        if boundary is not None and boundary // 2 < len(tiny):
+            writer._enter_stage(tiny[boundary // 2], previous=None, verbose=False)
+        writer._save(writer.output_dir / f"step{writer.step}.pt")
+
+        payload = torch.load(
+            writer.output_dir / f"step{writer.step}.pt", map_location="cpu",
+            weights_only=False,
+        )
+        assert payload["stage"]["window_fraction"] == pytest.approx(
+            time_window_fraction_at(writer.step, tiny)
+        ), f"第 {writer.step} 步存下的窗口与按步数推算的不一致"
+
+        reader = base._tiny_trainer(tmp_path / f"r{writer.step}", tmp_path / f"o{writer.step}")
+        reader.schedule = tiny
+        reader.load(writer.output_dir / f"step{writer.step}.pt")
+
+
 def test_entering_a_stage_sets_the_window_on_every_radius(tmp_path):
     """§14.2："同一套两侧网络及前沿同步扩展"——窗口要一起动。"""
     import test_review_regressions as base

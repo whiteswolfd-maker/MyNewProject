@@ -89,6 +89,28 @@ def evaluate_validation_isolation(
     protected = final_validation_radii_m(config)
     strict_blind = bool(config.get("splits.strict_blind_test", False))
 
+    # **保护清单为空时，整套检查没有任何对象。**
+    #
+    # ``strict_blind_test: true`` 配上 ``final_validation_radii_mm: []`` 会让下面
+    # 每一条检查都不成立——因为 `is_protected` 恒为假——于是即使训练列表里就有
+    # 本该隔离的算例，判定也是 ``ok=True``。默认配置不会走到这里，但"严格模式"
+    # 不能对自己配置的有效性不作要求，否则它只防误用，不防自相矛盾。
+    if not protected:
+        if strict_blind:
+            reasons.append(
+                "splits.strict_blind_test 为真，但 final_validation_radii_mm 是空的："
+                "没有任何半径被保护，隔离检查会全部落空并返回通过"
+            )
+        else:
+            reasons.append(
+                "final_validation_radii_mm 是空的：没有任何半径被声明为最终验证，"
+                "§16 的隔离因此无从执行"
+            )
+    elif any(not math.isfinite(r) or r <= 0.0 for r in protected):
+        reasons.append(
+            f"final_validation_radii_mm 含非正或非有限值：{list(protected)}"
+        )
+
     def same_radius(left: float, right: float) -> bool:
         return math.isclose(float(left), float(right), abs_tol=radius_tolerance_m)
 
