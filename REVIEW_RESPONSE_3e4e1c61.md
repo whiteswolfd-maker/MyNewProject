@@ -9,13 +9,21 @@
 | 本源码修改提交 | **`adf121499d5d054390352ca8e022c3d62433aa2f`**（已推送到 `origin/main`） |
 | 同一轮的中间提交 | `8d7fda6`（五项修复）、`6389c78` / `c3c9860`（文档） |
 | 远端复验提交（源码） | **`adf121499d5d054390352ca8e022c3d62433aa2f`**（**全新 `git clone`** 后在该目录内执行） |
-| 观测到的 head | `47d4eaa24e4fbfd6b29d33357f9734fb713a75c8`（同样是**全新克隆**，`git diff --stat adf1214 HEAD` 只列出本报告一个文件） |
+| 完整复验过的提交 | **`adf1214`**（源码）、**`56dbe10`**（head；同样在**全新克隆**里跑过完整 `pytest` 与联检） |
 
-**口径**：`pytest` 与联检的实测对象是**源码提交 `adf1214`**；其后的提交只改
-文档。以 head 为准复验时用
-`git diff --stat adf121499d5d054390352ca8e022c3d62433aa2f HEAD` 核对——
-输出里只有 `REVIEW_RESPONSE_3e4e1c61.md`（本轮还出现过 `AGENTS.md`），
-没有 `src/`、`tests/` 或 `scripts/`。这条命令本身是在 `47d4eaa` 的新克隆里跑的。
+**口径**：`pytest -q -rs` 与联检在**两个**提交上各跑过一次完整流程
+——`adf1214`（源码）与 `56dbe10`（head）。两者之间 `git diff --stat` 只列出
+本报告一个文件。若之后又有提交，用
+
+```bash
+git clone https://github.com/whiteswolfd-maker/MyNewProject.git <新目录>
+cd <新目录>
+git diff --stat adf121499d5d054390352ca8e022c3d62433aa2f HEAD
+```
+
+核对：输出里**只应出现** `AGENTS.md` 与 `REVIEW_RESPONSE_3e4e1c61.md`，
+不应出现 `src/`、`tests/` 或 `scripts/`。早先那个 `47d4eaa` 的克隆结果
+**不**为后来的提交背书，已作废。
 
 **源码提交换过一次。** 第一次修改提交是 `8d7fda6`，并且在它的基础上做过一次
 全新克隆复验。之后我在自查中发现事务快照漏了 `last_balance`、而且有三个只写
@@ -25,7 +33,7 @@
 | 本机环境 | Python **3.10.8**、torch **2.5.1+cu121**、numpy **1.26.4** |
 | 复核方环境 | 实跑 **484 passed / 6 skipped / 0 failed** |
 | 本机（原工作区） | `pytest -q -rs` → **520 passed / 0 skipped / 0 failed** |
-| 本机（**远端新克隆 `adf1214`**） | 同上：**520 passed / 0 skipped / 0 failed** |
+| 本机（**远端新克隆**：`adf1214` 与 `56dbe10` 各一次） | 同上：**520 passed / 0 skipped / 0 failed** |
 
 **关于 6 skipped**：复核环境缺真实提取数据，所以依赖它的测试跳过；本机在
 `C:\Users\work\Documents\GitHub\2\` 下**有**那些数据，因此不跳过。这是**环境差异**，
