@@ -19,7 +19,10 @@ import numpy as np
 import pytest
 
 from spherical_blast_pinn.data.contract import evaluate_case_contract, evaluate_data_contract
-from spherical_blast_pinn.data.extracted_case import load_extracted_case
+from spherical_blast_pinn.data.extracted_case import (
+    geometric_front_validity,
+    load_extracted_case,
+)
 from spherical_blast_pinn.physics import material as mat
 
 
@@ -472,3 +475,168 @@ def test_the_contract_rechecks_every_array_the_object_carries(tmp_path, name):
         f"{name}: 判了不就绪，但结构检查本身没有报出任何问题——"
         "说明拦住它的是别的理由，覆盖率仍然是个偶然"
     )
+
+
+# --------------------------------------------------------------------------
+# §5 前沿资格：档位封闭、证据一致、派生掩码可重算
+# --------------------------------------------------------------------------
+
+
+def _ready_case(tmp_path, name="s5"):
+    case = _load(_write_export(tmp_path / name))
+    verdict = evaluate_case_contract(case)
+    # 基线必须是**真的就绪**。写成 ``assert ... or True`` 之类的"永真断言"等于
+    # 没有基线，后面那些"改动之后仍就绪"的结论就全都失去意义。
+    assert verdict.ready, verdict.reasons
+    return case
+
+
+@pytest.mark.parametrize(
+    "mutate, needle",
+    [
+        # ① 删掉资格数组，却留着 level='arrays'
+        (lambda c: [c.front_supervision_eligibility.pop("contact_eligible"),
+                    c.front_supervision_eligibility.pop("shock_eligible")],
+         "does not support"),
+        # ② 置 None，同样留着 level='arrays'
+        (lambda c: c.front_supervision_eligibility.update(
+            contact_eligible=None, shock_eligible=None), "does not support"),
+        # ③ 未知档位
+        (lambda c: c.front_supervision_eligibility.update(
+            level="totally-fine"), "not one of"),
+        (lambda c: c.front_supervision_eligibility.update(
+            contact_level="totally-fine"), "not one of"),
+        # ④ 资格数组 dtype 不对
+        (lambda c: c.front_supervision_eligibility.update(
+            contact_eligible=np.ones(len(c.times))), "not bool"),
+        # ⑤ 资格数组形状不对
+        (lambda c: c.front_supervision_eligibility.update(
+            contact_eligible=np.ones((1, len(c.times)), dtype=bool)),
+         "one boolean per frame"),
+        # ⑥ 三态码越界
+        (lambda c: c.front_supervision_eligibility.update(
+            contact_status=np.full(len(c.times), 999, dtype=np.int64)),
+         "does not define"),
+    ],
+)
+def test_a_self_contradictory_eligibility_record_is_refused(tmp_path, mutate, needle):
+    """复核给的四个反例（外加 dtype / 形状 / 取值域）以前全部 ``ready=True``。"""
+    case = _ready_case(tmp_path)
+    mutate(case)
+    verdict = evaluate_case_contract(case)
+    assert not verdict.ready
+    assert any(needle in reason for reason in verdict.reasons), verdict.reasons
+
+
+def test_an_all_false_eligibility_array_cannot_keep_true_front_labels(tmp_path):
+    """**复核的原反例。** 两侧 eligible 全设 False，却保留原先为真的
+    ``contact_valid``/``shock_valid``——实际仍有 5 个"可监督帧"。
+
+    资格说白了"这一帧不够格当标签"，标签却说是。两份记录里只能有一份是真的，
+    而跑起来用的是后者：契约必须拒绝这种对象，而不是挑一个"看起来更可信"的当真。
+    """
+    case = _ready_case(tmp_path)
+    frames = len(case.times)
+    before = int(np.count_nonzero(case.contact_valid))
+    case.front_supervision_eligibility["contact_eligible"] = np.zeros(frames, dtype=bool)
+    case.front_supervision_eligibility["shock_eligible"] = np.zeros(frames, dtype=bool)
+
+    # 标签没有被一起改掉，矛盾仍然存在——而它以前是**看不见**的。
+    assert int(np.count_nonzero(case.contact_valid)) == before > 0
+    verdict = evaluate_case_contract(case)
+    assert not verdict.ready
+    assert any("disagrees" in reason for reason in verdict.reasons), verdict.reasons
+
+
+def test_the_derived_labels_can_be_recomputed_from_the_evidence(tmp_path):
+    """正式路径上，派生掩码本来就等于"几何 ∧ 证据"。把它改坏必须被发现。"""
+    case = _ready_case(tmp_path)
+    case.contact_valid = np.zeros(len(case.times), dtype=bool)
+    verdict = evaluate_case_contract(case)
+    assert not verdict.ready
+    assert any("contact_valid" in reason for reason in verdict.reasons)
+
+
+def test_an_explicit_false_never_becomes_a_front_label(tmp_path):
+    """显式 ``False`` 必须真的挡掉那一帧的标签——不是只写在记录里。
+
+    这里走**真实消费路径**：``supervisable_frames()`` 是采样器挑前沿标签时用的
+    那一个判据。
+    """
+    case = _ready_case(tmp_path)
+    frames = len(case.times)
+    eligible = np.ones(frames, dtype=bool)
+    eligible[1] = False
+    case.front_supervision_eligibility["contact_eligible"] = eligible
+    case.front_supervision_eligibility["shock_eligible"] = eligible
+    # 派生掩码要按**同一条规则**重算（几何 ∧ 证据），不是与旧值相与——相与会把
+    # 旧标签里本来就为 False 的帧也保留下来，那是另一个矛盾。
+    geometric_contact, geometric_shock, _ = geometric_front_validity(case)
+    case.contact_valid = geometric_contact & eligible
+    case.shock_valid = geometric_shock & eligible
+
+    verdict = evaluate_case_contract(case)
+    assert verdict.ready, verdict.reasons
+    usable = case.supervisable_frames()
+    assert bool(usable[1]) is False, "被显式否决的帧仍然进了可监督集合"
+
+
+def test_the_two_sides_keep_their_own_evidence_levels(tmp_path):
+    """一侧只有三态码、另一侧有资格数组：**整体**取最弱的一档。
+
+    但两侧的**标签**各自独立——缺激波不该撤销可靠的接触标签。
+    """
+    case = _ready_case(tmp_path)
+    block = case.front_supervision_eligibility
+    block.pop("shock_eligible")
+    block["shock_level"] = "legacy_state_code"
+    block["level"] = "legacy_state_code"
+    # 激波侧改回三态码判定：几何 ∧ (state == 2)。
+    case.shock_valid = np.isfinite(case.shock_radius) & (
+        np.asarray(block["shock_status"]) == 2
+    )
+    verdict = evaluate_case_contract(case)
+    # 记录自洽了，但整体档位是"旧格式"，契约仍然判未就绪（可诊断、不可训练）。
+    assert any("三态码" in reason for reason in verdict.reasons), verdict.reasons
+    # 而接触侧**没有**因此被撤销。
+    assert int(np.count_nonzero(case.contact_valid)) == int(
+        np.count_nonzero(geometric_front_validity(case)[0]
+                         & case.front_supervision_eligibility["contact_eligible"])
+    )
+
+
+def test_an_order_flag_that_contradicts_the_radii_is_refused(tmp_path):
+    """``ordering_ok`` 是一条独立记录，但它不能与半径本身矛盾。"""
+    case = _ready_case(tmp_path)
+    block = case.front_supervision_eligibility
+    block["ordering_ok"] = ~np.asarray(block["ordering_ok"], dtype=bool)
+    verdict = evaluate_case_contract(case)
+    assert not verdict.ready
+    assert any("ordering_ok" in reason for reason in verdict.reasons), verdict.reasons
+
+
+def test_the_overall_level_is_derived_from_the_sides_not_asserted(tmp_path):
+    """整体档位由两侧推导。单独写一个更强的整体档位不能通过。"""
+    case = _ready_case(tmp_path)
+    # 激波侧的资格数组被拿掉，它自己的档位**如实**改成三态码；而整体档位仍然
+    # 写着 "arrays"。两侧内部都自洽，只有整体那一格在说大话——它必须由两侧推导，
+    # 不能单独声明。
+    block = case.front_supervision_eligibility
+    block.pop("shock_eligible")
+    block["shock_level"] = "legacy_state_code"
+    geometric_shock = geometric_front_validity(case)[1]
+    case.shock_valid = geometric_shock & (np.asarray(block["shock_status"]) == 2)
+
+    verdict = evaluate_case_contract(case)
+    assert not verdict.ready
+    assert any("weakest grade" in reason for reason in verdict.reasons), verdict.reasons
+
+
+def test_the_contract_reports_where_the_problem_is(tmp_path):
+    """§5.6：拒绝时给出**准确位置与原因**，且不在拒绝之前崩溃。"""
+    case = _ready_case(tmp_path)
+    case.front_supervision_eligibility["level"] = "nonsense"
+    verdict = evaluate_case_contract(case)
+    assert not verdict.ready
+    reason = next(r for r in verdict.reasons if "front_supervision" in r)
+    assert "front_supervision_eligibility['level']" in reason

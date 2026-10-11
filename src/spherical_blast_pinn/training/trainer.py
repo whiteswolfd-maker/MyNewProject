@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,7 +89,7 @@ RUN_STATUS_MEANING: dict[str, str] = {
 #: 它们存在**（缺失即拒绝）。这两项记录的是"更新跑完了、判据没过、尚不允许推进"
 #: 这个中间状态；旧写法没有它们，读出来会被当成"没有待决判据"——那正是这两个
 #: 字段要区分的那件事。所以旧检查点按版本号直接拒绝，而不是"缺字段就默认通过"。
-CHECKPOINT_VERSION = 4
+CHECKPOINT_VERSION = 5
 
 
 class TrainingError(RuntimeError):
@@ -115,6 +116,9 @@ class NonFiniteUpdate(TrainingError):
         self.step = int(step)
         self.loss = float(loss)
         self.bad_parameters = list(bad_parameters)
+        # ``detail`` 也留成属性：精修的失败记录要把"第几次精修、第几次 closure"
+        # 结构化地写进诊断文件，而不是让调用方去正则匹配异常消息。
+        self.detail = str(detail)
         lines = [f"update {self.step} was blocked: {detail}"]
         if bad_parameters:
             lines.append(f"  non-finite gradient in: {list(bad_parameters)[:8]}")
@@ -187,17 +191,29 @@ class TrainingResult:
         return self.status == RUN_COMPLETED
 
     def as_dict(self) -> dict[str, Any]:
+        metadata = self.metadata or {}
+        refinement = metadata.get("refinement") or []
         return {
             "output_dir": str(self.output_dir),
             "updates": self.updates,
             "status": self.status,
             "status_meaning": RUN_STATUS_MEANING.get(self.status, "unknown status"),
             "formally_accepted": self.formally_accepted,
+            "final_stage_verdict_passed": bool(
+                (self.final_stage_verdict or {}).get("passed") is True
+            ),
             "final_loss": self.final_loss,
             "final_loss_step": int(self.final_loss_step),
             "final_stage_verdict": self.final_stage_verdict,
+            # **关键身份提到顶层。** 它们本来只在 ``metadata`` 里，读清单的人要往下
+            # 翻一层才看得到"这是一次诊断运行、它精修过、当前参数检查过没有"。
+            # 交付物之间的一致性正是靠这几个字段核对的，藏起来只会让人漏看。
+            "diagnostic": bool(metadata.get("diagnostic", False)),
+            "refined": bool(refinement),
+            "refinement_count": len(refinement),
+            "check_state": metadata.get("check_state"),
             "checkpoints": self.checkpoints,
-            "metadata": self.metadata,
+            "metadata": metadata,
             "history_length": len(self.history),
         }
 
@@ -331,6 +347,11 @@ class Trainer:
         #: "从检查点继续一次精修"是不支持的，这里如实记下来而不是假装支持。
         self.refine_history: list[dict[str, Any]] = []
         self._lbfgs_closures = 0
+        #: 一次回滚失败的记录。非 ``None`` 时这个对象处于未知状态，任何会读取或
+        #: 写出训练状态的入口都拒绝工作——继续用它是把这个混合状态当成正常结果。
+        self._unusable: str | None = None
+        #: 收尾时对"当前参数检查过没有"的判定，随检查点一起落盘。
+        self._final_check_state: str | None = None
 
         # -- 有界梯度平衡（§14） -------------------------------------------
         self.balance_config = BalanceConfig.from_config(config)
@@ -354,7 +375,48 @@ class Trainer:
         self.sampler.set_time_window(float(self.schedule[0].time_window_fraction))
         self.provenance = self._provenance()
 
+    def _assert_usable(self) -> None:
+        """一次回滚失败之后，这个对象不能再被使用。"""
+        if self._unusable is not None:
+            raise TrainingError(
+                "this trainer instance is in an unknown state and cannot be used: "
+                f"{self._unusable}"
+            )
+
     # -- 清单 -------------------------------------------------------------
+    def _data_identity(self) -> dict[str, Any]:
+        """这批数据的**内容**身份，用来回答"是不是同一批数据"。
+
+        刻意不包含目录字符串：把输出目录搬到别处是正常操作，不该让检查点作废；
+        而把同一路径下的数据换掉必须让它作废。所以按时间轴、径向网格、两条前沿
+        与三种材料的计数取哈希——它们是这个训练真正依赖的东西，且都是小数组。
+        """
+        import hashlib
+
+        identity: dict[str, Any] = {}
+        for case in self.cases:
+            digest = hashlib.sha256()
+            for name in ("times", "radius", "contact_radius", "shock_radius"):
+                value = getattr(case, name, None)
+                if value is None:
+                    digest.update(f"{name}:missing".encode("utf-8"))
+                    continue
+                digest.update(
+                    np.ascontiguousarray(np.asarray(value, dtype=np.float64)).tobytes()
+                )
+            material = np.asarray(getattr(case, "material", None))
+            if material.ndim == 2:
+                counts = np.bincount(material.astype(np.int64).ravel(), minlength=3)
+                digest.update(counts[:3].tobytes())
+            identity[case.case_id] = {
+                "charge_radius_m": float(case.charge_radius),
+                "frames": int(np.asarray(case.times).size),
+                "content_sha256": digest.hexdigest(),
+                "detonation_velocity_m_s": case.source.get("detonation_velocity_m_s"),
+                "symmetry_factor": case.source.get("symmetry_factor"),
+            }
+        return identity
+
     def _provenance(self) -> dict[str, Any]:
         return {
             "charge_radii": [float(c.charge_radius) for c in self.cases],
@@ -481,14 +543,38 @@ class Trainer:
             digest.update(np.ascontiguousarray(value.detach().cpu().numpy()).tobytes())
         return digest.hexdigest()
 
+    def _check_set_identity(self) -> str:
+        """固定检查集的**内容**身份，短哈希。
+
+        检查记录要能回答"这条结论是在哪一套点上得到的"。检查集定义变了（采样
+        配置、开发帧、数据）而参数没变时，旧结论不能给新定义背书。
+        """
+        import hashlib
+
+        payload = json.dumps(self.check_set.as_dict(), sort_keys=True, default=_jsonable)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
     def _check_stale(self) -> bool:
-        """当前参数下还没有检查结论吗（从来没查过 / 参数变了 / 步数变了）。"""
+        """当前参数下还没有**完整**检查结论吗。
+
+        条件有三条，缺一条就要重查：
+
+        * 从来没查过；
+        * 步数变了（``step`` 是报告的一部分）；
+        * 参数指纹变了——精修改参数不改步数，只用步数判断会把精修前的结论留下；
+        * 上一次是**窗口内**检查、或用的是另一套检查集。窗口检查与全时段检查
+          回答的不是同一个问题，不能因为步数和指纹相同就互相顶替。
+        """
         if not self.check_history:
             return True
         last = self.check_history[-1]
         if int(last.get("step", -1)) != int(self.step):
             return True
-        return last.get("parameter_fingerprint") != self.parameter_fingerprint()
+        if last.get("parameter_fingerprint") != self.parameter_fingerprint():
+            return True
+        if last.get("scope") != "full":
+            return True
+        return last.get("check_set_identity") != self._check_set_identity()
 
     # -- 独立检查 ---------------------------------------------------------
     def verify(
@@ -533,6 +619,11 @@ class Trainer:
         if window_fraction is not None:
             record["window_fraction"] = float(window_fraction)
         record["parameter_fingerprint"] = self.parameter_fingerprint()
+        # **这次检查是在什么范围、什么检查集上做的**，要随记录一起留下。
+        # 只记步数与指纹的话，"窗口内的阶段检查"与"全时段的固定检查"看起来是
+        # 两条同样的记录，可以互相顶替——而它们回答的不是同一个问题。
+        record["scope"] = "full" if window_fraction is None else "windowed"
+        record["check_set_identity"] = self._check_set_identity()
         self.check_history.append(record)
 
         if not update_best:
@@ -662,19 +753,34 @@ class Trainer:
         max_updates: int | None = None,
         verbose: bool = False,
         diagnostic: bool = False,
+        refinement: Sequence[Mapping[str, Any]] | None = None,
     ) -> TrainingResult:
         """跑训练循环。
 
         ``max_updates`` 截断的运行是 ``incomplete``（提示词 §1）：不拿没跑过的
         阶段判失败，也不宣称正式训练完成。``diagnostic=True`` 的运行不主张任何
         验收结论，无论它跑到哪一步。
+
+        ``refinement`` 由 :meth:`refine` 传入：这一批精修记录会成为本次运行的
+        **来源身份**。它必须在这里（写任何产物之前）参与终态的判定，否则会出现
+        "返回值说 diagnostic、``last.pt`` 里写着 completed"这种自相矛盾的交付——
+        以前 ``refine`` 就是把 ``run()`` 的结果拿来之后再改字段，只重写了清单，
+        检查点里留在原处的是 ``completed``。
         """
+        self._assert_usable()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         # 完整日程的长度。收尾判断必须用它，**不能**用截断后的 ``total``。
         schedule_total = sum(stage.updates for stage in self.schedule)
         total = schedule_total
         if max_updates is not None:
             total = min(total, int(max_updates))
+        # 模型**来源**里带着精修记录时，这次运行同样是诊断性的：参数不是一条
+        # 单一 Adam 轨迹的产物。去掉这一条，"加载精修过的检查点 → 再 run 一次"
+        # 就会把精修身份洗掉。
+        refinement_records = list(refinement) if refinement is not None else list(
+            self.refine_history
+        )
+        refined = bool(refinement_records)
 
         # 悬而未决的阶段判据：**先重新评价，再谈继续训练**。
         #
@@ -692,6 +798,9 @@ class Trainer:
 
         started = time.time()
         start_step = int(self.step)
+        #: 进入循环那一刻的参数指纹。收尾时用它回答"这次运行**改动过参数**吗"——
+        #: 这跟"步数涨了吗"不是同一个问题，精修就是那个反例。
+        parameters_at_entry = self.parameter_fingerprint()
         # **从实例状态起手，而不是从空字符串起手。**
         #
         # ``stage_name`` 初值写成 ``""`` 时，任何一次"重新调用 run()"都会被当成
@@ -769,10 +878,56 @@ class Trainer:
         final_step = int(self._last_update_loss_step)
 
         # 收尾检查：即使还没到 check_every，也要让最后一次迭代有物理验收结论。
-        # 一次更新都没发生时跳过——拿一个没动过的模型去跑完整检查，只会往
-        # ``best.pt`` 里写一份"从未训练过"的快照。
-        if self.check_every > 0 and self.step > start_step and self._check_stale():
+        #
+        # **"这一步检查过没有"不能用"步数有没有增加"代替。** 以前这里写的是
+        # ``self.step > start_step``，它把两种完全不同的情形混成了一类：
+        #
+        # * 零预算的调用（``step == start_step``）：确实什么都不该查——拿一个没
+        #   动过的模型去跑完整检查，只会往 ``best.pt`` 里写一份"从未训练过"的快照；
+        # * 精修之后的调用（``step`` 一点没动、参数却全变了）：**必须**重查，
+        #   否则报告里的误差、best/last 与最终结论对的是一个已经不存在的模型。
+        #
+        # 正确的判据是"这次运行确实改动过参数，且当前参数下还没有结论"。
+        # 指纹比较覆盖第一种（没动过 → 指纹相同 → 不查）；第二种由**调用方**告诉
+        # 我们——``refine`` 在进这个方法**之前**就把参数改完了，所以进入时的指纹
+        # 已经是精修后的，只比指纹会把精修看成"什么都没发生"。
+        parameters_moved = (
+            self.parameter_fingerprint() != parameters_at_entry
+            or refinement is not None
+        )
+        checked_this_call = False
+        if self.check_every > 0 and parameters_moved and self._check_stale():
             self.verify(verbose=verbose, total_loss_value=final)
+            checked_this_call = True
+        # 没有在这里重查时，**如实记下是哪一种"没查"**：关掉了检查、这次调用没动
+        # 参数、还是当前参数下已经有结论。三者混成一句"没有检查"会让一个"关掉了
+        # 检查"的运行看起来与"参数没变、结论仍有效"一样。
+        if self.check_every <= 0:
+            check_state = "checks_disabled"
+        elif checked_this_call:
+            check_state = "checked_on_current_parameters"
+        elif parameters_moved:
+            check_state = "current_parameters_already_carry_a_conclusion"
+        else:
+            check_state = "no_parameter_change_in_this_call"
+        check_state_note = {
+            "checks_disabled": (
+                "check_every <= 0: no acceptance check was executed, so no conclusion "
+                "about these parameters exists"
+            ),
+            "checked_on_current_parameters": (
+                "the full fixed check set was evaluated on the current parameters"
+            ),
+            "current_parameters_already_carry_a_conclusion": (
+                "the parameters changed during this call and already carry a check "
+                "conclusion from this call"
+            ),
+            "no_parameter_change_in_this_call": (
+                "this call performed no parameter update; the current parameters were "
+                "not re-checked, and any earlier conclusion applies only if its "
+                "parameter fingerprint matches the current one"
+            ),
+        }[check_state]
 
         # 最后一个阶段的判据：只有在它的预算**真的跑完**时才评价。
         #
@@ -823,6 +978,12 @@ class Trainer:
 
         if diagnostic:
             status = RUN_DIAGNOSTIC
+        elif refined:
+            # **精修过的运行一律是诊断性的。** 目标函数中途换过一次，这次运行不再
+            # 是一条单一优化轨迹；要得到正式结论就重跑一次不含精修的训练。
+            # 这一条必须在**写任何产物之前**生效，返回值、清单、检查点与 CLI 的
+            # ``train_result.json`` 才能引用同一个结论。
+            status = RUN_DIAGNOSTIC
         elif truncated:
             status = RUN_INCOMPLETE
         elif stage_verdict is not None and stage_verdict.get("passed") is True:
@@ -833,6 +994,7 @@ class Trainer:
         # 现在才写最终检查点：它带着上面那个结论。
         self._final_status = status
         self._final_stage_verdict = stage_verdict
+        self._final_check_state = check_state
         self._save(self.output_dir / "last.pt")
 
         result = TrainingResult(
@@ -855,8 +1017,31 @@ class Trainer:
                 "status_meaning": RUN_STATUS_MEANING.get(status, "unknown status"),
                 "schedule_total_updates": int(schedule_total),
                 "truncated": bool(truncated),
-                "diagnostic": bool(diagnostic),
+                "diagnostic": bool(diagnostic or refined),
+                "refined": bool(refined),
+                "diagnostic_reason": (
+                    "explicitly requested" if diagnostic
+                    else "the parameters come from an L-BFGS refinement, so this run is "
+                         "not a single optimisation trajectory"
+                    if refined else None
+                ),
+                # **判据通过 != 正式接受。** 精修过的运行可以是"最终判据确实通过"
+                # 同时"整次运行不能当正式结果"，两者都如实保留。
                 "final_stage_verdict": stage_verdict,
+                "final_stage_verdict_passed": bool(
+                    stage_verdict is not None and stage_verdict.get("passed") is True
+                ),
+                "formally_accepted": status == RUN_COMPLETED,
+                "refinement": refinement_records,
+                "refinement_note": (
+                    "L-BFGS refinement changed the parameters without advancing the "
+                    "step, so this run is reported as diagnostic; its objective also "
+                    "changed mid-run (one fixed sample batch, adaptive weights and the "
+                    "PDE weight frozen at the step where refinement started)"
+                    if refined else None
+                ),
+                "check_state": check_state,
+                "check_state_meaning": check_state_note,
                 "balancing": {
                     "config": self.balance_config.as_dict(),
                     "monitors": self.balancer.monitors(),
@@ -883,6 +1068,35 @@ class Trainer:
         return paths
 
     # -- L-BFGS 精修 ------------------------------------------------------
+    def resume_refinement(self, *_: Any, **__: Any) -> TrainingResult:
+        """**不支持，而且明确拒绝——不要假装支持。**
+
+        三种操作必须分开，它们不是同一件事：
+
+        ================================================  ==========================
+        操作                                              支持情况
+        ================================================  ==========================
+        用精修后的权重做**推理**                          支持（直接加载模型即可）
+        从精修后的权重**显式开始一次新的优化阶段**        支持（``run()``；来源身份保留）
+        继续一次**中断的** L-BFGS 精修                    **不支持**
+        ================================================  ==========================
+
+        L-BFGS 的优化器状态（历史方向与步长、Hessian 的对角近似、上一次的平坦梯度）
+        不进检查点，而更强的一点是：**线搜索本身不能在半途停下**。它的每一次求值都
+        假设"上一次试探的参数还在原处"，中途接管会得到一个既不是原来那条轨迹、
+        也不是一条新轨迹的东西——而损失曲线看起来完全正常。
+
+        所以这里放一个会抛错的方法，而不是只在报告里写一行
+        ``resume_supported: false``：后者要靠人去读，前者在调用时就拦住。
+        """
+        raise TrainingError(
+            "resuming an interrupted L-BFGS refinement is not supported: L-BFGS "
+            "optimiser state and the line-search state are not checkpointed, and a "
+            "line search cannot be stopped halfway and taken over. Load the refined "
+            "weights and start a new optimisation stage, or start a new refinement "
+            "with refine()"
+        )
+
     def refine(
         self,
         *,
@@ -894,9 +1108,14 @@ class Trainer:
         **采样点、权重与目标函数全部固定**：一次采样，反复求值。规范明确禁止
         在每次 closure 求值时重采样——那会让"同一次线搜索"里的目标函数不是
         同一个函数，线搜索的前提就不成立了。
+
+        精修是**事务性**的：动参数之前先取全状态快照，闭包、线搜索或收尾核对
+        任何一步失败都把对象还原回精修前的那一刻。L-BFGS 的线搜索会临时改参数，
+        所以只在闭包里抛错不足以保证模型还停在原处——必须由调用方负责还原。
         """
         if torch is None:  # pragma: no cover
             raise RuntimeError("PyTorch is required")
+        self._assert_usable()
         if self._stage_blocked:
             # 精修会改参数。在一个"判据没过、不允许推进"的状态上精修，等于绕过
             # 那道闸门——先把判据跑过再说。
@@ -908,6 +1127,12 @@ class Trainer:
         if iterations <= 0:
             return self.run(max_updates=self.step)
 
+        refine_index = len(self.refine_history) + 1
+        fingerprint_before = self.parameter_fingerprint()
+        # **快照要在取批次之前。** ``self.sampler.batch()`` 会推进采样器自己的
+        # 发生器；晚一步取快照，回滚之后采样序列已经前进了一次——参数还原了，
+        # 采样轨迹没有，而"恢复到精修前"的语义正好包括后者。
+        snapshot = self._snapshot_state()
         batches = self.sampler.batch()
         pde_weight = pde_weight_at(self.step, self.schedule)
         # **权重必须与训练时一致，而且要记下来。** 以前这里调用 ``total_loss`` 时
@@ -915,15 +1140,35 @@ class Trainer:
         # 权重被丢掉了，目标函数与训练时不是同一个，而精修的损失看起来完全正常。
         weights = self.balancer.weights()
         self._refine_weights = dict(weights)
+        objective_definition = {
+            "kind": "fixed-sample L-BFGS (strong Wolfe line search)",
+            "adaptive_weights": {key: float(value) for key, value in weights.items()},
+            "pde_weight": float(pde_weight),
+            "pde_weight_note": (
+                "frozen at the step where refinement started; the schedule's ramp is "
+                "not advanced by refinement"
+            ),
+            "samples": (
+                "one batch drawn once before the first closure; every closure evaluates "
+                "the same samples — resampling inside a line search would make the "
+                "objective a different function at each evaluation"
+            ),
+            "samples_fingerprint": _batch_fingerprint(batches),
+            "optimizer_state_checkpointed": False,
+            "resume_of_an_interrupted_refine": "not supported (see resume_refinement)",
+        }
+
+        closures = {"count": 0}
+        last: dict[str, Any] = {"total": float("nan")}
         optimizer = torch.optim.LBFGS(
             [p for p in self.model.parameters() if p.requires_grad],
             max_iter=iterations,
             history_size=50,
             line_search_fn="strong_wolfe",
         )
-        last: dict[str, Any] = {}
 
         def closure():
+            closures["count"] += 1
             optimizer.zero_grad(set_to_none=True)
             breakdown = total_loss(
                 batches,
@@ -932,57 +1177,171 @@ class Trainer:
                 contact_pressure=self.contact_pressure,
                 pde_weight=pde_weight,
             )
+            # **非有限损失在反传之前拦下。** 与 Adam 的 ``_update`` 同一条规则，
+            # 以前这一层只覆盖 Adam，精修那条路完全没查。
+            if not bool(torch.isfinite(breakdown.total)):
+                raise NonFiniteUpdate(
+                    step=int(self.step),
+                    loss=float("nan"),
+                    bad_parameters=[],
+                    detail=(
+                        f"refinement #{refine_index}, closure #{closures['count']}: the "
+                        "total loss is not finite; the line search is stopped before "
+                        "backward so no parameter is moved from it"
+                    ),
+                )
             breakdown.total.backward()
+            # **非有限梯度在更新或接受试探之前拦下。** 不裁剪、不跳过、不换成零：
+            # 那三种做法都把"这里有异常"变成"看起来还行"。
+            bad_parameters = [
+                name for name, parameter in self.model.named_parameters()
+                if parameter.requires_grad
+                and parameter.grad is not None
+                and not bool(torch.isfinite(parameter.grad).all())
+            ]
+            if bad_parameters:
+                raise NonFiniteUpdate(
+                    step=int(self.step),
+                    loss=float(breakdown.total.detach()),
+                    bad_parameters=bad_parameters,
+                    detail=(
+                        f"refinement #{refine_index}, closure #{closures['count']}: the "
+                        "gradient is not finite for these parameters; the trial step was "
+                        "not offered to the line search"
+                    ),
+                )
             last["total"] = float(breakdown.total.detach())
             return breakdown.total
 
-        self._lbfgs_closures = 0
+        failure: dict[str, Any] | None = None
+        try:
+            optimizer.step(closure)
 
-        def counted_closure():
-            self._lbfgs_closures += 1
-            return closure()
+            # 最终目标值必须在**被接受的最终参数**上求。线搜索最后一次求值的那个
+            # 试探点可能已经被否决（`strong_wolfe` 会回退），而 Adam 的旧损失更是
+            # 来自另一组参数——两者都不是精修的结果。
+            #
+            # **不能用 ``torch.no_grad()``**：目标函数内部要用 ``autograd.grad``
+            # 取前沿网络对坐标的导数（移动坐标的链式法则），关掉建图会让它在
+            # 求值阶段就抛错。这里只是**不调用 backward**——不反传就不会动参数。
+            with torch.enable_grad():
+                final_breakdown = total_loss(
+                    batches,
+                    self.model,
+                    weights=weights,
+                    contact_pressure=self.contact_pressure,
+                    pde_weight=pde_weight,
+                )
+                accepted_loss = float(final_breakdown.total.detach())
+            if not math.isfinite(accepted_loss):
+                raise NonFiniteUpdate(
+                    step=int(self.step),
+                    loss=accepted_loss,
+                    bad_parameters=[],
+                    detail=(
+                        f"refinement #{refine_index}: the objective evaluated on the "
+                        "accepted parameters is not finite, so the refined model cannot "
+                        "be reported as a usable result"
+                    ),
+                )
+            fingerprint_after = self.parameter_fingerprint()
+            parameters_changed = fingerprint_after != fingerprint_before
+        except BaseException as exc:
+            # **完整回滚。** 线搜索可能已经把参数挪到了一个被否决的试探点上，
+            # 所以"抛错"不等于"参数还在原处"。
+            self._restore_state(snapshot)
+            failure = {
+                "refinement_index": refine_index,
+                "step": int(self.step),
+                "closures": int(closures["count"]),
+                "iterations_requested": int(iterations),
+                "error": f"{exc.__class__.__name__}: {exc}",
+                "bad_parameters": list(getattr(exc, "bad_parameters", [])),
+                "objective": objective_definition,
+                "parameters_restored": True,
+                "fingerprint_restored": self.parameter_fingerprint() == fingerprint_before,
+                "note": (
+                    "the parameters and the last valid checkpoint were left untouched; "
+                    "this record is written to a separate diagnostics file, never into "
+                    "the resumable checkpoint"
+                ),
+            }
+            self._write_refinement_failure(failure)
+            raise
 
-        optimizer.step(counted_closure)
-        self.refine_history.append({
-            "step": self.step,
+        record = {
+            "index": refine_index,
+            "step": int(self.step),
             "iterations_requested": int(iterations),
-            "closures": int(self._lbfgs_closures),
-            "loss_after": last.get("total", float("nan")),
-            "weights": dict(weights),
+            "closures": int(closures["count"]),
+            # 线搜索最后一次试探值**单独**留着做诊断，不当成精修结果。
+            "loss_at_last_closure_evaluation": float(last.get("total", float("nan"))),
+            "loss_on_accepted_parameters": accepted_loss,
+            "loss_source": (
+                "evaluated on the parameters the line search actually accepted, on the "
+                "same fixed batch and weights as every closure"
+            ),
+            "weights": {key: float(value) for key, value in weights.items()},
             "pde_weight": float(pde_weight),
-            "parameters_changed": True,
+            "objective": objective_definition,
+            "fingerprint_before": fingerprint_before,
+            "fingerprint_after": fingerprint_after,
+            # **由指纹比较产生，不是写死的 True。** 一次一步都没走成的精修
+            # （例如强 Wolfe 立刻判满足）不该报成"参数变了"。
+            "parameters_changed": bool(parameters_changed),
             "resume_supported": False,
-        })
+            "resume_note": (
+                "L-BFGS optimiser state and line-search state are not checkpointed; "
+                "use resume_refinement() to be told so explicitly"
+            ),
+        }
+        self.refine_history.append(record)
         if verbose:
             print(
-                f"[lbfgs] fixed-sample refinement -> {last.get('total')} "
-                f"({self._lbfgs_closures} closures)"
+                f"[lbfgs] fixed-sample refinement #{refine_index} -> "
+                f"{accepted_loss:.6e} on accepted parameters "
+                f"({record['closures']} closures)"
             )
 
-        # **精修改了参数，必须重新评价。** 精修不动 ``step``，所以按"这一步查过了"
-        # 判断会把精修前的结论留在报告里——误差、best/last 与最终结论都对不上当前
-        # 参数。这里显式作废当前指纹下的检查结论，再让收尾流程重查一遍。
+        # **精修改了参数，必须重新评价。** 收尾流程按"参数指纹变了没有"判断要不要
+        # 重查（见 ``run``），所以这里只需要令旧结论失效。精修记录作为**来源身份**
+        # 传给 ``run``，让终态、检查点与清单在写出来之前就引用同一个结论。
         self._check_fingerprint = None
-        result = self.run(max_updates=self.step, verbose=verbose)
-        # 精修过之后状态一律不是"正式成功"：目标函数中途换过一次，这次运行不再是
-        # 一条单一优化轨迹。要得到正式结论，就重跑一次不含精修的训练。
-        result.status = RUN_DIAGNOSTIC
-        result.metadata["refinement"] = list(self.refine_history)
-        result.metadata["status"] = result.status
-        result.metadata["status_meaning"] = RUN_STATUS_MEANING[RUN_DIAGNOSTIC]
-        result.metadata["refinement_note"] = (
-            "L-BFGS refinement changed the parameters without advancing the step, so "
-            "this run is reported as diagnostic; its objective also changed mid-run"
+        return self.run(
+            max_updates=self.step,
+            verbose=verbose,
+            refinement=list(self.refine_history),
         )
-        (self.output_dir / "run_manifest.json").write_text(
-            json.dumps(result.as_dict(), indent=2, default=_jsonable), encoding="utf-8"
+
+    def _write_refinement_failure(self, failure: Mapping[str, Any]) -> Path:
+        """把一次失败的精修写到**独立**的诊断文件。
+
+        刻意不写进 ``last.pt``/``best.pt``：那两个是可恢复检查点，往里面塞一条
+        "这次精修崩了"的记录，会让人以为恢复出来的状态包含那次失败。目录里多一个
+        ``refinement_failures.json``，失败可查，可恢复状态的语义不变。
+        """
+        path = self.output_dir / "refinement_failures.json"
+        history: list[dict[str, Any]] = []
+        if path.exists():
+            try:
+                history = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001 - 诊断文件损坏不该盖掉真正的失败
+                history = []
+        # **不要把整份 dict 交给 ``_jsonable``**：它对不认识的对象回落到
+        # ``str(value)``，整份记录会被压成一行字符串，读回来既不是 dict 也不是
+        # JSON 结构。这里只把 JSON 无法直接序列化的**叶子**交给它。
+        history.append(dict(failure))
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(history, indent=2, default=_jsonable), encoding="utf-8"
         )
-        return result
+        return path
 
     # -- 检查点 -----------------------------------------------------------
     def _save(self, path: Path) -> Path:
         if torch is None:  # pragma: no cover
             raise RuntimeError("PyTorch is required")
+        self._assert_usable()
         payload = {
             "format": CHECKPOINT_FORMAT,
             "version": CHECKPOINT_VERSION,
@@ -990,6 +1349,22 @@ class Trainer:
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "learning_rates": [g["lr"] for g in self.optimizer.param_groups],
+            # **最后一次 Adam 更新的实测损失与它的步号。** 以前这两项只活在内存里：
+            # 恢复之后 ``_last_update_loss`` 回到构造时的 ``nan``、
+            # ``_last_update_loss_step`` 回到 0，于是"加载后不再更新"的一次
+            # ``run()`` 会把 ``final_loss=nan, final_loss_step=0`` 写进报告——
+            # 看起来像训练发散，其实是记录丢了。
+            "last_update_loss": float(self._last_update_loss),
+            "last_update_loss_step": int(self._last_update_loss_step),
+            # 精修历史也要落盘：不落盘的话，一次"精修 → 保存 → 新实例加载"会
+            # 得到一个精修历史为空、看起来像纯 Adam 跑出来的对象。
+            "refinement": list(self.refine_history),
+            # 日程、固定检查集与数据身份：**旧模型配另一套评估定义**是最难发现的
+            # 错配——所有数字都正常，只是它们不是同一件事上的数字。目录字符串
+            # 相同证明不了这些，所以按内容存。
+            "schedule": _schedule_signature(self.schedule),
+            "check_set": self.check_set.as_dict(),
+            "data_identity": self._data_identity(),
             "rng": _rng_state(self.seed),
             # 采样器自己的发生器**不在** ``np.random.get_state()`` 里，必须单独
             # 存：只恢复全局状态会让采样序列从别的地方继续，"中断后恢复到第 N 步"
@@ -1006,6 +1381,7 @@ class Trainer:
             "balancing": self.balancer.state_dict(),
             "run_status": getattr(self, "_final_status", None),
             "final_stage_verdict": getattr(self, "_final_stage_verdict", None),
+            "check_state": getattr(self, "_final_check_state", None),
             "stage": {
                 "current": self._current_stage,
                 "window_fraction": float(self._stage_window),
@@ -1043,13 +1419,37 @@ class Trainer:
         """
         if torch is None:  # pragma: no cover
             raise RuntimeError("PyTorch is required")
+        self._assert_usable()
         payload = torch.load(Path(path), map_location="cpu", weights_only=False)
         if payload.get("format") != CHECKPOINT_FORMAT:
             raise TrainingError(f"{path} is not a {CHECKPOINT_FORMAT} checkpoint")
         if int(payload.get("version", -1)) != CHECKPOINT_VERSION:
             raise TrainingError(
-                f"checkpoint version {payload.get('version')} does not match "
-                f"{CHECKPOINT_VERSION}"
+                f"{path} has checkpoint version {payload.get('version')}, but this "
+                f"trainer writes and reads version {CHECKPOINT_VERSION}. There is no "
+                "migration path: an older writer did not record the last update loss, "
+                "the schedule, the fixed check set or the data identity, and those "
+                "cannot be reconstructed from the file. Retrain, or import the weights "
+                "explicitly as an initialisation rather than as a resume."
+            )
+        # 全局随机状态是**严格续跑**的一部分：少了它，"恢复到第 N 步"与"连跑
+        # N 步"的采样序列不同。以前缺这一项时 ``_restore_rng(None)`` 静默返回，
+        # 于是恢复出来的是一条不同的轨迹，而损失曲线看不出任何异常。
+        rng_payload = payload.get("rng")
+        if not isinstance(rng_payload, Mapping):
+            raise TrainingError(
+                f"{path} carries no global RNG state; resuming from it would continue "
+                "the global random sequence from somewhere else, so 'resume to step N' "
+                "would not reproduce 'run N steps'"
+            )
+        missing_rng = [
+            key for key in ("numpy", "torch")
+            if rng_payload.get(key) is None and torch is not None
+        ]
+        if missing_rng:
+            raise TrainingError(
+                f"{path}: the global RNG record has no {missing_rng}; a partial record "
+                "cannot restore the sequence it claims to"
             )
         if abs(float(payload.get("time_scale", 0.0)) - self.time_scale) > 1.0e-12:
             raise TrainingError(
@@ -1073,6 +1473,81 @@ class Trainer:
         if not isinstance(payload["step"], (int, np.integer)):
             raise TrainingError(
                 f"the checkpoint's step is {payload['step']!r}, not an integer"
+            )
+        if int(payload["step"]) < 0:
+            raise TrainingError(f"the checkpoint's step is negative: {payload['step']!r}")
+
+        # -- 日程、检查集与数据身份：**必须是同一件事** ----------------------
+        #
+        # 只比"当前窗口"远远不够。同名阶段把预算从 2 改成 5、学习率与 PDE 权重
+        # 一起改掉，只要那一刻的窗口碰巧相同，以前就照常恢复——于是"从第 N 步继续"
+        # 换掉的目标函数和学习率，而检查点里的 best/last 结论是在另一套日程下得到的。
+        stored_schedule = payload.get("schedule")
+        if not isinstance(stored_schedule, list):
+            raise TrainingError(
+                f"{path} carries no schedule definition; resuming against a different "
+                "schedule would silently change the objective and the learning rate"
+            )
+        current_schedule = _schedule_signature(self.schedule)
+        if _signatures_differ(stored_schedule, current_schedule):
+            raise TrainingError(
+                f"{path} was trained on a different schedule. Stored "
+                f"{_describe_signature(stored_schedule)}; this trainer has "
+                f"{_describe_signature(current_schedule)}. Comparing the time window "
+                "alone is not enough to show it is the same training run"
+            )
+        stored_check_set = payload.get("check_set")
+        if not isinstance(stored_check_set, Mapping):
+            raise TrainingError(
+                f"{path} carries no fixed check-set definition; the stored best/last "
+                "verdicts would then be matched against a different evaluation set"
+            )
+        if _jsonable(stored_check_set) != _jsonable(self.check_set.as_dict()):
+            raise TrainingError(
+                f"{path} was evaluated on a different fixed check set; the best/last "
+                "conclusions in it do not belong to this trainer's evaluation definition"
+            )
+        stored_data = payload.get("data_identity")
+        if not isinstance(stored_data, Mapping):
+            raise TrainingError(
+                f"{path} carries no data identity; matching on the output directory "
+                "string would accept a different data set at the same path"
+            )
+        current_data = self._data_identity()
+        if _jsonable(stored_data) != _jsonable(current_data):
+            raise TrainingError(
+                f"{path} was trained on different data: stored "
+                f"{sorted(stored_data)}, this trainer has {sorted(current_data)}, or the "
+                "contents behind those ids differ. Moving an output directory is fine; "
+                "changing the data behind it is not"
+            )
+
+        for key in ("last_update_loss", "last_update_loss_step"):
+            if key not in payload:
+                raise TrainingError(
+                    f"{path} carries no {key!r}. Without it a resumed run that performs "
+                    "no update would report a fabricated NaN loss at step 0"
+                )
+        stored_loss = payload["last_update_loss"]
+        if not isinstance(stored_loss, (int, float, np.floating)):
+            raise TrainingError(
+                f"the checkpoint's last update loss is {stored_loss!r}, not a number"
+            )
+        if not isinstance(payload["last_update_loss_step"], (int, np.integer)):
+            raise TrainingError(
+                "the checkpoint's last update loss step is "
+                f"{payload['last_update_loss_step']!r}, not an integer"
+            )
+        if int(payload["last_update_loss_step"]) > int(payload["step"]):
+            raise TrainingError(
+                f"the checkpoint records its last measured loss at step "
+                f"{payload['last_update_loss_step']}, beyond its own step "
+                f"{payload['step']}"
+            )
+        if not isinstance(payload.get("refinement", []), list):
+            raise TrainingError(
+                f"the checkpoint's 'refinement' record is "
+                f"{type(payload.get('refinement')).__name__}, not a list"
             )
         if not isinstance(payload.get("model"), Mapping) or not isinstance(
             payload.get("optimizer"), Mapping
@@ -1151,8 +1626,21 @@ class Trainer:
         #   而且被阻塞的阶段必须正是它。
         #
         # 两条都是精确等值，不是"属于某个集合"。
-        blocked = bool(stage_payload["blocked"])
+        blocked = stage_payload["blocked"]
         pending = stage_payload["pending"]
+        # 类型先核：``bool("False")`` 是 ``True``，一个字符串 ``"false"`` 会被读成
+        # "已阻塞"，而它想说的正好相反。
+        if not isinstance(blocked, (bool, np.bool_)):
+            raise TrainingError(
+                f"the checkpoint's stage 'blocked' flag is {blocked!r}, which is not a "
+                "boolean; a truthy string would be read as 'blocked'"
+            )
+        blocked = bool(blocked)
+        if pending is not None and not isinstance(pending, str):
+            raise TrainingError(
+                f"the checkpoint's pending stage is {pending!r}, which is neither None "
+                "nor a stage name"
+            )
         stage_window_of = {
             stage.name: float(stage.time_window_fraction) for stage in self.schedule
         }
@@ -1194,7 +1682,22 @@ class Trainer:
         try:
             self._commit_checkpoint(payload, stored_window, recorded_stage, stage_payload)
         except Exception:
-            self._restore_state(snapshot)
+            try:
+                self._restore_state(snapshot)
+            except Exception as rollback_error:
+                # **回滚也失败**：对象现在处于"一半新、一半旧"的未知状态。继续用它
+                # 训练或保存会把那个混合状态当成正常结果写出去，所以把它标成不可用
+                # 并明确报出来——而不是吞掉回滚异常、把对象当成还能用。
+                self._unusable = (
+                    "a failed load could not be rolled back: "
+                    f"{rollback_error.__class__.__name__}: {rollback_error}"
+                )
+                raise TrainingError(
+                    f"restoring {path} failed, and rolling the object back failed too "
+                    f"({rollback_error.__class__.__name__}: {rollback_error}). This "
+                    "trainer instance is in an unknown state and must not be reused; "
+                    "build a new one."
+                ) from rollback_error
             raise
 
     # -- 恢复的提交与回滚（提示词 §3）--------------------------------------
@@ -1228,39 +1731,97 @@ class Trainer:
                 {
                     "sampler": sampler,
                     "window": float(sampler.window_fraction),
+                    # **窗口历史也要快照。** 只还原窗口值的话，回滚会在
+                    # ``_window_history`` 里留下一条"窗口曾经变过"的记录，而那次
+                    # 变化从未真正生效——历史是事实记录，不是尝试记录。
+                    "window_history": sampler.window_history,
                     "rng": _copy.deepcopy(sampler.rng_state()),
                 }
                 for sampler in self.sampler.samplers
             ],
             "last_update_loss": float(self._last_update_loss),
             "last_update_loss_step": int(self._last_update_loss_step),
+            "refine_history": _copy.deepcopy(self.refine_history),
             "final_status": getattr(self, "_final_status", None),
             "final_verdict": getattr(self, "_final_stage_verdict", None),
         }
 
     def _restore_state(self, snapshot: Mapping[str, Any]) -> None:
-        self.model.load_state_dict(snapshot["model"])
-        self.optimizer.load_state_dict(snapshot["optimizer"])
+        """把对象还原到快照那一刻。
+
+        顺序上**先做模型与优化器**（它们最可能抛错），但真正要保证的是：**任何一步
+        抛错都不能把对象留成"一半旧、一半新"**。所以调用方（``load``）在回滚本身
+        失败时会继续往上抛，并且不把对象当成可继续使用的正常对象——见
+        :meth:`load` 里 ``except`` 的处理。
+        """
+        import copy as _copy
+
+        # 先在**局部**把要用的东西取齐，避免还原到一半才发现快照缺字段。
+        restored_samplers = [
+            (entry["sampler"], float(entry["window"]),
+             [float(v) for v in entry["window_history"]],
+             _copy.deepcopy(entry["rng"]))
+            for entry in snapshot["samplers"]
+        ]
+        model_state = snapshot["model"]
+        optimizer_state = snapshot["optimizer"]
+        balancer_state = snapshot["balancer"]
+        rng_state = snapshot["rng"]
+        history = list(snapshot["history"])
+        check_history = list(snapshot["check_history"])
+        stage_history = list(snapshot["stage_history"])
+        refine_history = list(snapshot["refine_history"])
+        best = snapshot["best"]
+
+        # **每一步单独兜错，失败不中断其余步骤。** 回滚的每一个环节都可能抛错
+        # （优化器状态引用别的参数组、平衡器的记录对不上……），而"回滚到一半"
+        # 正是最坏的结果：对象既不是旧的也不是新的，却还能被继续使用。所以能还原
+        # 的一律还原，把失败收集起来最后一起报——并且由调用方把对象标成不可用。
+        failures: list[str] = []
+
+        def attempt(label: str, action) -> None:
+            try:
+                action()
+            except Exception as exc:  # noqa: BLE001 - 回滚要尽力而为，最后统一报
+                failures.append(f"{label}: {exc.__class__.__name__}: {exc}")
+
+        attempt("model", lambda: self.model.load_state_dict(model_state))
+        attempt("optimizer", lambda: self.optimizer.load_state_dict(optimizer_state))
+        attempt("balancer", lambda: self.balancer.load_state_dict(balancer_state))
+        attempt("global rng", lambda: _restore_global_rng(rng_state))
+        for sampler, window, window_history, rng in restored_samplers:
+            # 回滚要能**收窄**窗口，所以走 restore_ 而不是 set_；历史一起还原，
+            # 否则一次失败的恢复会留下一个从未生效过的窗口事件。
+            label = getattr(getattr(sampler, "case", None), "case_id", "?")
+            attempt(
+                f"sampler {label} window",
+                lambda s=sampler, w=window, h=window_history: s.restore_time_window(
+                    w, history=h
+                ),
+            )
+            attempt(
+                f"sampler {label} rng",
+                lambda s=sampler, r=rng: s.set_rng_state(r),
+            )
+
         self.step = int(snapshot["step"])
-        self.history = list(snapshot["history"])
-        self.check_history = list(snapshot["check_history"])
-        self.best = snapshot["best"]
+        self.history = history
+        self.check_history = check_history
+        self.best = best
         self._current_stage = snapshot["current_stage"]
         self._stage_window = float(snapshot["stage_window"])
         self._pending_stage = snapshot["pending_stage"]
         self._stage_blocked = bool(snapshot["stage_blocked"])
-        self.stage_history = list(snapshot["stage_history"])
-        self.balancer.load_state_dict(snapshot["balancer"])
-        _restore_global_rng(snapshot["rng"])
-        for entry in snapshot["samplers"]:
-            sampler = entry["sampler"]
-            # 回滚要能**收窄**窗口，所以走 restore_ 而不是 set_。
-            sampler.restore_time_window(entry["window"])
-            sampler.set_rng_state(entry["rng"])
+        self.stage_history = stage_history
         self._last_update_loss = float(snapshot["last_update_loss"])
         self._last_update_loss_step = int(snapshot["last_update_loss_step"])
+        self.refine_history = refine_history
         self._final_status = snapshot["final_status"]
         self._final_stage_verdict = snapshot["final_verdict"]
+        if failures:
+            raise TrainingError(
+                "rolling back did not restore everything: " + "; ".join(failures)
+            )
 
     def _commit_checkpoint(
         self,
@@ -1289,12 +1850,87 @@ class Trainer:
         self._final_status = payload.get("run_status")
         self._final_stage_verdict = payload.get("final_stage_verdict")
         self.stage_history = list(stage_payload.get("history", []))
+        # **最后一次实测损失与精修历史一起恢复。** 少了前者，零更新的恢复运行会
+        # 报 ``final_loss=nan, final_loss_step=0``；少了后者，一个精修过的模型
+        # 加载回来会显示成"从没精修过"。
+        self._last_update_loss = float(payload["last_update_loss"])
+        self._last_update_loss_step = int(payload["last_update_loss_step"])
+        self.refine_history = [dict(entry) for entry in payload.get("refinement", [])]
         self.balancer.load_state_dict(payload.get("balancing"))
 
 
 # --------------------------------------------------------------------------
 # 辅助
 # --------------------------------------------------------------------------
+
+
+#: 日程签名里参与比较的字段。``description`` **不**参与：改一句说明文字不该让
+#: 一个检查点作废，而改预算、学习率、PDE 权重或窗口必须让它作废。
+_SCHEDULE_SIGNATURE_FIELDS = (
+    "name",
+    "updates",
+    "pde_weight_start",
+    "pde_weight_end",
+    "learning_rate_start",
+    "learning_rate_end",
+    "time_window_fraction",
+)
+
+
+def _batch_fingerprint(batches: Any) -> str:
+    """固定样本批次的**内容**指纹，写进精修的目标函数定义里。
+
+    "同一次精修用的是同一批样本"是线搜索成立的前提，所以要有一个可以核对的
+    值，而不是一句说明文字。
+    """
+    import hashlib
+
+    digest = hashlib.sha256()
+    try:
+        entries = batches.as_dict() if hasattr(batches, "as_dict") else str(batches)
+    except Exception:  # noqa: BLE001 - 指纹失败不该阻止精修，但要如实说
+        return "unavailable: the batch could not be serialised"
+    digest.update(json.dumps(entries, sort_keys=True, default=_jsonable).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _schedule_signature(schedule: Sequence[Stage]) -> list[dict[str, Any]]:
+    """日程的**数值**签名，用于"这是不是同一次训练"的核对。"""
+    return [
+        {field: getattr(stage, field) for field in _SCHEDULE_SIGNATURE_FIELDS}
+        for stage in schedule
+    ]
+
+
+def _signatures_differ(stored: Sequence[Mapping[str, Any]], current: Sequence[Mapping[str, Any]]) -> bool:
+    """逐阶段、逐字段比较，浮点按相对 1e-12 判定相等。"""
+    if len(stored) != len(current):
+        return True
+    for left, right in zip(stored, current):
+        for field in _SCHEDULE_SIGNATURE_FIELDS:
+            a, b = left.get(field), right.get(field)
+            if isinstance(a, str) or isinstance(b, str):
+                if a != b:
+                    return True
+                continue
+            if a is None or b is None:
+                if a != b:
+                    return True
+                continue
+            scale = max(abs(float(a)), abs(float(b)), 1.0e-300)
+            if abs(float(a) - float(b)) > 1.0e-12 * scale:
+                return True
+    return False
+
+
+def _describe_signature(signature: Sequence[Mapping[str, Any]]) -> str:
+    return "; ".join(
+        f"{entry.get('name')}: {entry.get('updates')} updates, lr "
+        f"{entry.get('learning_rate_start')}->{entry.get('learning_rate_end')}, "
+        f"lambda_PDE {entry.get('pde_weight_start')}->{entry.get('pde_weight_end')}, "
+        f"window {entry.get('time_window_fraction')}"
+        for entry in signature
+    )
 
 
 def _stage_index(step: int, schedule: Sequence[Stage]) -> tuple[int, float]:

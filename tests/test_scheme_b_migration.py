@@ -1850,8 +1850,11 @@ def _contract_case(**overrides):
         material=np.zeros((3, 4), dtype=np.int64),
         contact_radius=np.full(3, 0.05),
         shock_radius=np.full(3, 0.10),
-        contact_valid=np.array([True, True, True]),
-        shock_valid=np.array([True, True, True]),
+        # 派生掩码必须能从本算例自己的资格证据重算出来（§5）。以前这两个替身写成
+        # 全 True，而下面的 ``contact_eligible`` 是 ``[T, T, F]``——一份"资格说不
+        # 算、标签说算"的自相矛盾记录。矛盾被拒绝是对的，所以改替身而不是放宽检查。
+        contact_valid=np.array([True, True, False]),
+        shock_valid=np.array([True, False, False]),
         valid=validity,
         source={
             "symmetry_factor": 8.0,

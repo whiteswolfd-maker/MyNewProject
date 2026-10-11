@@ -34,6 +34,10 @@ class GaugeMetrics:
     radius: float
     peak_overpressure: float = float("nan")
     arrival_time: float = float("nan")
+    #: 到达时刻是**观测到的**还是**只被夹住的**。第一个采样点就已经高于阈值时，
+    #: 真实到达在它之前，`arrival_time` 只是上界。把上界当观测值报出去，会让
+    #: "曲线开头就正压"读成一个漂亮的到达时间。
+    arrival_observed: bool = False
     positive_duration: float = float("nan")
     positive_impulse: float = float("nan")
     negative_impulse: float = float("nan")
@@ -45,6 +49,7 @@ class GaugeMetrics:
             "radius_m": self.radius,
             "peak_overpressure_pa": self.peak_overpressure,
             "arrival_time_s": self.arrival_time,
+            "arrival_observed": self.arrival_observed,
             "positive_duration_s": self.positive_duration,
             "positive_impulse_pa_s": self.positive_impulse,
             "negative_impulse_pa_s": self.negative_impulse,
@@ -90,8 +95,18 @@ def gauge_metrics(
         raise WaveformError("times and pressure must have the same length")
     if times.size < 3:
         raise WaveformError("a waveform needs at least three samples")
+    if not np.all(np.isfinite(times)):
+        raise WaveformError("times contains non-finite values")
     if np.any(np.diff(times) <= 0.0):
         raise WaveformError("times must be strictly increasing")
+    # **缺测段不跨着积分。** 一段中间带 NaN 的时程可以把面积凭空造出来或抹掉，
+    # 而结果看上去只是一个数。要处理缺口就把缺口切出去，分段评估——
+    # 这里不替调用方决定缺口属于哪一段。
+    if not np.all(np.isfinite(values)):
+        raise WaveformError(
+            "pressure contains non-finite values; a waveform with gaps cannot be "
+            "integrated as one record — split it at the gaps and evaluate each piece"
+        )
 
     metrics = GaugeMetrics(radius=float("nan"))
     peak = float(values.max())
@@ -106,11 +121,32 @@ def gauge_metrics(
         metrics.notes.append("找不到正超压的上穿点")
         return metrics
     metrics.arrival_time = arrival
+    # 第一个采样点就已经高于阈值时，真实到达在它**之前**，这里给出的只是上界。
+    metrics.arrival_observed = bool(arrival > float(times[0]))
+    if not metrics.arrival_observed:
+        metrics.notes.append(
+            "第一个采样点已经高于阈值：真实到达早于曲线起点，arrival_time 只是上界，"
+            "到达时间误差因此不可用"
+        )
 
-    # 正压阶段：从到达时刻起，到首次回到零（或曲线结束）。
-    after = times >= arrival
-    phase_times = times[after]
-    phase_values = values[after]
+    # **积分节点必须严格递增，起点必须是真正的到达时刻。**
+    #
+    # 这里以前有两处会把面积算错，而两处的结果都"看起来合理"：
+    #
+    # ① 把首个负压采样点留在节点里，再把插出来的过零时刻**追加到数组末尾**——
+    #    节点序列出现倒序（…, 2, 1.5）。``_trapezoid`` 只是逐段求和，不排序、
+    #    也不报错，于是 [0,1,2,3]/[2,2,-2,-2] 的 2.5 被算成 3.0。
+    # ② ``after = times >= arrival`` 把到达时刻到第一个采样点之间那一段整个丢掉，
+    #    到达落在两点之间时首段面积凭空消失。
+    if arrival <= float(times[0]):
+        # 到达就在第一个采样点上：那一点的超压是**实测值**，不是阈值。
+        arrival_value = float(values[0])
+    else:
+        # 到达落在两点之间，上穿点处的超压按定义就是阈值。
+        arrival_value = float(threshold)
+    phase_times = np.concatenate(([float(arrival)], times[times > arrival]))
+    phase_values = np.concatenate(([arrival_value], values[times > arrival]))
+
     negative_index = np.flatnonzero(phase_values <= 0.0)
     if negative_index.size == 0:
         metrics.positive_phase_complete = False
@@ -123,23 +159,35 @@ def gauge_metrics(
         return metrics
 
     stop = int(negative_index[0])
-    window_times = phase_times[: stop + 1] if stop > 0 else phase_times[:1]
-    window_values = phase_values[: stop + 1] if stop > 0 else phase_values[:1]
-    if stop > 0:
-        # 把过零点插值补进去，冲量的积分上限才是真正的相位终点。
+    if stop == 0:
+        # 到达时刻本身就不在正压段里（阈值取 0、且上穿点正好落在零点）：正相区间
+        # 退化成一个点，冲量为 0——不是拿后面的负值去凑一个面积。
+        nodes_t = phase_times[:1]
+        nodes_v = np.zeros(1)
+        zero_time = float(phase_times[0])
+    else:
         t0, t1 = float(phase_times[stop - 1]), float(phase_times[stop])
         v0, v1 = float(phase_values[stop - 1]), float(phase_values[stop])
         zero_time = t0 + (0.0 - v0) * (t1 - t0) / (v1 - v0) if v1 != v0 else t1
-        window_times = np.append(window_times, zero_time)
-        window_values = np.append(window_values, 0.0)
+        # 节点 = 过零之前的**全部非负采样点**，末端接**真正的过零点**。
+        # 首个负压点不留在节点里：它属于负相。
+        nodes_t = phase_times[:stop]
+        nodes_v = phase_values[:stop]
+        # 过零恰好落在节点上时 ``zero_time`` 就是最后一个节点，不重复追加。
+        if zero_time > float(nodes_t[-1]):
+            nodes_t = np.append(nodes_t, zero_time)
+            nodes_v = np.append(nodes_v, 0.0)
 
-    metrics.positive_duration = float(window_times[-1]) - arrival
-    metrics.positive_impulse = float(_trapezoid(np.maximum(window_values, 0.0), window_times))
+    metrics.positive_duration = float(nodes_t[-1]) - arrival
+    metrics.positive_impulse = float(_trapezoid(np.maximum(nodes_v, 0.0), nodes_t))
     metrics.positive_phase_complete = True
 
-    # 负相冲量：正压阶段之后到曲线结束。
+    # 负相冲量：从**同一个过零边界**起，节点同样严格递增。
     tail_times = phase_times[stop:]
     tail_values = phase_values[stop:]
+    if zero_time < float(tail_times[0]):
+        tail_times = np.concatenate(([zero_time], tail_times))
+        tail_values = np.concatenate(([0.0], tail_values))
     if tail_times.size >= 2:
         metrics.negative_impulse = float(
             _trapezoid(np.minimum(tail_values, 0.0), tail_times)

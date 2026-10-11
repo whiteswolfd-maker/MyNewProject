@@ -298,12 +298,25 @@ class RadiusSampler:
             self.case.pinn_times[usable] <= self.window_pinn_time_max + 1.0e-12
         ]
 
-    def restore_time_window(self, fraction: float) -> None:
+    @property
+    def window_history(self) -> list[float]:
+        """窗口依次取过的值。回滚要连它一起还原（见 :meth:`restore_time_window`）。"""
+        return list(self._window_history)
+
+    def restore_time_window(
+        self, fraction: float, *, history: Sequence[float] | None = None
+    ) -> None:
         """**无条件**把窗口设成 ``fraction``，用于回滚。
 
         与 :meth:`set_time_window` 的区别是它**允许收窄**——这正是回滚需要的：
         一次失败的恢复要把窗口还原成加载前的值，而那个值可能比现在的小。所以它
         只给回滚用，调用点必须能说清楚"这是在撤销一次未完成的修改"。
+
+        ``history`` 给出时连窗口历史一起还原。**回滚不得制造历史事件**：恢复流程
+        先按检查点里的值调一次 :meth:`set_time_window`（它会往历史里追一条），
+        随后某个后续步骤失败、再回滚——只还原窗口值而不还原历史，会在
+        ``[1.0, 0.25]`` 后面留下一个第三项，而那次变化从来没有真正生效过。
+        历史是"窗口实际取过哪些值"的记录，不是"曾经尝试过哪些值"。
         """
         value = float(fraction)
         if not math.isfinite(value) or not (0.0 < value <= 1.0):
@@ -311,12 +324,18 @@ class RadiusSampler:
         self._window_committed = True
         self.window_fraction = value
         self.window_pinn_time_max = value * self.full_pinn_time_max
+        if history is not None:
+            restored = [float(entry) for entry in history]
+            if not restored:
+                raise SamplingError("the window history to restore is empty")
+            self._window_history = restored
 
-    def window_state(self) -> dict[str, float]:
+    def window_state(self) -> dict[str, Any]:
         return {
             "fraction": float(self.window_fraction),
             "pinn_time_max": float(self.window_pinn_time_max),
             "full_pinn_time_max": float(self.full_pinn_time_max),
+            "history": list(self._window_history),
         }
 
     # -- 时间 -------------------------------------------------------------

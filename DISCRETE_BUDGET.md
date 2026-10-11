@@ -286,6 +286,31 @@ physical_input = added * Q,     Q = E_0 / rho_ref
 4. 六个候选修改各自实测，全部记录（§4.3）。**负结果同样是结果**：没有它们，下一个人
    会再走一遍同样的路。
 
+**复现记录（2026-10-11，本机 Python 3.10.8 / NumPy 1.26.4）**
+
+本文的 0.41 % 不是只有报告来源：它由公开函数 `detonation_energy_budget()` 现算得出，
+命令是
+
+```bash
+PYTHONPATH=src python -c "from spherical_blast_pinn.physics.detonation import \
+DetonationConfig, detonation_energy_budget; from spherical_blast_pinn.physics import material as mat; \
+print(detonation_energy_budget(charge_radius=0.05, detonation_velocity=mat.DETONATION_VELOCITY_REFERENCE, \
+config=DetonationConfig(cells=500))['cumulative']['energy_residual'])"
+```
+
+实测（同一半径、四档网格）：
+
+| 单元数 | `energy_residual` | `velocity_lumping_deficit` |
+|---|---|---|
+| 300 | +4.894e-03 | +2.380e-03 |
+| 500 | +4.088e-03 | +1.876e-03 |
+| 1000 | +3.364e-03 | +1.491e-03 |
+| 2000 | +2.949e-03 | +1.292e-03 |
+
+**它是分辨率的函数**，不是常数：从 300 到 2000 单元，残差降了约 1.66 倍。
+这只说明"加密网格会变"，**不说明它收敛到零**，也不说明收敛阶是多少——那是
+§6 的网格收敛检查要回答的另一个问题。**来源仍未定论**，本节下面的结论不变。
+
 **未完成，且是正式使用的阻塞项**
 
 * 相容离散**没有闭合**。残差 0.41% 的**来源尚未定论**：§4.3 的排除性实验只证伪了

@@ -289,7 +289,12 @@ def test_the_contract_does_not_trust_that_the_case_was_read(tmp_path):
 
     directory = _export(tmp_path / "mutated", times=[1.0e-5, 2.0e-5], rho=np.ones((2, 3)))
     case = load_extracted_case(directory, case_id="mutated")
-    assert evaluate_case_contract(case).ready or True  # 基线（可能因其他项不通过）
+    # **基线必须在结构上是干净的。** 不能用 ``assert ... or True`` 那种永真断言：
+    # 它在基线本来就坏着的时候也通过，下面的结论就没有意义。这里断言的是
+    # **结构检查**这一项——算例可能因为别的理由不就绪（例如这份三格网格上
+    # 前沿检测没产生可靠帧），那与本条要测的事情无关。
+    baseline = evaluate_case_contract(case)
+    assert baseline.detail["structural_problems"] == [], baseline.detail["structural_problems"]
 
     case.velocity = np.ones((1, 3))          # 帧数与时间轴对不上
     verdict = evaluate_case_contract(case)

@@ -11,7 +11,7 @@ data:
   cases:
     - case_id: tnt_50mm
       charge_radius_m: 0.050
-      directory: F:/2/extracted_geom/50mm_c
+      directory: F:/2/extracted_geom/50mm_d
       split: train
   # 这份配置只跑一个算例，没有盲测对象，所以**不**声明严格盲测——声明了却
   # 没有对象，验证隔离那一关会（正确地）拒绝开始。

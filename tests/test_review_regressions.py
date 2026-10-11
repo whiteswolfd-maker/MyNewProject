@@ -575,7 +575,11 @@ def test_compare_does_not_shift_the_prediction_a_second_time():
 
 
 def test_field_lookup_never_extrapolates_in_time():
-    from spherical_blast_pinn.cli.compare import _field_at, _time_bracket
+    from spherical_blast_pinn.cli.compare import (
+        SAMPLE_TIME_OUTSIDE,
+        _time_bracket,
+        sample_field,
+    )
 
     times = np.array([0.0, 1.0, 2.0])
     assert _time_bracket(times, 5.0) is None
@@ -590,9 +594,14 @@ def test_field_lookup_never_extrapolates_in_time():
         "radius": np.array([0.1, 0.2, 0.3]),
         "density": np.full((3, 3), 1.0),
         "region": np.zeros((3, 3), dtype=np.int64),
+        # 区域由**前沿**给出（§7.4），不再读 ``region`` 数组本身。
+        "contact_radius": np.array([0.15, 0.15, 0.15]),
+        "shock_radius": np.array([0.25, 0.25, 0.25]),
     }
-    out = _field_at(prediction, "density", np.array([0.15]), physical_time=9.0)
+    out, why = sample_field(prediction, "density", np.array([0.15]), physical_time=9.0)
     assert not np.isfinite(out[0])
+    # 原因要**说清楚是域外**，不能只是"给了一个 nan"。
+    assert why[0] == SAMPLE_TIME_OUTSIDE
 
 
 # ==========================================================================
@@ -1392,12 +1401,18 @@ def test_compare_fields_does_not_count_ambient_as_air():
 
 
 def test_compare_fields_keeps_mismatched_material_out_of_the_error():
-    """预测前沿错位时，材料不匹配的单元必须单独报，不能混进光滑区误差。"""
+    """预测前沿错位时，材料不匹配的单元必须单独报，不能混进光滑区误差。
+
+    **错位必须是物理上合法的错位。** 以前这里把预测的激波乘 0.6 推到接触面
+    以内，于是 ``R_s < R_c``——一个预测不可能给出的前沿组合。区域判定现在对这种
+    组合明确返回"不可用"（§7.4），而不是照着一个不可能的前沿去贴标签，所以这个
+    反例改成把**接触面**往里推：``R_c`` 变小、``R_s`` 不变，前沿顺序仍然合法，
+    参考里的一段产物落在预测的空气区里。
+    """
     from spherical_blast_pinn.cli.compare import compare_fields
 
     prediction = _synthetic_prediction()
-    # 把预测的激波往前推，让一部分参考的"空气"落在预测的产物区里。
-    prediction["shock_radius"] = prediction["shock_radius"] * 0.6
+    prediction["contact_radius"] = prediction["contact_radius"] * 0.6
     region = np.where(
         prediction["radius"][None, :] < prediction["contact_radius"][:, None],
         0,
@@ -1410,8 +1425,25 @@ def test_compare_fields_keeps_mismatched_material_out_of_the_error():
     case = _synthetic_reference_case()
     report = compare_fields(prediction, case)
     assert report["region_mismatch_total"] > 0, "构造的错位没有产生任何不匹配单元"
-    # 产物区里那些"参考说是空气、预测说是产物"的点不应该进入任何一个介质的误差。
+    # 产物区里那些"参考说是产物、预测说是空气"的点不应该进入任何一个介质的误差。
     assert report["compared_cells"] > 0
+    assert report["region_mismatch_cells"]["product"] > 0
+
+
+def test_a_front_order_violation_makes_the_region_unavailable_not_a_label():
+    """``R_s < R_c`` 是预测不可能给出的前沿组合。照它贴标签会把一个荒唐的预测
+    读成"材料错配很多"，而那听起来像一个可比较的结果。"""
+    from spherical_blast_pinn.cli.compare import _region_at, compare_fields
+
+    prediction = _synthetic_prediction()
+    prediction["shock_radius"] = prediction["contact_radius"] * 0.5
+    case = _synthetic_reference_case()
+
+    region = _region_at(prediction, case.radius, float(case.times[4]))
+    assert np.all(region == -1)
+    report = compare_fields(prediction, case)
+    assert report["region_mismatch_total"] == 0
+    assert report["compared_cells"] == 0
 
 
 def test_compare_field_scales_are_frozen_not_local():
@@ -1430,18 +1462,91 @@ def test_compare_field_scales_are_frozen_not_local():
 
 
 def test_compare_field_lookup_does_not_interpolate_across_a_discontinuity():
-    """跨区域的双线性插值会造出两侧都不属于的中间状态。"""
-    from spherical_blast_pinn.cli.compare import _field_at
+    """跨区域的插值会造出两侧都不属于的中间状态。
+
+    比"结果不是中间值"更明确的断言是**结果码**：落在接触面上的查询要么被直接
+    拒绝（``cross_discontinuity_interpolation``），要么给出**某一侧**的实数。
+    """
+    from spherical_blast_pinn.cli.compare import (
+        SAMPLE_CROSS_DISCONTINUITY,
+        SAMPLE_OK,
+        sample_field,
+    )
 
     prediction = _synthetic_prediction()
     i = 4
     contact = float(prediction["contact_radius"][i])
     # 落在一个网格区间跨过接触面的位置上。
     radius = np.array([contact])
-    value = _field_at(
+    value, why = sample_field(
         prediction, "density", radius, float(prediction["physical_time"][i])
     )
-    assert not np.isfinite(value[0]) or abs(value[0] - 1600.0) < 1e-6 or abs(value[0] - 6.0) < 1e-6
+    assert why[0] in (SAMPLE_OK, SAMPLE_CROSS_DISCONTINUITY)
+    if why[0] == SAMPLE_OK:
+        # 给出来的必须是**某一侧**的实数，不是 1600 与 6 之间的任何中间值。
+        assert value[0] == pytest.approx(1600.0, abs=1e-6) or value[0] == pytest.approx(
+            6.0, abs=1e-6
+        )
+    else:
+        assert not np.isfinite(value[0])
+
+
+def test_the_midpoint_between_product_and_air_is_not_fabricated():
+    """**复核给的原反例。** 同一半径上前一帧是空气（密度 2）、后一帧是产物
+    （密度 100），两帧内部左右节点各自同材料；中间时刻线性插值给出 51——一个
+    两侧都不属于的中间态。
+
+    修后：两个时间层的支撑点分属不同区域，插值被拒绝，并给出明确原因。
+    """
+    from spherical_blast_pinn.cli.compare import (
+        SAMPLE_CROSS_DISCONTINUITY,
+        sample_field,
+    )
+
+    prediction = {
+        "pinn_time": np.array([0.0, 1.0]),
+        "physical_time": np.array([0.0, 1.0]),
+        "start_time": 0.0,
+        "radius": np.array([0.10, 0.11]),
+        # 前一帧全是空气、后一帧全是产物：前沿在两帧之间扫过了整个网格。
+        "density": np.array([[2.0, 2.0], [100.0, 100.0]]),
+        "region": np.array([[1, 1], [0, 0]], dtype=np.int64),
+        "contact_radius": np.array([0.09, 0.12]),
+        "shock_radius": np.array([0.20, 0.20]),
+    }
+    value, why = sample_field(prediction, "density", np.array([0.105]), physical_time=0.5)
+    assert why[0] == SAMPLE_CROSS_DISCONTINUITY, why[0]
+    assert not np.isfinite(value[0]), "跨材料被插出了一个中间值"
+
+
+def test_an_exact_grid_node_is_not_poisoned_by_a_zero_weight_nan_neighbour():
+    """**复核给的原反例。** 精确落在节点上、自身有限、**零权重的邻点**是 NaN，
+    查询仍然得到 NaN——因为 ``nan * 0`` 是 ``nan``。
+
+    修后：零权重的支撑点不参与，值直接来自那个节点。
+    """
+    from spherical_blast_pinn.cli.compare import SAMPLE_OK, sample_field
+
+    prediction = {
+        "pinn_time": np.array([0.0, 1.0, 2.0]),
+        "physical_time": np.array([0.0, 1.0, 2.0]),
+        "start_time": 0.0,
+        "radius": np.array([0.10, 0.11, 0.12]),
+        # 中间节点在三个时刻上都是 NaN，两侧节点是有限值。
+        "density": np.array(
+            [[1.0, np.nan, 3.0], [1.0, np.nan, 3.0], [1.0, np.nan, 3.0]]
+        ),
+        "region": np.zeros((3, 3), dtype=np.int64),
+        "contact_radius": np.full(3, 0.05),
+        "shock_radius": np.full(3, 0.30),
+    }
+    # 精确落在 (t = 1, r = 0.10)：时间权重为 0 的那一层、以及径向零权重的
+    # 右邻点（0.11，NaN）都不该参与。
+    value, why = sample_field(
+        prediction, "density", np.array([0.10]), physical_time=1.0
+    )
+    assert why[0] == SAMPLE_OK, why[0]
+    assert value[0] == pytest.approx(1.0)
 
 
 # ==========================================================================

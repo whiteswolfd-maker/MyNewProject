@@ -620,6 +620,211 @@ MATERIAL_CODES = (0, 1, 2)
 #: 会把"我们对不上这份数据"说成"这一帧没测到"。
 FRONT_STATE_CODES = (0, 1, 2)
 
+# --------------------------------------------------------------------------
+# 前沿监督资格的档位：**封闭枚举，且证据必须与档位一致**
+# --------------------------------------------------------------------------
+
+#: 逐帧资格数组。最强的一档：直接说"这一帧够不够格当标签"。
+ELIGIBILITY_LEVEL_ARRAYS = "arrays"
+#: 只有三态检测码。它是**真证据**，但比上面那一档弱：它说"分辨得出吗"，
+#: 不说"够不够格当标签"。
+ELIGIBILITY_LEVEL_LEGACY_CODE = "legacy_state_code"
+#: 什么都没记。这一档下每一条有限半径都被当成标签——是**未核实**，不是通过。
+ELIGIBILITY_LEVEL_NONE = "none"
+ELIGIBILITY_LEVELS = (
+    ELIGIBILITY_LEVEL_ARRAYS,
+    ELIGIBILITY_LEVEL_LEGACY_CODE,
+    ELIGIBILITY_LEVEL_NONE,
+)
+#: "最弱规则"的序：整体档位取两侧里最弱的那一档。
+ELIGIBILITY_ORDER = {
+    ELIGIBILITY_LEVEL_ARRAYS: 2,
+    ELIGIBILITY_LEVEL_LEGACY_CODE: 1,
+    ELIGIBILITY_LEVEL_NONE: 0,
+}
+
+
+def geometric_front_validity(case: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """**几何**意义上的前沿有效性，以及两条前沿的排序是否成立。
+
+    这里刻意只用对象上已有的半径与装药半径重算，不读任何资格记录：它是
+    :func:`validate_front_eligibility` 用来核对"派生掩码有没有被改过"的基准。
+    装药半径那一条不是启发式过滤——接触面就是原装药表面所在的那个物质界面，
+    它只能随产物向外走；一条 ``R_c < R_0`` 的标签一定会把前沿网络往内拉。
+    """
+    contact = np.asarray(getattr(case, "contact_radius", None), dtype=np.float64)
+    shock = np.asarray(getattr(case, "shock_radius", None), dtype=np.float64)
+    charge_radius = float(getattr(case, "charge_radius", float("nan")))
+    geometric_contact = (
+        np.isfinite(contact)
+        & (contact > 0.0)
+        & (contact >= charge_radius - 1.0e-9)
+    )
+    geometric_shock = np.isfinite(shock)
+    ordering_ok = np.isfinite(contact) & np.isfinite(shock) & (shock > contact)
+    return geometric_contact, geometric_shock, ordering_ok
+
+
+def _eligibility_side_evidence(
+    block: Mapping[str, Any], side: str, *, path: Any
+):
+    """某一侧**实际**拿得出的证据档位，以及那份证据。
+
+    档位由证据本身推出来，不采信单独写着的 ``contact_level``：一个写着
+    ``arrays`` 却没有数组的记录，和一份真的带数组的记录，必须被区别对待。
+    """
+    eligible = block.get(f"{side}_eligible")
+    status = block.get(f"{side}_status")
+    if eligible is not None:
+        array = np.asarray(eligible)
+        if array.dtype != np.bool_:
+            raise DataError(
+                f"{path}: front_supervision_eligibility[{side!r}_eligible] has dtype "
+                f"{array.dtype}, not bool"
+            )
+        if array.ndim != 1:
+            raise DataError(
+                f"{path}: front_supervision_eligibility[{side!r}_eligible] has shape "
+                f"{array.shape}; it must be one boolean per frame"
+            )
+        return ELIGIBILITY_LEVEL_ARRAYS, array
+    if status is not None:
+        array = np.asarray(status)
+        if array.ndim != 1:
+            raise DataError(
+                f"{path}: front_supervision_eligibility[{side!r}_status] has shape "
+                f"{array.shape}; it must be one code per frame"
+            )
+        unknown = sorted(set(np.unique(array).tolist()) - set(FRONT_STATE_CODES))
+        if unknown:
+            raise DataError(
+                f"{path}: front_supervision_eligibility[{side!r}_status] contains "
+                f"{unknown}, which this reader does not define "
+                f"(known: {list(FRONT_STATE_CODES)})"
+            )
+        return ELIGIBILITY_LEVEL_LEGACY_CODE, array
+    return ELIGIBILITY_LEVEL_NONE, None
+
+
+def validate_front_eligibility(case: Any, *, path: Any = "<case>") -> None:
+    """前沿监督资格必须**自洽**：档位封闭、档位与证据一致、派生掩码与证据一致。
+
+    这一节针对的是"读取之后对象被改过、或者由程序直接构造"的情形。文件读取端
+    尊重显式 ``False`` 已经修好；但一个已经构造好的对象可以带着互相矛盾的记录
+    通过契约：
+
+    ==========================================  ============================
+    改动                                        修前契约的结论
+    ==========================================  ============================
+    ``*_eligible`` 置 ``None``，``level`` 仍写 ``arrays``   就绪
+    两侧 eligible 全 ``False``，``contact_valid`` 仍全真   就绪（且仍有 5 个
+                                              "可监督帧"）
+    ``level`` 改成未知字符串                     就绪
+    删掉 ``*_eligible`` 键                       就绪
+    ==========================================  ============================
+
+    修法不是再加几条特例，而是**只认一份权威数据**：档位从证据推出来、派生掩码
+    从证据重算出来，两者都必须与对象上的记录逐位相符。任何一处对不上都拒绝，
+    而不是挑一个"看起来更可信"的当真。
+    """
+    block = getattr(case, "front_supervision_eligibility", None)
+    if block is None:
+        # 这一档由契约的"资格等级"判据处理：未记录 = 未核实，不是通过。
+        return
+    if not isinstance(block, Mapping):
+        raise DataError(
+            f"{path}: front_supervision_eligibility is {type(block).__name__}, not a "
+            "mapping"
+        )
+
+    times = np.asarray(getattr(case, "times", None), dtype=np.float64)
+    geometric_contact, geometric_shock, ordering_ok = geometric_front_validity(case)
+    frame_count = times.size if times.ndim == 1 else geometric_contact.size
+
+    levels: dict[str, str] = {}
+    expected: dict[str, np.ndarray] = {}
+    for side, geometric in (("contact", geometric_contact), ("shock", geometric_shock)):
+        level, evidence = _eligibility_side_evidence(block, side, path=path)
+        levels[side] = level
+        if evidence is not None and evidence.shape != (frame_count,):
+            raise DataError(
+                f"{path}: front_supervision_eligibility[{side!r}] evidence has shape "
+                f"{evidence.shape} but the time axis has {frame_count} frames"
+            )
+        declared = block.get(f"{side}_level")
+        if declared is not None and declared not in ELIGIBILITY_LEVELS:
+            raise DataError(
+                f"{path}: front_supervision_eligibility[{side!r}_level] is {declared!r}, "
+                f"which is not one of {list(ELIGIBILITY_LEVELS)}. An unrecognised level "
+                "is a format mismatch, not a weaker grade"
+            )
+        if declared is not None and declared != level:
+            raise DataError(
+                f"{path}: front_supervision_eligibility[{side!r}_level] claims "
+                f"{declared!r} but the record actually carries {level!r} evidence. "
+                "A declared grade that its own evidence does not support cannot grant "
+                "formal eligibility"
+            )
+        if level == ELIGIBILITY_LEVEL_ARRAYS:
+            expected[side] = geometric & evidence
+        elif level == ELIGIBILITY_LEVEL_LEGACY_CODE:
+            expected[side] = geometric & (np.asarray(evidence) == 2)
+        else:
+            expected[side] = geometric
+
+    derived_overall = min(
+        (levels["contact"], levels["shock"]), key=lambda value: ELIGIBILITY_ORDER[value]
+    )
+    declared_overall = block.get("level")
+    if declared_overall is not None and declared_overall not in ELIGIBILITY_LEVELS:
+        raise DataError(
+            f"{path}: front_supervision_eligibility['level'] is {declared_overall!r}, "
+            f"which is not one of {list(ELIGIBILITY_LEVELS)}"
+        )
+    if declared_overall is not None and declared_overall != derived_overall:
+        raise DataError(
+            f"{path}: front_supervision_eligibility['level'] claims {declared_overall!r} "
+            f"but the two sides' evidence is {levels['contact']!r} / {levels['shock']!r}, "
+            f"whose weakest grade is {derived_overall!r}. The overall grade is derived "
+            "from the sides, not asserted alongside them"
+        )
+
+    # **派生掩码必须能被证据重算出来。** 这是"资格数组、几何有效性、派生掩码、
+    # 前沿采样用同一条规则"的可核对形式：不比对的话，一张全 False 的资格表配上
+    # 一份全 True 的 contact_valid 会两边都留着，而实际跑的是后者。
+    for side, attribute in (("contact", "contact_valid"), ("shock", "shock_valid")):
+        recorded = np.asarray(getattr(case, attribute, None))
+        if recorded.shape != expected[side].shape:
+            raise DataError(
+                f"{path}: {attribute} has shape {recorded.shape}, but the eligibility "
+                f"evidence implies {expected[side].shape}"
+            )
+        differing = int(np.count_nonzero(recorded.astype(bool) != expected[side]))
+        if differing:
+            raise DataError(
+                f"{path}: {attribute} disagrees with this case's own front evidence on "
+                f"{differing} of {recorded.size} frames (level {levels[side]!r}). "
+                "Recomputing the front labels from the recorded eligibility must "
+                "reproduce the labels the case carries"
+            )
+
+    # 两前沿的排序约束是一条**独立**记录：它只说空气层几何是否成立，不参与
+    # 任何一侧的标签判定（缺激波不该撤销可靠的接触标签）。
+    recorded_ordering = block.get("ordering_ok")
+    if recorded_ordering is not None:
+        array = np.asarray(recorded_ordering)
+        if array.dtype != np.bool_ or array.shape != ordering_ok.shape:
+            raise DataError(
+                f"{path}: front_supervision_eligibility['ordering_ok'] has shape "
+                f"{array.shape} and dtype {array.dtype}; it must be {ordering_ok.shape[0]} "
+                "booleans"
+            )
+        if not np.array_equal(array, ordering_ok):
+            raise DataError(
+                f"{path}: front_supervision_eligibility['ordering_ok'] disagrees with "
+                "the recorded front radii"
+            )
+
 
 # --------------------------------------------------------------------------
 # 场量布局：**声明出来的，不是从形状猜出来的**
@@ -954,6 +1159,8 @@ def validate_case_object(case: Any, *, path: Any = "<case>") -> None:
 
     # 前沿资格里**带出来的数组**同样要核。它们在对象上，不在文件里，所以读取时的
     # 那一次校验管不到；不核的话，一张被改坏的资格表会静默改变"哪些帧算标签"。
+    validate_front_eligibility(case, path=path)
+
     eligibility_block = getattr(case, "front_supervision_eligibility", None) or {}
     for name in ("contact_eligible", "shock_eligible", "ordering_ok"):
         value = eligibility_block.get(name)
@@ -1302,10 +1509,11 @@ def _load_with_volume_fraction_partition(
     # "资格优先"，也违反"两条前沿独立"：A 的缺失改变了 B 的判据。
     #: 资格证据的档位。**分档而不是只分"有/没有"**：三态码是真的证据，但它不是
     #: 当前契约要求的那一档（§10 的逐帧资格），两者混在一起会让"旧格式"读起来像
-    #: "已就绪"。
-    LEVEL_ARRAYS = "arrays"
-    LEVEL_LEGACY_CODE = "legacy_state_code"
-    LEVEL_NONE = "none"
+    #: "已就绪"。档位定义在模块级——读取端与核对端必须是**同一份枚举**，
+    #: 各写一份就又会分叉。
+    LEVEL_ARRAYS = ELIGIBILITY_LEVEL_ARRAYS
+    LEVEL_LEGACY_CODE = ELIGIBILITY_LEVEL_LEGACY_CODE
+    LEVEL_NONE = ELIGIBILITY_LEVEL_NONE
 
     def _front(eligibility, state, geometric, name: str):
         if eligibility is not None:
