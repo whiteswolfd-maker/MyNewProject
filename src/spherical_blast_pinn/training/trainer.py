@@ -89,7 +89,7 @@ RUN_STATUS_MEANING: dict[str, str] = {
 #: 它们存在**（缺失即拒绝）。这两项记录的是"更新跑完了、判据没过、尚不允许推进"
 #: 这个中间状态；旧写法没有它们，读出来会被当成"没有待决判据"——那正是这两个
 #: 字段要区分的那件事。所以旧检查点按版本号直接拒绝，而不是"缺字段就默认通过"。
-CHECKPOINT_VERSION = 6
+CHECKPOINT_VERSION = 7
 
 
 class TrainingError(RuntimeError):
@@ -372,6 +372,12 @@ class Trainer:
         #: 上一次的状态（复核实测：``best.pt`` 写 ``completed``，``last.pt`` 写
         #: ``diagnostic``，两份检查点的参数却相同）。
         self._best_dirty = False
+        #: **入选那一刻的状态快照**（模型、优化器、步号、RNG、采样器、平衡器、
+        #: 阶段……）。只记 ``self.best`` 这个记录是不够的：它只有分数与指纹，
+        #: 而发布 ``best.pt`` 时通用 ``_save()`` 读的是**当前**模型——继续训练到
+        #: 第 6 步之后，第 1 步选出的最佳会被写成一个第 6 步的检查点，且
+        #: ``best_check.parameter_fingerprint`` 与文件里的参数对不上（复核实测）。
+        self._best_candidate: dict[str, Any] | None = None
 
         # -- 有界梯度平衡（§14） -------------------------------------------
         self.balance_config = BalanceConfig.from_config(config)
@@ -680,10 +686,16 @@ class Trainer:
         if self.best is None or report.score < tuple(self.best["score"]):
             # **只登记候选，不写盘。** 验证函数在训练过程中被调用，那时本次运行的
             # 终态还没算出来；在这里 ``_save`` 会把新参数配上**上一次**的
-            # ``run_status``。真正的写出推迟到 ``run()`` 算完终态之后。
+            # ``run_status``。
+            #
+            # 而且**必须把那一刻的状态整个快照下来**：只留记录的话，发布的时候
+            # 通用保存路径读的是当前模型，中途选出的最佳会被写成末步的参数。
+            # 快照里每一项都是深拷贝／克隆，后续的原地更新改不动它。
             record["run_origin"] = dict(self._run_origin)
             record["refinement_count"] = len(self.refine_history)
+            record["check_set_identity"] = self._check_set_identity()
             self.best = record
+            self._best_candidate = self._checkpoint_state()
             self._best_dirty = True
             if verbose:
                 print(
@@ -822,6 +834,11 @@ class Trainer:
         """
         self._assert_usable()
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        # **一次正在进行的运行没有终态。** 上一次调用留下的结论如果不清掉，
+        # 循环里周期写出的检查点会带着一个旧状态（"跑到一半，文件说完成"）。
+        self._final_status = None
+        self._final_stage_verdict = None
+        self._final_check_state = None
         # 完整日程的长度。收尾判断必须用它，**不能**用截断后的 ``total``。
         schedule_total = sum(stage.updates for stage in self.schedule)
         total = schedule_total
@@ -1072,8 +1089,34 @@ class Trainer:
         # （复核实测：``best.pt`` 是 ``completed``、``last.pt`` 是 ``diagnostic``，
         # 而两份的参数完全相同）。保留旧最佳时**不重写** ``best.pt``：
         # 它自己的来源属于选出它的那次运行，不该被这次的状态改写。
-        if self._best_dirty:
-            self._save(self.output_dir / "best.pt")
+        # 多份产物**不是**一次原子操作：先写下未提交标记，发布完再删。进程在
+        # 两次写入之间被杀掉时，``load`` 能看到标记并拒绝把半套产物当成正常检查点。
+        self._begin_publish(["best.pt", "last.pt", "checks.json", "run_manifest.json"])
+        if self._best_dirty and self._best_candidate is not None:
+            # **用候选快照发布，不让通用保存路径去读当前模型。** 这份检查点属于
+            # 中途的某一步，它的参数、步号、优化器、RNG、采样器与平衡器都必须是
+            # 那一刻的。``best_check``（候选自己的检查记录）与它一一对应。
+            payload = self._build_payload(
+                self._best_candidate,
+                run_status=status,
+                # 判据是整个**运行**在它自己最后那组参数上评出来的，不是这个中途
+                # 候选的。挂在这里会把末步的结论套在中途模型身上。
+                final_stage_verdict=None,
+                check_state="candidate_selected_from_this_run",
+                extra={
+                    "candidate": {
+                        "step": int(self._best_candidate["step"]),
+                        "parameter_fingerprint": self.best.get("parameter_fingerprint"),
+                        "selected_in_run_with_status": status,
+                        "note": (
+                            "this checkpoint holds the best candidate selected during "
+                            "the run; the run's acceptance verdict was evaluated on the "
+                            "run's final parameters, not on these"
+                        ),
+                    }
+                },
+            )
+            self._write_payload(payload, self.output_dir / "best.pt")
             self._best_dirty = False
         self._save(self.output_dir / "last.pt")
 
@@ -1139,6 +1182,9 @@ class Trainer:
         (self.output_dir / "run_manifest.json").write_text(
             json.dumps(result.as_dict(), indent=2, default=_jsonable), encoding="utf-8"
         )
+        # 四份产物都写完了，撤掉未提交标记。放在最后一步：中途崩溃时标记还在，
+        # 加载端因此会把这一套产物认成"未提交"。
+        self._end_publish()
         return result
 
     def _checkpoint_paths(self) -> dict[str, str]:
@@ -1387,18 +1433,40 @@ class Trainer:
                 refinement=list(self.refine_history),
             )
         except BaseException as exc:
-            # **完整回滚。** 线搜索可能已经把参数挪到了一个被否决的试探点上，
-            # 所以"抛错"不等于"参数还在原处"；收尾的 ``run()`` 还可能已经写过盘。
-            # 内存与**盘上**两样一起还原。
-            rollback_error = None
+            # **内存与磁盘分别受保护、独立尝试。**
+            #
+            # 以前是一个 `try` 罩住两步：内存恢复一失败，第二步根本不执行，
+            # 于是本次失败精修写出的 ``last.pt`` 留在盘上——**另一个实例照样能
+            # 把它加载成功**（复核实测：`last.pt` 未恢复旧字节、仍带 1 条精修记录、
+            # 新实例加载成功）。一个对象不可用并不能阻止别的对象读盘。
+            memory_error: BaseException | None = None
             try:
                 self._restore_state(snapshot)
-                self._restore_artifacts(artifacts)
             except BaseException as rollback:  # noqa: BLE001 - 回滚失败要如实报
-                rollback_error = rollback
+                memory_error = rollback
+            # 内存恢复失败也要继续还原磁盘：两件事各有各的失败方式。
+            artifact_results = self._restore_artifacts(artifacts)
+            file_failures = {
+                name: result for name, result in artifact_results.items()
+                if str(result).startswith("FAILED")
+            }
+            restored_everything = memory_error is None and not file_failures
+            if not file_failures:
+                # **标记只描述盘上的一致性。** 内存恢复失败不影响目录里是什么，
+                # 所以只要每一份文件都还原了（或按原样删掉了），就要把标记撤掉
+                # ——否则一个恢复得好好的目录会被永久拒绝加载。内存那一路的失败
+                # 仍然由 ``_unusable`` 表达，那是**实例**的状态，不是盘的状态。
+                try:
+                    self._end_publish()
+                except Exception:  # noqa: BLE001 - 撤标记失败不影响结论
+                    pass
+            if not restored_everything:
                 self._unusable = (
-                    "a failed refinement could not be rolled back: "
-                    f"{rollback.__class__.__name__}: {rollback}"
+                    "a failed refinement could not be fully rolled back: "
+                    + "; ".join(
+                        ([f"memory: {memory_error}"] if memory_error is not None else [])
+                        + [f"{name}: {why}" for name, why in sorted(file_failures.items())]
+                    )
                 )
             failure = {
                 "refinement_index": refine_index,
@@ -1407,32 +1475,51 @@ class Trainer:
                 "closures": int(closures["count"]),
                 "iterations_requested": int(iterations),
                 "error": f"{exc.__class__.__name__}: {exc}",
-                "rollback_error": (
-                    None if rollback_error is None
-                    else f"{rollback_error.__class__.__name__}: {rollback_error}"
+                # 原始异常与**每一项**恢复异常都留下；不用一个总布尔值代替事实。
+                "memory_rollback_error": (
+                    None if memory_error is None
+                    else f"{memory_error.__class__.__name__}: {memory_error}"
                 ),
+                "artifact_rollback": dict(artifact_results),
+                "artifacts_restored": not file_failures,
                 "bad_parameters": list(getattr(exc, "bad_parameters", [])),
                 "objective": objective_definition,
-                "parameters_restored": rollback_error is None,
+                "parameters_restored": memory_error is None,
                 "fingerprint_restored": (
-                    rollback_error is None
+                    memory_error is None
                     and self.parameter_fingerprint() == fingerprint_before
                 ),
-                "artifacts_restored": rollback_error is None,
                 "note": (
                     "the parameters, the sampling sequence and the last valid "
                     "checkpoints were left untouched; this record is written to a "
                     "separate diagnostics file, never into the resumable checkpoint"
                 ),
             }
-            self._write_refinement_failure(failure)
-            if rollback_error is not None:
+            diagnostic_error: BaseException | None = None
+            try:
+                self._write_refinement_failure(failure)
+            except BaseException as log_error:  # noqa: BLE001 - 诊断写不进去也不能吞
+                diagnostic_error = log_error
+            if not restored_everything or diagnostic_error is not None:
                 raise TrainingError(
-                    f"refinement #{refine_index} failed ({exc.__class__.__name__}: {exc}) "
-                    "and rolling back failed too "
-                    f"({rollback_error.__class__.__name__}: {rollback_error}). This "
-                    "trainer instance is in an unknown state and must not be reused."
-                ) from rollback_error
+                    f"refinement #{refine_index} failed ({exc.__class__.__name__}: {exc})."
+                    + (
+                        f" Rolling back did not restore everything: "
+                        + "; ".join(
+                            ([f"memory: {memory_error}"] if memory_error is not None else [])
+                            + [f"{name}: {why}" for name, why in sorted(file_failures.items())]
+                        )
+                        + ". This trainer instance is in an unknown state and must not "
+                          "be reused."
+                        if not restored_everything else ""
+                    )
+                    + (
+                        f" The failure diagnostics file could not be written either "
+                        f"({diagnostic_error.__class__.__name__}: {diagnostic_error}); "
+                        "the original failure above is the one to act on."
+                        if diagnostic_error is not None else ""
+                    )
+                ) from (memory_error or diagnostic_error or exc)
             raise
 
         if verbose:
@@ -1443,9 +1530,22 @@ class Trainer:
             )
         return result
 
-    #: 一次事务要保护的**盘上**产物。``last.pt``/``best.pt`` 是可恢复检查点；
-    #: 收尾的 ``run()`` 会把它们重写，所以回滚必须连字节一起还原。
-    _PROTECTED_ARTIFACTS = ("last.pt", "best.pt")
+    #: 一次事务要保护的**盘上**产物。
+    #:
+    #: 按``run()`` 的**实际调用链**列：它先写 ``best.pt``（若有候选）、再写
+    #: ``last.pt``，然后写 ``checks.json``，最后写 ``run_manifest.json``。
+    #: 以前这里只有两份检查点，于是"``checks.json`` 已经发布、``run_manifest.json``
+    #: 才失败"这一档只回滚了一半（复核实测：``checks.json`` 未恢复、
+    #: ``_final_check_state`` 也未恢复）。
+    #:
+    #: ``cli/train.py`` 另外写的 ``train_result.json`` 不在这里：它在 ``run()``
+    #: **返回之后**由外层写下，责任属于外层。一次失败的运行不会走到那里。
+    _PROTECTED_ARTIFACTS = ("last.pt", "best.pt", "checks.json", "run_manifest.json")
+
+    #: 未提交标记。发布多份产物**不是**原子的：进程在两次写入之间被杀掉，目录里
+    #: 会留下"一部分新、一部分旧"的状态，而每一份单看都是合法文件。启动发布前写
+    #: 下这个标记，成功后删掉；``load`` 看到自己的名字在里面就拒绝加载。
+    _PUBLISH_MARKER = ".publish_in_progress.json"
 
     def _capture_artifacts(self) -> dict[str, bytes | None]:
         """把可恢复检查点的**字节**留底。``None`` 表示当时不存在。"""
@@ -1455,19 +1555,30 @@ class Trainer:
             captured[name] = path.read_bytes() if path.exists() else None
         return captured
 
-    def _restore_artifacts(self, captured: Mapping[str, bytes | None]) -> None:
-        """还原 :meth:`_capture_artifacts` 的快照。
+    def _restore_artifacts(self, captured: Mapping[str, bytes | None]) -> dict[str, str]:
+        """还原 :meth:`_capture_artifacts` 的快照，**逐个文件独立尝试**。
 
         当时不存在的文件要**删掉**：留下一个"这次事务新写出来的"检查点，就等于
         把一个从未成功过的状态发布出去了。
+
+        一个文件恢复失败不能让其余文件放弃：剩下的清单一并还原之后，盘上至少
+        回到"除了一个文件之外都是旧的"，而不是"一个都没还原"。返回每个文件的
+        实际结果，调用方据此写进失败诊断——**不以一个总布尔值代替事实**。
         """
+        results: dict[str, str] = {}
         for name, payload in captured.items():
             path = self.output_dir / name
-            if payload is None:
-                if path.exists():
-                    path.unlink()
-            else:
-                path.write_bytes(payload)
+            try:
+                if payload is None:
+                    if path.exists():
+                        path.unlink()
+                    results[name] = "removed (did not exist before)"
+                else:
+                    path.write_bytes(payload)
+                    results[name] = "restored to the previous bytes"
+            except Exception as exc:  # noqa: BLE001 - 逐个兜错，最后一起报
+                results[name] = f"FAILED: {exc.__class__.__name__}: {exc}"
+        return results
 
     def _write_refinement_failure(self, failure: Mapping[str, Any]) -> Path:
         """把一次失败的精修写到**独立**的诊断文件。
@@ -1494,63 +1605,66 @@ class Trainer:
         return path
 
     # -- 检查点 -----------------------------------------------------------
-    def _save(self, path: Path) -> Path:
-        if torch is None:  # pragma: no cover
-            raise RuntimeError("PyTorch is required")
-        self._assert_usable()
-        payload = {
-            "format": CHECKPOINT_FORMAT,
-            "version": CHECKPOINT_VERSION,
-            "step": self.step,
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
+    def _checkpoint_state(self) -> dict[str, Any]:
+        """构造一份检查点载荷所需要的那**一刻**的状态，一次取齐。
+
+        **每一项都是独立的副本**：模型张量克隆、优化器/平衡器/历史深拷贝。
+        只存 ``state_dict()`` 里仍然引用当前 tensor 的浅拷贝是不够的——后续的
+        原地更新会把它一起改掉，"候选快照"就退化成了"当前状态"。
+
+        这是"候选"与"当前"能被分开的前提，也是把保存拆成"取状态 / 拼载荷 /
+        原子写出"三层的中间那一层。
+        """
+        import copy as _copy
+
+        return {
+            "step": int(self.step),
+            "model": {
+                key: value.detach().clone()
+                for key, value in self.model.state_dict().items()
+            },
+            "optimizer": _copy.deepcopy(self.optimizer.state_dict()),
             "learning_rates": [g["lr"] for g in self.optimizer.param_groups],
-            # **最后一次 Adam 更新的实测损失与它的步号。** 以前这两项只活在内存里：
-            # 恢复之后 ``_last_update_loss`` 回到构造时的 ``nan``、
-            # ``_last_update_loss_step`` 回到 0，于是"加载后不再更新"的一次
-            # ``run()`` 会把 ``final_loss=nan, final_loss_step=0`` 写进报告——
-            # 看起来像训练发散，其实是记录丢了。
             "last_update_loss": float(self._last_update_loss),
             "last_update_loss_step": int(self._last_update_loss_step),
-            # 精修历史也要落盘：不落盘的话，一次"精修 → 保存 → 新实例加载"会
-            # 得到一个精修历史为空、看起来像纯 Adam 跑出来的对象。
-            "refinement": list(self.refine_history),
-            # 日程、固定检查集与数据身份：**旧模型配另一套评估定义**是最难发现的
-            # 错配——所有数字都正常，只是它们不是同一件事上的数字。目录字符串
-            # 相同证明不了这些，所以按内容存。
-            "schedule": _schedule_signature(self.schedule),
-            "check_set": self.check_set.as_dict(),
-            "data_identity": self._data_identity(),
+            "refinement": _copy.deepcopy(self.refine_history),
             "rng": _rng_state(self.seed),
-            # 采样器自己的发生器**不在** ``np.random.get_state()`` 里，必须单独
-            # 存：只恢复全局状态会让采样序列从别的地方继续，"中断后恢复到第 N 步"
-            # 于是不等于"连续跑 N 步"。
             "sampler_rng": self.sampler.rng_state(),
-            "history": self.history,
-            "checks": self.check_history,
-            "best_check": self.best,
-            "check_set": self.check_set.as_dict(),
-            "data_compatibility": self.gate.as_dict(),
-            # §14：恢复必须连阶段、时间窗口与自适应权重统计一起恢复。少了它们，
-            # "从第 N 步继续"会换掉采样区间和损失权重，与连续跑 N 步不是同一次
-            # 训练——而模型文件本身完全正常，看不出来。
-            "balancing": self.balancer.state_dict(),
-            "run_status": getattr(self, "_final_status", None),
-            "final_stage_verdict": getattr(self, "_final_stage_verdict", None),
-            "check_state": getattr(self, "_final_check_state", None),
-            # 模型**来源**要跟着参数走：只存"这次是诊断"而不存"这份参数为什么不是
-            # 正式结果"，加载之后一次零更新的 run() 就会把它算成完成。
+            "history": _copy.deepcopy(self.history),
+            "checks": _copy.deepcopy(self.check_history),
+            "best_check": _copy.deepcopy(self.best),
+            "balancing": _copy.deepcopy(self.balancer.state_dict()),
             "run_origin": dict(self._run_origin),
             "stage": {
                 "current": self._current_stage,
                 "window_fraction": float(self._stage_window),
-                # "更新跑完了、判据没过"是一个**合法的中间状态**，必须能存下来：
-                # 不存的话，恢复只能从步数推算阶段，推算出来的正是"已经进入下一
-                # 阶段"，于是同一个检查点会被自己的恢复函数判成日程不一致。
                 "pending": self._pending_stage,
                 "blocked": bool(self._stage_blocked),
-                "history": self.stage_history,
+                "history": _copy.deepcopy(self.stage_history),
             },
+        }
+
+    def _build_payload(
+        self,
+        state: Mapping[str, Any],
+        *,
+        run_status: str | None,
+        final_stage_verdict: Mapping[str, Any] | None,
+        check_state: str | None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """把"某一刻的状态"拼成一份检查点载荷。
+
+        与 :meth:`_checkpoint_state` 分开，是为了让 ``best.pt`` 能用**候选那一刻**
+        的状态拼载荷，而不是让通用保存路径去读当前模型。
+        """
+        payload = {
+            "format": CHECKPOINT_FORMAT,
+            "version": CHECKPOINT_VERSION,
+            "schedule": _schedule_signature(self.schedule),
+            "check_set": self.check_set.as_dict(),
+            "data_identity": self._data_identity(),
+            "data_compatibility": self.gate.as_dict(),
             "provenance": self.provenance,
             "config": self.config.to_dict() if hasattr(self.config, "to_dict") else {},
             "case_ids": [c.case_id for c in self.cases],
@@ -1562,13 +1676,88 @@ class Trainer:
                 for c in self.cases
             },
             "code_version": _code_version(),
+            "run_status": run_status,
+            "final_stage_verdict": final_stage_verdict,
+            "check_state": check_state,
+            # 尚未发布的最佳候选也一起留着：一次中断之后，恢复出来的实例不该
+            # 只剩一个分数、找不到对应的参数。
+            "pending_best_candidate": self._best_candidate,
+            "best_dirty": bool(self._best_dirty),
         }
+        payload.update(state)
+        payload.update(dict(extra or {}))
+        return payload
+
+    def _write_payload(self, payload: Mapping[str, Any], path: Path) -> Path:
+        """原子写出：先写临时文件，再替换。"""
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_suffix(target.suffix + ".tmp")
-        torch.save(payload, temporary)
+        torch.save(dict(payload), temporary)
         temporary.replace(target)
         return target
+
+    def _save(self, path: Path) -> Path:
+        """按**当前**状态写一份检查点。"""
+        if torch is None:  # pragma: no cover
+            raise RuntimeError("PyTorch is required")
+        self._assert_usable()
+        return self._write_payload(
+            self._build_payload(
+                self._checkpoint_state(),
+                run_status=getattr(self, "_final_status", None),
+                final_stage_verdict=getattr(self, "_final_stage_verdict", None),
+                check_state=getattr(self, "_final_check_state", None),
+            ),
+            Path(path),
+        )
+
+    # -- 多文件发布的事务标记 ---------------------------------------------
+
+    def _publish_marker_path(self) -> Path:
+        return self.output_dir / self._PUBLISH_MARKER
+
+    def _begin_publish(self, names) -> Path:
+        """写下"这些产物正在发布"。成功后由 :meth:`_end_publish` 删除。
+
+        单文件原子替换**不等于**多文件事务：``run()`` 要写四份产物，进程在第
+        二份和第三份之间被杀掉时，目录里留下的是一套互相矛盾的组合，而每一份
+        单看都合法。标记让加载端能把"未提交"认出来。
+        """
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        path = self._publish_marker_path()
+        path.write_text(
+            json.dumps({"artifacts": sorted(names)}, indent=2), encoding="utf-8"
+        )
+        return path
+
+    def _end_publish(self) -> None:
+        path = self._publish_marker_path()
+        if path.exists():
+            path.unlink()
+
+    def _refuse_if_uncommitted(self, path: Path) -> None:
+        """加载端必须**落实**拒绝规则，而不是只在日志里提一句。
+
+        标记在**被加载的那份检查点旁边**找，不是在自己的 ``output_dir`` 里找：
+        读它的人往往是一个新建的实例，输出目录与写出它的那次运行不同。
+        """
+        marker = Path(path).parent / self._PUBLISH_MARKER
+        if not marker.exists():
+            return
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - 标记坏掉时保守拒绝
+            raise TrainingError(
+                f"{marker} exists but cannot be read; a publish was interrupted, so "
+                f"{path} cannot be trusted as a committed checkpoint"
+            )
+        if Path(path).name in set(payload.get("artifacts") or ()):
+            raise TrainingError(
+                f"{path} was left uncommitted by an interrupted publish (see {marker}). "
+                "The directory holds a mixture of new and old artifacts; refusing to "
+                "load rather than treating it as a valid checkpoint"
+            )
 
     def load(self, path: Path | str) -> None:
         """恢复训练。
@@ -1579,6 +1768,9 @@ class Trainer:
         if torch is None:  # pragma: no cover
             raise RuntimeError("PyTorch is required")
         self._assert_usable()
+        # **未提交的产物不能当正常检查点加载。** 规则要在这里**落实**，不是在
+        # 日志里提一句——另一个实例读到的就是这一份盘上文件。
+        self._refuse_if_uncommitted(Path(path))
         payload = torch.load(Path(path), map_location="cpu", weights_only=False)
         if payload.get("format") != CHECKPOINT_FORMAT:
             raise TrainingError(f"{path} is not a {CHECKPOINT_FORMAT} checkpoint")
@@ -1694,6 +1886,21 @@ class Trainer:
                     f"the checkpoint's run_origin[{key!r}] is "
                     f"{stored_origin.get(key)!r}, not a boolean"
                 )
+        # 候选与"待发布"标志必须**在位**：一份中途写下的检查点如果丢了这两项，
+        # 恢复出来的实例就只剩 ``self.best`` 那张分数表，找不到对应的参数。
+        if "pending_best_candidate" not in payload:
+            raise TrainingError(
+                f"{path} carries no 'pending_best_candidate' key; a checkpoint written "
+                "mid-run may hold an unpublished best candidate, and without this field "
+                "it cannot be reconstructed"
+            )
+        if "best_dirty" not in payload or not isinstance(
+            payload["best_dirty"], (bool, np.bool_)
+        ):
+            raise TrainingError(
+                f"the checkpoint's 'best_dirty' flag is "
+                f"{payload.get('best_dirty')!r}, not a boolean"
+            )
         for key in ("last_update_loss", "last_update_loss_step"):
             if key not in payload:
                 raise TrainingError(
@@ -1916,6 +2123,14 @@ class Trainer:
             "refine_history": _copy.deepcopy(self.refine_history),
             "run_origin": dict(self._run_origin),
             "best_dirty": bool(self._best_dirty),
+            # 候选快照也要进事务：回滚之后如果只剩 ``self.best`` 那张分数表，
+            # 下一次发布就会拿**当前**模型去补 ``best.pt``。
+            "best_candidate": _copy.deepcopy(self._best_candidate),
+            "final_status": getattr(self, "_final_status", None),
+            "final_stage_verdict": _copy.deepcopy(
+                getattr(self, "_final_stage_verdict", None)
+            ),
+            "final_check_state": getattr(self, "_final_check_state", None),
             "final_status": getattr(self, "_final_status", None),
             "final_verdict": getattr(self, "_final_stage_verdict", None),
         }
@@ -1992,6 +2207,10 @@ class Trainer:
         self.refine_history = refine_history
         self._run_origin = dict(snapshot["run_origin"])
         self._best_dirty = bool(snapshot["best_dirty"])
+        self._best_candidate = _copy.deepcopy(snapshot["best_candidate"])
+        self._final_status = snapshot["final_status"]
+        self._final_stage_verdict = _copy.deepcopy(snapshot["final_stage_verdict"])
+        self._final_check_state = snapshot["final_check_state"]
         self._final_status = snapshot["final_status"]
         self._final_stage_verdict = snapshot["final_verdict"]
         if failures:
@@ -2030,6 +2249,15 @@ class Trainer:
             "explicit_diagnostic": bool(stored_origin.get("explicit_diagnostic", False)),
             "refined": bool(stored_origin.get("refined", False)),
         }
+        # 尚未发布的最佳候选随检查点一起回来：中断之后恢复出来的实例还能把
+        # ``best.pt`` 补出来，而不是只剩一个分数。
+        stored_candidate = payload.get("pending_best_candidate")
+        self._best_candidate = (
+            dict(stored_candidate) if isinstance(stored_candidate, Mapping) else None
+        )
+        self._best_dirty = bool(payload.get("best_dirty")) and (
+            self._best_candidate is not None
+        )
         self.stage_history = list(stage_payload.get("history", []))
         # **最后一次实测损失与精修历史一起恢复。** 少了前者，零更新的恢复运行会
         # 报 ``final_loss=nan, final_loss_step=0``；少了后者，一个精修过的模型
