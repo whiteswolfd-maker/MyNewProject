@@ -336,13 +336,11 @@ class Trainer:
         #: 最后一次参数更新的实测损失与它发生在哪一步。
         self._last_update_loss = float("nan")
         self._last_update_loss_step = 0
-        #: 参数指纹与那个指纹下的检查结论（提示词 §7）。
-        #:
-        #: **只用 step 判断"这一步检查过了"是不够的**：L-BFGS 精修改参数却不改
-        #: step，于是"同一步已检查"会把精修前的结论留下来，报告里的误差、best/last
-        #: 与最终结论都对不上当前参数。指纹取参数张量的内容哈希。
-        self._parameter_fingerprint: str | None = None
-        self._check_fingerprint: str | None = None
+        # **"这一步检查过了没有"由参数指纹判定**（``_check_stale`` 每次现算），
+        # 不缓存成实例属性：缓存下来的指纹在精修改参数之后会悄悄过期，而
+        # ``_check_fingerprint = None`` 这种"作废"手法一旦漏掉一处就再也发现不了。
+        # 早先的两个字段（``_parameter_fingerprint`` / ``_check_fingerprint``）只写
+        # 不读，已删除——它们让事务审计看起来漏了两项状态。
         #: 精修记录。精修**恢复不了**：L-BFGS 的优化器状态不进检查点，所以
         #: "从检查点继续一次精修"是不支持的，这里如实记下来而不是假装支持。
         self.refine_history: list[dict[str, Any]] = []
@@ -1104,6 +1102,11 @@ class Trainer:
                 final_stage_verdict=None,
                 check_state="candidate_selected_from_this_run",
                 extra={
+                    # ``best.pt`` **就是**已发布的候选，所以它自己不持有"待发布
+                    # 候选"——否则同一份状态在文件里存两遍（体积翻倍），而且
+                    # 加载它之后会被当成"还有候选没发布"。
+                    "pending_best_candidate": None,
+                    "best_dirty": False,
                     "candidate": {
                         "step": int(self._best_candidate["step"]),
                         "parameter_fingerprint": self.best.get("parameter_fingerprint"),
@@ -1285,7 +1288,8 @@ class Trainer:
             # 那套权重被丢掉了，目标函数与训练时不是同一个，而精修的损失看起来完全
             # 正常。
             weights = self.balancer.weights()
-            self._refine_weights = dict(weights)
+            # 下面记录用的是局部变量 ``weights`` 与 ``objective_definition``；
+            # 早先那个 ``self._refine_weights`` 只写不读，已删除。
             objective_definition.update({
                 "adaptive_weights": {key: float(value) for key, value in weights.items()},
                 "pde_weight": float(pde_weight),
@@ -1421,12 +1425,11 @@ class Trainer:
             stage = "history commit"
             self.refine_history.append(record)
 
-            # **精修改了参数，必须重新评价。** 收尾流程按"参数指纹变了没有"判断
-            # 要不要重查（见 ``run``），所以这里只需要令旧结论失效。精修记录作为
-            # **来源身份**传给 ``run``，让终态、检查点与清单在写出来之前就引用同
-            # 一个结论。
+            # **精修改了参数，必须重新评价。** 收尾流程按"参数指纹变了没有"
+            # 判断要不要重查（见 ``run`` 的 ``parameters_moved``），不需要在这里
+            # 作废什么——指纹是现算的。精修记录作为**来源身份**传给 ``run``，
+            # 让终态、检查点与清单在写出来之前就引用同一个结论。
             stage = "recheck and publish"
-            self._check_fingerprint = None
             result = self.run(
                 max_updates=self.step,
                 verbose=verbose,
@@ -2105,6 +2108,8 @@ class Trainer:
             "stage_blocked": bool(self._stage_blocked),
             "stage_history": _copy.deepcopy(self.stage_history),
             "balancer": _copy.deepcopy(self.balancer.state_dict()),
+            # 最近一次平衡记录是**可观测**的（报表与测试都读它），也要进事务。
+            "last_balance": _copy.deepcopy(self.last_balance),
             "rng": _snapshot_global_rng(),
             "samplers": [
                 {
@@ -2177,6 +2182,10 @@ class Trainer:
         attempt("model", lambda: self.model.load_state_dict(model_state))
         attempt("optimizer", lambda: self.optimizer.load_state_dict(optimizer_state))
         attempt("balancer", lambda: self.balancer.load_state_dict(balancer_state))
+        attempt(
+            "last balance record",
+            lambda: setattr(self, "last_balance", _copy.deepcopy(snapshot["last_balance"])),
+        )
         attempt("global rng", lambda: _restore_global_rng(rng_state))
         for sampler, window, window_history, rng in restored_samplers:
             # 回滚要能**收窄**窗口，所以走 restore_ 而不是 set_；历史一起还原，

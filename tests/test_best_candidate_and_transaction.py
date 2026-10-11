@@ -329,9 +329,22 @@ def test_a_failure_after_earlier_artifacts_were_published_rolls_all_of_them_back
     trainer.run(max_updates=1, verbose=False)
     before = _artifact_bytes(trainer)
     before_state = trainer._final_check_state
+    before_status = trainer._final_status
+    before_verdict = trainer._final_stage_verdict
     before_fingerprint = trainer.parameter_fingerprint()
     before_history = len(trainer.history)
     before_refine = len(trainer.refine_history)
+    # **随机轨迹、来源与候选**也要在事务里：少了它们，回滚之后要么采样序列
+    # 前进了一次，要么下一次发布拿当前模型去补 best.pt。
+    before_rng = [s.rng_state() for s in trainer.sampler.samplers]
+    before_windows = [s.window_fraction for s in trainer.sampler.samplers]
+    before_origin = dict(trainer._run_origin)
+    before_candidate_step = (
+        None if trainer._best_candidate is None else trainer._best_candidate["step"]
+    )
+    before_best = (
+        None if trainer.best is None else trainer.best.get("parameter_fingerprint")
+    )
 
     restore = _block_manifest(trainer)
     with pytest.raises(OSError, match="run_manifest"):
@@ -343,9 +356,20 @@ def test_a_failure_after_earlier_artifacts_were_published_rolls_all_of_them_back
         if payload is not None:
             assert after[name] == payload, f"{name} 没有恢复原字节"
     assert trainer._final_check_state == before_state
+    assert trainer._final_status == before_status
+    assert trainer._final_stage_verdict == before_verdict
     assert trainer.parameter_fingerprint() == before_fingerprint
     assert len(trainer.history) == before_history
     assert len(trainer.refine_history) == before_refine
+    assert [s.rng_state() for s in trainer.sampler.samplers] == before_rng
+    assert [s.window_fraction for s in trainer.sampler.samplers] == before_windows
+    assert dict(trainer._run_origin) == before_origin
+    assert (
+        None if trainer._best_candidate is None else trainer._best_candidate["step"]
+    ) == before_candidate_step
+    assert (
+        None if trainer.best is None else trainer.best.get("parameter_fingerprint")
+    ) == before_best
     # 失败诊断单独保留，不冒充成功检查历史。
     diagnostics = trainer.output_dir / "refinement_failures.json"
     assert diagnostics.exists()
