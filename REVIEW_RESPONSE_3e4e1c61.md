@@ -6,8 +6,9 @@
 |---|---|
 | 复核基线提交 | `3e4e1c61b351fb4665c35f4dfc7e832c12e80e70` |
 | 本机实际克隆到的基线 | `3e4e1c61b351fb4665c35f4dfc7e832c12e80e70`（`git clone` 实测，与复核一致） |
-| 本轮修改提交 | `8d7fda6303ece357bd9819e450b15cdab08522ef`（已推送到 `origin/main`） |
-| 远端复验提交 | `8d7fda6303ece357bd9819e450b15cdab08522ef`（**全新 `git clone`** 后在该目录内执行） |
+| 本源码修改提交 | `8d7fda6303ece357bd9819e450b15cdab08522ef`（已推送到 `origin/main`） |
+| 文档提交 | `6389c78b…`（只追加 `AGENTS.md` 的约定与这份报告，**不改源码**） |
+| 远端复验提交 | `8d7fda6303ece357bd9819e450b15cdab08522ef`（**全新 `git clone`** 后在该目录内执行；测试证据对应的是**源码**提交） |
 | 分支 | `main` |
 | 本机环境 | Python **3.10.8**、torch **2.5.1+cu121**、numpy **1.26.4** |
 | 复核方环境 | 实跑 **484 passed / 6 skipped / 0 failed** |
@@ -345,6 +346,11 @@ output   : C:\Users\work\AppData\Local\Temp\verify_out
 
 **测试**：520 passed / 0 skipped / 0 failed（本机与远端新克隆各跑一次）。
 本机 `pytest -q -rs` 在**新克隆目录**里执行，与复核命令一致。
+
+**测试所对应的源码提交是 `8d7fda6`**。其后的文档提交（`AGENTS.md` 与这份报告）
+只增加文字，没有改动 `src/`、`tests/` 或 `scripts/`——所以那一次测试结果同样
+适用于文档提交之后的树。用 `git diff --stat 8d7fda6 <docs-sha>` 可以核对：
+只有 `AGENTS.md` 与 `REVIEW_RESPONSE_3e4e1c61.md` 两个文件变化。
 
 ---
 
