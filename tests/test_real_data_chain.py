@@ -25,7 +25,7 @@ import pytest
 
 import torch
 
-REAL_CASE_DIR = Path("F:/2/extracted_geom/50mm_c")
+REAL_CASE_DIR = Path("F:/2/extracted_geom/50mm_d")
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "configs" / "experiments" / "geom_smoke.yaml"
 RADIUS = 0.05
 TIME_SCALE = 2.0
@@ -71,6 +71,9 @@ def test_the_reextracted_case_satisfies_the_data_contract(real_case):
     assert detail["symmetry_factor"] == 8.0
     assert detail["detonation_velocity_m_s"] > 0.0
     assert detail["material_partition_is_volume_fraction_based"] is True
+    # 来源必须是**结构化**记录，并且与布尔声明一致（提示词 §5）
+    assert detail["material_partition_source_ok"] is True
+    assert detail["material_partition_method"] == "ale_volume_fraction"
     assert detail["field_validity_fields"] == [
         "density", "pressure", "specific_energy", "velocity"
     ]

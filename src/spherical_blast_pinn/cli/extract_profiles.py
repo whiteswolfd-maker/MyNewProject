@@ -40,8 +40,13 @@ import numpy as np
 from ..constants import UNIT_SYSTEMS
 from ..data import compatibility as compat
 from ..data.shock_detect import detect_shock
-from ..data.extracted_case import FieldMapping
+from ..data.extracted_case import (
+    LAYOUT_FRAMES_BY_RADIUS,
+    PROFILE_LAYOUT_VERSION,
+    FieldMapping,
+)
 from ..data.interface_reconstruction import reconstruct_interface
+from ..data.provenance import METHOD_ALE_VOLUME_FRACTION, make_partition_source
 from ..data.kfile_parser import parse_deck
 from ..data.raw_reader import (
     VALIDATED_LASSO_VERSION,
@@ -586,6 +591,35 @@ def _shock_radius(
     return float(edge), diagnostics
 
 
+def _partition_input_identifier(deck_path: Path | None, d3plot_dir: Path) -> str:
+    """分区来源的**输入标识**：deck 内容与 d3plot 家族清单的哈希。
+
+    输入读不到时**不留空、也不编一个指纹**——写一个明确的 ``unavailable`` 标记与
+    原因。编出来的指纹比没有更糟：它看起来像一个可以核对的值，而实际上核对不了。
+    """
+    import hashlib
+
+    digest = hashlib.sha256()
+    try:
+        deck_bytes = Path(deck_path).read_bytes() if deck_path else b""
+    except OSError as exc:
+        return f"unavailable: the deck could not be read ({exc.__class__.__name__})"
+    if not deck_bytes:
+        return "unavailable: no deck path was given to the extractor"
+    digest.update(deck_bytes)
+    try:
+        family = list_d3plot_family(d3plot_dir)
+    except Exception as exc:  # noqa: BLE001 - 读不到就如实说
+        return f"unavailable: the d3plot family could not be listed ({exc})"
+    for path in family:
+        digest.update(Path(path).name.encode("utf-8"))
+        try:
+            digest.update(str(Path(path).stat().st_size).encode("utf-8"))
+        except OSError:  # pragma: no cover - 防御
+            digest.update(b"?")
+    return f"sha256:{digest.hexdigest()}"
+
+
 def extract_case(
     *,
     case_id: str,
@@ -607,6 +641,8 @@ def extract_case(
     """把一个算例的 d3plot 家族提取成剖面 + 材料分区。"""
     d3plot_dir = Path(d3plot_dir)
     layout = layout or D3plotLayout()
+    volume_fraction_columns = tuple(int(c) for c in layout.volume_fraction_columns)
+    partition_input_identifier = _partition_input_identifier(deck.deck_path, d3plot_dir)
     summary = parse_deck(deck.deck_path, geometry=False)
     part_map = _part_index_to_deck_id(summary)
 
@@ -1196,12 +1232,36 @@ def extract_case(
                 "released its chemical energy yet) and get no energy label"
             ),
         },
-        "material_partition_source": (
-            "ALE material volume fraction read from the d3plot history variables "
-            "(columns 1..7), summed over the explosive parts; pure product alpha >= 0.95, "
-            "pure air alpha <= 0.05, the mixed band is excluded from every label"
+        # **场量布局声明**（提示词 §4）。写出来之后，"这份文件是什么布局"是一个
+        # 可以核对的字段，而不是让读取器从形状上猜：上面两份 npz 写的是逐帧二维
+        # ``(n_states, n_shells)``。缺这一项的旧导出仍然按同一档读（缺省即逐帧
+        # 二维），但那份"缺省"是**推断**出来的，`source["profile_layout"]["declared"]`
+        # 会记为 `False`——读得出来不等于当初声明过。
+        "profile_layout": {
+            "version": PROFILE_LAYOUT_VERSION,
+            "layout": LAYOUT_FRAMES_BY_RADIUS,
+        },
+        # **结构化来源记录**（提示词 §5）。生产端与读端用同一份模式：自由文本
+        # 不能当机器证据，判据只看它，不看任何说明文字。
+        "material_partition_source": make_partition_source(
+            method=METHOD_ALE_VOLUME_FRACTION,
+            producer="cli.extract_profiles",
+            fields=("tnt_volume_fraction",),
+            input_identifier=partition_input_identifier,
+            detail={
+                "volume_fraction_columns": list(volume_fraction_columns),
+                "pure_product_threshold": float(PURE_PRODUCT_THRESHOLD),
+                "pure_air_threshold": float(PURE_AIR_THRESHOLD),
+                "mixed_band_excluded": True,
+                "symmetry_factor": float(grid.symmetry_multiplier),
+            },
         ),
         "material_partition_is_volume_fraction_based": True,
+        "material_partition_source_note": (
+            "ALE material volume fraction read from the d3plot history variables, "
+            "summed over the explosive parts; pure product alpha >= 0.95, pure air "
+            "alpha <= 0.05, the mixed band is excluded from every label"
+        ),
         "state_validity_source": (
             "per cell: (rho, p) must be a state of the declared EOS with e > 0. A shell "
             "is invalid if ANY cell contributing to it failed this, by volume, and the "

@@ -51,13 +51,78 @@ from .schedule import (
 
 #: 检查点格式标识与版本。加载时两者都必须匹配，否则拒绝。
 CHECKPOINT_FORMAT = "spherical_blast_pinn.checkpoint"
+
+# --------------------------------------------------------------------------
+# 一次运行的**终态**（提示词 §1）
+# --------------------------------------------------------------------------
+# 四档必须分开。"跑完了"与"通过了"不是一回事，而以前 ``ok`` 只看
+# ``updates > 0 and isfinite(final_loss)``——一个最终判据失败的运行和一次成功的
+# 正式训练拿到**同一个**布尔值，CLI 于是返回 0。
+RUN_COMPLETED = "completed"              # 预算跑满，最终阶段判据通过
+RUN_CRITERIA_FAILED = "criteria_failed"  # 预算跑满，最终阶段判据未通过
+RUN_INCOMPLETE = "incomplete"            # 预算被截断，完整日程没跑完
+RUN_DIAGNOSTIC = "diagnostic"            # 显式诊断运行：不主张任何验收结论
+
+#: 每个终态的含义，写进运行清单，免得读的人各自理解。
+RUN_STATUS_MEANING: dict[str, str] = {
+    RUN_COMPLETED: (
+        "the full schedule ran and the final stage's pre-declared criteria passed — "
+        "this is a numerically completed run, which is still not a physics acceptance"
+    ),
+    RUN_CRITERIA_FAILED: (
+        "the full schedule ran but the final stage's pre-declared criteria did not "
+        "pass; the run must not be presented as a formal success"
+    ),
+    RUN_INCOMPLETE: (
+        "the budget was truncated before the full schedule completed; no claim is made "
+        "about stages that never ran"
+    ),
+    RUN_DIAGNOSTIC: (
+        "an explicitly diagnostic run: it makes no acceptance claim at all"
+    ),
+}
 #: 第 3 版起检查点必须带**采样器自己的** RNG 状态（第 2 版只存全局 NumPy 状态，
 #: 恢复出来的不是一个连续的采样轨迹），并且带固定检查集与兼容性闸门的结论。
-CHECKPOINT_VERSION = 3
+#:
+#: 第 4 版起 ``stage`` 块必须同时带 ``pending`` 与 ``blocked``，且加载端**要求
+#: 它们存在**（缺失即拒绝）。这两项记录的是"更新跑完了、判据没过、尚不允许推进"
+#: 这个中间状态；旧写法没有它们，读出来会被当成"没有待决判据"——那正是这两个
+#: 字段要区分的那件事。所以旧检查点按版本号直接拒绝，而不是"缺字段就默认通过"。
+CHECKPOINT_VERSION = 4
 
 
 class TrainingError(RuntimeError):
     """训练无法继续。"""
+
+
+class NonFiniteUpdate(TrainingError):
+    """一次参数更新在**应用之前**被拦下：损失或梯度不是有限值（提示词 §8）。
+
+    这是一个硬失败，不是可以跳过去继续的事件：跳过之后**下一步大概率还会发散**，
+    而真正的问题——哪一步、哪个参数——会被埋在一串 nan 里。这里把步骤与参数名
+    直接报出来，并保证参数没有被改（拦截发生在 ``optimizer.step()`` 之前），
+    因而最近一个已知有效的检查点没有被覆盖。
+    """
+
+    def __init__(
+        self,
+        *,
+        step: int,
+        loss: float,
+        bad_parameters: Sequence[str],
+        detail: str,
+    ) -> None:
+        self.step = int(step)
+        self.loss = float(loss)
+        self.bad_parameters = list(bad_parameters)
+        lines = [f"update {self.step} was blocked: {detail}"]
+        if bad_parameters:
+            lines.append(f"  non-finite gradient in: {list(bad_parameters)[:8]}")
+        lines.append(
+            "  the parameters were NOT updated, so the last good checkpoint is intact; "
+            "no NaN was papered over with nan_to_num or a gradient filter"
+        )
+        super().__init__("\n".join(lines))
 
 
 class StageNotPassed(TrainingError):
@@ -91,19 +156,46 @@ class TrainingResult:
     output_dir: Path
     updates: int
     final_loss: float
+    #: 终态（提示词 §1）。见 :data:`RUN_STATUS_MEANING`。
+    status: str = RUN_DIAGNOSTIC
+    #: ``final_loss`` 是哪一步实测的。以前它取的是**最后一条日志**，一旦日志间隔
+    #: 不是 1，它就来自更早的模型——却和最终结论写在同一个字段里。
+    final_loss_step: int = 0
+    #: 最终阶段的判据结论（原始记录，含每条判据的实际值与限额）。
+    final_stage_verdict: dict[str, Any] | None = None
     history: list[dict[str, Any]] = field(default_factory=list)
     checkpoints: dict[str, str] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
-        return self.updates > 0 and np.isfinite(self.final_loss)
+        """**只有**"预算跑满且最终判据通过"才算成功。
+
+        截断是 ``incomplete``，判据失败是 ``criteria_failed``，诊断运行是
+        ``diagnostic``——三者都不是成功，而它们各自的原因不同，不能压成一个
+        ``False``。
+        """
+        return self.status == RUN_COMPLETED
+
+    @property
+    def formally_accepted(self) -> bool:
+        """正式验收。与 :attr:`ok` 同义，单独给一个名字免得被读成"物理验收通过"。
+
+        这一档只说明**数值运行**按要求跑完并通过了**数值**判据；物理验收另有
+        单独的闸门（参考场验收、物理依据），两者不能互相替代。
+        """
+        return self.status == RUN_COMPLETED
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "output_dir": str(self.output_dir),
             "updates": self.updates,
+            "status": self.status,
+            "status_meaning": RUN_STATUS_MEANING.get(self.status, "unknown status"),
+            "formally_accepted": self.formally_accepted,
             "final_loss": self.final_loss,
+            "final_loss_step": int(self.final_loss_step),
+            "final_stage_verdict": self.final_stage_verdict,
             "checkpoints": self.checkpoints,
             "metadata": self.metadata,
             "history_length": len(self.history),
@@ -225,6 +317,20 @@ class Trainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1.0e-3)
         self.step = 0
         self.history: list[dict[str, Any]] = []
+        #: 最后一次参数更新的实测损失与它发生在哪一步。
+        self._last_update_loss = float("nan")
+        self._last_update_loss_step = 0
+        #: 参数指纹与那个指纹下的检查结论（提示词 §7）。
+        #:
+        #: **只用 step 判断"这一步检查过了"是不够的**：L-BFGS 精修改参数却不改
+        #: step，于是"同一步已检查"会把精修前的结论留下来，报告里的误差、best/last
+        #: 与最终结论都对不上当前参数。指纹取参数张量的内容哈希。
+        self._parameter_fingerprint: str | None = None
+        self._check_fingerprint: str | None = None
+        #: 精修记录。精修**恢复不了**：L-BFGS 的优化器状态不进检查点，所以
+        #: "从检查点继续一次精修"是不支持的，这里如实记下来而不是假装支持。
+        self.refine_history: list[dict[str, Any]] = []
+        self._lbfgs_closures = 0
 
         # -- 有界梯度平衡（§14） -------------------------------------------
         self.balance_config = BalanceConfig.from_config(config)
@@ -313,18 +419,76 @@ class Trainer:
             self.last_balance = record.as_dict()
 
         self.optimizer.zero_grad(set_to_none=True)
+        # **非有限损失在反传之前就拦下。** 让它传下去只会得到一堆 NaN 梯度，
+        # 然后被后面的有限性检查再拦一次——但那时已经白算了一遍。
+        if not bool(torch.isfinite(breakdown.total)):
+            raise NonFiniteUpdate(
+                step=int(self.step) + 1, loss=float("nan"), bad_parameters=[],
+                detail="the total loss is not finite",
+            )
         breakdown.total.backward()
+
+        # **参数更新之前识别非有限梯度**（提示词 §8）。这一条缺失时，一次 NaN
+        # 梯度会把整个模型污染成 NaN，而训练"照常"跑完、损失显示为 nan、检查点覆盖
+        # 掉上一个已知有效的快照——事后什么也追不回来。
+        #
+        # 这里**不**用 ``nan_to_num``、不裁剪、不跳过该组：那三种做法都把异常变成
+        # "看起来还行"，而这一段存在的意义正好相反。定位到具体的参数名之后直接停。
+        bad_parameters = [
+            name for name, parameter in self.model.named_parameters()
+            if parameter.grad is not None
+            and not bool(torch.isfinite(parameter.grad).all())
+        ]
+        if bad_parameters:
+            self.optimizer.zero_grad(set_to_none=True)
+            raise NonFiniteUpdate(
+                step=int(self.step) + 1,
+                loss=float(breakdown.total.detach()),
+                bad_parameters=bad_parameters,
+                detail=(
+                    "the gradient is not finite for these parameters; the update was "
+                    "blocked before it could overwrite the last good checkpoint"
+                ),
+            )
+
         if self.gradient_clip > 0.0:
             torch.nn.utils.clip_grad_norm_(
                 [p for p in self.model.parameters() if p.requires_grad],
                 max_norm=self.gradient_clip,
             )
         self.optimizer.step()
+        # 最后一次更新的**实测**损失。收尾结论必须用它，不能用最后一条日志——
+        # 日志按 ``log_every`` 打，间隔不是 1 时它来自更早的模型。
+        self._last_update_loss = float(breakdown.total.detach())
         return breakdown
 
     def _set_learning_rate(self, value: float) -> None:
         for group in self.optimizer.param_groups:
             group["lr"] = float(value)
+
+    # -- 参数指纹（提示词 §7）----------------------------------------------
+    def parameter_fingerprint(self) -> str:
+        """当前模型参数的**内容**指纹。
+
+        ``step`` 不变但参数变过的情况是真实存在的：L-BFGS 精修就是。用 step 当
+        "检查过没有"的键，会让精修后的报告沿用精修前的结论。
+        """
+        import hashlib
+
+        digest = hashlib.sha256()
+        for name, value in sorted(self.model.state_dict().items()):
+            digest.update(name.encode("utf-8"))
+            digest.update(np.ascontiguousarray(value.detach().cpu().numpy()).tobytes())
+        return digest.hexdigest()
+
+    def _check_stale(self) -> bool:
+        """当前参数下还没有检查结论吗（从来没查过 / 参数变了 / 步数变了）。"""
+        if not self.check_history:
+            return True
+        last = self.check_history[-1]
+        if int(last.get("step", -1)) != int(self.step):
+            return True
+        return last.get("parameter_fingerprint") != self.parameter_fingerprint()
 
     # -- 独立检查 ---------------------------------------------------------
     def verify(
@@ -368,6 +532,7 @@ class Trainer:
         record = report.as_dict()
         if window_fraction is not None:
             record["window_fraction"] = float(window_fraction)
+        record["parameter_fingerprint"] = self.parameter_fingerprint()
         self.check_history.append(record)
 
         if not update_best:
@@ -491,7 +656,19 @@ class Trainer:
         return record
 
     # -- 主循环 -----------------------------------------------------------
-    def run(self, *, max_updates: int | None = None, verbose: bool = False) -> TrainingResult:
+    def run(
+        self,
+        *,
+        max_updates: int | None = None,
+        verbose: bool = False,
+        diagnostic: bool = False,
+    ) -> TrainingResult:
+        """跑训练循环。
+
+        ``max_updates`` 截断的运行是 ``incomplete``（提示词 §1）：不拿没跑过的
+        阶段判失败，也不宣称正式训练完成。``diagnostic=True`` 的运行不主张任何
+        验收结论，无论它跑到哪一步。
+        """
         self.output_dir.mkdir(parents=True, exist_ok=True)
         # 完整日程的长度。收尾判断必须用它，**不能**用截断后的 ``total``。
         schedule_total = sum(stage.updates for stage in self.schedule)
@@ -514,6 +691,7 @@ class Trainer:
             )
 
         started = time.time()
+        start_step = int(self.step)
         # **从实例状态起手，而不是从空字符串起手。**
         #
         # ``stage_name`` 初值写成 ``""`` 时，任何一次"重新调用 run()"都会被当成
@@ -541,6 +719,7 @@ class Trainer:
             self._set_learning_rate(learning_rate_at(self.step, self.schedule))
             breakdown = self._update()
             self.step += 1
+            self._last_update_loss_step = self.step
 
             # **步数一增加就切阶段**，不留到下一轮循环的开头。
             #
@@ -582,12 +761,17 @@ class Trainer:
             if self.step % self.checkpoint_every == 0:
                 self._save(self.output_dir / "last.pt")
 
-        self._save(self.output_dir / "last.pt")
-        final = float(self.history[-1]["total"]) if self.history else float("nan")
+        # **收尾结论必须在写最终检查点之前算出来。**
+        #
+        # 以前 ``last.pt`` 先写、判据后评，于是最终检查点里没有那个结论——从它
+        # 恢复的人看到的是一份"跑完了"的快照，而这次运行其实是被判失败的。
+        final = float(self._last_update_loss)
+        final_step = int(self._last_update_loss_step)
+
         # 收尾检查：即使还没到 check_every，也要让最后一次迭代有物理验收结论。
-        if self.check_every > 0 and (
-            not self.check_history or self.check_history[-1]["step"] != self.step
-        ):
+        # 一次更新都没发生时跳过——拿一个没动过的模型去跑完整检查，只会往
+        # ``best.pt`` 里写一份"从未训练过"的快照。
+        if self.check_every > 0 and self.step > start_step and self._check_stale():
             self.verify(verbose=verbose, total_loss_value=final)
 
         # 最后一个阶段的判据：只有在它的预算**真的跑完**时才评价。
@@ -597,20 +781,67 @@ class Trainer:
         # **一步没跑**，而 ``self.step (4) >= total (4)`` 成立，于是会拿一个完全
         # 没训练过的模型去评价第三段的最终判据。用完整日程的长度就不会。
         stage_verdict: dict[str, Any] | None = None
-        if self._current_stage is not None and self.step >= schedule_total:
-            last_stage = self.schedule[-1]
-            if last_stage.name == self._current_stage:
-                stage_verdict = self._evaluate_stage_criteria(
-                    self._current_stage,
-                    window_fraction=self._stage_window,
-                    fatal=False,
-                    verbose=verbose,
-                )
+        truncated = self.step < schedule_total
+        if truncated:
+            # 截断的运行**不评价任何阶段**：没跑到的阶段既不算通过也不算失败。
+            stage_verdict = None
+        elif self.check_every <= 0:
+            # 一次检查都没跑，就没有任何验收结论可言。**缺检查不是通过。**
+            stage_verdict = {
+                "event": "criteria",
+                "stage": self._current_stage,
+                "step": int(self.step),
+                "passed": False,
+                "criteria": [],
+                "reason": (
+                    "check_every <= 0, so no acceptance check was executed; a run with "
+                    "no checks cannot be reported as a formal success"
+                ),
+            }
+        elif self._current_stage is not None and (
+            self.schedule[-1].name == self._current_stage
+        ):
+            stage_verdict = self._evaluate_stage_criteria(
+                self._current_stage,
+                window_fraction=self._stage_window,
+                fatal=False,
+                verbose=verbose,
+            )
+        else:
+            # 预算跑满了，却停在**非最后一个**阶段——日程与循环不一致，不能算通过。
+            stage_verdict = {
+                "event": "criteria",
+                "stage": self._current_stage,
+                "step": int(self.step),
+                "passed": False,
+                "criteria": [],
+                "reason": (
+                    "the full schedule ran out but the run is not in its last stage; the "
+                    "final acceptance criteria were never evaluated"
+                ),
+            }
+
+        if diagnostic:
+            status = RUN_DIAGNOSTIC
+        elif truncated:
+            status = RUN_INCOMPLETE
+        elif stage_verdict is not None and stage_verdict.get("passed") is True:
+            status = RUN_COMPLETED
+        else:
+            status = RUN_CRITERIA_FAILED
+
+        # 现在才写最终检查点：它带着上面那个结论。
+        self._final_status = status
+        self._final_stage_verdict = stage_verdict
+        self._save(self.output_dir / "last.pt")
 
         result = TrainingResult(
             output_dir=self.output_dir,
             updates=self.step,
             final_loss=final,
+            status=status,
+            final_loss_step=final_step,
+            final_stage_verdict=stage_verdict,
             history=list(self.history),
             checkpoints=self._checkpoint_paths(),
             metadata={
@@ -620,6 +851,11 @@ class Trainer:
                 "best_check": self.best,
                 "data_compatibility": "unverified" if self.gate.unverified else "verified",
                 "stages": self.stage_history,
+                "status": status,
+                "status_meaning": RUN_STATUS_MEANING.get(status, "unknown status"),
+                "schedule_total_updates": int(schedule_total),
+                "truncated": bool(truncated),
+                "diagnostic": bool(diagnostic),
                 "final_stage_verdict": stage_verdict,
                 "balancing": {
                     "config": self.balance_config.as_dict(),
@@ -628,11 +864,14 @@ class Trainer:
                 "time_window": self.sampler.time_window_state(),
             },
         )
-        (self.output_dir / "run_manifest.json").write_text(
-            json.dumps(result.as_dict(), indent=2, default=_jsonable), encoding="utf-8"
-        )
+        # 落盘顺序：结论已经写进检查点（在 `_save` 里），再写清单与检查历史。
+        # 反过来写的话，中途崩溃会留下一份**有清单、没有结论**的目录，而清单看起来
+        # 是完整的。
         (self.output_dir / "checks.json").write_text(
             json.dumps(self.check_history, indent=2, default=_jsonable), encoding="utf-8"
+        )
+        (self.output_dir / "run_manifest.json").write_text(
+            json.dumps(result.as_dict(), indent=2, default=_jsonable), encoding="utf-8"
         )
         return result
 
@@ -658,12 +897,24 @@ class Trainer:
         """
         if torch is None:  # pragma: no cover
             raise RuntimeError("PyTorch is required")
+        if self._stage_blocked:
+            # 精修会改参数。在一个"判据没过、不允许推进"的状态上精修，等于绕过
+            # 那道闸门——先把判据跑过再说。
+            raise TrainingError(
+                f"refusing to refine while stage {self._pending_stage!r} is blocked on a "
+                "failed acceptance check; resolve the stage first"
+            )
         iterations = min(int(iterations), MAX_LBFGS_ITERATIONS)
         if iterations <= 0:
             return self.run(max_updates=self.step)
 
         batches = self.sampler.batch()
         pde_weight = pde_weight_at(self.step, self.schedule)
+        # **权重必须与训练时一致，而且要记下来。** 以前这里调用 ``total_loss`` 时
+        # 没传 ``weights``，于是精修悄悄退回了基础权重——自适应平衡器算出来的那套
+        # 权重被丢掉了，目标函数与训练时不是同一个，而精修的损失看起来完全正常。
+        weights = self.balancer.weights()
+        self._refine_weights = dict(weights)
         optimizer = torch.optim.LBFGS(
             [p for p in self.model.parameters() if p.requires_grad],
             max_iter=iterations,
@@ -677,6 +928,7 @@ class Trainer:
             breakdown = total_loss(
                 batches,
                 self.model,
+                weights=weights,
                 contact_pressure=self.contact_pressure,
                 pde_weight=pde_weight,
             )
@@ -684,14 +936,48 @@ class Trainer:
             last["total"] = float(breakdown.total.detach())
             return breakdown.total
 
-        optimizer.step(closure)
-        self.history.append(
-            {"step": self.step, "stage": "lbfgs", "total": last.get("total", float("nan")),
-             "lr": 0.0, "pde_weight": pde_weight, "per_case": {}, "terms": {}}
-        )
+        self._lbfgs_closures = 0
+
+        def counted_closure():
+            self._lbfgs_closures += 1
+            return closure()
+
+        optimizer.step(counted_closure)
+        self.refine_history.append({
+            "step": self.step,
+            "iterations_requested": int(iterations),
+            "closures": int(self._lbfgs_closures),
+            "loss_after": last.get("total", float("nan")),
+            "weights": dict(weights),
+            "pde_weight": float(pde_weight),
+            "parameters_changed": True,
+            "resume_supported": False,
+        })
         if verbose:
-            print(f"[lbfgs] fixed-sample refinement -> {last.get('total')}")
-        return self.run(max_updates=self.step)
+            print(
+                f"[lbfgs] fixed-sample refinement -> {last.get('total')} "
+                f"({self._lbfgs_closures} closures)"
+            )
+
+        # **精修改了参数，必须重新评价。** 精修不动 ``step``，所以按"这一步查过了"
+        # 判断会把精修前的结论留在报告里——误差、best/last 与最终结论都对不上当前
+        # 参数。这里显式作废当前指纹下的检查结论，再让收尾流程重查一遍。
+        self._check_fingerprint = None
+        result = self.run(max_updates=self.step, verbose=verbose)
+        # 精修过之后状态一律不是"正式成功"：目标函数中途换过一次，这次运行不再是
+        # 一条单一优化轨迹。要得到正式结论，就重跑一次不含精修的训练。
+        result.status = RUN_DIAGNOSTIC
+        result.metadata["refinement"] = list(self.refine_history)
+        result.metadata["status"] = result.status
+        result.metadata["status_meaning"] = RUN_STATUS_MEANING[RUN_DIAGNOSTIC]
+        result.metadata["refinement_note"] = (
+            "L-BFGS refinement changed the parameters without advancing the step, so "
+            "this run is reported as diagnostic; its objective also changed mid-run"
+        )
+        (self.output_dir / "run_manifest.json").write_text(
+            json.dumps(result.as_dict(), indent=2, default=_jsonable), encoding="utf-8"
+        )
+        return result
 
     # -- 检查点 -----------------------------------------------------------
     def _save(self, path: Path) -> Path:
@@ -718,6 +1004,8 @@ class Trainer:
             # "从第 N 步继续"会换掉采样区间和损失权重，与连续跑 N 步不是同一次
             # 训练——而模型文件本身完全正常，看不出来。
             "balancing": self.balancer.state_dict(),
+            "run_status": getattr(self, "_final_status", None),
+            "final_stage_verdict": getattr(self, "_final_stage_verdict", None),
             "stage": {
                 "current": self._current_stage,
                 "window_fraction": float(self._stage_window),
@@ -776,42 +1064,219 @@ class Trainer:
                 "written by this version."
             )
 
-        # -- 阶段与时间窗口：**先把所有的核对做完，再动这个对象** --------------
+        # -- 第一阶段：只读检查。**一个字节都不改** --------------------------
         #
-        # 以前这一段排在 ``load_state_dict`` 之后：窗口对不上时抛错，但模型、
-        # 优化器、步数与随机状态**已经装进去了**。调用者收到"恢复失败"，手里的
-        # 对象却已经不是加载前的那个——一个静静发生的半加载状态：它既不是原来的
-        # 训练，也不是检查点里的训练，而任何后续操作都会把它当成前者。
-        stage_payload = payload.get("stage") or {}
-        stored_step = int(payload["step"])
-        stored_window = stage_payload.get("window_fraction")
-        blocked = bool(stage_payload.get("blocked", False))
-        # 允许的窗口：按步数推算的那个，**以及**检查点自己记的那个阶段窗口。
-        # 后者覆盖"更新跑完了、判据没过、还没允许推进"这一档——那时步数已经在
-        # 边界上，按步数推算得到的是下一阶段，而实际用的还是上一阶段的窗口。
-        allowed = {time_window_fraction_at(stored_step, self.schedule)}
-        recorded_stage = stage_payload.get("current")
-        for stage in self.schedule:
-            if stage.name == recorded_stage:
-                allowed.add(float(stage.time_window_fraction))
-        if stored_window is not None and not any(
-            abs(float(stored_window) - value) <= 1.0e-12 for value in allowed
+        # 上一轮只把"窗口检查"挪到了前面，于是窗口之外的失败点仍然会半加载：
+        # 非法采样器 RNG、缺 ``window_fraction``、模型/优化器键不匹配，全都在
+        # 模型、优化器、步数与全局 RNG 已经改掉之后才报错。下面把**全部**前置
+        # 条件一次查完，任何一条不成立都在提交之前退出。
+        if not isinstance(payload["step"], (int, np.integer)):
+            raise TrainingError(
+                f"the checkpoint's step is {payload['step']!r}, not an integer"
+            )
+        if not isinstance(payload.get("model"), Mapping) or not isinstance(
+            payload.get("optimizer"), Mapping
         ):
             raise TrainingError(
-                f"the checkpoint was written in a stage whose time window is "
-                f"{stored_window}, but step {stored_step} of this schedule allows "
-                f"{sorted(allowed)}; the two schedules are not the same"
+                "the checkpoint must carry 'model' and 'optimizer' state dictionaries"
+            )
+        # 模型状态必须与本模型的键、形状完全对得上——先比，别等 load_state_dict
+        # 装到一半才发现。
+        current = self.model.state_dict()
+        stored_model = payload["model"]
+        missing = [key for key in current if key not in stored_model]
+        unexpected = [key for key in stored_model if key not in current]
+        if missing or unexpected:
+            raise TrainingError(
+                f"the checkpoint's model state does not match this model: missing "
+                f"{missing[:4]}, unexpected {unexpected[:4]}"
+            )
+        mismatched = [
+            key for key, value in current.items()
+            if tuple(stored_model[key].shape) != tuple(value.shape)
+        ]
+        if mismatched:
+            raise TrainingError(
+                f"the checkpoint's model state has the wrong shapes for {mismatched[:4]}"
+            )
+        if not isinstance(payload.get("balancing"), Mapping):
+            raise TrainingError(
+                "the checkpoint carries no adaptive-weight state; restoring without it "
+                "would silently fall back to the base weights"
+            )
+        # 采样器随机状态：结构、版本、每个算例的键一次查完。采样器抛的是
+        # ``SamplingError``；恢复的调用方要的是 ``TrainingError``，所以在这里
+        # 转一次，并保留它给出的**实际原因**（不把所有不兼容都说成"日程错误"）。
+        try:
+            self.sampler.validate_rng_state(payload["sampler_rng"])
+        except Exception as exc:
+            raise TrainingError(f"the checkpoint's sampler RNG state is not usable: {exc}") from exc
+
+        stage_payload = payload.get("stage")
+        if not isinstance(stage_payload, Mapping):
+            raise TrainingError(
+                "the checkpoint carries no 'stage' block; the training stage, its time "
+                "window and any pending stage verdict cannot be reconstructed"
+            )
+        for key in ("current", "window_fraction", "pending", "blocked"):
+            if key not in stage_payload:
+                raise TrainingError(
+                    f"the checkpoint's 'stage' block has no {key!r}. A missing record is "
+                    "not a pass: an older writer that omitted 'blocked' would be read as "
+                    "'no pending verdict', which is exactly the state this field exists "
+                    "to distinguish"
+                )
+        stored_step = int(payload["step"])
+        stored_window = stage_payload["window_fraction"]
+        if not isinstance(stored_window, (int, float, np.floating)) or not np.isfinite(
+            float(stored_window)
+        ):
+            raise TrainingError(
+                f"the checkpoint's stage window is {stored_window!r}, not a finite number"
+            )
+        recorded_stage = stage_payload["current"]
+        if recorded_stage is not None and recorded_stage not in {
+            stage.name for stage in self.schedule
+        }:
+            raise TrainingError(
+                f"the checkpoint was written in stage {recorded_stage!r}, which this "
+                "schedule does not define; refusing rather than guessing a stage"
+            )
+        # 允许的窗口**不是**"按步数算出的、或者任何一个记录过的阶段窗口"——那太松
+        # 了：任何阶段窗口都会被接受一次，等于把"窗口对不上"这件事放过去。真正的
+        # 一致性条件按**阻塞与否**分成两条：
+        #
+        # * 未阻塞：步数已经推进到下一阶段，窗口必须就是该步数所属阶段的窗口；
+        # * 已阻塞：步数停在边界上、阶段没切，窗口必须是**那个未切走的阶段**的窗口，
+        #   而且被阻塞的阶段必须正是它。
+        #
+        # 两条都是精确等值，不是"属于某个集合"。
+        blocked = bool(stage_payload["blocked"])
+        pending = stage_payload["pending"]
+        stage_window_of = {
+            stage.name: float(stage.time_window_fraction) for stage in self.schedule
+        }
+        if blocked:
+            if pending not in stage_window_of:
+                raise TrainingError(
+                    f"the checkpoint is marked blocked on stage {pending!r}, which this "
+                    "schedule does not define"
+                )
+            if recorded_stage != pending:
+                raise TrainingError(
+                    f"the checkpoint is blocked on {pending!r} but records its current "
+                    f"stage as {recorded_stage!r}; a blocked checkpoint must still be "
+                    "sitting in the stage whose criteria failed"
+                )
+            expected_window = stage_window_of[recorded_stage]
+        else:
+            if pending is not None:
+                raise TrainingError(
+                    f"the checkpoint records a pending stage {pending!r} but is not "
+                    "marked blocked; the two fields must agree"
+                )
+            expected_window = time_window_fraction_at(stored_step, self.schedule)
+        if abs(float(stored_window) - float(expected_window)) > 1.0e-12:
+            raise TrainingError(
+                f"the checkpoint's stage window is {stored_window}, but "
+                f"{'the blocked stage' if blocked else 'step'} "
+                f"{recorded_stage if blocked else stored_step} of this schedule requires "
+                f"{expected_window}; this is not the same schedule"
             )
 
-        # 校验全部通过，从这里开始才改对象
+        # ---- 第二阶段：真正提交。任何一步失败都要把对象还原回去 --------------
+        #
+        # "先把几个 if 挪到前面"不等于事务性：模型/优化器的 ``load_state_dict``
+        # 本身就可能在中途抛错（键不匹配、形状不符、优化器状态里引用了别的参数
+        # 组），那时前面的检查全过了也没用。所以这里对**所有**受影响的状态做快照，
+        # 提交过程中任何异常都完整回滚——包括全局随机状态，它同样是被改过的。
+        snapshot = self._snapshot_state()
+        try:
+            self._commit_checkpoint(payload, stored_window, recorded_stage, stage_payload)
+        except Exception:
+            self._restore_state(snapshot)
+            raise
+
+    # -- 恢复的提交与回滚（提示词 §3）--------------------------------------
+
+    def _snapshot_state(self) -> dict[str, Any]:
+        """把所有会被 ``load`` 改到的状态拷一份。
+
+        覆盖：模型、优化器、步数、历史、best、阶段/窗口/待决/阻塞、平衡器、
+        各采样器（含窗口与 RNG）、全局随机状态。
+        """
+        import copy as _copy
+
+        return {
+            "model": {
+                key: value.detach().clone()
+                for key, value in self.model.state_dict().items()
+            },
+            "optimizer": _copy.deepcopy(self.optimizer.state_dict()),
+            "step": int(self.step),
+            "history": _copy.deepcopy(self.history),
+            "check_history": _copy.deepcopy(self.check_history),
+            "best": _copy.deepcopy(self.best),
+            "current_stage": self._current_stage,
+            "stage_window": float(self._stage_window),
+            "pending_stage": self._pending_stage,
+            "stage_blocked": bool(self._stage_blocked),
+            "stage_history": _copy.deepcopy(self.stage_history),
+            "balancer": _copy.deepcopy(self.balancer.state_dict()),
+            "rng": _snapshot_global_rng(),
+            "samplers": [
+                {
+                    "sampler": sampler,
+                    "window": float(sampler.window_fraction),
+                    "rng": _copy.deepcopy(sampler.rng_state()),
+                }
+                for sampler in self.sampler.samplers
+            ],
+            "last_update_loss": float(self._last_update_loss),
+            "last_update_loss_step": int(self._last_update_loss_step),
+            "final_status": getattr(self, "_final_status", None),
+            "final_verdict": getattr(self, "_final_stage_verdict", None),
+        }
+
+    def _restore_state(self, snapshot: Mapping[str, Any]) -> None:
+        self.model.load_state_dict(snapshot["model"])
+        self.optimizer.load_state_dict(snapshot["optimizer"])
+        self.step = int(snapshot["step"])
+        self.history = list(snapshot["history"])
+        self.check_history = list(snapshot["check_history"])
+        self.best = snapshot["best"]
+        self._current_stage = snapshot["current_stage"]
+        self._stage_window = float(snapshot["stage_window"])
+        self._pending_stage = snapshot["pending_stage"]
+        self._stage_blocked = bool(snapshot["stage_blocked"])
+        self.stage_history = list(snapshot["stage_history"])
+        self.balancer.load_state_dict(snapshot["balancer"])
+        _restore_global_rng(snapshot["rng"])
+        for entry in snapshot["samplers"]:
+            sampler = entry["sampler"]
+            # 回滚要能**收窄**窗口，所以走 restore_ 而不是 set_。
+            sampler.restore_time_window(entry["window"])
+            sampler.set_rng_state(entry["rng"])
+        self._last_update_loss = float(snapshot["last_update_loss"])
+        self._last_update_loss_step = int(snapshot["last_update_loss_step"])
+        self._final_status = snapshot["final_status"]
+        self._final_stage_verdict = snapshot["final_verdict"]
+
+    def _commit_checkpoint(
+        self,
+        payload: Mapping[str, Any],
+        stored_window: float,
+        recorded_stage: str | None,
+        stage_payload: Mapping[str, Any],
+    ) -> None:
         self.model.load_state_dict(payload["model"])
         self.optimizer.load_state_dict(payload["optimizer"])
-        self.step = stored_step
+        self.step = int(payload["step"])
         self.history = list(payload.get("history", []))
         self.check_history = list(payload.get("checks", []))
         self.best = payload.get("best_check")
         _restore_rng(payload.get("rng"))
-        self.sampler.set_rng_state(payload.get("sampler_rng"))
+        self.sampler.set_rng_state(payload["sampler_rng"])
 
         # 恢复**当时实际在用**的窗口，而不是按步数另算一个。两者在正常路径上
         # 相等（上面的核对保证了这一点），在"判据未过、尚未推进"那一档上前者
@@ -819,8 +1284,10 @@ class Trainer:
         self.sampler.set_time_window(float(stored_window))
         self._stage_window = float(stored_window)
         self._current_stage = recorded_stage
-        self._pending_stage = stage_payload.get("pending")
-        self._stage_blocked = blocked
+        self._pending_stage = stage_payload["pending"]
+        self._stage_blocked = bool(stage_payload["blocked"])
+        self._final_status = payload.get("run_status")
+        self._final_stage_verdict = payload.get("final_stage_verdict")
         self.stage_history = list(stage_payload.get("history", []))
         self.balancer.load_state_dict(payload.get("balancing"))
 
@@ -856,6 +1323,36 @@ def _rng_state(seed: int) -> dict[str, Any]:
     if torch is not None:
         state["torch"] = torch.get_rng_state()
     return state
+
+
+def _snapshot_global_rng() -> dict[str, Any]:
+    """当前全局随机状态的快照，供回滚用。
+
+    与 :func:`_rng_state` 的区别是它**不绑定 seed 语义**：回滚要还原的是"现在
+    这一刻"的状态，不是"某一次运行开始时的"。
+    """
+    import random
+
+    state: dict[str, Any] = {"python": None, "numpy": None, "torch": None}
+    state["python"] = random.getstate()
+    state["numpy"] = np.random.get_state()
+    if torch is not None:
+        state["torch"] = torch.get_rng_state()
+    return state
+
+
+def _restore_global_rng(payload: Mapping[str, Any] | None) -> None:
+    """还原 :func:`_snapshot_global_rng` 的快照。"""
+    if not payload:  # pragma: no cover - defensive
+        return
+    import random
+
+    if payload.get("python") is not None:
+        random.setstate(payload["python"])
+    if payload.get("numpy") is not None:
+        np.random.set_state(payload["numpy"])
+    if torch is not None and payload.get("torch") is not None:
+        torch.set_rng_state(payload["torch"])
 
 
 def _restore_rng(payload: Mapping[str, Any] | None) -> None:

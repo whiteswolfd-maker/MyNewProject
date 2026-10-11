@@ -1,0 +1,38 @@
+{
+  "charge_radius_m": 0.08,
+  "start_time_s": 1.5999999999999997e-06,
+  "time_origin": "physical_time = pinn_time + start_time, applied exactly once here",
+  "time_end_physical_s": 0.00014388155811781406,
+  "time_end_source": "default: the end of the training scaled-time coverage, mapped to this radius through t_phys = s hat T_* R_0 / U_* + epsilon(R_0)",
+  "n_times": 200,
+  "n_radii": 600,
+  "scaled_time_coverage_s_max": 1.0,
+  "scaled_time_coverage_provenance": {
+    "definition": "max over training cases of s = hat_t / hat T_*, hat_t = U_* t_PINN / R_0",
+    "time_scale": 3.4122469046263957,
+    "s_max": 1.0,
+    "governing_radius": 0.1,
+    "per_case": {
+      "0.05": {
+        "pinn_time_max": 4.7944821173790845e-05,
+        "hat_t_max": 1.8397275914863713,
+        "s_max": 0.5391543000572526
+      },
+      "0.08": {
+        "pinn_time_max": 0.00012826840738449245,
+        "hat_t_max": 3.076178542384775,
+        "s_max": 0.9015111240086489
+      },
+      "0.1": {
+        "pinn_time_max": 0.00017785194764726757,
+        "hat_t_max": 3.4122469046263957,
+        "s_max": 1.0
+      }
+    },
+    "radius_independent": true
+  },
+  "n_extrapolated_times": 0,
+  "checkpoint": "outputs/final/best.pt",
+  "physics_parameters_source": "checkpoint provenance, not the target radius data",
+  "target_radius_truth_used": false
+}

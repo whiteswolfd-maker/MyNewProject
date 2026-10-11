@@ -1,0 +1,75 @@
+{
+  "reference_radius_m": 0.05,
+  "start_time_s": 1e-06,
+  "initial_product_pressure_pa": 8220261897.155153,
+  "derived": {
+    "e_star_j_kg": 3680981.5950920247,
+    "u_star_m_s": 1918.588438173238,
+    "product_pressure_scale_pa": 6000000000.0,
+    "air_pressure_scale_pa": 4509202.453987731
+  },
+  "field": {
+    "reference_radius": 0.05,
+    "n_times": 21,
+    "n_cells": 1148,
+    "n_product_cells": 600,
+    "time_min": 4.105979898347196e-09,
+    "time_max": 4e-06,
+    "cell_radius_min": 6.614171049867502e-05,
+    "cell_radius_max": 1.9964096358814072,
+    "spatial_coordinates": "per-frame current Lagrangian cell centres; queries are interpolated within the material block each query point belongs to at that frame",
+    "cells_inside": 600,
+    "cfl": 0.2,
+    "contact_displacement_over_R0": 1.3185501244519415,
+    "growth": 1.01,
+    "initial_condition": "scheme A: whole charge converts at t=0 (uniform, at rest, e = E0/rho0)",
+    "max_cell_displacement_over_R0": 0.3177803749301637,
+    "mesh": {
+      "air_cells": 548,
+      "charge_radius": 0.05,
+      "max_width": 0.019450536587848788,
+      "min_width": 8.33333333333311e-05,
+      "n_cells": 1148,
+      "outer_radius": 2.0060875287060536,
+      "product_cells": 600
+    },
+    "method": "1D spherical Lagrangian finite volume, staggered, von Neumann-Richtmyer viscosity",
+    "outer_radius_factor": 40.0,
+    "q1": 1.5,
+    "q2": 0.06,
+    "steps": 14342,
+    "total_mass_final": 3.364452066557008,
+    "total_mass_initial": 3.364452066557008
+  },
+  "checks": {
+    "min_density": 1.2249999999999999,
+    "min_specific_energy": 206785.71428571432,
+    "min_pressure": 101324.99999999999,
+    "mass_relative_drift": 0.0,
+    "contact_over_R0_at_start_time": 1.0787175119649817,
+    "shock_over_R0_at_start_time": 1.0930406639749721,
+    "gap_m_at_start_time": 0.0007161576004995202,
+    "outer_boundary_undisturbed": {
+      "max_relative_pressure_excess": 1.4361623714154308e-16,
+      "max_absolute_velocity": 1.2520588101230868e-15,
+      "n_cells_inspected": 5
+    },
+    "positive_ok": true
+  },
+  "material": {
+    "jwl": {
+      "A": 371200000000.0,
+      "B": 3747100000.0,
+      "R1": 4.15,
+      "R2": 0.95,
+      "omega": 0.3,
+      "rho0": 1630.0,
+      "energy_shift": 0.0
+    },
+    "rho0": 1630.0,
+    "E0_volume_energy": 6000000000.0,
+    "gamma_air": 1.4,
+    "air_density": 1.225,
+    "air_pressure": 101325.0
+  }
+}

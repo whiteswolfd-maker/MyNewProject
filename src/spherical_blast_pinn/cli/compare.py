@@ -251,9 +251,29 @@ def compare_fields(prediction: dict[str, Any], case, *, buffer_cells: int = 3) -
         for medium in ("product", "air")
         for name in field_names
     }
+    #: 每个字段的**全程计数**。每一类都单独记，且这些类**互斥**：候选点 =
+    #: 参考缺测 + 域外 + 保护区 + 区域错配 + 插值不可用 + 模型非有限 + 实际比较。
+    #: 记这几个数不是装饰——"三个候选点里一个预测是 NaN"这件事只有在这一列里
+    #: 才看得见，否则它就从分母里消失了。
+    counts = {
+        f"{medium}_{name}": dict.fromkeys(
+            ("candidates", "reference_missing", "model_non_finite",
+             "outside_domain", "buffer_zone", "region_mismatch",
+             "interpolation_unavailable", "unclassified", "compared"),
+            0,
+        )
+        for medium in ("product", "air")
+        for name in field_names
+    }
     mismatch = {medium: 0 for medium in ("product", "air", "ambient")}
     excluded_inside_prediction_domain = 0
     compared_cells = 0
+    # 参考数据用的是逐字段有效性还是那张联合掩码——退化要写出来。
+    validity_source = (
+        "per-field validity (case.field_validity)"
+        if getattr(case, "field_validity", None) is not None
+        else "joint `case.valid` mask (per-field validity not recorded on this case)"
+    )
 
     for frame in frames:
         physical_time = float(case.times[frame])
@@ -276,32 +296,63 @@ def compare_fields(prediction: dict[str, Any], case, *, buffer_cells: int = 3) -
                 # 一样地"好看"，衡量不出任何东西（见 README 第八节）。
                 continue
 
-            valid = case.valid[frame] & reference_here & (region == label)
             contact = case.contact_radius[frame]
             shock = case.shock_radius[frame]
             near = (np.abs(case.radius - contact) <= buffer_cells * cell) | (
                 np.abs(case.radius - shock) <= buffer_cells * cell
             )
-            valid = valid & ~near
-            indices = np.flatnonzero(valid)
+            indices = np.flatnonzero(reference_here)
             if indices.size == 0:
                 continue
             radii_sample = case.radius[indices]
             values = case.sample_at(int(frame), radii_sample)
             weights = 4.0 * np.pi * radii_sample**2 * cell
+            inside = (region[indices] >= 0)
+            in_region = region[indices] == label
+            in_buffer = near[indices]
 
             for name in field_names:
-                reference = values[name]
-                model = _field_at(
-                    prediction, name, radii_sample, physical_time
+                key = f"{medium}_{name}"
+                entry = counts[key]
+                entry["candidates"] += int(indices.size)
+                # **逐字段有效性**（§11.1）：一个字段缺失不该丢掉同一位置其他
+                # 可靠的字段。以前这里用的是 ``case.valid``——那是"四项联合可用"
+                # 的掩码，于是独立有效的字段在评估里被一起丢掉，而训练采样早就
+                # 改成逐字段了。训练与评估用两套有效性，评估出来的误差不是同一个
+                # 量。
+                field_valid = _field_validity_at(case, frame, name, indices)
+                outside = ~inside
+                entry["outside_domain"] += int(np.count_nonzero(outside))
+                entry["region_mismatch"] += int(
+                    np.count_nonzero(~outside & ~in_region)
                 )
-                good = np.isfinite(reference) & np.isfinite(model)
+                entry["buffer_zone"] += int(
+                    np.count_nonzero(~outside & in_region & in_buffer)
+                )
+                position_ok = (~outside) & in_region & (~in_buffer)
+                # ``reference_missing`` 只记**位置本来可用、但这个字段自己没有效**
+                # 的点。写成 ``count_nonzero(~keep)`` 会把域外、错配、保护区一起算
+                # 进来——那三类已经在上面各自记过，再加一遍就是重复计数。
+                keep = position_ok & field_valid
+                entry["reference_missing"] += int(
+                    np.count_nonzero(position_ok & ~field_valid)
+                )
+                if not np.any(keep):
+                    continue
+                reference = values[name][keep]
+                model = _field_at(prediction, name, radii_sample[keep], physical_time)
+                model_bad = ~np.isfinite(model)
+                entry["model_non_finite"] += int(np.count_nonzero(model_bad))
+                good = np.isfinite(reference) & ~model_bad
+                entry["compared"] += int(np.count_nonzero(good))
+                entry["unclassified"] += int(
+                    np.count_nonzero(~np.isfinite(reference) & ~model_bad)
+                )
                 if not np.any(good):
                     continue
-                w = weights[good]
+                w = weights[keep][good]
                 difference = model[good] - reference[good]
                 scale = medium_scale[name][medium]
-                key = f"{medium}_{name}"
                 totals[key]["num"] += float(np.sum(w * (difference / scale) ** 2))
                 totals[key]["den"] += float(np.sum(w))
                 totals[key]["n"] += int(np.count_nonzero(good))
@@ -329,12 +380,37 @@ def compare_fields(prediction: dict[str, Any], case, *, buffer_cells: int = 3) -
         "region_mismatch_cells": mismatch,
         "region_mismatch_total": int(sum(mismatch.values())),
         "cells_outside_prediction_grid": int(excluded_inside_prediction_domain),
+        "validity_source": validity_source,
+        "counts": counts,
+        "counts_meaning": (
+            "per medium and field, mutually exclusive: candidates = "
+            "reference_missing + outside_domain + region_mismatch + buffer_zone + "
+            "compared, and within the kept subset every point is either compared or "
+            "counted in model_non_finite / unclassified"
+        ),
     }
+    incomplete: list[str] = []
     for key, entry in totals.items():
         if entry["den"] > 0.0:
             result[f"{key}_relative_l2"] = float(np.sqrt(entry["num"] / entry["den"]))
             result[f"{key}_n_points"] = entry["n"]
             result[f"{key}_max_abs_error"] = entry["max_abs"]
+        else:
+            # **零样本不是零误差。** 以前这一项直接不出现在结果里，读的人看到的
+            # 是一张少了行的表，而不是"这一项没法评价"。
+            result[f"{key}_available"] = False
+            result[f"{key}_relative_l2"] = float("nan")
+            incomplete.append(key)
+        if counts[key]["model_non_finite"] > 0:
+            incomplete.append(f"{key} (model non-finite: {counts[key]['model_non_finite']})")
+    result["unavailable_fields"] = sorted(set(incomplete))
+    result["complete"] = not incomplete
+    result["note_on_incomplete"] = (
+        "fields listed in unavailable_fields did not contribute a usable error: either no "
+        "comparable point existed, or the model returned non-finite values there. A "
+        "finite-subset error is still reported for the rest, and it does not certify the "
+        "whole evaluation"
+    )
     for medium in ("product", "air"):
         keys = [f"{medium}_{name}_relative_l2" for name in field_names]
         present = [result[k] for k in keys if k in result]
@@ -342,6 +418,19 @@ def compare_fields(prediction: dict[str, Any], case, *, buffer_cells: int = 3) -
             float(np.mean(present)) if present else float("nan")
         )
     return result
+
+
+def _field_validity_at(case, frame: int, name: str, indices: np.ndarray) -> np.ndarray:
+    """某个字段在第 ``frame`` 帧上、``indices`` 这些位置处的可用性。
+
+    有逐字段记录就用它；没有就退回联合掩码，并把退化写进 ``validity_source``。
+    训练采样早就按字段各自取点了，评估这一侧以前还在用联合掩码——两边不是同一个
+    有效性，算出来的误差也就不是同一个量。
+    """
+    validity = getattr(case, "field_validity", None)
+    if validity is not None and name in validity:
+        return np.asarray(validity[name][frame], dtype=bool)[indices]
+    return np.asarray(case.valid[frame], dtype=bool)[indices]
 
 
 def _field_at(prediction, name: str, radii, physical_time: float) -> np.ndarray:

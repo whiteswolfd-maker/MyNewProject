@@ -25,6 +25,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .provenance import evaluate_partition_source
+
 #: 契约结构的版本。**字段含义变了就要 +1**——提取器、材料映射、几何、前沿检测、
 #: 字段有效性、观测语义，任何一项的语义变化都会让旧数据不再满足新契约。
 CONTRACT_VERSION = 2
@@ -134,10 +136,35 @@ def _symmetry_factor(source: Mapping[str, Any]) -> tuple[float | None, list[str]
     return factor, problems
 
 
+def _structural_problems(case: Any) -> list[str]:
+    """对**已经构造好的对象**再做一遍结构检查（提示词 §4）。
+
+    读取时的校验只保护"从文件读进来的那一份"。一个直接构造出来的、或者读完之后被
+    改过的对象完全没有经过它——复核就是这么做的：读取后把 velocity 改成错误形状，
+    再直接调契约，仍然 ``ready=True``。契约不能信任"据说读取过"。
+
+    这里以前把要检查的数组**又列了一遍**（只列了七个），与读取端各查各的；漏掉的
+    那几项改坏了照样判就绪。现在整件事交给 ``validate_case_object``——**对象上有什么
+    就查什么**，清单不再由这里维护。
+    """
+    from .extracted_case import DataError, validate_case_object
+
+    try:
+        validate_case_object(case, path=getattr(case, "case_id", "<case>"))
+    except DataError as exc:
+        return [f"结构检查未通过：{exc}"]
+    except Exception as exc:  # noqa: BLE001 - 契约是报告工具，不崩
+        return [f"结构检查无法完成：{exc.__class__.__name__}: {exc}"]
+    return []
+
+
 def evaluate_case_contract(case: Any) -> ContractVerdict:
     """单个算例的契约检查。"""
     reasons: list[str] = []
     detail: dict[str, Any] = {"case_id": getattr(case, "case_id", None)}
+    structural = _structural_problems(case)
+    detail["structural_problems"] = structural
+    reasons.extend(structural)
     source = dict(getattr(case, "source", {}) or {})
 
     # -- 算例标识与几何 ---------------------------------------------------
@@ -215,11 +242,19 @@ def evaluate_case_contract(case: Any) -> ContractVerdict:
     declared = source.get("material_partition_is_volume_fraction_based")
     authoritative = declared is True
     detail["material_partition_is_volume_fraction_based"] = declared
-    # **标志之外还要有来源记录。** 只有一个布尔量时，那个 True 是谁写的、依据是什么
-    # 都无从核对——上一轮的教训正是"判据从信任说明文字换成信任读取器"。标志与来源
-    # 记录必须同时存在，且各说各的：标志说"是不是"，来源记录说"从哪来的"。
-    recorded_source = str(source.get("material_partition_source_recorded") or "").strip()
-    detail["material_partition_source_recorded"] = recorded_source or None
+    # **来源必须是结构化的，而且要与布尔声明互相印证。**
+    #
+    # 走过的两个弯路：先是用自由文本加子串匹配（"not from volume fraction" 被读成
+    # 肯定），再是"必须有一个非空值"（数字 123、任意字典、一句否认都能通过）。
+    # 两者是同一个毛病——都没有核实来源，只是换了一种方式相信它。现在按
+    # `data/provenance.py` 的模式检查结构、类型、版本、必填字段与一致性。
+    recorded_source = source.get("material_partition_source_recorded")
+    detail["material_partition_source_recorded"] = recorded_source
+    source_verdict = evaluate_partition_source(
+        recorded_source, declared_volume_fraction=declared
+    )
+    detail["material_partition_source_ok"] = source_verdict.ok
+    detail["material_partition_method"] = source_verdict.method
     if not authoritative:
         recorded = (
             "提取器没有留下这个标志（未核实）" if declared is None
@@ -231,11 +266,9 @@ def evaluate_case_contract(case: Any) -> ContractVerdict:
             "给出的接触面位置有量化跳变、大量帧落在装药半径以内（物理上不可能）。"
             "契约上判为未就绪——权威分区必须重新提取"
         )
-    elif not recorded_source:
-        reasons.append(
-            "材料分区声明为体积分数来源，但**没有留下结构化来源记录**"
-            "（material_partition_source）：只有一个是/否标志时，那个 True 是谁写的、"
-            "依据是什么都无从核对"
+    else:
+        reasons.extend(
+            f"材料分区的来源记录不合规：{problem}" for problem in source_verdict.problems
         )
 
     # -- 每个场量各自的有效性（§11.1）-------------------------------------

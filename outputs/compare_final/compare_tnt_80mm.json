@@ -1,0 +1,196 @@
+{
+  "case_id": "tnt_80mm",
+  "charge_radius_m": 0.08,
+  "checks": {
+    "units": "\u4e24\u4fa7\u5747\u4e3a SI",
+    "charge_radius_match": true,
+    "time_origin_s": 1.5999999999999997e-06,
+    "reference_time_origin_s": 1.5999999999999997e-06,
+    "time_origin_match": true,
+    "time_origin_rule": "t_PINN = t_phys - epsilon(R_0); the prediction's physical_time already carries the shift, so nothing is shifted again here",
+    "time_alignment_optimised": false,
+    "scaled_time_coverage_s_max": 1.0
+  },
+  "trajectories": {
+    "available": true,
+    "normalisation": "charge radius R_0 (fixed, from the prediction's own scales)",
+    "n_overlap_points": 330,
+    "overlap_physical_time_s": [
+      1.2297861512617597e-05,
+      0.00012961774276765725
+    ],
+    "contact_relative_rms": 0.7098271434355508,
+    "shock_relative_rms": 5.945249052483847,
+    "shock_arrival": {
+      "r_over_R0_2": {
+        "model_s": null,
+        "reference_s": null,
+        "absolute_error_s": null,
+        "relative_error": null
+      },
+      "r_over_R0_5": {
+        "model_s": null,
+        "reference_s": 4.079349894643045e-05,
+        "absolute_error_s": null,
+        "relative_error": null
+      },
+      "r_over_R0_10": {
+        "model_s": null,
+        "reference_s": null,
+        "absolute_error_s": null,
+        "relative_error": null
+      }
+    }
+  },
+  "fields": {
+    "available": true,
+    "metric": "sqrt( sum_shell w (model - reference)^2 / sum_shell w ) / scale, w = 4 pi r^2 dr (spherical shell volume), scale = fixed physical scale from the checkpoint",
+    "buffer_cells": 3,
+    "buffer_width_m": 0.0030012004801922565,
+    "buffer_basis": "reference data radial resolution, fixed before the comparison",
+    "volume_weighted": true,
+    "normalisation_scales": {
+      "density_product": 1630.0,
+      "density_air": 1.225,
+      "velocity": 1918.588438173238,
+      "specific_energy": 3680981.5950920247
+    },
+    "reference_label_semantics": "0=product, 1=air, 2=undisturbed ambient",
+    "ambient_cells_excluded": true,
+    "compared_cells": 65000,
+    "region_mismatch_cells": {
+      "product": 1650,
+      "air": 12073,
+      "ambient": 0
+    },
+    "region_mismatch_total": 13723,
+    "cells_outside_prediction_grid": 0,
+    "product_density_relative_l2": 0.12862001870221537,
+    "product_density_n_points": 2214,
+    "product_density_max_abs_error": 1378.792965619711,
+    "product_velocity_relative_l2": 0.0759893029725415,
+    "product_velocity_n_points": 2214,
+    "product_velocity_max_abs_error": 1467.1603971947916,
+    "product_specific_energy_relative_l2": 0.2093071410974094,
+    "product_specific_energy_n_points": 2214,
+    "product_specific_energy_max_abs_error": 6264854.765749818,
+    "product_relative_l2_over_fields": 0.13797215425738876,
+    "air_relative_l2_over_fields": NaN
+  },
+  "gauges": [
+    {
+      "radius_m": 0.16,
+      "model": {
+        "radius_m": 0.16,
+        "peak_overpressure_pa": 0.0,
+        "arrival_time_s": NaN,
+        "positive_duration_s": NaN,
+        "positive_impulse_pa_s": NaN,
+        "negative_impulse_pa_s": NaN,
+        "positive_phase_complete": false,
+        "notes": [
+          "\u6574\u6761\u65f6\u7a0b\u90fd\u6ca1\u6709\u6b63\u8d85\u538b"
+        ]
+      },
+      "reference": {
+        "radius_m": 0.16,
+        "peak_overpressure_pa": 329350016.4803217,
+        "arrival_time_s": 1.0895044159209702e-05,
+        "positive_duration_s": 0.00010169907890141072,
+        "positive_impulse_pa_s": 749.5633029658775,
+        "negative_impulse_pa_s": -1.058761886183575,
+        "positive_phase_complete": true,
+        "notes": []
+      },
+      "relative_errors": {
+        "peak_overpressure_relative": 1.0,
+        "arrival_time_relative": NaN,
+        "positive_duration_relative": NaN,
+        "positive_impulse_relative": NaN
+      },
+      "absolute_errors": {
+        "peak_overpressure_pa": -329350016.4803217,
+        "arrival_time_s": NaN,
+        "positive_duration_s": NaN,
+        "positive_impulse_pa_s": NaN
+      },
+      "notes": []
+    },
+    {
+      "radius_m": 0.4,
+      "model": {
+        "radius_m": 0.4,
+        "peak_overpressure_pa": 0.0,
+        "arrival_time_s": NaN,
+        "positive_duration_s": NaN,
+        "positive_impulse_pa_s": NaN,
+        "negative_impulse_pa_s": NaN,
+        "positive_phase_complete": false,
+        "notes": [
+          "\u6574\u6761\u65f6\u7a0b\u90fd\u6ca1\u6709\u6b63\u8d85\u538b"
+        ]
+      },
+      "reference": {
+        "radius_m": 0.4,
+        "peak_overpressure_pa": 722149.1285277187,
+        "arrival_time_s": 3.730613138399873e-05,
+        "positive_duration_s": 4.948896117493134e-05,
+        "positive_impulse_pa_s": 13.466128882284885,
+        "negative_impulse_pa_s": -1.6381665269179388,
+        "positive_phase_complete": true,
+        "notes": []
+      },
+      "relative_errors": {
+        "peak_overpressure_relative": 1.0,
+        "arrival_time_relative": NaN,
+        "positive_duration_relative": NaN,
+        "positive_impulse_relative": NaN
+      },
+      "absolute_errors": {
+        "peak_overpressure_pa": -722149.1285277187,
+        "arrival_time_s": NaN,
+        "positive_duration_s": NaN,
+        "positive_impulse_pa_s": NaN
+      },
+      "notes": []
+    },
+    {
+      "radius_m": 0.8,
+      "model": {
+        "radius_m": 0.8,
+        "peak_overpressure_pa": 0.0,
+        "arrival_time_s": NaN,
+        "positive_duration_s": NaN,
+        "positive_impulse_pa_s": NaN,
+        "negative_impulse_pa_s": NaN,
+        "positive_phase_complete": false,
+        "notes": [
+          "\u6574\u6761\u65f6\u7a0b\u90fd\u6ca1\u6709\u6b63\u8d85\u538b"
+        ]
+      },
+      "reference": {
+        "radius_m": 0.8,
+        "peak_overpressure_pa": 13422.284082081314,
+        "arrival_time_s": 0.0001372619020519979,
+        "positive_duration_s": 6.619656065816174e-06,
+        "positive_impulse_pa_s": 0.053556184680118635,
+        "negative_impulse_pa_s": NaN,
+        "positive_phase_complete": false,
+        "notes": [
+          "\u66f2\u7ebf\u5728\u6b63\u538b\u9636\u6bb5\u7ed3\u675f\u4e4b\u524d\u88ab\u7ec8\u6b62\u65f6\u95f4\u622a\u65ad\uff1a\u6b63\u76f8\u51b2\u91cf\u6807\u4e3a\u4e0d\u5b8c\u6574\uff0c\u4e0d\u4f5c\u4e3a\u5b8c\u6574\u7684\u6b63\u76f8\u51b2\u91cf\u4f7f\u7528"
+        ]
+      },
+      "relative_errors": {
+        "peak_overpressure_relative": 0.1324676445307803,
+        "arrival_time_relative": NaN
+      },
+      "absolute_errors": {
+        "peak_overpressure_pa": -13422.284082081314,
+        "arrival_time_s": NaN
+      },
+      "notes": [
+        "\u53c2\u8003\u66f2\u7ebf\u88ab\u7ec8\u6b62\u65f6\u95f4\u622a\u65ad\uff0c\u6b63\u538b\u9636\u6bb5\u4e0d\u5b8c\u6574\uff1a\u6b63\u76f8\u6301\u7eed\u65f6\u95f4\u4e0e\u51b2\u91cf\u4e0d\u53c2\u4e0e\u5224\u5206"
+      ]
+    }
+  ]
+}

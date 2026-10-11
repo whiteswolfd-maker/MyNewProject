@@ -1832,10 +1832,26 @@ def _contract_case(**overrides):
     from spherical_blast_pinn.data.compatibility import SYNTHETIC
 
     validity = np.ones((3, 4), dtype=bool)
+    profile = np.ones((3, 4), dtype=np.float64)
     base = dict(
         case_id="c",
         charge_radius=0.05,
         times=np.array([0.0, 1.0e-6, 2.0e-6]),
+        radius=np.linspace(0.004, 0.05, 4),
+        # 契约现在对**任何**对象做同一套结构检查（提示词 §4），所以替身也得带上
+        # 与时间轴一致的剖面数组——否则被拦下的是"形状不对"，不是被测的那一项。
+        density=profile,
+        velocity=profile,
+        pressure=profile,
+        # 契约现在查对象上的**每一个**数组（不是一张写死的七个名字的清单），所以
+        # 替身必须带齐 ``ExtractedCase`` 的必填字段，否则被拦下的是"替身不全"，
+        # 而不是被测的那一项。
+        specific_energy=profile,
+        material=np.zeros((3, 4), dtype=np.int64),
+        contact_radius=np.full(3, 0.05),
+        shock_radius=np.full(3, 0.10),
+        contact_valid=np.array([True, True, True]),
+        shock_valid=np.array([True, True, True]),
         valid=validity,
         source={
             "symmetry_factor": 8.0,
@@ -1847,7 +1863,14 @@ def _contract_case(**overrides):
             "material_partition_is_volume_fraction_based": True,
             # 标志之外还要有**结构化来源记录**：只有一个是/否标志时，那个 True
             # 是谁写的、依据是什么都无从核对。
-            "material_partition_source_recorded": "ALE material volume fraction (columns 1..7)",
+            "material_partition_source_recorded": {
+                "method": "ale_volume_fraction",
+                "producer": "cli.extract_profiles",
+                "producer_version": 1,
+                "fields": ["tnt_volume_fraction"],
+                "input_identifier": "sha256:test",
+                "detail": {"pure_product_threshold": 0.95},
+            },
             "energy_source": "reconstructed from JWL",
         },
         # 契约要求的两个分项记录，形状与真实导出一致

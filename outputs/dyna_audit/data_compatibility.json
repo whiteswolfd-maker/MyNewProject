@@ -1,0 +1,70 @@
+{
+  "format": "spherical_blast_pinn.data_compatibility",
+  "version": 1,
+  "generated_by": "spherical_blast_pinn.cli.audit_dyna",
+  "notes": [
+    "training reads this file; a case whose status is not 'compatible' may not supervise a scheme-A model without an explicit override"
+  ],
+  "cases": {
+    "tnt_50mm": {
+      "case_id": "tnt_50mm",
+      "status": "incompatible",
+      "checks": {
+        "detonation_model": "incompatible",
+        "time_origin": "incompatible",
+        "unit_system": "compatible",
+        "jwl_parameters": "compatible",
+        "material_partition": "incompatible"
+      },
+      "reasons": [
+        "detonation_model：不一致",
+        "time_origin：不一致",
+        "material_partition：incompatible"
+      ],
+      "evidence": {
+        "material_partition": {
+          "material_masks_from": "",
+          "has_volume_fraction_field": false,
+          "rejected_frames_below_charge_radius": 92,
+          "detector": {
+            "shock_pressure_ratio": 0.001,
+            "contact_smoothing_cells": 5,
+            "contact_density_ratio_floor": 1.02,
+            "minimum_cells_per_medium": 3
+          }
+        }
+      },
+      "source": "outputs\\dyna_audit\\dyna_audit.json"
+    },
+    "tnt_80mm": {
+      "case_id": "tnt_80mm",
+      "status": "incompatible",
+      "checks": {
+        "detonation_model": "incompatible",
+        "time_origin": "unknown",
+        "unit_system": "compatible",
+        "jwl_parameters": "compatible",
+        "material_partition": "incompatible"
+      },
+      "reasons": [
+        "detonation_model：不一致",
+        "time_origin：缺证据",
+        "material_partition：incompatible"
+      ],
+      "evidence": {
+        "material_partition": {
+          "material_masks_from": "",
+          "has_volume_fraction_field": false,
+          "rejected_frames_below_charge_radius": 2,
+          "detector": {
+            "shock_pressure_ratio": 0.001,
+            "contact_smoothing_cells": 5,
+            "contact_density_ratio_floor": 1.02,
+            "minimum_cells_per_medium": 3
+          }
+        }
+      },
+      "source": "outputs\\dyna_audit\\dyna_audit.json"
+    }
+  }
+}

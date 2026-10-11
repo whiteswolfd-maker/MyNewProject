@@ -1,0 +1,75 @@
+{
+  "material_table": {
+    "jwl": {
+      "A": 371200000000.0,
+      "B": 3747100000.0,
+      "R1": 4.15,
+      "R2": 0.95,
+      "omega": 0.3,
+      "rho0": 1630.0,
+      "energy_shift": 0.0
+    },
+    "rho0": 1630.0,
+    "E0_volume_energy": 6000000000.0,
+    "e_star_j_kg": 3680981.5950920247,
+    "u_star_m_s": 1918.588438173238,
+    "p_init_pa": 8220261897.155153,
+    "gamma_air": 1.4,
+    "air_density": 1.225,
+    "air_pressure": 101319.99999999999,
+    "air_specific_energy_j_kg": 206775.51020408163,
+    "product_pressure_scale_pa": 6000000000.0,
+    "air_pressure_scale_pa": 4509202.453987731
+  },
+  "initial_pressure": {
+    "expected_pa": 8220261897.0,
+    "computed_pa": 8220261897.155153,
+    "relative_deviation": 1.887449286655408e-11,
+    "passed": true
+  },
+  "air_card": {
+    "coefficients": {
+      "C0": 0.0,
+      "C1": 0.0,
+      "C2": 0.0,
+      "C3": 0.0,
+      "C4": 0.3999999999999999,
+      "C5": 0.3999999999999999,
+      "C6": 0.0
+    },
+    "equivalent_to_ideal_gas": true,
+    "note": ""
+  },
+  "closure": {
+    "tolerance": 1e-06,
+    "max_relative_closure_error": 3.222668316752811e-16,
+    "passed": true,
+    "cases": [
+      {
+        "case_id": "tnt_50mm",
+        "n_product_points": 5808,
+        "n_air_points": 24079,
+        "max_relative_closure_error": 2.331252702845211e-16,
+        "product_relative": 2.331252702845211e-16,
+        "air_relative": 2.0822278242013244e-16
+      },
+      {
+        "case_id": "tnt_80mm",
+        "n_product_points": 7323,
+        "n_air_points": 28977,
+        "max_relative_closure_error": 3.222668316752811e-16,
+        "product_relative": 3.222668316752811e-16,
+        "air_relative": 2.1973670953435086e-16
+      },
+      {
+        "case_id": "tnt_100mm",
+        "n_product_points": 2028,
+        "n_air_points": 5403,
+        "max_relative_closure_error": 2.1013098860630223e-16,
+        "product_relative": 1.9320242830174702e-16,
+        "air_relative": 2.1013098860630223e-16
+      }
+    ]
+  },
+  "energy_definition": "\u6bd4\u5185\u80fd e\uff08J/kg\uff09\u7531 (rho, p) \u6309\u6750\u6599\u5404\u81ea\u7684\u72b6\u6001\u65b9\u7a0b\u53cd\u89e3\uff1b\u4e0d\u662f\u6bd4\u603b\u80fd\uff0c\u4e5f\u4e0d\u662f\u4f53\u79ef\u80fd\u91cf\u3002deck \u7684 E0 \u662f\u6309**\u53c2\u8003\u4f53\u79ef**\u5b9a\u4e49\u7684 J/m^3\uff0c\u6362\u7b97\u89c1 material_table.e_star_j_kg"
+}

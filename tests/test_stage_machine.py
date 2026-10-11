@@ -722,12 +722,12 @@ def test_a_rejected_checkpoint_does_not_half_load_the_target(tmp_path):
     reader = base._tiny_trainer(tmp_path / "r", tmp_path / "out_r")
     reader.schedule = tiny
     reader.check_every = 0
-    # 篡改保存的窗口，制造一个"日程不一致"的检查点
+    # 篡改保存的窗口，制造一个"日程不一致"的检查点（阶段名保持合法，好让这条
+    # 测试落在**窗口**那道校验上，而不是"阶段名不认识"那道）。
     payload = torch.load(
         writer.output_dir / "one.pt", map_location="cpu", weights_only=False
     )
     payload["stage"]["window_fraction"] = 0.999
-    payload["stage"]["current"] = "no-such-stage"
     torch.save(payload, writer.output_dir / "broken.pt")
 
     before = {
@@ -736,7 +736,7 @@ def test_a_rejected_checkpoint_does_not_half_load_the_target(tmp_path):
     before_step = reader.step
     before_window = reader.sampler.samplers[0].window_fraction
 
-    with pytest.raises(TrainingError, match="schedules are not the same"):
+    with pytest.raises(TrainingError, match="not the same schedule"):
         reader.load(writer.output_dir / "broken.pt")
 
     assert reader.step == before_step, "步数在恢复失败时已经被改掉了"

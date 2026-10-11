@@ -1,0 +1,198 @@
+{
+  "cases": [
+    {
+      "case_id": "tnt_50mm",
+      "deck": "F:\\tnt\\tnt_files\\dp0\\SYS\\MECH\\input.k",
+      "findings": [
+        {
+          "\u5ba1\u67e5\u9879": "1. \u6574\u7403\u77ac\u65f6\u521d\u59cb\u5316\u8fd8\u662f\u6709\u9650\u901f\u5ea6\u7206\u8f70",
+          "\u7ed3\u8bba": "\u6709\u9650\u901f\u5ea6\u7206\u8f70\uff08programmed burn\uff09\u3002\u5361\u7247\u6709 4 \u5f20 *MAT_HIGH_EXPLOSIVE_BURN \u4e0e\u4e00\u5f20 *INITIAL_DETONATION\uff0c\u8d77\u7206\u70b9 (0.0, 0.0, 0.0)\uff0clt = 0.0",
+          "\u8bc1\u636e\u6587\u4ef6\u53ca\u4f4d\u7f6e": "F:\\tnt\\tnt_files\\dp0\\SYS\\MECH\\input.k: *MAT_HIGH_EXPLOSIVE_BURN / *INITIAL_DETONATION",
+          "\u4e0e\u65b9\u6848 A \u662f\u5426\u4e00\u81f4": "\u4e0d\u4e00\u81f4",
+          "\u53ef\u7528\u65f6\u7a7a\u8303\u56f4": "\u4ec5 t_phys >= t_b = R_0/D \u7684\u5e27\u4e0e\u65b9\u6848 A \u53ef\u6bd4",
+          "\u4ecd\u7f3a\u4ec0\u4e48\u4fe1\u606f": "\u8d77\u7206\u70b9\u662f\u5426\u6070\u597d\u662f\u7403\u5fc3\uff0c\u9700\u8981\u51e0\u4f55\u5750\u6807\u6838\u5bf9\uff08\u89c1\u7b2c 7 \u9879\uff09"
+        },
+        {
+          "\u5ba1\u67e5\u9879": "5. \u5355\u4f4d\u5236",
+          "\u7ed3\u8bba": "mm_s_t\uff1b\u5224\u636e\u662f\u70b8\u836f\u5bc6\u5ea6\u800c\u4e0d\u662f\u6587\u4ef6\u540d\uff1a\u5361\u7247 ro = 1.63e-09\uff0c\u6309\u8be5\u5355\u4f4d\u5236\u6362\u7b97\uff08\u00d71e+12\uff09\u5f97 1630 kg/m^3\uff0c\u4e0e\u89c4\u8303\u7684 1630 kg/m^3 \u4e00\u81f4",
+          "\u8bc1\u636e\u6587\u4ef6\u53ca\u4f4d\u7f6e": "F:\\tnt\\tnt_files\\dp0\\SYS\\MECH\\input.k: *MAT_HIGH_EXPLOSIVE_BURN \u7684 ro = 1.63e-09",
+          "\u4e0e\u65b9\u6848 A \u662f\u5426\u4e00\u81f4": "\u4e00\u81f4",
+          "\u53ef\u7528\u65f6\u7a7a\u8303\u56f4": "",
+          "\u4ecd\u7f3a\u4ec0\u4e48\u4fe1\u606f": ""
+        },
+        {
+          "\u5ba1\u67e5\u9879": "3a. JWL \u7cfb\u6570\u4e0e\u89c4\u8303 \u00a74 \u662f\u5426\u4e00\u81f4",
+          "\u7ed3\u8bba": "\u4e00\u81f4\uff08\u5df2\u6309\u8bc6\u522b\u51fa\u7684\u5355\u4f4d\u5236\u6362\u7b97\u5230 SI\uff09",
+          "\u8bc1\u636e\u6587\u4ef6\u53ca\u4f4d\u7f6e": "F:\\tnt\\tnt_files\\dp0\\SYS\\MECH\\input.k: *EOS_JWL \u7b2c 2 \u53f7",
+          "\u4e0e\u65b9\u6848 A \u662f\u5426\u4e00\u81f4": "\u4e00\u81f4",
+          "\u53ef\u7528\u65f6\u7a7a\u8303\u56f4": "",
+          "\u4ecd\u7f3a\u4ec0\u4e48\u4fe1\u606f": ""
+        },
+        {
+          "\u5ba1\u67e5\u9879": "3b/c/d. E0\u3001V0 \u4e0e\u80fd\u91cf\u53c2\u8003\u96f6\u70b9",
+          "\u7ed3\u8bba": "E0 = 6000\uff08\u6309\u53c2\u8003\u4f53\u79ef\u7684\u80fd\u91cf\u5bc6\u5ea6\uff09\uff1bV0 = 1\uff1b\u6362\u7b97\u5230 SI \u540e E0 = 6e+09 J/m^3",
+          "\u8bc1\u636e\u6587\u4ef6\u53ca\u4f4d\u7f6e": "F:\\tnt\\tnt_files\\dp0\\SYS\\MECH\\input.k: *EOS_JWL \u7b2c 2 \u884c",
+          "\u4e0e\u65b9\u6848 A \u662f\u5426\u4e00\u81f4": "\u4e00\u81f4",
+          "\u53ef\u7528\u65f6\u7a7a\u8303\u56f4": "",
+          "\u4ecd\u7f3a\u4ec0\u4e48\u4fe1\u606f": "\u80fd\u91cf\u53c2\u8003\u96f6\u70b9\u9700\u8981 *DATABASE_EXTENT_BINARY \u7684 engflg \u4e0e\u8fd0\u884c\u65f6\u80fd\u91cf\u7edf\u8ba1\u5171\u540c\u786e\u8ba4\uff1b\u4ec5\u51ed\u5361\u7247\u4e0d\u80fd\u65ad\u5b9a"
+        },
+        {
+          "\u5ba1\u67e5\u9879": "6. \u7ec8\u6b62\u65f6\u95f4\u4e0e\u8f93\u51fa\u95f4\u9694",
+          "\u7ed3\u8bba": "endtim = 0.001\uff08\u65f6\u95f4\u5355\u4f4d\uff09\uff1bd3plot \u95f4\u9694 = 1e-06\uff1b\u2192 \u7ea6 1000 \u4e2a\u8f93\u51fa\u5e27",
+          "\u8bc1\u636e\u6587\u4ef6\u53ca\u4f4d\u7f6e": "F:\\tnt\\tnt_files\\dp0\\SYS\\MECH\\input.k",
+          "\u4e0e\u65b9\u6848 A \u662f\u5426\u4e00\u81f4": "\u4e00\u81f4",
+          "\u53ef\u7528\u65f6\u7a7a\u8303\u56f4": "",
+          "\u4ecd\u7f3a\u4ec0\u4e48\u4fe1\u606f": "\u5916\u8fb9\u754c\u6761\u4ef6\u9700\u8981 *BOUNDARY_* \u5361\u7247\uff08\u89c1\u7b2c 8 \u9879\uff09"
+        },
+        {
+          "\u5ba1\u67e5\u9879": "7. \u8ba1\u7b97\u57df\u5f62\u72b6\u4e0e\u5bf9\u79f0\u9762",
+          "\u7ed3\u8bba": "\u4e09\u4e2a\u65b9\u5411\u8de8\u5ea6\u76f8\u540c\uff08\u5305\u56f4\u76d2\u8de8\u5ea6 [5000.0, 5000.0, 5000.0]\uff0c\u6700\u5927\u534a\u5f84 8660.25\uff09\uff0c\u4e0e\u6574\u7403\u6216\u516b\u5206\u4e4b\u4e00\u7403\u76f8\u7b26\uff1b\u4f46\u6954\u5f62\u4f53\u7684\u5305\u56f4\u76d2\u4e5f\u662f\u6b63\u65b9\u4f53\uff0c\u6240\u4ee5\u5bf9\u79f0\u9762\u4ecd\u9700\u6838\u5bf9 *BOUNDARY_SPC_SET",
+          "\u8bc1\u636e\u6587\u4ef6\u53ca\u4f4d\u7f6e": "F:\\tnt\\tnt_files\\dp0\\SYS\\MECH\\input.k: *NODE \u5305\u56f4\u76d2 ((-5000.0, 0.0), (0.0, 5000.0), (0.0, 5000.0))",
+          "\u4e0e\u65b9\u6848 A \u662f\u5426\u4e00\u81f4": "\u7f3a\u8bc1\u636e",
+          "\u53ef\u7528\u65f6\u7a7a\u8303\u56f4": "",
+          "\u4ecd\u7f3a\u4ec0\u4e48\u4fe1\u606f": "\u5bf9\u79f0\u9762\u9760 *BOUNDARY_SPC_SET \u5b9a\u4e49\uff0c\u5176\u81ea\u7531\u5ea6\u7ec4\u5408\u9700\u8981\u9010\u6761\u6838\u5bf9\uff1b\u8d28\u91cf\u4e0e\u80fd\u91cf\u7edf\u8ba1\u662f\u5426\u9700\u8981\u51e0\u4f55\u500d\u6570\u53d6\u51b3\u4e8e\u6b64"
+        },
+        {
+          "\u5ba1\u67e5\u9879": "8. \u5916\u8fb9\u754c\u6761\u4ef6\u4e0e\u5bf9\u79f0\u9762",
+          "\u7ed3\u8bba": "3 \u7ec4 *BOUNDARY_SPC_SET\uff0c\u7ea6\u675f\u81ea\u7531\u5ea6\uff08x/y/z\uff09= ['1/0/0', '0/1/0', '0/0/1']\uff1b1 \u7ec4 *BOUNDARY_NON_REFLECTING\u3002\u4e09\u7ec4\u5404\u7ea6\u675f\u4e00\u4e2a\u65b9\u5411\u7684\u5e73\u52a8\uff0c\u4e0e\u4e09\u4e2a\u5bf9\u79f0\u9762\u4e00\u81f4\uff1b\u914d\u5408\u975e\u53cd\u5c04\u5916\u8fb9\u754c\uff0c\u8ba1\u7b97\u57df\u662f\u6574\u7403\u7684\u516b\u5206\u4e4b\u4e00\uff0c\u8d28\u91cf\u4e0e\u80fd\u91cf\u7edf\u8ba1\u9700\u8981\u4e58\u4ee5 8",
+          "\u8bc1\u636e\u6587\u4ef6\u53ca\u4f4d\u7f6e": "F:\\tnt\\tnt_files\\dp0\\SYS\\MECH\\input.k: *BOUNDARY_SPC_SET / *BOUNDARY_NON_REFLECTING / *SET_NODE_LIST",
+          "\u4e0e\u65b9\u6848 A \u662f\u5426\u4e00\u81f4": "\u7f3a\u8bc1\u636e",
+          "\u53ef\u7528\u65f6\u7a7a\u8303\u56f4": "",
+          "\u4ecd\u7f3a\u4ec0\u4e48\u4fe1\u606f": "\u975e\u53cd\u5c04\u8fb9\u754c\u5728\u5f3a\u7206\u70b8\u4e0b\u7684\u5b9e\u9645\u5438\u6536\u6548\u679c\u9700\u8981\u8fd0\u884c\u65f6\u6570\u636e\u6838\u5bf9\uff1b\u4ec5\u51ed\u5361\u7247\u4e0d\u80fd\u65ad\u5b9a\u665a\u671f\u6709\u65e0\u53cd\u5c04\u6c61\u67d3"
+        },
+        {
+          "\u5ba1\u67e5\u9879": "2. \u65f6\u95f4\u96f6\u70b9\u4ee3\u8868\u4ec0\u4e48",
+          "\u7ed3\u8bba": "\u65f6\u95f4\u96f6\u70b9\u4e0d\u662f\u6574\u7403\u540c\u65f6\u8f6c\u5316\u3002\u9010\u5e27\u7684\u5f3a\u538b\u7f29\u524d\u6cbf\u662f\u79fb\u52a8\u7684\uff1at = 9.862e-07 s \u65f6\u5728 r = 0.006002 m\uff08P = 1.03e+10 Pa\uff09\uff0ct = 6.948e-06 s \u65f6\u5728 r = 0.04802 m\u3002\u7ebf\u6027\u62df\u5408\u659c\u7387 7029 m/s\uff0c\u4e0e\u5361\u7247\u7206\u901f 6930 m/s \u7684\u76f8\u5bf9\u504f\u5dee 1.435%",
+          "\u8bc1\u636e\u6587\u4ef6\u53ca\u4f4d\u7f6e": "F:\\2\\extracted\\raw_line.npz: \u9010\u5e27\u53d6 P > 1e+09 Pa \u7684\u6700\u5916\u4fa7\u534a\u5f84\uff0c\u5bf9 t \u4f5c\u7ebf\u6027\u62df\u5408\uff087 \u5e27\uff0c\u622a\u8ddd -8.585e-04 m\uff09",
+          "\u4e0e\u65b9\u6848 A \u662f\u5426\u4e00\u81f4": "\u4e0d\u4e00\u81f4",
+          "\u53ef\u7528\u65f6\u7a7a\u8303\u56f4": "t_phys >= t_b = R_0/D \u4e4b\u540e\u624d\u5b58\u5728\u7a7a\u6c14\u5c42\uff1b\u6b64\u524d\u5256\u9762\u4e0a\u53ea\u6709\u672a\u53cd\u5e94\u7684\u88c5\u836f\u548c\u7206\u8f70\u524d\u6cbf\uff0c\u6ca1\u6709\u63a5\u89e6\u9762",
+          "\u4ecd\u7f3a\u4ec0\u4e48\u4fe1\u606f": "\u5361\u7247\u6ca1\u6709\u8f93\u51fa\u53cd\u5e94\u8fdb\u5ea6\u5b57\u6bb5\uff08*DATABASE_EXTENT_BINARY \u672a\u5f00\u542f ialemat \u4e00\u7c7b\u7684\u6750\u6599\u72b6\u6001\u8f93\u51fa\uff09\uff0c\u53cd\u5e94\u901f\u7387\u672c\u8eab\u65e0\u6cd5\u9010\u5e27\u786e\u8ba4\uff0c\u53ea\u80fd\u7531\u524d\u6cbf\u4f4d\u7f6e\u95f4\u63a5\u5224\u65ad"
+        }
+      ],
+      "detail": {
+        "title": null,
+        "termination_time": 0.001,
+        "d3plot_interval": 1e-06,
+        "initial_detonation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "initial_detonation_time": 0.0,
+        "control_ale": {
+          "field_0": -1.0,
+          "field_1": 1.0,
+          "field_2": 1.0,
+          "field_3": -1.0,
+          "field_4": 0.0,
+          "field_5": 0.0,
+          "field_6": 0.0,
+          "field_7": 0.0
+        },
+        "n_parts": 7,
+        "part_names": {
+          "1": "air",
+          "2": "tnt",
+          "3": "1n1",
+          "4": "tnt1",
+          "5": "air1",
+          "6": "air11",
+          "7": "tnt11"
+        },
+        "detonation_velocity_raw_card_units": 6930000.0,
+        "explosive_density_raw": 1.63e-09,
+        "unit_system_inferred": "mm_s_t",
+        "explosive_density_kg_m3": 1629.9999999999998,
+        "density_to_si_factor": 999999999999.9999,
+        "jwl_card_raw": {
+          "A": 371200.0,
+          "B": 3747.1,
+          "R1": 4.15,
+          "R2": 0.95,
+          "omeg": 0.3,
+          "E0": 6000.0,
+          "V0": 1.0
+        },
+        "e0_volume_energy_raw": 6000.0,
+        "e0_volume_energy_si": 6000000000.0,
+        "v0": 1.0,
+        "specific_energy_j_kg": 3680981.5950920247,
+        "geometry": {
+          "n_nodes": 1250370,
+          "n_solid_elements": 1220736,
+          "bounding_box": [
+            [
+              -5000.0,
+              0.0
+            ],
+            [
+              0.0,
+              5000.0
+            ],
+            [
+              0.0,
+              5000.0
+            ]
+          ],
+          "radius_min": 0.0,
+          "radius_max": 8660.254037844386,
+          "total_volume": 125000000000.00977,
+          "counts_by_part": {
+            "1": 335808,
+            "2": 30528,
+            "3": 127200,
+            "4": 31800,
+            "5": 349800,
+            "6": 316800,
+            "7": 28800
+          },
+          "radius_by_part": {
+            "1": [
+              49.99804582672533,
+              8660.254037844386
+            ],
+            "2": [
+              25.0,
+              50.00148932244871
+            ],
+            "3": [
+              0.0,
+              43.30127018922193
+            ],
+            "4": [
+              25.0,
+              50.00007488454647
+            ],
+            "5": [
+              49.99859538039408,
+              8660.254037844386
+            ],
+            "6": [
+              49.99799868656757,
+              8660.254037844386
+            ],
+            "7": [
+              25.0,
+              50.001158033904126
+            ]
+          },
+          "volume_by_part": {
+            "1": 41666644852.77331,
+            "2": 16605.3899926844,
+            "3": 15625.00000000485,
+            "4": 16605.807454745052,
+            "5": 41666644852.53536,
+            "6": 41666644852.796585,
+            "7": 16605.345151449506
+          },
+          "element_format": "two_line"
+        },
+        "n_nodes": 1250370,
+        "n_elements": 1220736,
+        "detonation_velocity_raw": 6930000.0,
+        "detonation_velocity_m_s": 6930.0,
+        "warnings": []
+      }
+    }
+  ]
+}

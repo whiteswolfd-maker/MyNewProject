@@ -62,7 +62,14 @@ def _write_export(
         # 提取器把"分区是不是从体积分数读的"写在元数据里。读取器**照读**，
         # 不自己盖章——否则判据只是从"信任说明文字"换成"信任读取器"。
         metadata["material_partition_is_volume_fraction_based"] = True
-        metadata["material_partition_source"] = "ALE material volume fraction (d3plot)"
+        metadata["material_partition_source"] = {
+            "method": "ale_volume_fraction",
+            "producer": "cli.extract_profiles",
+            "producer_version": 1,
+            "fields": ["tnt_volume_fraction"],
+            "input_identifier": "sha256:test",
+            "detail": {"pure_product_threshold": 0.95},
+        }
     if with_symmetry:
         metadata["symmetry_factor"] = 8.0
         metadata["symmetry_share"] = 0.125
@@ -314,7 +321,7 @@ def test_a_malformed_field_validity_companion_is_refused(tmp_path):
     payload = dict(np.load(directory / "material.npz", allow_pickle=True))
     payload["field_valid_density"] = payload["field_valid_density"][:, :5]
     np.savez(directory / "material.npz", **payload)
-    with pytest.raises(Exception, match="per-field validity"):
+    with pytest.raises(Exception, match="field_valid_density"):
         _load(directory)
 
 
@@ -348,3 +355,120 @@ def test_the_verdict_records_what_it_looked_at(tmp_path):
     # 最后一帧不具资格，所以资格计数比帧数少一 —— 这正是"资格"与"半径有限"分开了
     assert detail["front_eligibility_counts"] == {"contact": 5, "shock": 5}
     assert detail["n_frames"] == 6
+
+
+# --------------------------------------------------------------------------
+# §5 来源记录必须是结构化的
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad, needle",
+    [
+        (123, "结构化映射"),
+        ({"unrelated": "value"}, "缺字段"),
+        ("ALE material volume fraction", "结构化映射"),
+        ({"method": "ale_volume_fraction", "producer": "x", "producer_version": 99,
+          "fields": ["a"], "input_identifier": "sha256:x"}, "不被支持"),
+        ({"method": "made_up", "producer": "x", "producer_version": 1,
+          "fields": ["a"], "input_identifier": "sha256:x"}, "枚举"),
+        ({"method": "heuristic_density_detector", "producer": "x", "producer_version": 1,
+          "fields": ["a"], "input_identifier": "sha256:x"}, "互相矛盾"),
+    ],
+)
+def test_an_unstructured_or_inconsistent_source_is_refused(tmp_path, bad, needle):
+    """**复核点名的原反例。** 数字、任意字典、缺字段、不支持版本、方法矛盾。
+
+    上一轮把判据从"子串匹配"改成了"必须有一个非空值"——数字 ``123``、任意字典、
+    一句否认都能通过。那只是换了一种方式相信来源。
+    """
+    directory = _write_export(tmp_path / "src")
+    metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+    metadata["material_partition_source"] = bad
+    (directory / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
+    )
+    verdict = evaluate_case_contract(_load(directory))
+    assert not verdict.ready
+    assert any(needle in reason for reason in verdict.reasons), verdict.reasons
+
+
+def test_a_structured_source_that_agrees_with_the_flag_is_accepted(tmp_path):
+    """合法的结构 + 与布尔标志一致 ⇒ 通过。规则不能严到连正确的记录也拒绝。"""
+    verdict = evaluate_case_contract(_load(_write_export(tmp_path / "good")))
+    assert verdict.ready, verdict.reasons
+    assert verdict.detail["material_partition_source_ok"] is True
+    assert verdict.detail["material_partition_method"] == "ale_volume_fraction"
+
+
+def test_an_input_identifier_must_not_be_faked_when_the_input_is_unavailable():
+    """输入读不到时留一个明确的标记，不编指纹。"""
+    from spherical_blast_pinn.data.provenance import validate_partition_source
+
+    problems = validate_partition_source({
+        "method": "ale_volume_fraction",
+        "producer": "cli.extract_profiles",
+        "producer_version": 1,
+        "fields": ["tnt_volume_fraction"],
+        "input_identifier": "   ",
+    })
+    assert any("输入标识" in problem for problem in problems)
+
+
+# --------------------------------------------------------------------------
+# §4 契约与读取端必须查**同一套**数组
+# --------------------------------------------------------------------------
+
+
+_MUTATIONS = {
+    # 复核点名的那个：读取后把 velocity 改成错误形状。
+    "velocity": lambda case: setattr(case, "velocity", np.ones((1, 20))),
+    "density": lambda case: setattr(case, "density", np.ones((1, 20))),
+    "pressure": lambda case: setattr(case, "pressure", np.ones((1, 20))),
+    "times": lambda case: setattr(case, "times", np.array([[1.0]])),
+    "radius": lambda case: setattr(case, "radius", np.array([[1.0, 2.0]])),
+    # 下面这些以前**整片漏掉**：契约把要查的数组又列了一遍，只列了七个名字，
+    # 于是改坏它们照样判就绪。
+    "specific_energy": lambda case: setattr(case, "specific_energy", np.ones((1, 20))),
+    "material_all_999": lambda case: setattr(case, "material", np.full((2, 20), 999)),
+    "material_float": lambda case: setattr(case, "material", np.full((2, 20), 1.5)),
+    "valid_float_nan": lambda case: setattr(case, "valid", np.full((2, 20), np.nan)),
+    "valid_shape": lambda case: setattr(case, "valid", np.ones((1, 20), dtype=bool)),
+    "contact_valid_length": lambda case: setattr(case, "contact_valid", np.ones(5, dtype=bool)),
+    "contact_radius_length": lambda case: setattr(case, "contact_radius", np.ones(5)),
+    "field_validity_shape": lambda case: case.field_validity.__setitem__(
+        "density", np.ones((1, 20), dtype=bool)
+    ),
+    "field_validity_dtype": lambda case: case.field_validity.__setitem__(
+        "density", np.ones((2, 20))
+    ),
+    "front_eligibility_shape": lambda case: case.front_supervision_eligibility.__setitem__(
+        "contact_eligible", np.ones(5, dtype=bool)
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_MUTATIONS))
+def test_the_contract_rechecks_every_array_the_object_carries(tmp_path, name):
+    """契约对**对象**的检查必须与读取端覆盖面相同。
+
+    修前：``velocity`` / ``density`` / ``pressure`` / ``times`` / ``radius`` 改坏会被
+    拦下，而 ``specific_energy``、``material``、``valid``、逐字段掩码、前沿资格数组
+    改坏**仍然 ``ready=True``**——同一类错误两样待遇，等于说覆盖面是个偶然。
+
+    断言必须落在 ``structural_problems`` 上，不能只看 ``ready``：有几项以前虽然
+    也判了不就绪，却是因为**别的原因**顺带被拦住的（结构检查本身一条问题都没报）。
+    那种"碰巧拦住了"不是覆盖率。
+    """
+    case = _load(_write_export(tmp_path / name))
+    baseline = evaluate_case_contract(case)
+    assert baseline.ready, baseline.reasons          # 改之前必须是就绪的
+
+    _MUTATIONS[name](case)
+    verdict = evaluate_case_contract(case)
+
+    assert not verdict.ready, f"{name}: 改坏了却仍然就绪"
+    assert verdict.detail["structural_problems"], (
+        f"{name}: 判了不就绪，但结构检查本身没有报出任何问题——"
+        "说明拦住它的是别的理由，覆盖率仍然是个偶然"
+    )

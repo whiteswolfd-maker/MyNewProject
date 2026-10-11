@@ -611,10 +611,136 @@ def _cell_width(radius: np.ndarray) -> float:
 # --------------------------------------------------------------------------
 
 
+#: 材料编码的取值域：0 产物、1 空气、2 未受扰动。
+#: 别的值不是"另一个区域"，是格式对不上。
+MATERIAL_CODES = (0, 1, 2)
+
 #: 前沿三态码的取值域。**0/1/2 之外的码不是"另一档无效"，是格式错误**：
 #: 读取器不认识它，说明这份导出与当前约定不是同一套。把它当成普通无效帧处理，
 #: 会把"我们对不上这份数据"说成"这一帧没测到"。
 FRONT_STATE_CODES = (0, 1, 2)
+
+
+# --------------------------------------------------------------------------
+# 场量布局：**声明出来的，不是从形状猜出来的**
+# --------------------------------------------------------------------------
+
+#: 布局声明的版本。加字段或改语义都要升版本。
+PROFILE_LAYOUT_VERSION = 1
+SUPPORTED_PROFILE_LAYOUT_VERSIONS: tuple[int, ...] = (1,)
+
+#: 逐帧二维 ``(n_t, n_x)``。既有导出的形式，也是缺省。
+LAYOUT_FRAMES_BY_RADIUS = "frames_by_radius"
+
+#: 单帧一维 ``(n_x,)``：只在时间轴恰好一帧时成立。它说的是"这个文件只存了一帧，
+#: 所以省掉了那一维"，**不**说明怎么读多帧——多帧时用它没有意义。
+LAYOUT_SINGLE_FRAME_1D = "single_frame_1d"
+PROFILE_LAYOUTS = (LAYOUT_FRAMES_BY_RADIUS, LAYOUT_SINGLE_FRAME_1D)
+
+
+def declared_profile_layout(
+    metadata: Mapping[str, Any] | None, *, path: Any = "<memory>"
+) -> tuple[str, int, bool]:
+    """读出这份导出**声明**的场量布局，返回 ``(layout, version, declared)``。
+
+    缺省是逐帧二维，``declared=False``：既有的导出没有这一项，而它们全都是
+    ``(n_t, n_x)``。所以缺省值是**与既有数据一致**的那一档，不是一个"随便读读看"
+    的宽松档。
+
+    这是提示词 §4 要求的那条**版本化规则**。以前一维单帧靠 ``np.atleast_2d``
+    顺手接住，有三处不对：没有声明（读得进去，但"这份文件是什么布局"没有答案）、
+    没有记录（读完之后对象上看不出它是一维场）、而且形状是**读取器自己造出来的**
+    ——校验拿到的已经是 ``(1, n_x)``，于是"一维场配多帧时间轴"这种真正的格式
+    错误被报成 "density has shape (1, 4)"，把读取器的猜测说成文件里的内容。
+    """
+    raw = (metadata or {}).get("profile_layout")
+    if raw is None:
+        return LAYOUT_FRAMES_BY_RADIUS, PROFILE_LAYOUT_VERSION, False
+    if not isinstance(raw, Mapping):
+        raise DataError(
+            f"{path}: 'profile_layout' must be a mapping with 'version' and 'layout', "
+            f"got {type(raw).__name__}"
+        )
+    unknown = sorted(set(raw) - {"version", "layout"})
+    if unknown:
+        raise DataError(f"{path}: 'profile_layout' carries unknown keys {unknown}")
+    layout = raw.get("layout")
+    if layout not in PROFILE_LAYOUTS:
+        raise DataError(
+            f"{path}: 'profile_layout.layout' is {layout!r}, which this reader does not "
+            f"define (known: {list(PROFILE_LAYOUTS)}). An undeclared or unrecognised "
+            "layout is a format mismatch, not a field to be guessed from its shape"
+        )
+    version = raw.get("version")
+    # ``bool`` 是 ``int`` 的子类，``True in (1,)`` 为真——所以先排除它，否则
+    # ``"version": true`` 会被当成版本 1 读进来。
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise DataError(
+            f"{path}: 'profile_layout.version' is {version!r}, not an integer"
+        )
+    if version not in SUPPORTED_PROFILE_LAYOUT_VERSIONS:
+        raise DataError(
+            f"{path}: 'profile_layout.version' is {version}, supported: "
+            f"{list(SUPPORTED_PROFILE_LAYOUT_VERSIONS)}"
+        )
+    return str(layout), int(version), True
+
+
+def layout_shape(*, layout: str, times: np.ndarray, radius: np.ndarray, path: Any):
+    """按声明的布局给出**规范**形状。
+
+    ``single_frame_1d`` 只在时间轴恰好一帧时成立：它是"单帧省掉一维"的写法，
+    对多帧什么也没说。多帧配这一档是**文件自相矛盾**，不是"大概是一帧"。
+    """
+    if layout == LAYOUT_SINGLE_FRAME_1D:
+        if times.size != 1:
+            raise DataError(
+                f"{path}: the declared profile layout is {LAYOUT_SINGLE_FRAME_1D!r}, but "
+                f"the time axis has {times.size} frames. That layout is the 1-D form of a "
+                "*single* frame and says nothing about how to read several"
+            )
+        return (radius.size,)
+    return (times.size, radius.size)
+
+
+def normalise_to_layout(
+    array: np.ndarray,
+    *,
+    name: str,
+    layout: str,
+    times: np.ndarray,
+    radius: np.ndarray,
+    path: Any,
+) -> np.ndarray:
+    """按声明的布局核对，**一律返回规范形状 ``(n_t, n_x)``**，不做 dtype 转换。
+
+    「声明」描述的是**文件里**的排布，不是读取器内部的口径。对象上永远只有规范
+    形状一种：``single_frame_1d`` 读进来之后也是 ``(1, n_x)``，与"只有一帧的二维
+    导出"逐字相同——这正是要记 ``source["profile_layout"]`` 的原因。若这里跟着
+    声明返回一维，同一个对象就会有两种形状，下游每一处都得再判断一次。
+
+    这里替掉的是 ``np.atleast_2d``。那一句对任意一维数组都会静默提升成
+    ``(1, n_x)``，于是布局是**猜**出来的：没有声明、没有记录，而且校验看到的
+    是读取器造出来的形状。
+    """
+    declared = layout_shape(layout=layout, times=times, radius=radius, path=path)
+    if array.shape != declared:
+        if layout == LAYOUT_FRAMES_BY_RADIUS:
+            hint = (
+                f"the declared layout is {LAYOUT_FRAMES_BY_RADIUS!r} (version "
+                f"{PROFILE_LAYOUT_VERSION}); a 1-D field is only readable from an export "
+                f"that declares {LAYOUT_SINGLE_FRAME_1D!r} — this reader no longer guesses "
+                "the layout from the shape"
+            )
+        else:
+            hint = (
+                f"the declared layout is {LAYOUT_SINGLE_FRAME_1D!r} (version "
+                f"{PROFILE_LAYOUT_VERSION}), which requires one value per radial point"
+            )
+        raise DataError(
+            f"{path}: {name} has shape {array.shape}, but {hint}"
+        )
+    return array.reshape(times.size, radius.size)
 
 
 def _check_axis(values, *, name: str, path) -> np.ndarray:
@@ -636,6 +762,8 @@ def validate_case_arrays(
     fronts: Mapping[str, Any] | None = None,
     states: Mapping[str, Any] | None = None,
     eligibility: Mapping[str, Any] | None = None,
+    layout: str = LAYOUT_FRAMES_BY_RADIUS,
+    layout_version: int = PROFILE_LAYOUT_VERSION,
     path: Any = "<memory>",
 ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     """**所有数组与两条坐标轴的关系，一次核完。**
@@ -674,23 +802,28 @@ def validate_case_arrays(
     if not np.all(np.diff(radius) > 0.0):
         raise DataError(f"{path}: the radial axis must be strictly increasing")
 
-    expected = (times.size, radius.size)
+    # 布局声明必须先自洽：多帧时间轴配"单帧一维"是文件自相矛盾，先于任何场量报出来。
+    layout_shape(layout=layout, times=times, radius=radius, path=path)
+
     normalised: dict[str, np.ndarray] = {}
     for name, values in profiles.items():
         array = np.asarray(values, dtype=np.float64)
-        if array.ndim == 1 and array.size == radius.size and times.size == 1:
-            array = array.reshape(1, -1)
-        if array.shape != expected:
-            raise DataError(
-                f"{path}: {name} has shape {array.shape}, expected {expected} "
-                f"(frames, radial points). Every profile must share one grid; a "
-                "field whose frame count differs from the time axis will fail later, "
-                "at a query, where the reason is no longer visible"
-            )
-        normalised[name] = array
+        # 形状由**声明**决定，不由形状本身决定（以前这里有一句 `ndim == 1 and
+        # size == radius.size and times.size == 1` 的顺手展平；两条真实读取路径都
+        # 在上游先做了 ``np.atleast_2d``，所以那一句在正式路径上是死代码——真正
+        # 生效的是读取器的猜法，而且它不留记录）。
+        normalised[name] = normalise_to_layout(
+            array, name=name, layout=layout, times=times, radius=radius, path=path
+        )
 
     for name, values in (fronts or {}).items():
-        array = np.asarray(values, dtype=np.float64).reshape(-1)
+        array = np.asarray(values, dtype=np.float64)
+        if array.ndim != 1:
+            raise DataError(
+                f"{path}: front {name!r} has shape {array.shape}; a front record is one "
+                "value per frame, so it must be 1-D (flattening here would hide the "
+                "wrong shape)"
+            )
         if array.size != times.size:
             raise DataError(
                 f"{path}: front {name!r} has {array.size} entries but the time axis "
@@ -701,7 +834,12 @@ def validate_case_arrays(
         normalised[name] = array
 
     for name, values in (states or {}).items():
-        array = np.asarray(values).reshape(-1)
+        array = np.asarray(values)
+        if array.ndim != 1:
+            raise DataError(
+                f"{path}: state code {name!r} has shape {array.shape}; it must be 1-D, "
+                "one code per frame"
+            )
         if array.size != times.size:
             raise DataError(
                 f"{path}: state code {name!r} has {array.size} entries but the time "
@@ -733,6 +871,117 @@ def validate_case_arrays(
         normalised[name] = array
 
     return times, radius, normalised
+
+
+def validate_case_object(case: Any, *, path: Any = "<case>") -> None:
+    """对**一个已经构造好的 ExtractedCase** 做与读取时同一套检查。
+
+    读取时的校验只保护"从文件读进来的那一份"。直接构造出来的对象、或者读完之后
+    被改过的对象完全没有经过它，所以这里必须能独立跑一遍。
+
+    **它以前只覆盖了七个数组里的六个**：契约把 ``times`` / ``radius`` /
+    ``density`` / ``velocity`` / ``pressure`` / ``contact_radius`` /
+    ``shock_radius`` 交给校验，漏掉了 ``specific_energy``、``material``、
+    ``valid``、逐字段有效性掩码与前沿资格数组。后果是同一类错误两样待遇：
+
+    ==========================================  ==================
+    读取后改坏的对象                            契约的结论
+    ==========================================  ==================
+    ``velocity`` 形状不对                       拒绝（``ready=False``）
+    ``specific_energy`` 形状不对                **放行（``ready=True``）**
+    ``material`` 全改成 999                     **放行**
+    ``material`` 改成 float                     **放行**
+    ``front_supervision_eligibility`` 形状不对  **放行**
+    ==========================================  ==================
+
+    "改坏了却仍然就绪"与"改坏了就拒绝"并存，等于说这份检查的覆盖面是个偶然。
+    现在对象上**每一个**数组都过一遍，规则与读取端共用。
+    """
+    times = np.asarray(getattr(case, "times", None), dtype=np.float64)
+    radius = np.asarray(getattr(case, "radius", None), dtype=np.float64)
+
+    validate_case_arrays(
+        times=times,
+        radius=radius,
+        # 对象上的剖面**已经**是规范形状（读取端归一的），所以这里用缺省布局。
+        profiles={
+            name: np.asarray(getattr(case, name, None), dtype=np.float64)
+            for name in ("density", "velocity", "pressure", "specific_energy")
+        },
+        fronts={
+            name: np.asarray(getattr(case, name, None), dtype=np.float64)
+            for name in ("contact_radius", "shock_radius")
+        },
+        # 这两项在 ``ExtractedCase`` 上是必填字段，所以**不**跳过缺失：一个没有
+        # 它们的对象已经不是这份数据了，不该靠"没写就当没有"混过去。
+        eligibility={
+            name: np.asarray(getattr(case, name, None))
+            for name in ("contact_valid", "shock_valid")
+        },
+        path=path,
+    )
+
+    expected = (times.size, radius.size)
+
+    def _check_domain(name, array, *, dtype, allowed=None):
+        if array.shape != expected:
+            raise DataError(
+                f"{path}: {name} has shape {array.shape}, expected {expected}"
+            )
+        if dtype is not None and not np.issubdtype(array.dtype, dtype):
+            raise DataError(
+                f"{path}: {name} has dtype {array.dtype}, not {np.dtype(dtype)}"
+            )
+        if allowed is not None:
+            unknown = sorted(set(np.unique(array).tolist()) - set(allowed))
+            if unknown:
+                raise DataError(
+                    f"{path}: {name} contains {unknown}, which this reader does not "
+                    f"define (known: {sorted(allowed)}). An unrecognised code is a "
+                    "format mismatch, not a region"
+                )
+
+    _check_domain(
+        "material", np.asarray(getattr(case, "material", None)),
+        dtype=np.integer, allowed=MATERIAL_CODES,
+    )
+    _check_domain("valid", np.asarray(getattr(case, "valid", None)), dtype=np.bool_)
+
+    # 逐字段有效性：每一张都必须是 ``(n_t, n_x)`` 的真布尔量。``None`` 表示"没记录"，
+    # 与"都有效"不是一回事，所以是整体缺省而不是就地补一张。
+    for name, mask in (getattr(case, "field_validity", None) or {}).items():
+        _check_domain(f"field_validity[{name!r}]", np.asarray(mask), dtype=np.bool_)
+
+    # 前沿资格里**带出来的数组**同样要核。它们在对象上，不在文件里，所以读取时的
+    # 那一次校验管不到；不核的话，一张被改坏的资格表会静默改变"哪些帧算标签"。
+    eligibility_block = getattr(case, "front_supervision_eligibility", None) or {}
+    for name in ("contact_eligible", "shock_eligible", "ordering_ok"):
+        value = eligibility_block.get(name)
+        if value is None:
+            continue
+        array = np.asarray(value)
+        if array.shape != (times.size,) or array.dtype != np.bool_:
+            raise DataError(
+                f"{path}: front_supervision_eligibility[{name!r}] has shape "
+                f"{array.shape} and dtype {array.dtype}; it must be {times.size} "
+                "booleans, one per frame"
+            )
+    for name in ("contact_status", "shock_status"):
+        value = eligibility_block.get(name)
+        if value is None:
+            continue
+        array = np.asarray(value)
+        if array.ndim != 1 or array.shape != (times.size,):
+            raise DataError(
+                f"{path}: front_supervision_eligibility[{name!r}] has shape "
+                f"{array.shape}; it must be one code per frame"
+            )
+        unknown = sorted(set(np.unique(array).tolist()) - set(FRONT_STATE_CODES))
+        if unknown:
+            raise DataError(
+                f"{path}: front_supervision_eligibility[{name!r}] contains {unknown}, "
+                f"which this reader does not define (known: {list(FRONT_STATE_CODES)})"
+            )
 
 
 def load_extracted_case(
@@ -774,18 +1023,26 @@ def load_extracted_case(
                 f"available keys are {sorted(data.files)}"
             )
 
-    times = np.asarray(data[mapping.key("time")], dtype=np.float64).reshape(-1)
-    radius = np.asarray(data[mapping.key("radius")], dtype=np.float64).reshape(-1)
-    density = np.atleast_2d(np.asarray(data[mapping.key("density")], dtype=np.float64))
-    velocity = np.atleast_2d(np.asarray(data[mapping.key("velocity")], dtype=np.float64))
-    pressure = np.atleast_2d(np.asarray(data[mapping.key("pressure")], dtype=np.float64))
+    # **先保留原始形状**：``reshape(-1)`` 会把一个二维的轴摊平，等校验拿到它时
+    # 维度错误已经不在了。规范化只能在校验**之后**做。
+    layout, layout_version, layout_declared = declared_profile_layout(
+        metadata, path=meta_path
+    )
+    times = np.asarray(data[mapping.key("time")], dtype=np.float64)
+    radius = np.asarray(data[mapping.key("radius")], dtype=np.float64)
+    density = np.asarray(data[mapping.key("density")], dtype=np.float64)
+    velocity = np.asarray(data[mapping.key("velocity")], dtype=np.float64)
+    pressure = np.asarray(data[mapping.key("pressure")], dtype=np.float64)
 
-    # 统一的形状 / 坐标轴校验（两条读取路径共用同一套规则）。
+    # 统一的形状 / 坐标轴校验（两条读取路径共用同一套规则）。**布局按声明**：
+    # 以前这里先 ``np.atleast_2d``，形状就成了读取器造的，校验再也看不到原始的
+    # 维度，一维单帧于是"读得进去、没有声明、没有记录"。
     times, radius, checked = validate_case_arrays(
         times=times, radius=radius,
         profiles={
             "density": density, "velocity": velocity, "pressure": pressure,
         },
+        layout=layout, layout_version=layout_version,
         path=npz_path,
     )
     density, velocity, pressure = (
@@ -864,6 +1121,14 @@ def load_extracted_case(
             "metadata": str(meta_path),
             "field_map": mapping.mapping,
             "metadata_raw": metadata,
+            # **读的是哪种布局，对象上要看得出来。** 以前一维单帧读进来之后，
+            # `density.shape` 是 `(1, n)`，与"一份只有一帧的二维导出"完全一样，
+            # 下游无从分辨，也无法回头核对当初声明的是什么。
+            "profile_layout": {
+                "version": layout_version,
+                "layout": layout,
+                "declared": layout_declared,
+            },
             "contact_contrast_median": float(np.median(contact_contrast)),
             "frames_rejected_contact_below_charge_radius": int(np.count_nonzero(below_charge)),
             "frames_with_detected_contact_below_charge_radius": int(
@@ -902,11 +1167,16 @@ def _load_with_volume_fraction_partition(
             )
     block = np.load(companion, allow_pickle=True)
 
-    times = np.asarray(data[mapping.key("time")], dtype=np.float64).reshape(-1)
-    radius = np.asarray(data[mapping.key("radius")], dtype=np.float64).reshape(-1)
-    density = np.atleast_2d(np.asarray(data[mapping.key("density")], dtype=np.float64))
-    velocity = np.atleast_2d(np.asarray(data[mapping.key("velocity")], dtype=np.float64))
-    pressure = np.atleast_2d(np.asarray(data[mapping.key("pressure")], dtype=np.float64))
+    # **先保留原始形状**：``reshape(-1)`` 会把一个二维的轴摊平，等校验拿到它时
+    # 维度错误已经不在了。规范化只能在校验**之后**做。
+    layout, layout_version, layout_declared = declared_profile_layout(
+        metadata, path=meta_path
+    )
+    times = np.asarray(data[mapping.key("time")], dtype=np.float64)
+    radius = np.asarray(data[mapping.key("radius")], dtype=np.float64)
+    density = np.asarray(data[mapping.key("density")], dtype=np.float64)
+    velocity = np.asarray(data[mapping.key("velocity")], dtype=np.float64)
+    pressure = np.asarray(data[mapping.key("pressure")], dtype=np.float64)
 
     charge_radius = float(metadata.get("R_0", np.nan))
     if not np.isfinite(charge_radius) or charge_radius <= 0.0:
@@ -917,22 +1187,54 @@ def _load_with_volume_fraction_partition(
     times, radius, checked = validate_case_arrays(
         times=times, radius=radius,
         profiles={"density": density, "velocity": velocity, "pressure": pressure},
+        layout=layout, layout_version=layout_version,
         path=npz_path,
     )
     density, velocity, pressure = (
         checked["density"], checked["velocity"], checked["pressure"]
     )
 
-    material = np.atleast_2d(np.asarray(block["material"], dtype=np.int64))
-    valid = np.atleast_2d(np.asarray(block["valid"], dtype=bool))
-    if material.shape != density.shape or valid.shape != density.shape:
+    # **材料编码与有效性掩码的原始类型先查，再转换。**
+    #
+    # ``np.asarray(x, dtype=int)`` 会把 999 照单全收，``dtype=bool`` 会把 ``nan``
+    # 变成 ``True``——于是"材料表里全是 999"读起来像一份正常分区，"联合掩码全是
+    # NaN"读起来像"整帧都有效"。这两件事都实际复现过。
+    material_raw = np.asarray(block["material"])
+    valid_raw = np.asarray(block["valid"])
+    # 只要求是**整数类型**，不钉死 int64：``np.where`` 在 Windows 上给 int32，
+    # 在 Linux 上给 int64。钉死位宽会把一份完全正常的导出按平台判成错误。
+    if not np.issubdtype(material_raw.dtype, np.integer):
         raise DataError(
-            f"{companion} has material {material.shape} / valid {valid.shape}, but the "
-            f"profiles are {density.shape}; the companion file belongs to another extraction"
+            f"{companion} carries 'material' with dtype {material_raw.dtype}, not an "
+            "integer type; casting a float table would turn NaN into a valid-looking code"
         )
+    unknown_codes = sorted(set(np.unique(material_raw).tolist()) - set(MATERIAL_CODES))
+    if unknown_codes:
+        raise DataError(
+            f"{companion}: 'material' contains {unknown_codes}, which this reader does "
+            f"not define (known: {sorted(MATERIAL_CODES)}). An unrecognised material code "
+            "is a format mismatch, not a region"
+        )
+    if valid_raw.dtype != np.bool_:
+        raise DataError(
+            f"{companion} carries 'valid' with dtype {valid_raw.dtype}, not bool; "
+            "`dtype=bool` would turn every NaN into True, i.e. an all-NaN mask would "
+            "read back as 'everything valid'"
+        )
+    # 配套掩码走**与剖面同一条布局规则**。以前这里是 ``np.atleast_2d`` 之后再比
+    # ``density.shape``：形状比得上是因为读取器刚刚把两边都改成了同一个形状，
+    # 而不是因为文件里本来就是那个形状。
+    material = normalise_to_layout(
+        material_raw, name="'material'", layout=layout, times=times, radius=radius,
+        path=companion,
+    )
+    valid = normalise_to_layout(
+        valid_raw, name="'valid'", layout=layout, times=times, radius=radius,
+        path=companion,
+    )
 
-    contact_radius = np.asarray(block["contact_radius"], dtype=np.float64).reshape(-1)
-    shock_radius = np.asarray(block["shock_radius"], dtype=np.float64).reshape(-1)
+    contact_radius = np.asarray(block["contact_radius"], dtype=np.float64)
+    shock_radius = np.asarray(block["shock_radius"], dtype=np.float64)
     # 前沿的有效性判据在这里是"数出来了"，不是"猜出来了"。
     #
     # **两条前沿必须解耦**（§11.1）。以前 ``contact_valid`` 里带着
@@ -960,6 +1262,9 @@ def _load_with_volume_fraction_partition(
     # 前沿、状态码、资格数组**一起**交给统一的校验：它们的维度、长度、取值域
     # 与两条坐标轴的关系在那里一次核完。以前每个数组各查各的，于是"资格数组被
     # ``reshape(-1)`` 展平"和"状态码 999 被当成普通无效帧"都能溜过去。
+    #
+    # 这里传的剖面已经是**规范形状**（上面那次校验返回的），规范形状正是缺省布局
+    # 所描述的东西，所以这次不再带 ``layout``：声明的布局描述的是文件，不是对象。
     _, _, checked_fronts = validate_case_arrays(
         times=times, radius=radius,
         profiles={
@@ -1053,11 +1358,10 @@ def _load_with_volume_fraction_partition(
     # 壳层平均的 ``(rho, p)`` 再解一次准；而且产物膨胀到低密度、压力转负之后那个
     # 反解没有实数解，重新解会给一批已被标为有效的壳层填上 ``nan``。
     if "e" in data.files:
-        energy = np.atleast_2d(np.asarray(data["e"], dtype=np.float64))
-        if energy.shape != density.shape:
-            raise DataError(
-                f"{npz_path} carries 'e' with shape {energy.shape}, expected {density.shape}"
-            )
+        energy = normalise_to_layout(
+            np.asarray(data["e"], dtype=np.float64), name="'e'", layout=layout,
+            times=times, radius=radius, path=npz_path,
+        )
         energy_source = "written by the extractor from the per-cell EOS inverse"
     else:
         energy = np.full_like(density, np.nan)
@@ -1094,6 +1398,11 @@ def _load_with_volume_fraction_partition(
             "material_companion": str(companion),
             "field_map": mapping.mapping,
             "metadata_raw": dict(metadata),
+            "profile_layout": {
+                "version": layout_version,
+                "layout": layout,
+                "declared": layout_declared,
+            },
             "material_masks_from": (
                 "ALE material volume fraction (d3plot history variables 1..7); "
                 "pure product alpha >= 0.95, pure air alpha <= 0.05, "
@@ -1132,7 +1441,9 @@ def _load_with_volume_fraction_partition(
             },
         },
         detector=DetectorSettings(),
-        field_validity=_field_validity_from_companion(block, density.shape),
+        field_validity=_field_validity_from_companion(
+            block, layout=layout, times=times, radius=radius
+        ),
         front_supervision_eligibility={
             "source": front_eligibility,
             "level": eligibility_level,
@@ -1156,7 +1467,9 @@ def _load_with_volume_fraction_partition(
     )
 
 
-def _field_validity_from_companion(block, shape) -> dict[str, np.ndarray] | None:
+def _field_validity_from_companion(
+    block, *, layout: str, times: np.ndarray, radius: np.ndarray,
+) -> dict[str, np.ndarray] | None:
     """从配套文件里读逐字段有效性（§11.1）。
 
     缺任何一项就整体返回 ``None``：只给一半的字段有效性，会让调用方以为另一半
@@ -1178,19 +1491,20 @@ def _field_validity_from_companion(block, shape) -> dict[str, np.ndarray] | None
         return None
     out: dict[str, np.ndarray] = {}
     for logical, key in names.items():
-        raw = np.atleast_2d(np.asarray(block[key]))
-        if raw.shape != tuple(shape):
-            raise DataError(
-                f"the companion file carries {key} with shape {raw.shape}, expected "
-                f"{tuple(shape)}; the per-field validity does not belong to these profiles"
-            )
+        raw = np.asarray(block[key])
         if raw.dtype != np.bool_:
             raise DataError(
                 f"the companion array {key!r} has dtype {raw.dtype}, not bool. Converting "
                 "a float array with `dtype=bool` would turn every NaN into True, so an "
                 "all-NaN mask would read back as 'everything valid'"
             )
-        out[logical] = raw
+        # 逐字段有效性是**场量**，所以走与场量同一条布局规则：声明什么布局就按
+        # 什么布局读。以前这里是 ``np.atleast_2d`` 之后再比 ``shape``，一维掩码
+        # 会被静默提升成 ``(1, n)``，与"本来就存成 (1, n)"无从分辨。
+        out[logical] = normalise_to_layout(
+            raw, name=f"{key!r}", layout=layout, times=times, radius=radius,
+            path="the companion file",
+        )
     return out
 
 

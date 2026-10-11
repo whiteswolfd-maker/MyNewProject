@@ -1,0 +1,11 @@
+{
+  "charge_radius_m": 0.08,
+  "start_time_s": 1.5999999999999997e-06,
+  "time_end_s": 0.00017785194764726757,
+  "n_times": 40,
+  "n_radii": 200,
+  "training_time_coverage_s": 0.00017785194764726757,
+  "n_extrapolated_times": 0,
+  "checkpoint": "outputs/smoke/last.pt",
+  "physics_parameters_source": "checkpoint provenance, not the target radius data"
+}

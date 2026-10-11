@@ -227,12 +227,37 @@ class RadiusSampler:
         """
         return {"seed": self.seed, "bit_generator": self.rng.bit_generator.state}
 
-    def set_rng_state(self, state: Mapping[str, Any] | None) -> None:
-        if not state:
-            return
+    def validate_rng_state(self, state: Any) -> None:
+        """检查一份采样器随机状态**结构完整**，不修改任何东西。
+
+        以前 ``set_rng_state`` 是"没有就返回"：空字典、缺 ``bit_generator``、
+        类型不对——全都静默跳过。于是恢复出来的采样序列是**另一条轨迹**，而"恢复
+        到第 N 步"与"连跑 N 步"的差别在损失曲线上完全看不出来。
+        """
+        if not isinstance(state, Mapping):
+            raise SamplingError(
+                f"case {self.case.case_id!r}: sampler RNG state must be a mapping, got "
+                f"{type(state).__name__}"
+            )
+        if "seed" not in state:
+            raise SamplingError(
+                f"case {self.case.case_id!r}: sampler RNG state has no 'seed'"
+            )
         payload = state.get("bit_generator")
-        if payload is not None:
-            self.rng.bit_generator.state = payload
+        if not isinstance(payload, Mapping):
+            raise SamplingError(
+                f"case {self.case.case_id!r}: sampler RNG state has no 'bit_generator' "
+                f"mapping (got {type(payload).__name__})"
+            )
+        if "state" not in payload or "bit_generator" not in payload:
+            raise SamplingError(
+                f"case {self.case.case_id!r}: the bit-generator state must carry both "
+                f"'bit_generator' and 'state'; it carries {sorted(payload)}"
+            )
+
+    def set_rng_state(self, state: Mapping[str, Any] | None) -> None:
+        self.validate_rng_state(state)
+        self.rng.bit_generator.state = state["bit_generator"]
 
     # -- 时间窗口（§14.2）--------------------------------------------------
     def set_time_window(self, fraction: float) -> dict[str, float]:
@@ -272,6 +297,20 @@ class RadiusSampler:
         return usable[
             self.case.pinn_times[usable] <= self.window_pinn_time_max + 1.0e-12
         ]
+
+    def restore_time_window(self, fraction: float) -> None:
+        """**无条件**把窗口设成 ``fraction``，用于回滚。
+
+        与 :meth:`set_time_window` 的区别是它**允许收窄**——这正是回滚需要的：
+        一次失败的恢复要把窗口还原成加载前的值，而那个值可能比现在的小。所以它
+        只给回滚用，调用点必须能说清楚"这是在撤销一次未完成的修改"。
+        """
+        value = float(fraction)
+        if not math.isfinite(value) or not (0.0 < value <= 1.0):
+            raise SamplingError(f"time window fraction must lie in (0, 1], got {fraction!r}")
+        self._window_committed = True
+        self.window_fraction = value
+        self.window_pinn_time_max = value * self.full_pinn_time_max
 
     def window_state(self) -> dict[str, float]:
         return {
@@ -726,12 +765,47 @@ class GroupedSampler:
             },
         }
 
-    def set_rng_state(self, payload: Mapping[str, Any] | None) -> None:
-        if not payload:
-            return
-        stored = payload.get("samplers") or {}
+    #: 采样器随机状态的结构版本。
+    RNG_STATE_VERSION = 1
+
+    def validate_rng_state(self, payload: Any) -> None:
+        """整份采样器随机状态的**结构**校验，不改任何东西。
+
+        要求：是一个带版本的映射；带 ``samplers`` 子映射；**每一个**本组的算例
+        都在里面。缺一个算例就等于那台采样器会从别处继续——而它同样不会报错。
+        """
+        if not isinstance(payload, Mapping):
+            raise SamplingError(
+                f"the sampler RNG state must be a mapping, got {type(payload).__name__}"
+            )
+        if int(payload.get("version", -1)) != self.RNG_STATE_VERSION:
+            raise SamplingError(
+                f"the sampler RNG state has version {payload.get('version')!r}, "
+                f"expected {self.RNG_STATE_VERSION}"
+            )
+        stored = payload.get("samplers")
+        if not isinstance(stored, Mapping):
+            raise SamplingError(
+                "the sampler RNG state has no 'samplers' mapping; restoring from it "
+                "would leave every sampler on a different trajectory without saying so"
+            )
+        missing = [
+            sampler.case.case_id for sampler in self.samplers
+            if sampler.case.case_id not in stored
+        ]
+        if missing:
+            raise SamplingError(
+                f"the sampler RNG state is missing {missing}; every case that will be "
+                "sampled must carry its own state"
+            )
         for sampler in self.samplers:
-            sampler.set_rng_state(stored.get(sampler.case.case_id))
+            sampler.validate_rng_state(stored[sampler.case.case_id])
+
+    def set_rng_state(self, payload: Mapping[str, Any] | None) -> None:
+        self.validate_rng_state(payload)
+        stored = payload["samplers"]
+        for sampler in self.samplers:
+            sampler.set_rng_state(stored[sampler.case.case_id])
 
     def as_dict(self) -> dict[str, Any]:
         return {

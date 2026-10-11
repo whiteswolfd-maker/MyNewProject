@@ -1,0 +1,141 @@
+{
+  "reference_radius_m": 0.05,
+  "start_time_s": 1e-06,
+  "initial_product_pressure_pa": 8220261897.155153,
+  "derived": {
+    "e_star_j_kg": 3680981.5950920247,
+    "u_star_m_s": 1918.588438173238,
+    "product_pressure_scale_pa": 6000000000.0,
+    "air_pressure_scale_pa": 4509202.453987731
+  },
+  "field": {
+    "reference_radius": 0.05,
+    "n_times": 41,
+    "n_cells": 3196,
+    "n_product_cells": 2000,
+    "time_min": 1.2317939695040565e-09,
+    "time_max": 9.858008658008658e-06,
+    "cell_radius_min": 1.9842513149593602e-05,
+    "cell_radius_max": 1.9978160083875331,
+    "spatial_coordinates": "per-frame current Lagrangian cell centres; queries are interpolated within the material block each query point belongs to at that frame",
+    "method": "1D spherical Lagrangian finite volume, staggered, von Neumann-Richtmyer viscosity",
+    "q1": 1.5,
+    "q2": 0.06,
+    "cfl": 0.2,
+    "cells_inside": 2000,
+    "growth": 1.005,
+    "outer_radius_factor": 40.0,
+    "mesh": {
+      "n_cells": 3196,
+      "charge_radius": 0.05,
+      "outer_radius": 2.0026740355692283,
+      "min_width": 2.4999999999997247e-05,
+      "max_width": 0.009739796196861716,
+      "product_cells": 2000,
+      "air_cells": 1196
+    },
+    "steps": 133802,
+    "total_mass_initial": 3.347652592405711,
+    "total_mass_final": 3.347652592405711,
+    "initial_condition": "scheme A: whole charge converts at t=0 (uniform, at rest, e = E0/rho0)",
+    "contact_displacement_over_R0": 1.7289971000663742,
+    "max_cell_displacement_over_R0": 0.7287601268592749
+  },
+  "checks": {
+    "min_density": 1.2249999999999999,
+    "min_specific_energy": 206775.51020408163,
+    "min_pressure": 101319.99999999996,
+    "mass_relative_drift": 0.0,
+    "contact_over_R0_at_start_time": 1.0815358496129523,
+    "shock_over_R0_at_start_time": 1.0983245954278318,
+    "gap_m_at_start_time": 0.000839437290743969,
+    "outer_boundary_undisturbed": {
+      "max_relative_pressure_excess": 2.872466488031357e-16,
+      "max_absolute_velocity": 1.2234585632942918e-14,
+      "n_cells_inspected": 5
+    },
+    "positive_ok": true
+  },
+  "material": {
+    "jwl": {
+      "A": 371200000000.0,
+      "B": 3747100000.0,
+      "R1": 4.15,
+      "R2": 0.95,
+      "omega": 0.3,
+      "rho0": 1630.0,
+      "energy_shift": 0.0
+    },
+    "rho0": 1630.0,
+    "E0_volume_energy": 6000000000.0,
+    "gamma_air": 1.4,
+    "air_density": 1.225,
+    "air_pressure": 101319.99999999999
+  },
+  "grid_convergence": {
+    "levels": [
+      {
+        "cells_inside": 500,
+        "contact_over_R0": 1.077520860660308,
+        "shock_over_R0": 1.0916290871883128,
+        "min_density": 1.2249999999999999,
+        "mass_relative_drift": 0.0,
+        "contact_relative_deviation": 0.0037240597190516317
+      },
+      {
+        "cells_inside": 1000,
+        "contact_over_R0": 1.0810848752239177,
+        "shock_over_R0": 1.0961969534912481,
+        "min_density": 1.2249999999999999,
+        "mass_relative_drift": 0.0,
+        "contact_relative_deviation": 0.00042877134908038454
+      },
+      {
+        "cells_inside": 2000,
+        "contact_over_R0": 1.0815486122815017,
+        "shock_over_R0": 1.0982599185619928,
+        "min_density": 1.2249999999999999,
+        "mass_relative_drift": 0.0,
+        "contact_relative_deviation": 0.0
+      }
+    ],
+    "finest": 2000,
+    "max_contact_relative_deviation": 0.0037240597190516317
+  },
+  "timestep_sensitivity": {
+    "levels": [
+      {
+        "cfl": 0.4,
+        "contact_over_R0": 1.0826483386718082,
+        "shock_over_R0": 1.099967550221477,
+        "contact_relative_deviation": 0.0015009630012473415
+      },
+      {
+        "cfl": 0.2,
+        "contact_over_R0": 1.0815486122815017,
+        "shock_over_R0": 1.0982599185619928,
+        "contact_relative_deviation": 0.0004836640320538489
+      },
+      {
+        "cfl": 0.1,
+        "contact_over_R0": 1.0810257590041477,
+        "shock_over_R0": 1.097741244801363,
+        "contact_relative_deviation": 0.0
+      }
+    ],
+    "max_contact_relative_deviation": 0.0015009630012473415
+  },
+  "scaling_check": {
+    "k": 2.0,
+    "reference_radius": 0.05,
+    "other_radius": 0.1,
+    "state_relative_deviation": {
+      "density": 5.490446543218168e-13,
+      "velocity": 2.561755382604114e-13,
+      "specific_energy": 6.249317267405471e-13
+    },
+    "contact_over_R0_reference": 1.077520860660308,
+    "contact_over_R0_other": 1.0775208606603086,
+    "contact_shape_deviation": 6.661338147750939e-16
+  }
+}
