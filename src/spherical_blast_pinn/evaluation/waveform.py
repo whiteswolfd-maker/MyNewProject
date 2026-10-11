@@ -107,6 +107,15 @@ def gauge_metrics(
             "pressure contains non-finite values; a waveform with gaps cannot be "
             "integrated as one record — split it at the gaps and evaluate each piece"
         )
+    # 阈值本身要合法。**零阈值是合法的**——噪声为零的解析曲线就该能用 0——
+    # 所以这里只拒绝负数与非有限值；上一版的零阈值错误由相位起点的处理修掉，
+    # 不是靠"禁止 0"盖过去。
+    ratio = float(minimum_overpressure_ratio)
+    if not np.isfinite(ratio) or ratio < 0.0:
+        raise WaveformError(
+            f"minimum_overpressure_ratio must be finite and non-negative, got "
+            f"{minimum_overpressure_ratio!r}"
+        )
 
     metrics = GaugeMetrics(radius=float("nan"))
     peak = float(values.max())
@@ -147,8 +156,26 @@ def gauge_metrics(
     phase_times = np.concatenate(([float(arrival)], times[times > arrival]))
     phase_values = np.concatenate(([arrival_value], values[times > arrival]))
 
-    negative_index = np.flatnonzero(phase_values <= 0.0)
-    if negative_index.size == 0:
+    # **相位起点与相位终点是两件事。** 阈值取 0 时，上穿点就落在零点上，于是
+    # ``phase_values[0]`` 本身就是 0——它是**正相的起点**。从下标 0 开始找第一个
+    # ``<= 0`` 会立刻选中这个起点，把整段正相判成"退化成一个点"，面积 0、时长 0，
+    # 还报 ``positive_phase_complete=True``。
+    #
+    # 正确的顺序是：先定位**严格正**的区间，再从那里往后找第一次下穿（或到零）。
+    strictly_positive = np.flatnonzero(phase_values > 0.0)
+    if strictly_positive.size == 0:
+        # 到达之后一次正压都没有：正相区间退化成一个点。
+        metrics.positive_duration = 0.0
+        metrics.positive_impulse = 0.0
+        metrics.positive_phase_complete = True
+        metrics.notes.append(
+            "到达时刻之后没有任何正超压：正相区间退化成一个点，冲量为 0"
+        )
+        return metrics
+
+    first_positive = int(strictly_positive[0])
+    tail = np.flatnonzero(phase_values[first_positive:] <= 0.0)
+    if tail.size == 0:
         metrics.positive_phase_complete = False
         metrics.notes.append(
             "曲线在正压阶段结束之前被终止时间截断：正相冲量标为不完整，不作为完整的正相冲量使用"
@@ -158,25 +185,18 @@ def gauge_metrics(
         metrics.positive_impulse = float(_trapezoid(np.maximum(phase_values, 0.0), phase_times))
         return metrics
 
-    stop = int(negative_index[0])
-    if stop == 0:
-        # 到达时刻本身就不在正压段里（阈值取 0、且上穿点正好落在零点）：正相区间
-        # 退化成一个点，冲量为 0——不是拿后面的负值去凑一个面积。
-        nodes_t = phase_times[:1]
-        nodes_v = np.zeros(1)
-        zero_time = float(phase_times[0])
-    else:
-        t0, t1 = float(phase_times[stop - 1]), float(phase_times[stop])
-        v0, v1 = float(phase_values[stop - 1]), float(phase_values[stop])
-        zero_time = t0 + (0.0 - v0) * (t1 - t0) / (v1 - v0) if v1 != v0 else t1
-        # 节点 = 过零之前的**全部非负采样点**，末端接**真正的过零点**。
-        # 首个负压点不留在节点里：它属于负相。
-        nodes_t = phase_times[:stop]
-        nodes_v = phase_values[:stop]
-        # 过零恰好落在节点上时 ``zero_time`` 就是最后一个节点，不重复追加。
-        if zero_time > float(nodes_t[-1]):
-            nodes_t = np.append(nodes_t, zero_time)
-            nodes_v = np.append(nodes_v, 0.0)
+    stop = first_positive + int(tail[0])
+    t0, t1 = float(phase_times[stop - 1]), float(phase_times[stop])
+    v0, v1 = float(phase_values[stop - 1]), float(phase_values[stop])
+    zero_time = t0 + (0.0 - v0) * (t1 - t0) / (v1 - v0) if v1 != v0 else t1
+    # 节点 = 过零之前的**全部**采样点（包括起点那个 0），末端接**真正的过零点**。
+    # 首个非正点不留在节点里：它属于负相。起点那个 0 留在节点里，它是相位的左端。
+    nodes_t = phase_times[:stop]
+    nodes_v = phase_values[:stop]
+    # 过零恰好落在节点上时 ``zero_time`` 就是最后一个节点，不重复追加。
+    if zero_time > float(nodes_t[-1]):
+        nodes_t = np.append(nodes_t, zero_time)
+        nodes_v = np.append(nodes_v, 0.0)
 
     metrics.positive_duration = float(nodes_t[-1]) - arrival
     metrics.positive_impulse = float(_trapezoid(np.maximum(nodes_v, 0.0), nodes_t))
@@ -257,20 +277,60 @@ def compare_gauge(
     reference.radius = float(radius)
 
     comparison = WaveformComparison(radius=float(radius), model=model, reference=reference)
+    # 峰值超压两边都有定义，无条件比较。
     comparison.errors = {
         "peak_overpressure_relative": relative_error(
             model.peak_overpressure, reference.peak_overpressure, scale=pressure_scale
         ),
-        "arrival_time_relative": relative_error(
-            model.arrival_time, reference.arrival_time, scale=time_scale
-        ),
     }
     comparison.absolute_errors = {
         "peak_overpressure_pa": model.peak_overpressure - reference.peak_overpressure,
-        "arrival_time_s": model.arrival_time - reference.arrival_time,
     }
 
-    if reference.positive_phase_complete:
+    # **到达时间误差：两边的到达都必须是被观测到的。**
+    #
+    # ``arrival_observed=False`` 表示曲线起点就已经高于阈值，真实到达在记录之外,
+    # 给出的只是**上界**。拿两个上界相减会得到 0——一个"两边完全一致"的假象，
+    # 而它衡量的是"两条曲线都从正压开始"，不是到达时间。
+    if model.arrival_observed and reference.arrival_observed:
+        comparison.errors["arrival_time_relative"] = relative_error(
+            model.arrival_time, reference.arrival_time, scale=time_scale
+        )
+        comparison.absolute_errors["arrival_time_s"] = (
+            model.arrival_time - reference.arrival_time
+        )
+    else:
+        comparison.notes.append(
+            "到达时间不可比较："
+            + ("模型" if not model.arrival_observed else "")
+            + ("与" if not model.arrival_observed and not reference.arrival_observed else "")
+            + ("参考" if not reference.arrival_observed else "")
+            + "曲线的起点已经处于正相，真实到达在记录之外，给出的只是上界"
+        )
+
+    # **正相时长与冲量：两边都要覆盖完整的正相。**
+    #
+    # 以前只检查了参考一侧。模型被截断而参考完整时，两边算的就不是同一个量：
+    # 模型给的是"已覆盖区间上的部分积分"，参考给的是完整冲量，两者相减得到的
+    # 误差既不是模型误差也不是数据误差。已覆盖区间上的积分值仍然保留在
+    # ``model.positive_impulse`` 里，只是不当成可比指标。
+    incomplete_sides = [
+        name for name, entry in (("模型", model), ("参考", reference))
+        if not entry.positive_phase_complete
+    ]
+    if incomplete_sides and model.positive_phase_complete != reference.positive_phase_complete:
+        for name in incomplete_sides:
+            comparison.notes.append(
+                f"{name}曲线被终止时间截断，正压阶段不完整："
+                "正相持续时间与冲量不参与判分（已覆盖区间上的积分值仍保留在各自指标里）"
+            )
+    elif incomplete_sides:
+        comparison.notes.append(
+            "两条曲线都被终止时间截断，正压阶段都不完整："
+            "正相持续时间与冲量不参与判分（各自的已覆盖区间积分值仍保留）"
+        )
+
+    if model.positive_phase_complete and reference.positive_phase_complete:
         comparison.errors["positive_duration_relative"] = relative_error(
             model.positive_duration, reference.positive_duration, scale=time_scale
         )
@@ -282,10 +342,6 @@ def compare_gauge(
         )
         comparison.absolute_errors["positive_impulse_pa_s"] = (
             model.positive_impulse - reference.positive_impulse
-        )
-    else:
-        comparison.notes.append(
-            "参考曲线被终止时间截断，正压阶段不完整：正相持续时间与冲量不参与判分"
         )
     return comparison
 

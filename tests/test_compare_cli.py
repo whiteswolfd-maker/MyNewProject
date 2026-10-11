@@ -434,3 +434,75 @@ def test_a_missing_ambient_pressure_is_refused_not_defaulted(environment):
         compare_module.load_prediction(
             _write_prediction(tmp_path / "no_ambient.npz", prediction)
         )
+
+
+# --------------------------------------------------------------------------
+# 第七轮 §5 前沿插值：零权重的邻帧不得污染
+# --------------------------------------------------------------------------
+
+
+def _front_prediction(contact: np.ndarray, shock: np.ndarray) -> dict:
+    # 时间轴取**整数**节点，好让"精确命中第 i 帧"在测试里是字面可读的。
+    times = np.arange(contact.size, dtype=np.float64)
+    return {
+        "pinn_time": times,
+        "physical_time": times,
+        "start_time": 0.0,
+        "radius": np.linspace(0.01, 0.20, 20),
+        "density": np.full((contact.size, 20), 1000.0),
+        "contact_radius": np.asarray(contact, dtype=np.float64),
+        "shock_radius": np.asarray(shock, dtype=np.float64),
+    }
+
+
+def test_an_exact_hit_on_a_frame_ignores_a_missing_neighbour_frame():
+    """**复核的原反例。** 查询第一帧本身有效的节点，只把**第二帧**的接触面改成
+    NaN：修前结果变成 ``NaN`` / ``front_record_unavailable``。
+
+    零权重的那一帧整个不参与计算，它的缺测无从污染结果。
+    """
+    prediction = _front_prediction(
+        contact=np.array([0.05, np.nan, 0.05]), shock=np.full(3, 0.30)
+    )
+    values, why = compare_module.sample_field(
+        prediction, "density", np.array([0.05]), 0.0
+    )
+    assert why[0] == compare_module.SAMPLE_OK
+    assert values[0] == pytest.approx(1000.0)
+    contact, shock = compare_module._fronts_at(prediction, 0.0)
+    assert contact == pytest.approx(0.05)
+    assert shock == pytest.approx(0.30)
+
+
+def test_an_exact_hit_on_the_last_frame_ignores_a_missing_neighbour_frame():
+    prediction = _front_prediction(
+        contact=np.array([0.05, np.nan, 0.05]), shock=np.full(3, 0.30)
+    )
+    contact, shock = compare_module._fronts_at(prediction, 2.0)
+    assert contact == pytest.approx(0.05)
+    assert shock == pytest.approx(0.30)
+
+
+def test_a_query_genuinely_between_frames_needs_both_frames():
+    """真正落在两帧之间时，两个支撑点的权重都非零——缺一个就必须拒绝。"""
+    prediction = _front_prediction(
+        contact=np.array([0.05, np.nan, 0.05]), shock=np.full(3, 0.30)
+    )
+    values, why = compare_module.sample_field(
+        prediction, "density", np.array([0.05]), 0.5
+    )
+    assert why[0] == compare_module.SAMPLE_FRONT_UNAVAILABLE
+    assert not np.isfinite(values[0])
+
+
+def test_the_front_rules_agree_between_exact_nodes_and_between_frames():
+    """首帧、末帧、内部节点用同一条规则：零权重不参与，非零权重必须有效。"""
+    prediction = _front_prediction(
+        contact=np.array([0.05, 0.06, np.nan, 0.08]), shock=np.full(4, 0.30)
+    )
+    # 内部节点 t = 1.0（精确命中第 1 帧，第 2 帧权重为 0）
+    contact, _ = compare_module._fronts_at(prediction, 1.0)
+    assert contact == pytest.approx(0.06)
+    # 落在第 2、3 帧之间：第 2 帧权重非零且缺测 → 拒绝
+    contact, _ = compare_module._fronts_at(prediction, 2.5)
+    assert not np.isfinite(contact)

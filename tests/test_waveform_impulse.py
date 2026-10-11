@@ -153,3 +153,144 @@ def test_too_few_samples_is_refused():
 def test_mismatched_lengths_are_refused():
     with pytest.raises(WaveformError, match="same length"):
         gauge_metrics([0, 1, 2], [102, 98], ambient=100)
+
+
+# --------------------------------------------------------------------------
+# 第七轮 §6 指标的可用性标志必须控制最终判分
+# --------------------------------------------------------------------------
+
+
+def _gauge(times, model_pressure, reference_pressure):
+    from spherical_blast_pinn.evaluation.waveform import compare_gauge
+
+    return compare_gauge(
+        times=times,
+        model_pressure=model_pressure,
+        reference_pressure=reference_pressure,
+        ambient=100.0,
+        pressure_scale=100.0,
+        time_scale=3.0,
+        impulse_scale=300.0,
+        radius=0.1,
+    )
+
+
+def test_an_incomplete_model_phase_removes_the_phase_errors():
+    """**复核的原反例。** 模型正相尚未结束、参考已经结束：修前仍然输出正相时长
+    与冲量误差——而那两边算的根本不是同一个量。"""
+    times = np.array([0.0, 1.0, 2.0, 3.0])
+    comparison = _gauge(
+        times,
+        model_pressure=np.array([102.0, 104.0, 103.0, 103.0]),   # 末端仍正压
+        reference_pressure=np.array([102.0, 104.0, 99.0, 99.0]),  # 已经过零
+    )
+    assert comparison.model.positive_phase_complete is False
+    assert comparison.reference.positive_phase_complete is True
+    assert "positive_duration_relative" not in comparison.errors
+    assert "positive_impulse_relative" not in comparison.errors
+    # 已覆盖区间上的积分值仍然保留在各自的指标里。
+    assert np.isfinite(comparison.model.positive_impulse)
+    assert np.isfinite(comparison.reference.positive_impulse)
+    assert any("截断" in note for note in comparison.notes)
+
+
+def test_both_truncated_is_reported_as_such():
+    times = np.array([0.0, 1.0, 2.0, 3.0])
+    comparison = _gauge(
+        times,
+        model_pressure=np.array([102.0, 104.0, 103.0, 103.0]),
+        reference_pressure=np.array([102.0, 104.0, 103.5, 103.5]),
+    )
+    assert "positive_impulse_relative" not in comparison.errors
+    assert any("两条曲线" in note for note in comparison.notes)
+
+
+def test_an_unobserved_arrival_removes_the_arrival_error():
+    """**复核的原反例。** ``arrival_observed=False`` 时修前仍然输出到达时间误差，
+    甚至显示为零——那衡量的是"两条曲线都从正压开始"，不是到达时间。"""
+    times = np.array([0.0, 1.0, 2.0, 3.0])
+    comparison = _gauge(
+        times,
+        model_pressure=np.array([103.0, 104.0, 99.0, 99.0]),
+        reference_pressure=np.array([101.0, 104.0, 99.0, 99.0]),
+    )
+    assert comparison.model.arrival_observed is False
+    assert comparison.reference.arrival_observed is False
+    assert "arrival_time_relative" not in comparison.errors
+    assert any("到达" in note for note in comparison.notes)
+
+
+def test_a_fully_observed_pair_still_gets_all_the_errors():
+    """对照组：两边都观测到、都完整时，四项误差照常给出。"""
+    times = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 2.5])
+    model = np.array([100.0, 102.0, 104.0, 102.0, 99.0, 99.0])
+    reference = np.array([100.0, 101.5, 103.0, 101.0, 99.0, 99.0])
+    comparison = _gauge(times, model, reference)
+    assert comparison.model.arrival_observed is True
+    assert comparison.reference.arrival_observed is True
+    assert comparison.model.positive_phase_complete is True
+    assert comparison.reference.positive_phase_complete is True
+    for key in (
+        "peak_overpressure_relative", "arrival_time_relative",
+        "positive_duration_relative", "positive_impulse_relative",
+    ):
+        assert key in comparison.errors, key
+
+
+# --------------------------------------------------------------------------
+# 第七轮 §7 零阈值下，上穿零点不是正相终点
+# --------------------------------------------------------------------------
+
+
+def test_a_zero_threshold_does_not_confuse_the_start_with_the_end():
+    """**复核的原反例。** 超压 ``[0, 2, 0, -1]``、阈值 0：正确面积 2、时长 2。
+
+    修前：到达插值点恰好为零，找"第一个 ``<= 0``"时直接选中了这个**起点**，
+    于是面积 0、时长 0，还报 ``positive_phase_complete=True``。
+    """
+    metrics = gauge_metrics(
+        [0, 1, 2, 3], [100, 102, 100, 99], ambient=100, minimum_overpressure_ratio=0.0
+    )
+    assert metrics.positive_impulse == pytest.approx(2.0, abs=1e-12)
+    assert metrics.positive_duration == pytest.approx(2.0, abs=1e-12)
+    assert metrics.positive_phase_complete is True
+
+
+def test_the_zero_threshold_case_still_reports_the_original_regression():
+    """同一次改动不能把原来的 2.5 反例弄坏。"""
+    metrics = gauge_metrics([0, 1, 2, 3], [102, 102, 98, 98], ambient=100)
+    assert metrics.positive_impulse == pytest.approx(2.5, abs=1e-12)
+
+
+def test_a_zero_threshold_with_a_leading_zero_plateau():
+    """连续零起点：正相从第一个严格正值开始，终点仍是第一次下穿。"""
+    metrics = gauge_metrics(
+        [0, 1, 2, 3, 4], [100, 100, 102, 100, 99], ambient=100,
+        minimum_overpressure_ratio=0.0,
+    )
+    assert metrics.positive_impulse == pytest.approx(2.0, abs=1e-12)
+    assert metrics.positive_duration == pytest.approx(2.0, abs=1e-12)
+
+
+def test_a_zero_threshold_that_never_goes_positive():
+    """峰值恰好为 0：整条曲线没有正超压。
+
+    规定下来的行为是"不可用"（``nan`` + 说明），**不是** 0——0 是一个"量出来的
+    冲量"，而这里根本没有正压段可以积分。这条与"峰值小于 0"走同一条路径。
+    """
+    metrics = gauge_metrics(
+        [0, 1, 2, 3], [100, 100, 100, 99], ambient=100, minimum_overpressure_ratio=0.0
+    )
+    assert metrics.peak_overpressure == pytest.approx(0.0)
+    assert not np.isfinite(metrics.positive_impulse)
+    assert any("没有正超压" in note for note in metrics.notes)
+
+
+@pytest.mark.parametrize("ratio", [-1.0, float("nan"), float("inf")])
+def test_an_invalid_threshold_is_refused(ratio):
+    """零阈值是**合法**的；负值与非有限值不是。"""
+    with pytest.raises(WaveformError, match="minimum_overpressure_ratio"):
+        gauge_metrics(
+            [0, 1, 2, 3], [102, 102, 98, 98], ambient=100,
+            minimum_overpressure_ratio=ratio,
+        )

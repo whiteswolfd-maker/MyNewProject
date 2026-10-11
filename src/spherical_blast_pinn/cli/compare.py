@@ -259,6 +259,11 @@ def _fronts_at(prediction: Mapping[str, Any], pinn_time: float) -> tuple[float, 
     帧间插值方法是明确写出来的：两条前沿各自按时间线性插值。以前 ``_region_at``
     直接取时间区间的**左端**那一帧的前沿，于是"查询最后一帧"时用的是倒数第二帧
     的前沿——查询时刻越靠近区间右端，错得越多，而结果看不出任何异常。
+
+    **只有权重非零的那一帧才需要有效。** 查询精确落在第 ``i`` 帧上时权重是 0，
+    另一帧整个不参与计算；无条件检查两个端点会让"第 i+1 帧前沿缺测"把一次完全
+    可用的查询判成不可用——场量插值早就按这个规则改了（零权重支撑点不参与），
+    前沿这一侧当时漏掉了。
     """
     times = np.asarray(prediction["pinn_time"], dtype=np.float64)
     bracket = _time_bracket(times, float(pinn_time))
@@ -268,13 +273,23 @@ def _fronts_at(prediction: Mapping[str, Any], pinn_time: float) -> tuple[float, 
     j = min(i + 1, times.size - 1)
     contact = np.asarray(prediction["contact_radius"], dtype=np.float64)
     shock = np.asarray(prediction["shock_radius"], dtype=np.float64)
-    corners = (contact[i], contact[j], shock[i], shock[j])
-    if not all(np.isfinite(value) for value in corners):
+
+    contact_total = 0.0
+    shock_total = 0.0
+    weight_total = 0.0
+    for index, share in ((i, 1.0 - weight), (j, weight)):
+        if share <= 0.0:
+            continue          # 零权重的帧不参与，它的缺测无从污染结果
+        c = float(contact[index])
+        s = float(shock[index])
+        if not (np.isfinite(c) and np.isfinite(s)):
+            return float("nan"), float("nan")
+        contact_total += share * c
+        shock_total += share * s
+        weight_total += share
+    if weight_total <= 0.0:  # pragma: no cover - 两个权重不可能同时为 0
         return float("nan"), float("nan")
-    return (
-        float((1.0 - weight) * contact[i] + weight * contact[j]),
-        float((1.0 - weight) * shock[i] + weight * shock[j]),
-    )
+    return contact_total / weight_total, shock_total / weight_total
 
 
 def sample_field(

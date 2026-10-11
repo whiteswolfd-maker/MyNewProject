@@ -721,3 +721,298 @@ def test_changing_the_data_behind_the_same_path_is_refused(monkeypatch, tmp_path
     fresh.cases[0].times = np.asarray(fresh.cases[0].times) * 1.5
     with pytest.raises(TrainingError, match="different data"):
         fresh.load(trainer.output_dir / "last.pt")
+
+
+# ==========================================================================
+# 第七轮 §1 精修的**整条流程**都在事务里
+# ==========================================================================
+
+
+def _state_fingerprint(trainer):
+    """参数 + 采样器随机状态 + 历史长度 + 检查点字节，一次取齐。"""
+    best = trainer.output_dir / "best.pt"
+    return {
+        "parameters": trainer.parameter_fingerprint(),
+        "sampler_rng": [s.rng_state() for s in trainer.sampler.samplers],
+        "window": [s.window_fraction for s in trainer.sampler.samplers],
+        "refine_history": len(trainer.refine_history),
+        "check_history": len(trainer.check_history),
+        "last_pt": (trainer.output_dir / "last.pt").read_bytes(),
+        "best_pt": best.read_bytes() if best.exists() else None,
+    }
+
+
+@pytest.mark.parametrize("where", ["sampling", "optimisation", "recheck", "save"])
+def test_a_refinement_failure_at_any_stage_rolls_the_whole_flow_back(
+    monkeypatch, tmp_path, where
+):
+    """**复核的原反例（收尾 ``verify()`` 抛错）。**
+
+    修前：``try`` 只罩住"线搜索 + 最终求值"，于是收尾的 ``verify`` 抛错会留下
+    —— 参数没恢复、``refine_history`` 多一条、没有失败诊断文件、内存模型与
+    ``last.pt`` 不一致。
+
+    这里把失败注入在**四个不同阶段**：采样、优化、复检、写盘。
+    """
+    import torch
+
+    _Criteria(monkeypatch)
+    trainer, _ = _tiny(monkeypatch, tmp_path, name="roll_" + where)
+    trainer.run(max_updates=1, verbose=False)
+    before = _state_fingerprint(trainer)
+
+    if where == "sampling":
+        def boom(*_a, **_k):
+            raise RuntimeError("injected: sampling")
+        monkeypatch.setattr(trainer.sampler, "batch", boom)
+    elif where == "optimisation":
+        def boom(*_a, **_k):
+            raise RuntimeError("injected: L-BFGS step")
+        monkeypatch.setattr(torch.optim.LBFGS, "step", boom)
+    elif where == "recheck":
+        def boom(*_a, **_k):
+            raise RuntimeError("injected: the post-refinement re-check")
+        monkeypatch.setattr(trainer, "verify", boom)
+    else:
+        def boom(*_a, **_k):
+            raise RuntimeError("injected: writing the checkpoint")
+        monkeypatch.setattr(trainer, "_save", boom)
+
+    with pytest.raises(Exception):
+        trainer.refine(iterations=1, verbose=False)
+    monkeypatch.undo()
+
+    after = _state_fingerprint(trainer)
+    assert after["parameters"] == before["parameters"], where + ": 参数没有恢复"
+    assert after["sampler_rng"] == before["sampler_rng"], where + ": 采样序列没有恢复"
+    assert after["window"] == before["window"]
+    assert after["refine_history"] == before["refine_history"], where + ": 精修历史多了记录"
+    assert after["check_history"] == before["check_history"]
+    assert after["last_pt"] == before["last_pt"], where + ": last.pt 被改了"
+    assert after["best_pt"] == before["best_pt"], where + ": best.pt 被改了"
+
+    diagnostics = trainer.output_dir / "refinement_failures.json"
+    assert diagnostics.exists(), where + ": 没有失败诊断文件"
+    record = json.loads(diagnostics.read_text(encoding="utf-8"))[-1]
+    assert record["stage"] == {
+        "sampling": "sampling",
+        "optimisation": "optimisation",
+        "recheck": "recheck and publish",
+        "save": "recheck and publish",
+    }[where]
+    assert record["parameters_restored"] is True
+    assert record["artifacts_restored"] is True
+    # 失败之后实例仍然可用（回滚成功了）。
+    trainer.run(max_updates=trainer.step, verbose=False)
+
+
+def test_a_failed_rollback_during_refinement_marks_the_instance_unusable(
+    monkeypatch, tmp_path
+):
+    """§1：回滚本身失败时，保留原始异常与回滚异常，并禁止继续使用。"""
+    _Criteria(monkeypatch)
+    trainer, _ = _tiny(monkeypatch, tmp_path, name="roll_poison")
+    trainer.run(max_updates=1, verbose=False)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("injected: the re-check fails")
+
+    original_restore = trainer._restore_state
+
+    def also_boom(_snapshot):
+        raise RuntimeError("injected: rolling back fails too")
+
+    monkeypatch.setattr(trainer, "verify", boom)
+    monkeypatch.setattr(trainer, "_restore_state", also_boom)
+    with pytest.raises(TrainingError, match="unknown state"):
+        trainer.refine(iterations=1, verbose=False)
+    monkeypatch.setattr(trainer, "_restore_state", original_restore)
+    monkeypatch.undo()
+
+    with pytest.raises(TrainingError, match="unknown state"):
+        trainer.run(max_updates=trainer.step)
+    with pytest.raises(TrainingError, match="unknown state"):
+        trainer._save(tmp_path / "never.pt")
+
+
+# ==========================================================================
+# 第七轮 §2 best.pt 的终态必须与选出它的那次运行一致
+# ==========================================================================
+
+
+def test_best_pt_carries_the_status_of_the_run_that_selected_it(monkeypatch, tmp_path):
+    """**复核的原反例。** 修前：``best.pt`` 写 ``completed``、``last.pt`` 写
+    ``diagnostic``，两份检查点的参数却完全相同。"""
+    import torch
+
+    _Criteria(monkeypatch)
+    trainer, tiny = _tiny(monkeypatch, tmp_path, name="best_status")
+    trainer.run(max_updates=_total(tiny), verbose=False)
+    trainer.best = None                     # 让精修后的复检一定成为新的最佳
+    trainer.refine(iterations=1, verbose=False)
+
+    best = torch.load(
+        trainer.output_dir / "best.pt", map_location="cpu", weights_only=False
+    )
+    last = torch.load(
+        trainer.output_dir / "last.pt", map_location="cpu", weights_only=False
+    )
+    assert best["run_status"] == RUN_DIAGNOSTIC
+    assert last["run_status"] == RUN_DIAGNOSTIC
+    assert best["run_origin"]["refined"] is True
+    assert trainer.best["run_origin"]["refined"] is True
+
+
+def test_a_kept_earlier_best_keeps_its_own_status(monkeypatch, tmp_path):
+    """§2：保留旧最佳时**不重写** ``best.pt``——它自己的来源属于选出它的那次运行。"""
+    import torch
+
+    _Criteria(monkeypatch)
+    trainer, tiny = _tiny(monkeypatch, tmp_path, name="best_kept")
+    trainer.run(max_updates=_total(tiny), verbose=False)
+    assert (trainer.output_dir / "best.pt").exists()
+
+    # 把当前最佳设成**打不败**的（score 越小越好），于是精修之后的复检不会
+    # 取代它 —— 这正是"保留旧最佳"那条分支。
+    trainer.best = dict(trainer.best or {})
+    trainer.best["score"] = [-1.0e9, -1.0e9, -1.0e9]
+    trainer.best["parameter_fingerprint"] = "kept-earlier-model"
+    trainer._best_dirty = False
+    (trainer.output_dir / "best.pt").unlink()
+    trainer._save(trainer.output_dir / "best.pt")
+    best_before = (trainer.output_dir / "best.pt").read_bytes()
+    status_before = torch.load(
+        trainer.output_dir / "best.pt", map_location="cpu", weights_only=False
+    )["run_status"]
+
+    trainer.refine(iterations=1, verbose=False)
+
+    assert trainer.best["parameter_fingerprint"] == "kept-earlier-model"
+    assert (trainer.output_dir / "best.pt").read_bytes() == best_before, (
+        "保留旧最佳时 best.pt 被重写了——它的来源属于选出它的那次运行"
+    )
+    kept = torch.load(
+        trainer.output_dir / "best.pt", map_location="cpu", weights_only=False
+    )
+    assert kept["run_status"] == status_before
+
+
+# ==========================================================================
+# 第七轮 §3 显式诊断身份要跟着参数走
+# ==========================================================================
+
+
+def test_an_explicit_diagnostic_identity_survives_save_load_and_further_runs(
+    monkeypatch, tmp_path
+):
+    """**复核的原反例。** 修前：``diagnostic=True`` 跑完存盘，新实例加载得到
+    ``diagnostic``，但一次**零更新**的 ``run()`` 会把它算成 ``completed``、
+    ``formally_accepted=True``。"""
+    import torch
+
+    _Criteria(monkeypatch)
+    trainer, tiny = _tiny(monkeypatch, tmp_path, name="origin")
+    trainer.run(max_updates=_total(tiny), verbose=False, diagnostic=True)
+    checkpoint = torch.load(
+        trainer.output_dir / "last.pt", map_location="cpu", weights_only=False
+    )
+    assert checkpoint["run_origin"]["explicit_diagnostic"] is True
+
+    fresh, _ = _tiny(monkeypatch, tmp_path, name="origin_fresh")
+    fresh.load(trainer.output_dir / "last.pt")
+    assert fresh._run_origin["explicit_diagnostic"] is True
+
+    zero = fresh.run(max_updates=fresh.step, verbose=False)
+    assert zero.status == RUN_DIAGNOSTIC
+    assert zero.formally_accepted is False
+
+    # 继续更新也不行：身份跟着参数走，不跟"这一次调用"走。
+    more = fresh.run(max_updates=fresh.step + 1, verbose=False)
+    assert more.status == RUN_DIAGNOSTIC
+    assert more.formally_accepted is False
+
+
+def test_a_plain_run_keeps_its_normal_status(monkeypatch, tmp_path):
+    """对照组：没有诊断来源的运行照常可以被判为完成。"""
+    _Criteria(monkeypatch)
+    trainer, tiny = _tiny(monkeypatch, tmp_path, name="origin_plain")
+    result = trainer.run(max_updates=_total(tiny), verbose=False)
+    assert result.status == RUN_COMPLETED
+    assert result.metadata["run_origin"] == {
+        "explicit_diagnostic": False, "refined": False
+    }
+    assert result.metadata["diagnostic"] is False
+
+
+def test_a_checkpoint_without_a_run_origin_is_refused(monkeypatch, tmp_path):
+    import torch
+
+    _Criteria(monkeypatch)
+    trainer, tiny = _tiny(monkeypatch, tmp_path, name="origin_missing")
+    trainer.run(max_updates=_total(tiny), verbose=False)
+    checkpoint = torch.load(
+        trainer.output_dir / "last.pt", map_location="cpu", weights_only=False
+    )
+    del checkpoint["run_origin"]
+    path = tmp_path / "no_origin.pt"
+    torch.save(checkpoint, path)
+    fresh, _ = _tiny(monkeypatch, tmp_path, name="origin_missing2")
+    with pytest.raises(TrainingError, match="run_origin"):
+        fresh.load(path)
+
+
+# ==========================================================================
+# 第七轮 §4 数据身份必须覆盖真正参与训练的数据
+# ==========================================================================
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda case: setattr(case, "density", np.asarray(case.density) * 2.0),
+        lambda case: setattr(case, "velocity", np.asarray(case.velocity) + 123.0),
+        lambda case: setattr(case, "pressure", np.asarray(case.pressure) * 0.5),
+        lambda case: setattr(
+            case, "specific_energy", np.asarray(case.specific_energy) * 0.5
+        ),
+        # 整体轮转 0→1→2→0：每个单元都变，且仍在合法取值域里。
+        lambda case: setattr(
+            case, "material", (np.asarray(case.material) + 1) % 3
+        ),
+        lambda case: setattr(case, "valid", ~np.asarray(case.valid)),
+    ],
+)
+def test_a_changed_field_is_refused_by_the_data_identity(monkeypatch, tmp_path, mutate):
+    """**复核的原反例。** 修前只哈希坐标轴、前沿与材料码的**计数**：把密度乘 2、
+    速度加 123，哈希一字不变，旧检查点照常加载。"""
+    _Criteria(monkeypatch)
+    trainer, tiny = _tiny(monkeypatch, tmp_path, name="data")
+    trainer.run(max_updates=_total(tiny), verbose=False)
+
+    fresh, _ = _tiny(monkeypatch, tmp_path, name="data_fresh")
+    mutate(fresh.cases[0])
+    with pytest.raises(TrainingError, match="different data"):
+        fresh.load(trainer.output_dir / "last.pt")
+
+
+def test_missing_and_empty_are_different_in_the_data_identity(monkeypatch, tmp_path):
+    """§4：``None`` 与"空数组"必须分开——"没记录逐字段有效性"和"全 False"是两件事。"""
+    _Criteria(monkeypatch)
+    trainer, _ = _tiny(monkeypatch, tmp_path, name="id_missing")
+    case = trainer.cases[0]
+    case.field_validity = None
+    identity_missing = trainer._data_identity()[case.case_id]["content_sha256"]
+    case.field_validity = {}
+    identity_empty = trainer._data_identity()[case.case_id]["content_sha256"]
+    assert identity_missing != identity_empty
+
+
+def test_the_data_identity_ignores_the_case_id_label(monkeypatch, tmp_path):
+    """身份按 case_id 索引，所以改名要被拒绝（不是同一份数据的同一个位置）。"""
+    _Criteria(monkeypatch)
+    trainer, tiny = _tiny(monkeypatch, tmp_path, name="id_label")
+    trainer.run(max_updates=_total(tiny), verbose=False)
+    fresh, _ = _tiny(monkeypatch, tmp_path, name="id_label2")
+    fresh.cases[0].case_id = "renamed"
+    with pytest.raises(TrainingError, match="different data"):
+        fresh.load(trainer.output_dir / "last.pt")
