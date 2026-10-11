@@ -6,14 +6,19 @@
 |---|---|
 | 复核基线提交 | `3e4e1c61b351fb4665c35f4dfc7e832c12e80e70` |
 | 本机实际克隆到的基线 | `3e4e1c61b351fb4665c35f4dfc7e832c12e80e70`（`git clone` 实测，与复核一致） |
-| 本源码修改提交 | `8d7fda6303ece357bd9819e450b15cdab08522ef`（已推送到 `origin/main`） |
-| 文档提交 | `6389c78b…`（只追加 `AGENTS.md` 的约定与这份报告，**不改源码**） |
-| 远端复验提交 | `8d7fda6303ece357bd9819e450b15cdab08522ef`（**全新 `git clone`** 后在该目录内执行；测试证据对应的是**源码**提交） |
+| 本源码修改提交 | **`adf121499d5d054390352ca8e022c3d62433aa2f`**（已推送到 `origin/main`） |
+| 同一轮的中间提交 | `8d7fda6`（五项修复）、`6389c78` / `c3c9860`（文档） |
+| 远端复验提交 | **`adf121499d5d054390352ca8e022c3d62433aa2f`**（**全新 `git clone`** 后在该目录内执行） |
+
+**源码提交换过一次。** 第一次修改提交是 `8d7fda6`，并且在它的基础上做过一次
+全新克隆复验。之后我在自查中发现事务快照漏了 `last_balance`、而且有三个只写
+不读的陈旧字段（见 §2 末），于是又提交了 `adf1214`。**按复核的要求，前一次克隆
+的结果不为 `adf1214` 背书**——§6 的所有实测数字都来自对 `adf1214` 的**新克隆**。
 | 分支 | `main` |
 | 本机环境 | Python **3.10.8**、torch **2.5.1+cu121**、numpy **1.26.4** |
 | 复核方环境 | 实跑 **484 passed / 6 skipped / 0 failed** |
 | 本机（原工作区） | `pytest -q -rs` → **520 passed / 0 skipped / 0 failed** |
-| 本机（**远端新克隆**） | 同上：**520 passed / 0 skipped / 0 failed** |
+| 本机（**远端新克隆 `adf1214`**） | 同上：**520 passed / 0 skipped / 0 failed** |
 
 **关于 6 skipped**：复核环境缺真实提取数据，所以依赖它的测试跳过；本机在
 `C:\Users\work\Documents\GitHub\2\` 下**有**那些数据，因此不跳过。这是**环境差异**，
@@ -101,6 +106,16 @@ _final_check_state  = 'checked_on_current_parameters'（原本 = 'current_parame
 * `run()` 开头清掉上一次的终态（一次正在进行的运行没有终态）。
 * 多文件发布前写 `.publish_in_progress.json`，成功后删除；`load()` 在**被加载
   检查点旁边**找这个标记，命中即拒绝。
+
+**自查补上的两处**（按"实际调用链"重新枚举了一遍会变的内存状态）：
+
+* `last_balance`（最近一次平衡记录）**是可观测的**——报表与
+  `tests/test_stage_machine.py` 都读它——但没有进快照。回滚之后它会与
+  `balancer` 的状态对不上，而两者本该描述同一件事。已纳入并逐项恢复。
+* `_parameter_fingerprint` / `_check_fingerprint` / `_refine_weights` 三个字段
+  **只写不读**。指纹现在由 `_check_stale()` 每次现算，不需要缓存，也就不需要
+  "把缓存置 `None` 来作废"这种容易漏一处的做法。已删除——留着它们会让这份
+  事务审计**看起来**漏了三项状态。
 
 ### §3 内存恢复与磁盘恢复必须独立尝试
 
@@ -255,11 +270,11 @@ a263eba9903881f574a22a61e5bd96d0904a1b7c41f37f88298dfe666b57d429
 ## 6. 远端新克隆复验
 
 ```bash
-git clone https://github.com/whiteswolfd-maker/MyNewProject.git verify_clone
-cd verify_clone
+git clone https://github.com/whiteswolfd-maker/MyNewProject.git final2
+cd final2
 
 git rev-parse HEAD
-# 8d7fda6303ece357bd9819e450b15cdab08522ef
+# adf121499d5d054390352ca8e022c3d62433aa2f
 
 git ls-files --error-unmatch scripts/bounded_snake_check.py
 # scripts/bounded_snake_check.py          <- 存在且被跟踪
@@ -269,7 +284,7 @@ git status --short
 # （空）
 
 PYTHONPATH=src python -m pytest -q -rs
-# 520 passed, 47 warnings in 283.46s      <- 0 skipped（本机有真实数据）
+# 520 passed, 47 warnings in 306.39s      <- 0 skipped（本机有真实数据）
 
 PYTHONPATH=src python scripts/bounded_snake_check.py <仓库外目录>
 # exit 0
@@ -281,8 +296,8 @@ PYTHONPATH=src python scripts/bounded_snake_check.py <仓库外目录>
 version  : 4
 ok       : True
 checks   : 27 | passed: 27
-duration : 4.35 s
-output   : C:\Users\work\AppData\Local\Temp\verify_out
+duration : 4.8 s
+output   : C:\Users\work\AppData\Local\Temp\final2_out
 ```
 
 **输出目录在仓库之外**，脚本无盘符硬编码。
@@ -326,19 +341,19 @@ output   : C:\Users\work\AppData\Local\Temp\verify_out
 
 ## 7. 交付清单
 
-**修改提交**：`8d7fda6303ece357bd9819e450b15cdab08522ef`（`main`，已推送）
+**修改提交**：`adf121499d5d054390352ca8e022c3d62433aa2f`（`main`，已推送）
 
 `sha256` 前 16 位（**换行符统一为 LF 后**计算；仓库 `.gitattributes` 是
 `* text=auto`，工作区为 CRLF）：
 
 | 文件 | 字节（LF） | sha256[:16] |
 |---|---:|---|
-| `src/spherical_blast_pinn/training/trainer.py` | 124129 | `a08c57a8ea1ecd00` |
+| `src/spherical_blast_pinn/training/trainer.py` | 124938 | `5dcc505aade010df` |
 | `src/spherical_blast_pinn/evaluation/waveform.py` | 19968 | `9216ecf6aa645f06` |
 | `src/spherical_blast_pinn/cli/compare.py` | 54828 | `a54fa8746798ac1b` |
 | `src/spherical_blast_pinn/data/extracted_case.py` | 81407 | `2539ded5ea5c58c0` |
 | `scripts/bounded_snake_check.py` | 49749 | `1cd8005b47f24fa7` |
-| `tests/test_best_candidate_and_transaction.py` | 24312 | `1011427756cea1c6` |
+| `tests/test_best_candidate_and_transaction.py` | 25575 | `767cddd3a98dfbd9` |
 | `tests/test_waveform_impulse.py` | 20599 | `6b2151411c999c5e` |
 | `tests/test_refine_and_checkpoint.py` | 42793 | `154182feb11ff895` |
 | `tests/test_compare_cli.py` | 22064 | `8ccca85d4be03198` |
@@ -347,10 +362,9 @@ output   : C:\Users\work\AppData\Local\Temp\verify_out
 **测试**：520 passed / 0 skipped / 0 failed（本机与远端新克隆各跑一次）。
 本机 `pytest -q -rs` 在**新克隆目录**里执行，与复核命令一致。
 
-**测试所对应的源码提交是 `8d7fda6`**。其后的文档提交（`AGENTS.md` 与这份报告）
-只增加文字，没有改动 `src/`、`tests/` 或 `scripts/`——所以那一次测试结果同样
-适用于文档提交之后的树。用 `git diff --stat 8d7fda6 <docs-sha>` 可以核对：
-只有 `AGENTS.md` 与 `REVIEW_RESPONSE_3e4e1c61.md` 两个文件变化。
+**测试所对应的源码提交是 `adf1214`**。其后的提交只增删文档，没有改动
+`src/`、`tests/` 或 `scripts/`——可以用 `git diff --stat adf1214 <docs-sha>`
+核对，输出里只会出现 `AGENTS.md` 与 `REVIEW_RESPONSE_3e4e1c61.md`。
 
 ---
 
