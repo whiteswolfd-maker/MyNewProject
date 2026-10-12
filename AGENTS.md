@@ -425,6 +425,22 @@ pytest -q
   定义**，在 ``training/checkpoint.py``——保存端与读取端各维护一份清单时，
   ``predict`` 要求了一个 ``_build_payload`` 从来没写过的字段，一整类方案 B 的
   检查点被误判成旧方案文件（复核实测）。
+* **冻结爆速 ``D`` 的契约是三层**，由 ``training.checkpoint.require_detonation_velocity``
+  一处定义。保存端写（``_build_payload`` 取 ``_frozen_detonation_velocity()``），
+  恢复端与预测端读，**恢复端传 ``expected=``**：
+  ① 顶层 ``detonation_velocity`` 必须是合法的**有限正实数**——布尔、字符串、
+  列表一律拒绝，不许 ``float()`` 把 ``True`` / ``"6930"`` 悄悄变成合法输入；
+  ② 顶层值必须与 ``case_ids`` 列出的**每一个**算例的 ``scales[case_id]`` 记录一致。
+  ``SimilitudeScales.as_dict()`` **不写** ``D``，写的是 ``start_time = T_h``，所以按
+  ``D = R_0 / (T_h - epsilon(R_0))`` 反解再比；缺记录、缺键、值不可用一律拒绝，
+  **忽略缺少记录的算例**或**只取第一个算例**都是错的；
+  ③ 恢复端还要顶层值与**接收实例实际使用的**尺度一致（``scales_by_radius``，不是
+  ``cases`` 的元数据）。只查"文件内部自洽"拦不住一份自洽的检查点被另一个爆速的
+  实例恢复。
+  修前只有预测端读它、且只查①的"是不是数"，于是同一份检查点被两个入口解释成
+  两条时间轴：50 mm 上恢复端 ``T_h = 8.21500721501 µs``、预测端 ``41.5186385737 µs``
+  （复核实测：顶层改成 1234，``scales`` 记录仍是 6930 那条）。**不**为这个校验
+  升级检查点版本：``D`` 已由既有字段唯一确定，加字段反而要迁移。
 * 场量布局**声明**在 `metadata.json` 的 `profile_layout = {version, layout}` 里，
   不靠形状推断。`frames_by_radius` 是逐帧二维 `(n_t, n_x)`（缺省，与既有导出
   一致），`single_frame_1d` 是单帧的一维 `(n_x,)`。读取器里**不得**再出现

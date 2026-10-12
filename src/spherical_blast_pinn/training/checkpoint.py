@@ -13,6 +13,11 @@
   读出来、校验之后使用。缺失即拒绝，**不用默认常量补齐**：``D`` 决定方案 B 的
   时间原点 ``T_h = R_0/D + epsilon``，补一个默认值不会报错，只会把整条轨迹平移
   一个爆轰穿越时间 ``T_b``（50 mm 上是 7.2 µs）。
+  **三层**都要过：顶层是合法有限正**实数**（不许 ``float()`` 吞掉 ``True`` 或
+  ``"6930"``）；顶层与 ``case_ids`` 里**每一个**算例的 ``scales`` 记录一致
+  （记录里没有 ``D``，按 ``T_h`` 反解）；恢复端还要与**接收实例实际使用的**
+  尺度一致。以前只查第一层、且只有预测端调它，于是"同一份检查点被两个入口
+  解释成两条时间轴"（复核实测，见测试文件）。
 * :func:`refuse_if_uncommitted` —— 多文件发布不是原子的。发布前写下标记、成功后
   删除，**两个入口都必须落实**这条规则。以前只有 ``Trainer.load`` 查它，于是
   "恢复训练被拒绝的文件，仍能被预测入口读进去"（复核实测）。
@@ -30,7 +35,13 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any, Mapping, NoReturn
+from typing import Any, Mapping, NoReturn, Sequence
+
+import numpy as np
+
+# ``epsilon(R_0)`` 是反解逐算例冻结爆速时要减掉的那一项。定义只有一份，在
+# ``physics/similitude.py``（``physics`` 不反向依赖 ``training``，无循环导入）。
+from ..physics.similitude import start_delay
 
 #: 检查点格式标识与版本。加载时两者都必须匹配，否则拒绝。
 CHECKPOINT_FORMAT = "spherical_blast_pinn.checkpoint"
@@ -50,6 +61,22 @@ CHECKPOINT_VERSION = 8
 
 #: 冻结爆速的字段名。保存端与读取端共用这一个名字。
 DETONATION_VELOCITY_FIELD = "detonation_velocity"
+
+#: 逐算例 ``scales`` 记录里用来**反解**冻结爆速的两个键。名字来自
+#: :meth:`..physics.similitude.SimilitudeScales.as_dict`——它**不写**
+#: ``detonation_velocity``，写的是 ``start_time = T_h = R_0/D + epsilon(R_0)``，
+#: 而 ``(charge_radius, start_time)`` 这对值把 ``D`` 唯一确定下来：
+#: ``D = R_0 / (T_h - epsilon(R_0))``。所以"逐算例记录里的冻结值"就是它。
+SCALES_CHARGE_RADIUS_KEY = "charge_radius"
+SCALES_START_TIME_KEY = "start_time"
+
+#: 比较两个爆速时的**相对**容差。
+#:
+#: 反解要经过 ``T_h - epsilon`` 这一步（两个约 1e-5 秒的数相减），float64 上的
+#: 往返误差量级在 1e-16，远小于这里。而任何**真实**的不一致——换了爆速、换了
+#: 材料卡——相对差都在 1e-3 以上。这条容差只放过"同一个数的舍入"，不放过
+#: "另一个数"。
+DETONATION_VELOCITY_RELATIVE_TOLERANCE = 1.0e-9
 
 #: 未提交标记的文件名。发布多份产物**不是**原子的：进程在两次写入之间被杀掉，
 #: 目录里会留下"一部分新、一部分旧"的状态，而每一份单看都是合法文件。
@@ -271,39 +298,177 @@ def refuse_if_uncommitted(
 # --------------------------------------------------------------------------
 
 
+def _real_number(value: Any) -> float | None:
+    """取"合法的实数"；布尔、字符串、列表、``None`` 等一律返回 ``None``。
+
+    ``bool`` 必须**显式**排除：``isinstance(True, int)`` 为真，而 ``float(True)``
+    会安静地得到 ``1.0``——一个"看起来合法"的爆速。``"6930"`` 同理：
+    ``float("6930")`` 成功，于是错误类型被转成了合法输入。
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return None
+    if not isinstance(value, (int, float, np.integer, np.floating)):
+        return None
+    return float(value)
+
+
+def _scales_records(
+    payload: Mapping[str, Any], path: Path | str, error: type[Exception]
+) -> list[tuple[str, Mapping[str, Any]]]:
+    """取出 ``case_ids`` 声明的每个算例及其 ``scales`` 记录，缺一不可。
+
+    返回的顺序与 ``case_ids`` 一致——**不排序、不取第一个**：调用方要检查的是
+    每一个算例，任何"只比第一个"的写法都会漏掉"只有某个算例对不上"这一档。
+    """
+    case_ids = payload.get("case_ids")
+    if isinstance(case_ids, (str, bytes)) or not isinstance(case_ids, Sequence) or not case_ids:
+        raise error(
+            f"{path} carries no usable 'case_ids' ({case_ids!r}); without the list of "
+            "cases this checkpoint is for, the per-case frozen scales cannot be matched "
+            "against the top-level detonation velocity"
+        )
+    for case_id in case_ids:
+        if not isinstance(case_id, str) or not case_id:
+            raise error(
+                f"the checkpoint's 'case_ids' contains {case_id!r}, which is not a "
+                "case name"
+            )
+    scales = payload.get("scales")
+    if not isinstance(scales, Mapping):
+        raise error(
+            f"{path} carries no 'scales' block ({type(scales).__name__}); the per-case "
+            "frozen scales are what the training run actually used"
+        )
+    missing = [case_id for case_id in case_ids if case_id not in scales]
+    if missing:
+        raise error(
+            f"{path} records no scales for {missing}, which its own 'case_ids' lists. A "
+            "missing record is not a pass: those cases are part of the run"
+        )
+    unexpected = [key for key in scales if key not in set(case_ids)]
+    if unexpected:
+        raise error(
+            f"{path} carries scales for {unexpected}, which its own 'case_ids' does not "
+            "list; the two describe different sets of cases"
+        )
+    return [(case_id, scales[case_id]) for case_id in case_ids]
+
+
 def require_detonation_velocity(
     payload: Mapping[str, Any],
     path: Path | str,
     *,
+    expected: float | None = None,
     error: type[Exception] = TrainingError,
 ) -> float:
-    """读出检查点里**冻结的**爆速并校验。
+    """读出检查点里**冻结的**爆速并校验，返回它。
 
-    三个拒绝理由各自报出来：**没有这个字段**（旧写入端根本没保存它）、
-    **不是数**、**不是有限正数**。三者都不允许回落到默认常量——``D`` 进
-    ``T_h = R_0/D + epsilon``，默认值换来的是整条轨迹的平移，而不是一个错误。
+    保存端写什么、读取端要求什么只有这一份定义。``Trainer.load`` 与
+    ``cli.predict.load_model_from_checkpoint`` 都调它——以前**只有预测端**调，
+    于是删掉这个字段或把它改成 ``-1`` 时"恢复训练放行、预测拒绝"（复核实测）。
+
+    校验分三层，任何一层不成立都**硬失败**：
+
+    1. **顶层字段**必须存在，且是合法的**有限正实数**（``True``、``"6930"``、
+       ``[6930]`` 都不算——不许用 ``float()`` 把错误类型转成合法输入）；
+    2. **文件内部**：顶层值必须与 ``case_ids`` 里**每一个**算例的
+       ``scales[case_id]`` 记录一致。记录里没有 ``detonation_velocity`` 键，
+       ``SimilitudeScales.as_dict()`` 写的是 ``start_time = T_h``，所以按
+       ``D = R_0 / (T_h - epsilon(R_0))`` 反解再比。缺记录、缺键、值不可用一律
+       拒绝：**不得忽略缺少记录的算例，也不得无条件取第一个算例**；
+    3. ``expected``（恢复端传入接收实例**实际使用**的爆速）不为 ``None`` 时，
+       顶层值还必须与它一致。只查"文件内部自洽"是不够的：一份自洽的检查点照样
+       能被一个不同爆速的实例恢复，恢复出来是另一条时间轴——实测同一份文件在
+       恢复端给出 ``T_h = 8.21500721501 µs``、在预测端给出 ``41.5186385737 µs``。
+
+    ``D`` 进 ``T_h = R_0/D + epsilon(R_0)``，所以任何一层都不允许回落到默认常量：
+    补一个默认值换来的不是错误，而是整条轨迹平移一个爆轰穿越时间。
     """
     if DETONATION_VELOCITY_FIELD not in payload:
         raise error(
-            f"{path} carries no {DETONATION_VELOCITY_FIELD!r}. That field is the "
-            "charge's detonation velocity, a frozen physical parameter: the scheme-B "
-            "time origin T_h = R_0/D + epsilon cannot be reconstructed without it, and "
-            "substituting a default would shift the whole predicted trajectory by the "
-            "detonation transit time. Checkpoints written before this field existed "
-            "must be retrained, not reinterpreted"
+            f"{path} carries no {DETONATION_VELOCITY_FIELD!r}, but checkpoint version "
+            f"{CHECKPOINT_VERSION} requires it. That field is the charge's detonation "
+            "velocity, a frozen physical parameter: the scheme-B time origin "
+            "T_h = R_0/D + epsilon(R_0) cannot be reconstructed without it, and "
+            "substituting a default would shift the whole trajectory by the detonation "
+            "transit time. A version-8 checkpoint without it is damaged, not an older "
+            "scheme's file"
         )
     raw = payload[DETONATION_VELOCITY_FIELD]
-    try:
-        velocity = float(raw)
-    except (TypeError, ValueError) as exc:
+    velocity = _real_number(raw)
+    if velocity is None:
         raise error(
-            f"the checkpoint's {DETONATION_VELOCITY_FIELD} is {raw!r}, not a number"
-        ) from exc
+            f"the checkpoint's {DETONATION_VELOCITY_FIELD} is {raw!r} "
+            f"({type(raw).__name__}), not a real number"
+        )
     if not math.isfinite(velocity) or velocity <= 0.0:
         raise error(
             f"the checkpoint's {DETONATION_VELOCITY_FIELD} must be finite and positive, "
-            f"got {velocity!r}; it sets the time origin T_h = R_0/D + epsilon"
+            f"got {velocity!r}; it sets the time origin T_h = R_0/D + epsilon(R_0)"
         )
+
+    # -- 第二层：与逐算例 scales 记录里的冻结值一致 ------------------------
+    for case_id, record in _scales_records(payload, path, error):
+        if not isinstance(record, Mapping):
+            raise error(
+                f"the checkpoint's scales for case {case_id!r} are "
+                f"{type(record).__name__}, not a record"
+            )
+        radius = _real_number(record.get(SCALES_CHARGE_RADIUS_KEY))
+        if radius is None or not math.isfinite(radius) or radius <= 0.0:
+            raise error(
+                f"the checkpoint's scales for case {case_id!r} record "
+                f"{SCALES_CHARGE_RADIUS_KEY} = "
+                f"{record.get(SCALES_CHARGE_RADIUS_KEY)!r}, which is not a finite "
+                "positive radius"
+            )
+        start_time = _real_number(record.get(SCALES_START_TIME_KEY))
+        if start_time is None or not math.isfinite(start_time):
+            raise error(
+                f"the checkpoint's scales for case {case_id!r} record "
+                f"{SCALES_START_TIME_KEY} = {record.get(SCALES_START_TIME_KEY)!r}, "
+                "which is not a finite number; the frozen detonation velocity of that "
+                "case cannot be recovered from it"
+            )
+        transit = start_time - start_delay(radius)
+        if transit <= 0.0:
+            raise error(
+                f"the checkpoint's scales for case {case_id!r} put the time origin "
+                f"{SCALES_START_TIME_KEY} = {start_time!r} s at or before the handover "
+                f"delay epsilon({radius!r}) = {start_delay(radius)!r} s, so no positive "
+                "detonation velocity produces it"
+            )
+        implied = radius / transit
+        if abs(implied - velocity) > DETONATION_VELOCITY_RELATIVE_TOLERANCE * max(
+            abs(implied), abs(velocity)
+        ):
+            raise error(
+                f"the checkpoint's top-level {DETONATION_VELOCITY_FIELD} is {velocity!r} "
+                f"m/s, but its scales for case {case_id!r} imply {implied!r} m/s: "
+                f"{SCALES_START_TIME_KEY} = {start_time!r} s at "
+                f"{SCALES_CHARGE_RADIUS_KEY} = {radius!r} m is T_h = R_0/D + epsilon(R_0) "
+                "only for that other value. The two describe different time axes, so "
+                "neither can be trusted"
+            )
+
+    # -- 第三层：与**接收实例实际使用的**尺度一致（恢复端传入 expected） ----
+    if expected is not None:
+        reference = _real_number(expected)
+        if reference is None or not math.isfinite(reference) or reference <= 0.0:
+            raise error(
+                f"cannot compare the checkpoint's {DETONATION_VELOCITY_FIELD} against "
+                f"{expected!r}, which is not a finite positive detonation velocity"
+            )
+        if abs(velocity - reference) > DETONATION_VELOCITY_RELATIVE_TOLERANCE * max(
+            abs(velocity), abs(reference)
+        ):
+            raise error(
+                f"the checkpoint was trained with {DETONATION_VELOCITY_FIELD} = "
+                f"{velocity!r} m/s, but this trainer's scales use {reference!r} m/s. "
+                "Resuming would rebuild the time origin T_h = R_0/D + epsilon(R_0) from "
+                "a different D, silently shifting the trajectory by the difference in "
+                "detonation transit time. Refusing rather than adopting either value"
+            )
     return velocity
 
 
@@ -372,7 +537,10 @@ __all__ = [
     "CHECKPOINT_FORMAT",
     "CHECKPOINT_VERSION",
     "DETONATION_VELOCITY_FIELD",
+    "DETONATION_VELOCITY_RELATIVE_TOLERANCE",
     "PUBLISH_ARTIFACTS_KEY",
+    "SCALES_CHARGE_RADIUS_KEY",
+    "SCALES_START_TIME_KEY",
     "PUBLISH_MARKER",
     "PUBLISH_OWNER_KEY",
     "TrainingError",

@@ -50,6 +50,7 @@ from .checkpoint import (
     read_publish_marker,
     refuse_if_uncommitted,
     require_best_candidate_consistency,
+    require_detonation_velocity,
 )
 from .schedule import (
     MAX_LBFGS_ITERATIONS,
@@ -1916,6 +1917,18 @@ class Trainer:
                 "the checkpoint was trained with a different hat T_*; resuming would "
                 "silently change the network's time input"
             )
+        # **冻结爆速也要核。** 与 ``time_scale`` 同一个道理，但以前**完全没查**：
+        # 恢复端从不读顶层 ``detonation_velocity``，于是把它删掉或改成 ``-1``
+        # 都能照常恢复（复核实测）；而顶层与逐算例 ``scales`` 记录互相矛盾时，
+        # 恢复端用**接收实例的** D、预测端用**文件里的** D，同一份检查点被解释成
+        # 两条时间轴（50 mm 上实测 8.21500721501 µs 对 41.5186385737 µs）。
+        #
+        # ``expected`` 传的是本实例**实际使用**的尺度（``_frozen_detonation_velocity``
+        # 读的是冻结的 ``scales_by_radius``，不是 ``cases`` 的元数据）：只查"文件
+        # 内部自洽"拦不住一份自洽的检查点被另一个爆速的实例恢复。
+        require_detonation_velocity(
+            payload, path, expected=self._frozen_detonation_velocity()
+        )
         if "sampler_rng" not in payload:
             raise TrainingError(
                 f"{path} has no sampler RNG state. Restoring training from it would "
