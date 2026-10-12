@@ -2,9 +2,6 @@
 静止均匀状态的球对称 PDE 残差，尤其是动量几何项。"""
 from __future__ import annotations
 
-import math
-
-import numpy as np
 import pytest
 
 from spherical_blast_pinn.physics.moving_frame import (

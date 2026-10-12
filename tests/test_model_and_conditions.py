@@ -6,13 +6,12 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-import numpy as np
 import pytest
 
 from spherical_blast_pinn.losses.terms import contact_loss, shock_loss
 from spherical_blast_pinn.models.air_net import AirFields
 from spherical_blast_pinn.models.front_net import FrontNet
-from spherical_blast_pinn.models.product_net import ProductFields, ProductNet
+from spherical_blast_pinn.models.product_net import ProductNet
 from spherical_blast_pinn.physics import material as mat
 from spherical_blast_pinn.physics.moving_frame import FrontData
 from spherical_blast_pinn.physics.similitude import SimilitudeScales
@@ -166,7 +165,6 @@ def _ideal_gas_jump(shock_mach: float):
     """理想气体法向激波的正解。"""
     m = float(shock_mach)
     rho0, p0 = AMBIENT.density, AMBIENT.pressure
-    e0 = AMBIENT.specific_energy
     density_ratio = ((GAMMA + 1.0) * m * m) / ((GAMMA - 1.0) * m * m + 2.0)
     pressure_ratio = (2.0 * GAMMA * m * m - (GAMMA - 1.0)) / (GAMMA + 1.0)
     c0 = math.sqrt(GAMMA * p0 / rho0)

@@ -17,7 +17,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from spherical_blast_pinn.data import compatibility as compat
 from spherical_blast_pinn.data.compatibility import (
     COMPATIBLE,
     INCOMPATIBLE,

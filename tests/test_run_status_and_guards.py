@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -259,8 +258,6 @@ class _FakeCase:
 
 
 def _prediction(case: _FakeCase, *, density_offset=0.0, non_finite_at=None):
-    n_t = case.times.size
-    n_r = case.radius.size
     density = np.where(case.material == 0, 1600.0 + density_offset, 6.0)
     if non_finite_at is not None:
         density = density.copy()

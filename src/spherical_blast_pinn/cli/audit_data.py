@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from ._common import (
-    SetupError,
     add_common_arguments,
     configure_stdout,
     load_cases,

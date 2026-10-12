@@ -33,12 +33,11 @@ import json
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
 from ..constants import UNIT_SYSTEMS
-from ..data import compatibility as compat
 from ..data.shock_detect import detect_shock
 from ..data.extracted_case import (
     LAYOUT_FRAMES_BY_RADIUS,
@@ -51,7 +50,6 @@ from ..data.kfile_parser import parse_deck
 from ..data.raw_reader import (
     VALIDATED_LASSO_VERSION,
     D3plotLayout,
-    RawFrame,
     RawReadError,
     UnitFactors,
     fixed_mesh_geometry,
@@ -432,12 +430,6 @@ def _iter_frames(
             yield frame
 
 
-def _crossing_radius(centres: np.ndarray, values: np.ndarray, level: float) -> float:
-    """``values`` 从上方穿过 ``level`` 的半径，线性插值；没有穿过时返回 ``nan``。"""
-    radius, _, _ = _crossing_radius_and_gap(centres, values, level)
-    return radius
-
-
 def _crossing_radius_and_gap(
     centres: np.ndarray, values: np.ndarray, level: float
 ) -> tuple[float, float, int]:
@@ -682,14 +674,6 @@ def extract_case(
                 f"the deck declares ALE material {highest} but the d3plot carries "
                 f"{declared_ale.size} ALE material(s); the mapping cannot be trusted"
             )
-
-    # ``element_solid_part_indexes`` 是 0 基的下标；卡片的 part id 可能是任意整数。
-    deck_ids = np.asarray(
-        [part_map.get(int(index), -1) for index in np.unique(case.part_indexes)], dtype=np.int64
-    )
-    lookup = {int(index): int(part_map.get(int(index), -1)) for index in np.unique(case.part_indexes)}
-    element_part_ids = np.asarray([lookup[int(v)] for v in case.part_indexes], dtype=np.int64)
-    del deck_ids
 
     units = UnitFactors(
         length=deck.length_to_m,

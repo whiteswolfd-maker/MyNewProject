@@ -317,28 +317,6 @@ def mixed_cell_mask(frame: RawFrame) -> np.ndarray:
     return (alpha > PURE_AIR_THRESHOLD) & (alpha < PURE_PRODUCT_THRESHOLD)
 
 
-def _weighted_shell_mean(
-    index: np.ndarray,
-    weight: np.ndarray,
-    values: np.ndarray,
-    n_shells: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Volume-weighted mean per shell via ``bincount``."""
-    valid = index >= 0
-    idx = index[valid]
-    w = weight[valid]
-    v = np.asarray(values, dtype=np.float64)[valid]
-    finite = np.isfinite(v) & np.isfinite(w) & (w > 0.0)
-    idx, w, v = idx[finite], w[finite], v[finite]
-
-    numerator = np.bincount(idx, weights=w * v, minlength=n_shells)
-    denominator = np.bincount(idx, weights=w, minlength=n_shells)
-    counts = np.bincount(idx, minlength=n_shells).astype(np.float64)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        mean = np.where(denominator > 0.0, numerator / np.maximum(denominator, 1.0e-300), np.nan)
-    return mean, denominator, counts
-
-
 def _shell_dispersion(
     index: np.ndarray,
     values: np.ndarray,
@@ -643,7 +621,6 @@ def shell_average(
     前者是"每单位体积有多少"，后者是"每单位质量有多少"——能量和速度是强度量，
     按体积平均会被高密度区以外的样本稀释，按质量平均才是它们的守恒平均。
     """
-    volume = np.abs(np.asarray(frame.cell_volume, dtype=np.float64))
     alpha = np.asarray(frame.tnt_volume_fraction, dtype=np.float64)
 
     if medium == PRODUCT:

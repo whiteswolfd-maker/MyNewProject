@@ -107,7 +107,6 @@ def specific_energy_from_pressure(
     if np.any(product):
         rho = density[product]
         rho_safe = np.maximum(rho, 1.0e-30)
-        v = params.rho0 / rho_safe
         p_cold = jwl_pressure_numpy(rho, np.zeros_like(rho), params)
         with np.errstate(divide="ignore", invalid="ignore"):
             value = (pressure[product] - p_cold) / (params.omega * rho_safe)

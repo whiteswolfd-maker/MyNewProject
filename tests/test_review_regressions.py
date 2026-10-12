@@ -8,7 +8,6 @@ vs 当前坐标、50 mm 尺度 vs 本算例尺度）。
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 
 import numpy as np
@@ -34,7 +33,7 @@ from spherical_blast_pinn.physics.eos import (
     jwl_sound_speed_squared,
     jwl_sound_speed_squared_numpy,
 )
-from spherical_blast_pinn.physics.moving_frame import AIR, PRODUCT, FrontData
+from spherical_blast_pinn.physics.moving_frame import PRODUCT, FrontData
 from spherical_blast_pinn.physics.pde import medium_residual
 from spherical_blast_pinn.physics.detonation import DetonationConfig
 from spherical_blast_pinn.physics.precursor import PrecursorConfig, solve_reference_field
@@ -1043,7 +1042,7 @@ def test_anchor_is_opt_in_and_has_a_window():
 
 
 def test_anchor_is_configurable_through_build_model():
-    from spherical_blast_pinn.models.coupled_model import build_model, resolve_front_anchor
+    from spherical_blast_pinn.models.coupled_model import resolve_front_anchor
 
     class _Config:
         def __init__(self, payload):
@@ -1081,7 +1080,6 @@ def test_pde_path_does_not_abort_when_the_contact_dips_below_the_charge_radius(t
     case = _write_case(tmp_path)
     radius = case.charge_radius
     scales = _scales(radius)
-    product = ProductNet_like = None  # noqa: F841 - 见下方导入
 
     from spherical_blast_pinn.models.product_net import ProductNet
 

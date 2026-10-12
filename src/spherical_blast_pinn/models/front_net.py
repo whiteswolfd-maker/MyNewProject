@@ -98,16 +98,6 @@ class FrontState:
         }
 
 
-def _softplus_inverse(value: float) -> float:
-    """``log(expm1(value))``，``softplus`` 的反函数。"""
-    value = float(value)
-    if not math.isfinite(value) or value <= 0.0:
-        raise ModelError(f"softplus inverse needs a positive finite argument, got {value}")
-    if value > 30.0:
-        return value  # expm1 溢出前的渐近：softplus(z) ~ z
-    return math.log(math.expm1(value))
-
-
 class FrontNet(nn.Module if nn is not None else object):  # type: ignore[misc]
     """``s -> (hat R_c, hat h)``。
 

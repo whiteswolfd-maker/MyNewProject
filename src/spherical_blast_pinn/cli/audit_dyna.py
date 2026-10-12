@@ -385,7 +385,6 @@ def audit_deck(case_id: str, deck_path: Path) -> DeckAudit:
     # -- 6. 终止时间与输出间隔 -------------------------------------------
     endtim = summary.termination_time
     dt_plot = summary.d3plot_interval
-    unit_time = 1.0 if "SI" in str(audit.detail.get("unit_system_inferred")) else 1.0
     detail = []
     if endtim is not None:
         detail.append(f"endtim = {endtim:g}（时间单位）")

@@ -28,7 +28,6 @@ from ..physics.eos import (
     jwl_pressure_numpy,
 )
 from ._common import (
-    SetupError,
     add_common_arguments,
     configure_stdout,
     load_cases,

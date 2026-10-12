@@ -30,13 +30,17 @@ from ..models.product_net import ProductNet
 from ..models.air_net import AirNet
 from ..models.front_net import FrontNet
 from ..models.mlp import resolve_device, resolve_dtype
-from ..physics import material as mat
 from ..physics.similitude import (
     SimilitudeScales,
     physical_time_from_scaled,
     scaled_time_coverage,
 )
-from ..training.trainer import CHECKPOINT_FORMAT, CHECKPOINT_VERSION
+from ..training.checkpoint import (
+    CHECKPOINT_FORMAT,
+    CHECKPOINT_VERSION,
+    refuse_if_uncommitted,
+    require_detonation_velocity,
+)
 from ._common import (
     SetupError,
     add_common_arguments,
@@ -55,25 +59,30 @@ def load_model_from_checkpoint(path: Path, *, charge_radius: float, device=None)
     """
     if torch is None:  # pragma: no cover
         raise RuntimeError("PyTorch is required")
-    payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+    path = Path(path)
+    # **发布完整性：与 ``Trainer.load`` 用同一条规则。** 预测同样会拿一套"一部分新、
+    # 一部分旧"的产物当真值使用，所以"训练恢复被拒绝"不能是唯一的防线——以前只有
+    # 训练入口查这个标记，复核实测：一个被恢复拒绝的未提交检查点，预测照样读进去。
+    refuse_if_uncommitted(path, error=SetupError)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
     if payload.get("format") != CHECKPOINT_FORMAT:
         raise SetupError(f"{path} is not a {CHECKPOINT_FORMAT} checkpoint")
     if int(payload.get("version", -1)) != CHECKPOINT_VERSION:
-        raise SetupError(f"checkpoint version {payload.get('version')} is not supported")
+        raise SetupError(
+            f"checkpoint version {payload.get('version')} is not supported by this "
+            f"build, which reads version {CHECKPOINT_VERSION}; retrain rather than "
+            "reinterpreting an older field layout"
+        )
 
     time_scale = float(payload["time_scale"])
     # 爆速随检查点冻结：时间原点 T_h = R_0/D + epsilon 必须与训练时完全一致，
-    # 否则推理的整条轨迹会平移一个 T_b。缺这个键的检查点是方案 A 的，直接拒绝。
-    if "detonation_velocity" not in payload:
-        raise SetupError(
-            "this checkpoint carries no detonation velocity, so the scheme-B time origin "
-            "T_h = R_0/D + epsilon cannot be reconstructed; it was written by the "
-            "scheme-A pipeline and must not be used"
-        )
+    # 否则推理的整条轨迹会平移一个 T_b。读取与校验走**共用**的那条规则
+    # （``training.checkpoint``），保存端写什么、这边要求什么只有一个定义。
+    detonation_velocity = require_detonation_velocity(payload, path, error=SetupError)
     scales = SimilitudeScales.for_radius(
         charge_radius,
         time_scale=time_scale,
-        detonation_velocity=float(payload["detonation_velocity"]),
+        detonation_velocity=detonation_velocity,
     )
     state = payload["model"]
 
@@ -304,6 +313,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     # 训练覆盖：在 ``s`` 上是**一个与半径无关的数**，由检查点里冻结的 ``hat T_*``
     # 与各训练算例的最后有效 ``t_PINN`` 得到。目标半径的真值不参与。
     time_scale = float(payload["time_scale"])
+    # 同一个冻结爆速，走同一条读取规则。默认 ``--time-end`` 要把 ``s_max`` 映回
+    # 物理时间，而那个映射里含 ``T_h = R_0/D + epsilon``，所以它也要这个值。
+    detonation_velocity = require_detonation_velocity(
+        payload, args.checkpoint, error=SetupError
+    )
     valid = dict(payload.get("provenance", {}).get("valid_pinn_time_max", {}) or {})
     # 检查点里 ``valid_pinn_time_max`` 以 case_id 为键；覆盖判据需要的是半径，
     # 因为 hat_t = U_* t_PINN / R_0。半径从同一份检查点的 scales 里读，不猜。
@@ -335,8 +349,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"T_h = R_0/D + epsilon(R_0) = {model.scales.start_time():.6g} s for this radius"
             )
     elif s_max is not None:
+        # ``detonation_velocity`` 是必填的：``t_phys = s hat T_* R_0 / U_* + T_h``
+        # 里的 ``T_h`` 就是 ``R_0/D + epsilon``。以前这里没传它，于是**默认**
+        # ``--time-end`` 这条路一走到就 ``TypeError``——而它从来没被测过，因为
+        # 没有一条测试真的从训练检查点走到预测（复核指出的断链）。
         end_physical = physical_time_from_scaled(
-            s_max, args.radius, time_scale=time_scale
+            s_max,
+            args.radius,
+            time_scale=time_scale,
+            detonation_velocity=detonation_velocity,
         )
         end_source = (
             "default: the end of the training scaled-time coverage, mapped to this "

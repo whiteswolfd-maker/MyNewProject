@@ -266,18 +266,6 @@ def _physical_volume_ratio_range(jwl: JWLParameters) -> tuple[float, float]:
     return pole * 1.05, 1.0 - 1.0e-9
 
 
-def _valid_volume_ratio_mask(volume_ratio, jwl: JWLParameters, volume_energy: float):
-    """保留 ``V`` 位于极点上侧、且 ``p_H`` 与 ``D_RH`` 都为正的那些点。"""
-    lower, _ = _physical_volume_ratio_range(jwl)
-    V = np.asarray(volume_ratio, dtype=np.float64)
-    mask = V > lower
-    if not np.any(mask):
-        return mask
-    p = rayleigh_hugoniot_pressure(V, jwl=jwl, volume_energy=volume_energy)
-    d = rayleigh_hugoniot_velocity(V, jwl=jwl, volume_energy=volume_energy)
-    return mask & np.isfinite(p) & (p > 0.0) & np.isfinite(d) & (d > 0.0)
-
-
 # --------------------------------------------------------------------------
 # 冷压项与波前关系
 # --------------------------------------------------------------------------
@@ -779,8 +767,6 @@ class ProductsDetonation:
             }
         time_new = self.time + dt
         front_new = self.detonation_velocity * time_new
-        front_old = float(self.radii[k + 1])
-        inner_old = float(self.radii[k])
 
         # 波前到达节点是一个**离散事件**。主循环已经把 dt 夹到它，但
         # ``D * (t + dt)`` 与节点半径之间还差一次浮点舍入。判据若写成
@@ -848,7 +834,6 @@ class ProductsDetonation:
         internal[:k] -= (pressure[:k] + q[:k]) * (
             specific_volume_new[:k] - self.specific_volume[:k]
         )
-        u_cell_old = 0.5 * (self.velocity[k] + self.velocity[k + 1])
 
         # 7) 节点加速度 du/dt = -r^2 dp/dm（节点质量取两侧单元质量的一半）。
         node_mass = np.zeros(count + 1)

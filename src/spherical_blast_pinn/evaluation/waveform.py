@@ -316,7 +316,6 @@ def compare_gauge(
     model = gauge_metrics(times, model_pressure, ambient=ambient)
     model.radius = float(radius)
     if reference_pressure is None:
-        empty = GaugeMetrics(radius=float(radius))
         return WaveformComparison(
             radius=float(radius), model=model, reference=None,
             notes=["没有参考时程，只报告模型指标"],

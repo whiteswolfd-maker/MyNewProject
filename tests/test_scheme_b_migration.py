@@ -287,7 +287,6 @@ def test_overlap_allocation_beats_centroid_binning_at_a_shell_boundary():
     """一个正好骑在壳层边界上的单元：质心分箱会把它整个算进一边。"""
     from spherical_blast_pinn.data.shell_average import overlap_assignment_from_arrays
 
-    edges = np.array([0.0, 1.0, 2.0])
     grid = _grid(2, 0.0, 2.0)
     r_in = np.array([0.9])
     r_out = np.array([1.1])
@@ -1950,13 +1949,6 @@ def test_data_contract_reports_missing_time_origin_instead_of_crashing():
     from spherical_blast_pinn.data.compatibility import SYNTHETIC
     from spherical_blast_pinn.data.contract import evaluate_case_contract
     from spherical_blast_pinn.data.extracted_case import DataError
-
-    case = SimpleNamespace(
-        case_id="old-cache",
-        charge_radius=0.05,
-        times=np.array([0.0, 1.0e-6]),
-        source={"symmetry_factor": 8.0, "material_masks_from": "ALE material volume fraction"},
-    )
 
     class _C:
         case_id = "old-cache"

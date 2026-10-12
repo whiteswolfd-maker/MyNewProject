@@ -203,11 +203,6 @@ UNIT_SYSTEM_ALIASES: Final[dict[str, str]] = {
     "mm_tonne_s": "mm_s_t",
 }
 
-#: Pressure (Pa) that a unit system implies for a 1-unit pressure value.  Used
-#: only by the `auto` detector to shortlist physically plausible candidates.
-_PRESSURE_DIAGNOSTIC_TNT: Final[float] = 2.0e10  # ~20 GPa, order of JWL A+B
-
-
 def resolve_unit_system(name: str) -> UnitSystem:
     """Return the :class:`UnitSystem` for ``name`` (aliases accepted)."""
     key = UNIT_SYSTEM_ALIASES.get(name.strip(), name.strip())

@@ -8,14 +8,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
 try:  # pragma: no cover
     import torch
 except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
-from ..physics import material as mat
 from ..physics.moving_frame import AIR, PRODUCT, check_moving_frame
 from ..physics.pde import combined_pde_loss, medium_residual
 from ..sampling.batch import SampleBatch
@@ -602,7 +601,6 @@ def pde_loss(batch: SampleBatch, model) -> TermBreakdown:
     """
     if torch is None:  # pragma: no cover
         raise RuntimeError("PyTorch is required")
-    scales = batch.scales
 
     product = medium_pde_residual(batch, model, PRODUCT)
     air = medium_pde_residual(batch, model, AIR)

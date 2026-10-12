@@ -221,13 +221,6 @@ class JWLParameters:
         }
 
 
-def _cj_energy(v: float, params: JWLParameters) -> float:
-    """Order-of-magnitude specific energy used only by :meth:`cj_state_estimate`."""
-    return 0.5 * (params.A * v * math.exp(-params.R1 * v) + params.B * v * math.exp(-params.R2 * v)) / max(
-        params.rho0, TINY_DENSITY
-    )
-
-
 def _cold_pressure_scalar(v: float, params: JWLParameters) -> float:
     v = max(v, 1.0e-12)
     return params.A * (1.0 - params.omega / (params.R1 * v)) * math.exp(-params.R1 * v) + params.B * (

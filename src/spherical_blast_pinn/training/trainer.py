@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover
 
 from ..data import compatibility as compat
 from ..data.extracted_case import ExtractedCase
-from ..evaluation.checks import CheckReport, CheckSet, build_check_set, run_checks
+from ..evaluation.checks import CheckReport, build_check_set, run_checks
 from ..losses.objective import LossBreakdown, contact_pressure_scale, total_loss
 from ..models.coupled_model import CoupledModel
 from ..physics.precursor import ReferenceField
@@ -38,6 +38,18 @@ from .balancing import (
     BoundedGradientBalancer,
     live_groups,
     measure_gradient_norms,
+)
+from .checkpoint import (
+    CHECKPOINT_FORMAT,
+    CHECKPOINT_VERSION,
+    DETONATION_VELOCITY_FIELD,
+    PUBLISH_MARKER,
+    PUBLISH_OWNER_KEY,
+    TrainingError,
+    publish_marker_path,
+    read_publish_marker,
+    refuse_if_uncommitted,
+    require_best_candidate_consistency,
 )
 from .schedule import (
     MAX_LBFGS_ITERATIONS,
@@ -50,8 +62,11 @@ from .schedule import (
     time_window_fraction_at,
 )
 
-#: 检查点格式标识与版本。加载时两者都必须匹配，否则拒绝。
-CHECKPOINT_FORMAT = "spherical_blast_pinn.checkpoint"
+#: 检查点格式标识、版本号与读取规则现在定义在 :mod:`.checkpoint`——保存端与
+#: 读取端（``cli.predict``）共用同一份定义，这里只是重新导出。
+#:
+#: 放在那儿的原因见该模块的说明：两边各维护一份清单时，"保存端写了什么"与
+#: "读取端要求什么"会悄悄脱节。
 
 # --------------------------------------------------------------------------
 # 一次运行的**终态**（提示词 §1）
@@ -89,11 +104,7 @@ RUN_STATUS_MEANING: dict[str, str] = {
 #: 它们存在**（缺失即拒绝）。这两项记录的是"更新跑完了、判据没过、尚不允许推进"
 #: 这个中间状态；旧写法没有它们，读出来会被当成"没有待决判据"——那正是这两个
 #: 字段要区分的那件事。所以旧检查点按版本号直接拒绝，而不是"缺字段就默认通过"。
-CHECKPOINT_VERSION = 7
-
-
-class TrainingError(RuntimeError):
-    """训练无法继续。"""
+#: 第 8 版起顶层带 ``detonation_velocity``（见 :mod:`.checkpoint`）。
 
 
 class NonFiniteUpdate(TrainingError):
@@ -376,6 +387,14 @@ class Trainer:
         #: 第 6 步之后，第 1 步选出的最佳会被写成一个第 6 步的检查点，且
         #: ``best_check.parameter_fingerprint`` 与文件里的参数对不上（复核实测）。
         self._best_candidate: dict[str, Any] | None = None
+        #: 本次**发布事务**的归属标识，由 :meth:`_begin_publish` 铸造。
+        #: :meth:`_end_publish` 只清理属于它的那一个标记。刻意**不进**
+        #: ``_snapshot_state``：它是事务机制，不是训练状态——回滚时若把它一并还原，
+        #: 回滚方就再也认不出"刚才是自己写的标记"，于是要么删错、要么删不掉。
+        self._publish_token: str | None = None
+        #: 本次事务开始时目录里已经存在的未完成发布（若有）。``run()`` 会重写全部
+        #: 产物，覆盖它是合法的，但这件事要留下痕迹，不能假装没发生过。
+        self._superseded_publish: dict[str, Any] | None = None
 
         # -- 有界梯度平衡（§14） -------------------------------------------
         self.balance_config = BalanceConfig.from_config(config)
@@ -406,6 +425,34 @@ class Trainer:
                 "this trainer instance is in an unknown state and cannot be used: "
                 f"{self._unusable}"
             )
+
+    def _frozen_detonation_velocity(self) -> float:
+        """本次训练**实际使用**的卡片爆速 ``D``，从冻结的尺度集合里取。
+
+        取尺度集合、不取 ``cases[0]``：尺度集合是构造时就冻结下来的那份，
+        它才是网络与时间轴真正用的东西，而 ``cases`` 的元数据只是来源记录。
+
+        **四个算例必须给出同一个 ``D``。** 它们共用同一套尺度化网络，只有一个
+        ``D`` 时"预测端拿一个 ``D`` 重建 ``T_h``"才成立；不一致时这里硬失败，
+        而不是悄悄挑一个——挑错的后果是整条预测轨迹平移一个爆轰穿越时间，而
+        两个 ``D`` 都有 m/s 的量纲，错了不会报错。
+        """
+        values = {float(s.detonation_velocity) for s in self.scales_by_radius.values()}
+        if len(values) != 1:
+            raise TrainingError(
+                "the training scales carry more than one detonation velocity "
+                f"({sorted(values)}); a single checkpoint cannot describe what time "
+                "origin to rebuild, and picking one silently would shift the predicted "
+                "trajectory by R_0/D"
+            )
+        velocity = values.pop()
+        if not math.isfinite(velocity) or velocity <= 0.0:
+            raise TrainingError(
+                "the training scales carry detonation velocity "
+                f"{velocity!r}; it must be finite and positive because the scheme-B "
+                "time origin is T_h = R_0/D + epsilon"
+            )
+        return velocity
 
     # -- 清单 -------------------------------------------------------------
     def _data_identity(self) -> dict[str, Any]:
@@ -885,7 +932,6 @@ class Trainer:
             )
 
         started = time.time()
-        start_step = int(self.step)
         #: 进入循环那一刻的参数指纹。收尾时用它回答"这次运行**改动过参数**吗"——
         #: 这跟"步数涨了吗"不是同一个问题，精修就是那个反例。
         parameters_at_entry = self.parameter_fingerprint()
@@ -1169,6 +1215,10 @@ class Trainer:
                 ),
                 "check_state": check_state,
                 "check_state_meaning": check_state_note,
+                # **本次发布覆盖掉的未完成发布**（若有）。``run()`` 会重写全部四份
+                # 产物，所以覆盖它是合法的——但那是"修复了一个不一致的目录"，不是
+                # "什么都没发生过"，清单里要看得见。
+                "superseded_uncommitted_publish": self._superseded_publish,
                 "balancing": {
                     "config": self.balance_config.as_dict(),
                     "monitors": self.balancer.monitors(),
@@ -1256,6 +1306,28 @@ class Trainer:
         iterations = min(int(iterations), MAX_LBFGS_ITERATIONS)
         if iterations <= 0:
             return self.run(max_updates=self.step)
+
+        # **目录里留着未完成的发布时不许开始精修。**
+        #
+        # 精修的事务语义建立在"开始那一刻的盘上状态"上：它先留底、失败再还原。
+        # 若开始时就有一套"一部分新、一部分旧"的产物，那它留的底本身就是不一致的
+        # 状态，还原回去只是把不一致**原样恢复**——而上一版随后还会把标记删掉
+        # （``_end_publish`` 当时是无条件删除），于是那套从未提交成功的产物变成
+        # "加载成功"（复核实测：四份文件字节未变、旧标记被删除、新实例由拒绝变成功）。
+        #
+        # 恢复路径是 ``run()``：它会重写全部四份产物，覆盖一次未完成的发布是合法的
+        # ——``_begin_publish`` 会把被覆盖的那一份记进 ``supersedes``。
+        # 零预算精修走的就是 ``run()``，所以它在上面先返回，不经过这道检查。
+        unfinished = self.unfinished_publish()
+        if unfinished is not None:
+            raise TrainingError(
+                f"{self.output_dir} holds an unfinished publish (see "
+                f"{self._publish_marker_path()}); its artifacts may be a mixture of new "
+                "and old. Refusing to refine on top of it, because the refinement "
+                "transaction would snapshot that inconsistent state and restore it "
+                "verbatim. Run the trainer (which rewrites every artifact) or resolve "
+                "the marker first"
+            )
 
         refine_index = len(self.refine_history) + 1
         fingerprint_before = self.parameter_fingerprint()
@@ -1548,7 +1620,9 @@ class Trainer:
     #: 未提交标记。发布多份产物**不是**原子的：进程在两次写入之间被杀掉，目录里
     #: 会留下"一部分新、一部分旧"的状态，而每一份单看都是合法文件。启动发布前写
     #: 下这个标记，成功后删掉；``load`` 看到自己的名字在里面就拒绝加载。
-    _PUBLISH_MARKER = ".publish_in_progress.json"
+    #:
+    #: 文件名、字段名与读取规则都定义在 :mod:`.checkpoint`，训练与预测共用。
+    _PUBLISH_MARKER = PUBLISH_MARKER
 
     def _capture_artifacts(self) -> dict[str, bytes | None]:
         """把可恢复检查点的**字节**留底。``None`` 表示当时不存在。"""
@@ -1673,6 +1747,11 @@ class Trainer:
             "case_ids": [c.case_id for c in self.cases],
             "split": {c.case_id: c.source.get("split") for c in self.cases},
             "time_scale": self.time_scale,
+            # **冻结爆速必须随检查点走。** 预测入口要在**新半径**上重建时间原点
+            # ``T_h = R_0/D + epsilon(R_0)``，而它读不到训练时的任何对象——只能读
+            # 这个文件。以前保存端从不写它，于是预测入口把每一份方案 B 的训练
+            # 检查点都当成"方案 A 的旧文件"拒掉（复核实测）。
+            DETONATION_VELOCITY_FIELD: self._frozen_detonation_velocity(),
             "contact_pressure_scale_pa": self.contact_pressure,
             "scales": {
                 c.case_id: self.scales_by_radius[float(c.charge_radius)].as_dict()
@@ -1718,7 +1797,11 @@ class Trainer:
     # -- 多文件发布的事务标记 ---------------------------------------------
 
     def _publish_marker_path(self) -> Path:
-        return self.output_dir / self._PUBLISH_MARKER
+        return publish_marker_path(self.output_dir)
+
+    def unfinished_publish(self) -> dict[str, Any] | None:
+        """本目录里有没有**上一次没做完**的发布。没有则 ``None``。"""
+        return read_publish_marker(self.output_dir)
 
     def _begin_publish(self, names) -> Path:
         """写下"这些产物正在发布"。成功后由 :meth:`_end_publish` 删除。
@@ -1726,41 +1809,64 @@ class Trainer:
         单文件原子替换**不等于**多文件事务：``run()`` 要写四份产物，进程在第
         二份和第三份之间被杀掉时，目录里留下的是一套互相矛盾的组合，而每一份
         单看都合法。标记让加载端能把"未提交"认出来。
+
+        **标记记下自己的归属**（``owner``）。没有归属时，后来的一次失败操作只能
+        *无条件*删除标记——包括删除**上一次**中断留下的那一个，于是一套从未提交
+        成功的产物变成"看起来已提交"（复核实测）。有了归属，
+        :meth:`_end_publish` 就只清理自己写的那一个。
+
+        标记已经存在时，说明上一次发布没有完成。这里把它的内容记进
+        ``supersedes`` 并留在实例上，**不假装它不存在**：``run()`` 随后会重写
+        全部四份产物，覆盖它是合法的，但"覆盖掉了一次未完成的发布"这件事要
+        留下痕迹。
         """
         self.output_dir.mkdir(parents=True, exist_ok=True)
         path = self._publish_marker_path()
-        path.write_text(
-            json.dumps({"artifacts": sorted(names)}, indent=2), encoding="utf-8"
-        )
+        previous = read_publish_marker(self.output_dir)
+        self._superseded_publish = previous
+        self._publish_token = f"{id(self):x}-{time.time_ns():x}"
+        body: dict[str, Any] = {
+            "artifacts": sorted(names),
+            PUBLISH_OWNER_KEY: self._publish_token,
+        }
+        if previous is not None:
+            body["supersedes"] = previous
+        path.write_text(json.dumps(body, indent=2), encoding="utf-8")
         return path
 
-    def _end_publish(self) -> None:
+    def _end_publish(self) -> bool:
+        """撤掉**本次事务自己**的标记；不是自己的标记一律留着。
+
+        返回是否撤掉了。上一版是无条件 ``unlink()``：一次失败的 ``refine()``
+        会把上一次失败的 ``run()`` 留下的标记一起删掉，而它回滚到的是那次的
+        半套产物——目录由"拒绝加载"变成"加载成功"（复核实测）。
+        """
+        if self._publish_token is None:
+            # 这次事务根本没开始过发布。此时存在的标记一定是**别人的**——包括
+            # 更早的写入端留下的、没有 ``owner`` 字段的老标记——一律不动。
+            return False
         path = self._publish_marker_path()
-        if path.exists():
-            path.unlink()
+        if not path.exists():
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - 读不懂就不动它，保守留下
+            return False
+        if not isinstance(payload, dict):
+            return False
+        if payload.get(PUBLISH_OWNER_KEY) != self._publish_token:
+            return False
+        path.unlink()
+        return True
 
     def _refuse_if_uncommitted(self, path: Path) -> None:
         """加载端必须**落实**拒绝规则，而不是只在日志里提一句。
 
         标记在**被加载的那份检查点旁边**找，不是在自己的 ``output_dir`` 里找：
         读它的人往往是一个新建的实例，输出目录与写出它的那次运行不同。
+        预测入口调用的是同一个函数（:func:`..training.checkpoint.refuse_if_uncommitted`）。
         """
-        marker = Path(path).parent / self._PUBLISH_MARKER
-        if not marker.exists():
-            return
-        try:
-            payload = json.loads(marker.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001 - 标记坏掉时保守拒绝
-            raise TrainingError(
-                f"{marker} exists but cannot be read; a publish was interrupted, so "
-                f"{path} cannot be trusted as a committed checkpoint"
-            )
-        if Path(path).name in set(payload.get("artifacts") or ()):
-            raise TrainingError(
-                f"{path} was left uncommitted by an interrupted publish (see {marker}). "
-                "The directory holds a mixture of new and old artifacts; refusing to "
-                "load rather than treating it as a valid checkpoint"
-            )
+        refuse_if_uncommitted(Path(path))
 
     def load(self, path: Path | str) -> None:
         """恢复训练。
@@ -1904,6 +2010,11 @@ class Trainer:
                 f"the checkpoint's 'best_dirty' flag is "
                 f"{payload.get('best_dirty')!r}, not a boolean"
             )
+        # **``best_dirty=True`` 必须对应一份完整的候选。** 少了这一步，一份
+        # "标志为真、候选为空"的检查点会**加载成功**：标志被悄悄清成 ``False``，
+        # 最佳记录的分数还在、参数却没有，再次运行也不再产出 ``best.pt``
+        # （复核实测）。这是**输入自相矛盾**，按本仓库的约定直接拒绝。
+        require_best_candidate_consistency(payload, path)
         for key in ("last_update_loss", "last_update_loss_step"):
             if key not in payload:
                 raise TrainingError(
@@ -2264,9 +2375,15 @@ class Trainer:
         self._best_candidate = (
             dict(stored_candidate) if isinstance(stored_candidate, Mapping) else None
         )
-        self._best_dirty = bool(payload.get("best_dirty")) and (
-            self._best_candidate is not None
+        # **标志照抄，不在这里兜底。** 旧写法是
+        # ``bool(...) and self._best_candidate is not None``——"候选缺失"被悄悄
+        # 折成 ``False``，自相矛盾的输入于是变成一份看不出异常的实例。
+        # 一致性由 :func:`require_best_candidate_consistency` 负责，``load`` 的
+        # 只读阶段已经查过；这里再查一次，任何绕过 ``load`` 的调用路径也拦得住。
+        require_best_candidate_consistency(
+            payload, "the checkpoint about to be committed"
         )
+        self._best_dirty = bool(payload.get("best_dirty"))
         self.stage_history = list(stage_payload.get("history", []))
         # **最后一次实测损失与精修历史一起恢复。** 少了前者，零更新的恢复运行会
         # 报 ``final_loss=nan, final_loss_step=0``；少了后者，一个精修过的模型

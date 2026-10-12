@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -356,8 +356,6 @@ def detect_shock(
             "p": float(np.mean(p[-n_ref:])),
             "u": float(np.mean(u[-n_ref:])),
         }
-        reference_pressure = max(abs(outer_ref["p"]), float(ambient_pressure))
-
         for k in peak_index:
             # 跃迁带 = 峰周围**梯度仍高于噪声底**的连续区间。
             #

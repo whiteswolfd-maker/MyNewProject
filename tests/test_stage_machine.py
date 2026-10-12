@@ -34,7 +34,6 @@ from spherical_blast_pinn.training.schedule import (
 )
 
 from test_review_regressions import (  # noqa: E402  (tests/ 由 pytest 放进 sys.path)
-    TIME_SCALE,
     _scales,
     _tiny_reference,
     _write_case,

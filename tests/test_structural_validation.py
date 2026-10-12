@@ -24,7 +24,6 @@ from spherical_blast_pinn.data.extracted_case import (
     load_extracted_case,
     validate_case_arrays,
 )
-from spherical_blast_pinn.physics import material as mat
 
 GRID = np.linspace(0.002, 0.30, 3)
 

@@ -30,7 +30,6 @@ import torch
 from spherical_blast_pinn.evaluation.checks import CheckReport
 from spherical_blast_pinn.training.balancing import BalanceConfig
 from spherical_blast_pinn.training.trainer import (
-    RUN_COMPLETED,
     RUN_DIAGNOSTIC,
     TrainingError,
 )

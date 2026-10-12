@@ -9,9 +9,7 @@ import numpy as np
 import pytest
 
 from spherical_blast_pinn.data.extracted_case import (
-    DetectorSettings,
     ExtractedCase,
-    FieldMapping,
     specific_energy_from_pressure,
 )
 from spherical_blast_pinn.physics import material as mat
@@ -19,12 +17,10 @@ from spherical_blast_pinn.physics.detonation import DetonationConfig
 from spherical_blast_pinn.physics.precursor import (
     build_lagrangian_mesh,
     PrecursorConfig,
-    SphericalPrecursor,
     solve_reference_field,
 )
 from spherical_blast_pinn.physics.similitude import (
     REFERENCE_RADIUS,
-    REFERENCE_START_TIME,
     SimilitudeScales,
     freeze_time_scale,
     physical_to_pinn_time,

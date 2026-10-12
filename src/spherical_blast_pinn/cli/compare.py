@@ -24,7 +24,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from ..data.extracted_case import load_extracted_case
-from ..evaluation.waveform import compare_gauge, gauge_metrics
+from ..evaluation.waveform import compare_gauge
 from ..physics import material as mat
 from ._common import (
     SetupError,
@@ -546,7 +546,6 @@ def compare_fields(prediction: dict[str, Any], case, *, buffer_cells: int = 3) -
     4. **分介质报告**，并保留错配统计与界面被排除的统计。
     """
     physical_time_grid = np.asarray(prediction["physical_time"], dtype=np.float64)
-    radii_grid = np.asarray(prediction["radius"], dtype=np.float64)
     usable = case.supervisable_frames()
     frames = np.flatnonzero(usable)
     if frames.size == 0:

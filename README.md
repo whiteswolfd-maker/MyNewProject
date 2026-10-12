@@ -235,6 +235,11 @@ python -m spherical_blast_pinn.cli.compare --config configs/base.yaml \
   --prediction outputs/predict/80mm.npz --case tnt_80mm --output outputs/compare
 ```
 
+第 6 步的爆速读自**检查点**里冻结的那一份（``detonation_velocity``），不读配置、
+也不用默认常量：它进时间原点 ``T_h = R_0/D + epsilon(R_0)``，补一个默认值不会
+报错，只会把整条预测轨迹平移一个爆轰穿越时间。第 6 步与第 5 步的恢复共用**同一条**
+发布完整性规则——上一节说的那个未提交标记，两个入口都拒绝。
+
 测试：
 
 ```bash

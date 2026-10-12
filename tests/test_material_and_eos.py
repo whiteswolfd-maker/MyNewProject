@@ -115,7 +115,6 @@ def test_jwl_derivatives_match_finite_differences(rho, e):
     params = mat.product_jwl()
     density = torch.tensor([[rho]], dtype=torch.float64, requires_grad=True)
     energy = torch.tensor([[e]], dtype=torch.float64, requires_grad=True)
-    pressure = jwl_pressure_numpy(np.array([rho]), np.array([e]), params)[0]
 
     analytic_rho, analytic_e = jwl_pressure_derivatives(
         density.detach(), energy.detach(), params

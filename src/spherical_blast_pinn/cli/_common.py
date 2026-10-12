@@ -31,7 +31,6 @@ from ..physics import material as mat
 from ..physics.similitude import (
     SimilitudeScales,
     freeze_time_scale,
-    handover_time,
 )
 from ..sampling.sampler import SamplingConfig
 

@@ -446,7 +446,6 @@ class SphericalPrecursor:
         self.density = 1.0 / self.specific_volume
 
         product = self.mesh.material == PRODUCT
-        centres = self.mesh.centres
         if not np.any(product):
             raise PrecursorError("网格里没有产物单元，无法铺方案 B 的初值")
 

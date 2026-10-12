@@ -33,7 +33,6 @@ except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
 from ..data.extracted_case import ExtractedCase
-from ..physics import material as mat
 from ..physics.precursor import ReferenceField
 from ..physics.similitude import SimilitudeScales
 from .batch import SampleBatch

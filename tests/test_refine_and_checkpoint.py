@@ -60,10 +60,6 @@ def _total(tiny) -> int:
     return sum(stage.updates for stage in tiny)
 
 
-def _fingerprint_of(trainer) -> str:
-    return trainer.parameter_fingerprint()
-
-
 def _inject_non_finite_gradient(trainer):
     """给第一个可训练参数挂一个把梯度改成 NaN 的 hook，返回移除函数。"""
     parameter = next(p for p in trainer.model.parameters() if p.requires_grad)

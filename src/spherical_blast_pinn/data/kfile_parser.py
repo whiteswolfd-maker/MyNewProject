@@ -328,7 +328,6 @@ class DeckSummary:
 # Parsing
 # --------------------------------------------------------------------------
 
-_MATERIAL_KEYS = ("ro", "d", "pcj", "beta", "k", "g", "sigy")
 _JWL_KEYS = ("A", "B", "R1", "R2", "omeg", "E0", "V0")
 _POLY_KEYS = ("C0", "C1", "C2", "C3", "C4", "C5", "C6")
 
