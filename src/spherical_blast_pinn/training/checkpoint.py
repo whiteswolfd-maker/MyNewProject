@@ -16,6 +16,11 @@
 * :func:`refuse_if_uncommitted` —— 多文件发布不是原子的。发布前写下标记、成功后
   删除，**两个入口都必须落实**这条规则。以前只有 ``Trainer.load`` 查它，于是
   "恢复训练被拒绝的文件，仍能被预测入口读进去"（复核实测）。
+  标记的**结构**由 :func:`require_publish_marker_contract` 一处定义并强制：
+  存在就必须是一个带非空 ``artifacts`` 名字列表与 ``owner`` 的 JSON 对象。
+  以前只问"顶层是不是字典"，于是 ``{}``、``{"artifacts": []}`` 被当成"没有未提交
+  产物"，``{"artifacts": "last.pt"}`` 被逐字符遍历——**三个坏标记两个入口都放行**
+  （复核实测）。
 * :func:`require_best_candidate_consistency` —— ``best_dirty`` 与候选快照必须
   互相印证。一个 ``best_dirty=True`` 却没有任何候选的检查点不能"加载成功并把
   标志悄悄清掉"：那会让一次中断之后的最佳模型无声消失。
@@ -25,7 +30,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, NoReturn
 
 #: 检查点格式标识与版本。加载时两者都必须匹配，否则拒绝。
 CHECKPOINT_FORMAT = "spherical_blast_pinn.checkpoint"
@@ -50,9 +55,17 @@ DETONATION_VELOCITY_FIELD = "detonation_velocity"
 #: 目录里会留下"一部分新、一部分旧"的状态，而每一份单看都是合法文件。
 PUBLISH_MARKER = ".publish_in_progress.json"
 
+#: 标记里列出"这次发布正在写哪些产物"的键。值必须是**非空的名字列表**：
+#: 它不是"缺少时的默认为空"，而是"读不懂就不能当已提交"。空列表/字符串/字典
+#: 都被下面那条契约明确拒绝，见 :func:`require_publish_marker_contract`。
+PUBLISH_ARTIFACTS_KEY = "artifacts"
+
 #: 标记里记录"这次发布属于哪个事务"的键。没有它，一个后来的事务就无法判断
 #: 标记是不是自己写的，只能**无条件**删除——那会把上一次中断的痕迹一起抹掉，
 #: 让一套从未提交成功的产物变成"看起来已提交"（复核实测）。
+#:
+#: 它是**必需**字段：缺了它的老标记一律保持阻断，不当成"没有标记"，也不当成
+#: "本次事务的标记"。把"读不懂归属"当放行，等于把上面那个洞重新打开一次。
 PUBLISH_OWNER_KEY = "owner"
 
 
@@ -70,6 +83,127 @@ def publish_marker_path(output_dir: Path | str) -> Path:
     return Path(output_dir) / PUBLISH_MARKER
 
 
+def _illegal_artifact_name(name: Any) -> str | None:
+    """``PUBLISH_ARTIFACTS_KEY`` 的一个列表项不合法时给出理由，否则 ``None``。
+
+    "合法名字"按**它在标记目录里的作用**定义：标记旁边的一个**文件**。所以路径
+    分隔符、"``.``/``..``"、空串都不算名字——它们要么指向别的地方，要么什么都没
+    指向。类型必须**原样**是字符串：以前这里靠 ``str(name)`` 兜底，结果是任何
+    错误类型都被强行转成合法输入（``5`` → ``"5"``、``None`` → ``"None"``），
+    错误类型永远不会被判为错。
+    """
+    if not isinstance(name, str):
+        return f"is {type(name).__name__}, not a string"
+    if not name.strip():
+        return "is empty"
+    if name in (".", ".."):
+        return "is a directory reference, not a file name"
+    if "/" in name or "\\" in name:
+        return "contains a path separator, so it does not name a file in this directory"
+    if "\x00" in name:
+        return "contains a NUL byte"
+    return None
+
+
+def require_publish_marker_contract(
+    payload: Any,
+    path: Path | str,
+    *,
+    error: type[Exception] = TrainingError,
+) -> list[str]:
+    """校验未提交标记的**结构**，合法则返回它的产物名字列表。
+
+    这是标记结构的**唯一定义**。契约只有三条，但每一条都是"读不懂就拒绝"：
+
+    1. 顶层是 JSON 对象；
+    2. ``artifacts`` 存在，是一个**非空**列表，每项是合法、非空的文件名字符串；
+    3. ``owner`` 存在，是一个非空字符串。
+
+    为什么要这么严：这几种输入**都是合法的 JSON 对象**，所以"不是对象就拒绝"
+    拦不住它们，而每一种都会让"未提交"这件事静默消失——
+
+    * ``{}`` / ``{"artifacts": []}``：取不到或取到空的 ``artifacts``，被
+      ``or ()`` 兜成空集合，读起来和"全部已提交"一模一样；
+    * ``{"artifacts": "last.pt"}``：字符串被**逐字符**遍历成
+      ``{'l','a','s','t','.','p'}``，``"last.pt" in artifacts`` 为假；
+    * 缺 ``owner``：没人能说清这个标记属于哪个事务。
+
+    三者修前都会让训练恢复与预测**双双放行**（复核实测）。所以这里不做任何
+    "缺省即无害"的解读：标记存在就必须能按上面的契约读懂。
+    """
+
+    def fail(reason: str) -> NoReturn:
+        raise error(
+            f"{path} is not a usable publish marker ({reason}); a publish was "
+            "interrupted, so the artifacts beside it cannot be trusted as committed. "
+            "Refusing to read them rather than assuming the marker says nothing"
+        )
+
+    if not isinstance(payload, dict):
+        fail(f"it is {type(payload).__name__}, not a JSON object")
+
+    if PUBLISH_ARTIFACTS_KEY not in payload:
+        fail(f"it carries no {PUBLISH_ARTIFACTS_KEY!r} field")
+    artifacts = payload[PUBLISH_ARTIFACTS_KEY]
+    if not isinstance(artifacts, list):
+        fail(
+            f"its {PUBLISH_ARTIFACTS_KEY!r} is {type(artifacts).__name__}, not a list; a "
+            "string here would be walked character by character and match no artifact"
+        )
+    if not artifacts:
+        fail(
+            f"its {PUBLISH_ARTIFACTS_KEY!r} list is empty, so it names no artifact at "
+            "all: that reads exactly like 'everything is committed'"
+        )
+    for index, name in enumerate(artifacts):
+        reason = _illegal_artifact_name(name)
+        if reason is not None:
+            fail(f"its {PUBLISH_ARTIFACTS_KEY}[{index}] = {name!r} {reason}")
+
+    if PUBLISH_OWNER_KEY not in payload:
+        fail(
+            f"it carries no {PUBLISH_OWNER_KEY!r} field, so no transaction can be shown "
+            "to own it; without an owner a marker cannot be told apart from an earlier "
+            "interrupted publish"
+        )
+    owner = payload[PUBLISH_OWNER_KEY]
+    if not isinstance(owner, str) or not owner.strip():
+        fail(
+            f"its {PUBLISH_OWNER_KEY!r} is {owner!r}, not a non-empty string; the owner "
+            "is what tells this transaction's marker apart from an earlier one"
+        )
+
+    supersedes = payload.get("supersedes")
+    if supersedes is not None and not isinstance(supersedes, dict):
+        fail(f"its 'supersedes' is {type(supersedes).__name__}, not a JSON object")
+
+    return list(artifacts)
+
+
+def _read_marker_json(marker: Path, *, error: type[Exception]) -> Any:
+    """解析标记文件。读不出来（权限、编码、目录、损坏的 JSON）**一律拒绝**。
+
+    返回解析结果本身，``None`` 不在这里被当成"没有标记"：JSON 的 ``null`` 也是
+    一个合法文档，把它和"文件不存在"混为一谈就会放过一个读不懂的标记。
+    """
+    try:
+        text = marker.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 - 读不懂就拒绝，不做任何猜测
+        raise error(
+            f"{marker} exists but cannot be read ({exc.__class__.__name__}: {exc}); a "
+            "publish was interrupted, so the artifacts beside it cannot be trusted as "
+            "committed"
+        ) from exc
+    try:
+        return json.loads(text)
+    except Exception as exc:  # noqa: BLE001 - 同上
+        raise error(
+            f"{marker} exists but cannot be read ({exc.__class__.__name__}: {exc}); a "
+            "publish was interrupted, so the artifacts beside it cannot be trusted as "
+            "committed"
+        ) from exc
+
+
 def read_publish_marker(
     output_dir: Path | str, *, error: type[Exception] = TrainingError
 ) -> dict[str, Any] | None:
@@ -79,36 +213,32 @@ def read_publish_marker(
     有没有没发布的产物"），有时按检查点问（"这一份能不能读"）。后者
     :func:`refuse_if_uncommitted` 会自己取父目录。
 
-    标记存在却读不出来时**保守拒绝**：宁可让一个可能完好的目录多拒绝一次，
-    也不能把"读不懂标记"当成"没有标记"。
+    标记存在时**必须**满足 :func:`require_publish_marker_contract`。读不出来、
+    或者结构不合法，都**保守拒绝**：宁可让一个可能完好的目录多拒绝一次，也不能
+    把"读不懂标记"当成"没有标记"。
     """
     marker = publish_marker_path(output_dir)
     if not marker.exists():
         return None
-    try:
-        payload = json.loads(marker.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001 - 读不懂就拒绝，不做任何猜测
-        raise error(
-            f"{marker} exists but cannot be read ({exc.__class__.__name__}: {exc}); a "
-            "publish was interrupted, so the artifacts beside it cannot be trusted as "
-            "committed"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise error(
-            f"{marker} is not a JSON object ({type(payload).__name__}); a publish was "
-            "interrupted, so the artifacts beside it cannot be trusted as committed"
-        )
+    payload = _read_marker_json(marker, error=error)
+    require_publish_marker_contract(payload, marker, error=error)
     return payload
 
 
 def uncommitted_artifacts(
     output_dir: Path | str, *, error: type[Exception] = TrainingError
 ) -> set[str] | None:
-    """``output_dir`` 里那批**未提交**产物的名字；没有标记时 ``None``。"""
-    payload = read_publish_marker(output_dir, error=error)
-    if payload is None:
+    """``output_dir`` 里那批**未提交**产物的名字；没有标记时 ``None``。
+
+    校验走的是**同一个** :func:`require_publish_marker_contract`，不做第二套
+    判断。返回的集合直接来自校验通过的那个列表，**不再经过 ``str()``**——那一步
+    正是让错误类型冒充合法输入的地方。
+    """
+    marker = publish_marker_path(output_dir)
+    if not marker.exists():
         return None
-    return {str(name) for name in (payload.get("artifacts") or ())}
+    payload = _read_marker_json(marker, error=error)
+    return set(require_publish_marker_contract(payload, marker, error=error))
 
 
 def refuse_if_uncommitted(
@@ -118,6 +248,12 @@ def refuse_if_uncommitted(
 
     训练恢复与预测入口都调它。只在一处检查时，"恢复被拒绝"与"可以用来预测"
     会同时成立——而预测同样会拿一套新旧混合的产物当真值使用。
+
+    标记在**被加载检查点的父目录**里找，不是调用方自己的输出目录：读它的往往是
+    一个新实例，写出那次运行的输出目录与它不同（规则 §6）。
+
+    标记存在却读不懂、或结构不合法时，:func:`uncommitted_artifacts` 已经抛错，
+    这里不再有第二条路径——"读不懂"与"列出了这一份"都落进同一个拒绝。
     """
     artifacts = uncommitted_artifacts(Path(checkpoint_path).parent, error=error)
     name = Path(checkpoint_path).name
@@ -236,6 +372,7 @@ __all__ = [
     "CHECKPOINT_FORMAT",
     "CHECKPOINT_VERSION",
     "DETONATION_VELOCITY_FIELD",
+    "PUBLISH_ARTIFACTS_KEY",
     "PUBLISH_MARKER",
     "PUBLISH_OWNER_KEY",
     "TrainingError",
@@ -244,5 +381,6 @@ __all__ = [
     "refuse_if_uncommitted",
     "require_best_candidate_consistency",
     "require_detonation_velocity",
+    "require_publish_marker_contract",
     "uncommitted_artifacts",
 ]
