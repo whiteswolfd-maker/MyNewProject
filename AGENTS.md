@@ -362,10 +362,96 @@ pytest -q
   保存拆成三层：``_checkpoint_state()`` 取状态 / ``_build_payload()`` 拼载荷 /
   ``_write_payload()`` 原子写出。未发布的候选随检查点一起存
   （``pending_best_candidate`` + ``best_dirty``），中断后不会只剩一个分数。
-* **``best_dirty=True`` 必须对应一份完整的候选**，加载端核对候选步号、模型状态
-  与最佳记录，**不一致就拒绝**。以前是"没有候选就把标志悄悄清成 ``False``"：
-  一份自相矛盾的检查点会**加载成功**，最佳记录的分数还在、参数却没有，再次运行
-  也不再产出 ``best.pt``。这是输入自相矛盾，不是可以自动纠正的缺省值。
+* **``best_dirty=True`` 必须对应一份完整、自证一致的候选**，加载端**不一致就
+  拒绝**。以前是"没有候选就把标志悄悄清成 ``False``"：一份自相矛盾的检查点会
+  **加载成功**，最佳记录的分数还在、参数却没有，再次运行也不再产出 ``best.pt``。
+  这是输入自相矛盾，不是可以自动纠正的缺省值。具体查四件事（`checkpoint.py`）：
+
+  1. **候选要走与顶层载荷同一份状态校验**（`validate_state_snapshot`）。以前顶层
+     有一套逐条检查、候选只查了"是不是 Mapping、步号对不对"，于是候选的模型结构、
+     优化器、阶段、采样器与全局 RNG、平衡器、历史全都没人验——实测把候选 `model`
+     清空、删候选 `optimizer`、改一个候选参数，三种都能**加载成功**。
+  2. **指纹从候选的实际参数重算**，等于记录里的值（算法只有一份：
+     `parameter_fingerprint_of`，`Trainer.parameter_fingerprint()` 也调它）。
+     只查"记录里那个指纹是非空字符串"时，"改参数、指纹不动"无人能发现——而
+     `best.pt` 的 `candidate.parameter_fingerprint` 正是靠它声称"这一份就是被选中
+     的那组参数"。**不把记录改成重算值来"修复"**：那会让坏文件看起来是好的。
+  3. **步号三处各自合法、且表示同一步**：候选的 `step`、候选内部
+     `best_check.step`、顶层 `best_check.step`。三处**分别**走
+     `require_step_value()`——缺失、`None`、字符串、浮点、布尔（Python 与 NumPy）
+     与非负范围**都明确拒绝**，而且**不先 `int()`**：`int("1")`、`int(1.0)`、
+     `int(True)` 全都得到 `1`，正好把"合法记录"与"损坏记录"的差别抹掉。以前这里
+     对非整数直接 `return`/`continue`，注释说"后续状态校验会负责"，但后续只查了
+     快照自身的 `step`——另外两处根本没人验，删掉或写成 `"broken"` 都能一路发布
+     （复核实测）。**不修补**：缺的不拿顶层步号补，不一致的不拿当前训练步号覆盖。
+     * **快照自带的 `best_check` 也要验**（`validate_state_snapshot`）：已发布的
+       `best.pt` 没有待发布候选，`require_best_candidate_consistency()` 会在第一道
+       判据就返回，文件**自身**的最佳记录必须由共享只读校验查。
+       `best_check=None`（还没产生过最佳）仍是**合法**初始状态。
+  4. **选择依据不矛盾**：候选内部的 `best_check` 与顶层最佳记录的指纹、`score`、
+     `check_set_identity` 相同。比 `score` 时 **NaN 要当作等于自己**——`score`
+     里带 NaN 是合法的（某个分量没有可测值），直接比会把正常候选判成矛盾。
+
+  **候选参数可以与顶层当前参数不同**（它本来就可能来自更早的一步），不得要求二者
+  数值相同。**必需字段**的依据是"写入端写了、恢复端读了"（`_checkpoint_state()`
+  产生、`_commit_checkpoint()` 消费）：`model`/`optimizer`/`balancing`/`rng`/
+  `sampler_rng`/`stage`/`run_origin`/`last_update_loss`(+`_step`)/`history`/
+  `checks`/`refinement`。写而不读的字段（`learning_rates`）**不在此列**。
+  **合法初始状态要保留**：空优化器状态（尚未更新）、未测损失 `nan` 都不能判成损坏。
+
+  **非模型状态也要真查，不能只查"键在不在、是不是 Mapping"。** 实测四种都能
+  **加载成功并发布成 `best.pt`**，直到**下一个**实例恢复它时才炸：
+
+  | 变异 | 何时才发现 | 真实报错 |
+  |---|---|---|
+  | 候选 `optimizer = {}` | 恢复 `best.pt` 时 | `KeyError: 'param_groups'` |
+  | 候选 `rng['torch'] = 0` | 恢复 `best.pt` 时 | `TypeError: expected a torch.ByteTensor` |
+  | 候选 `stage.window_fraction = 0.123` | 恢复 `best.pt` 时 | 窗口与步号对应的日程不符 |
+  | 候选 `state[pid].exp_avg_sq = -1` | **下一次更新之后** | 参数变 NaN，再下一次 `NonFiniteUpdate` |
+
+  最后一行是最隐蔽的一条：`-1` 是**有限**值，所以"张量有限性"那条放它过去；
+  `load` 通过、`best.pt` 写下、新实例恢复也通过——污染发生在**继续训练的第一
+  步**，那时坏文件已经在盘上了。
+
+  * **优化器结构**（`validate_optimizer_state`）：`param_groups`/`state` 必须都在
+    （`state` 为**空**是合法的初始状态，`{}` 不是）；参数组数量、参数标识与
+    当前优化器的对应关系逐组相等；已存在的逐参数状态要形状对得上参数、
+    数值有限。
+  * **优化器状态的数值语义**：`OPTIMIZER_NON_NEGATIVE_FIELDS`
+    （`exp_avg_sq`/`max_exp_avg_sq`）是**梯度的平方**的估计，必须逐元素非负——
+    Adam 要开它的平方根再除，负值开方得 NaN。`exp_avg` 是**一阶矩，允许为负**，
+    不能套同一条规则（那会把正常训练历史判成损坏）。**不许**用取绝对值、截断到
+    零、清空动量、重建状态或 `nan_to_num` 把坏记录"修"成能过。
+  * **"跑得动"与"结果是好的"是两件事**（`_probe_optimizer_step` →
+    `_require_probe_results_finite`）：探针在**隔离的**优化器上（克隆参数、
+    新建实例、深拷贝状态——`load_state_dict` 在同 dtype 下会把张量原样接过去，
+    不深拷贝就改到了候选自己的动量上）真走一步之后，还要检查**探针参数**与
+    **探针优化器的浮点状态**是否全部有限。`step()` 完全可以不抛异常、直接产出
+    NaN。实测：`exp_avg = 1e308` 配 `exp_avg_sq = 0` 两个值都有限且非负，
+    更新量放大约 `1e6` 倍直接把参数推成 `inf`，全程不抛异常。
+  * **全局随机状态**（`_validate_global_rng_state`）：`numpy`/`torch` 非空只说明
+    "写了东西"。要用**独立的临时生成器**（`RandomState()`/`Generator()`/
+    `Random()`）验证它真能被接受；**不**改全局再恢复——失败路径正是最需要全局
+    序列保持原样的时候。`python` 一项按契约可选，给了就要能用。
+  * **阶段与窗口**：一律按**这份快照自己的** `step`/`current`/`pending`/`blocked`
+    判断（见下），**不是**接收实例的步号——候选来自更早一步是合法情形，照着
+    接收实例去算会把正常候选整批判成损坏。
+  * **顶层载荷与待发布候选走同一条规则**（`_snapshot_rules()` 是上下文的唯一
+    构造点）：不得只在某一个加载入口追加特判。
+  * 校验上下文（模型结构、采样器/优化器/全局随机的验证器、`stage_windows`、
+    `window_at_step`）**全部必填**：给默认值等于"调用方忘了传就静默不查"，
+    而这一项要修的正是那种静默。
+
+* **阶段、窗口与步号的三条一致性规则**（`validate_state_snapshot`，顶层载荷与
+  候选**共用**；`load()` 里原来那份**已删除**，同一份规则不留两处）：
+  阶段名要么是 `None`、要么必须在这套日程里（`stage_windows` 的键）；
+  **未阻塞**时窗口必须等于该**快照自己的**步号所属阶段的窗口；
+  **已阻塞**时 `pending` 与 `current` 必须是同一个阶段、窗口属于该阶段，
+  且 `pending` 非空与 `blocked` 必须同时成立。两条都是**精确等值**，不是
+  "属于某个集合"——那太松，任何阶段窗口都会被接受一次。
+* **``best.pt`` 发布之前**就要查完候选（`run()` 在 `_begin_publish` 之前调同一条
+  规则）：候选一旦落盘就一直声称"这就是被选中的那组参数"，等发布完再发现坏了，
+  坏文件已经在盘上。恢复出来的候选在下游被改坏后同样会走到这里。
 * ``best.pt`` 的 ``run_status`` 是**选中它的那次运行**的状态；它的
   ``final_stage_verdict`` 为 ``None``（判据是在整次运行自己最后那组参数上评出来
   的，不套在中途候选身上）。``candidate`` 块给出候选的步号与指纹。
@@ -441,6 +527,26 @@ pytest -q
   两条时间轴：50 mm 上恢复端 ``T_h = 8.21500721501 µs``、预测端 ``41.5186385737 µs``
   （复核实测：顶层改成 1234，``scales`` 记录仍是 6930 那条）。**不**为这个校验
   升级检查点版本：``D`` 已由既有字段唯一确定，加字段反而要迁移。
+* **逐算例记录必须互相绑定**，由
+  ``training.checkpoint.require_case_scales_association`` 一处校验。同一个算例在
+  检查点里写了四遍——``case_ids``、``scales``、``data_identity``、``provenance``
+  （``case_ids``/``charge_radii`` 是平行列表，``start_times``/``valid_pinn_time_max``
+  按 ``case_id`` 取键）。要求：``case_ids`` 非空不重复；``scales`` 与 ``data_identity``
+  的键集**恰好**等于 ``case_ids``（缺记录与来源不明的多记录都拒绝）；
+  ``scales[case_id].charge_radius`` == ``data_identity[case_id].charge_radius_m``；
+  ``scales[case_id].time_scale`` == 顶层 ``time_scale``；
+  ``provenance['charge_radii']`` 按平行下标与 ``case_ids`` 对齐；
+  ``provenance['start_times'][case_id]`` == ``scales[case_id].start_time``；
+  ``valid_pinn_time_max`` 覆盖同一批算例且是有限非负数。
+  每个算例的 ``start_time`` 还要**按定义**等于 ``T_h = R_0/D + epsilon(R_0)``
+  （用顶层冻结 ``D`` 与该算例自己的半径正向算），恢复端再按 ``case_id`` 与
+  **接收实例实际使用的**半径与起始时间逐项对照（``_instance_case_scales()``）。
+  只比爆速拦不住下面这种副本：``charge_radius`` 0.05→0.10、``start_time`` 同乘 2，
+  反算出的 ``D`` 一模一样，而尺度记录已经不属于那个算例——修前共享校验、
+  ``Trainer.load()``、预测加载**全部通过**、预测 CLI 返回 0，只是默认结束时间从
+  300 µs 变成 154.108 µs、``s_max`` 从 5.59815 变成 2.79908（复核实测）。
+  ``case_ids``/``scales`` 改名而 ``data_identity``/``provenance`` 不改名同样必须拒绝。
+  **不**为这个校验升级检查点版本：四份记录本来就都在文件里。
 * 场量布局**声明**在 `metadata.json` 的 `profile_layout = {version, layout}` 里，
   不靠形状推断。`frames_by_radius` 是逐帧二维 `(n_t, n_x)`（缺省，与既有导出
   一致），`single_frame_1d` 是单帧的一维 `(n_x,)`。读取器里**不得**再出现

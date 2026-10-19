@@ -38,7 +38,7 @@ MAX_UPDATES = 18
 MAX_REFINE_ITERATIONS = 5
 
 #: 这份脚本的版本。改了检查项就升它，否则"上次联检通过"指的不是同一件事。
-SNAKE_CHECK_VERSION = 4
+SNAKE_CHECK_VERSION = 5
 
 
 # --------------------------------------------------------------------------
@@ -534,7 +534,6 @@ def _compare_case(directory: Path):
     for index in range(n_t):
         product = grid < contact[index]
         air = (grid >= contact[index]) & (grid < shock[index])
-        ambient = ~(product | air)
         material[index] = np.where(product, 0, np.where(air, 1, 2))
         density[index] = np.where(
             product, 1600.0, np.where(air, 6.0 * mat.AIR_DENSITY, mat.AIR_DENSITY)
@@ -595,7 +594,6 @@ def _check_compare_cli(rec, out_dir):
     root.mkdir(parents=True, exist_ok=True)
     case, contact, shock = _compare_case(root / "case")
     radii = np.asarray(case.radius, dtype=np.float64)
-    n_t = case.times.size
     region = np.where(
         radii[None, :] < contact[:, None], 0,
         np.where(radii[None, :] < shock[:, None], 1, 2),
@@ -659,6 +657,242 @@ def _check_compare_cli(rec, out_dir):
         fields_available=report.get("fields", {}).get("available"),
         comparable_points=report.get("fields", {}).get("comparable_points"),
         elapsed_s=round(time.time() - started, 2),
+    )
+
+
+def _check_prediction_chain(rec, out_dir):
+    """⑯b 训练 → 保存检查点 → **预测入口** → 对照报告：整条链真的走一遍。
+
+    **复核点名的断链。** 上面那条 ``compare`` 检查把参考数组**直接写进预测
+    NPZ**，于是"对照命令能跑"被当成了"整条预测链路能跑"——而训练检查点里
+    根本没有预测端要求的 ``detonation_velocity``，一份正常训练出来的检查点
+    在预测入口第一行就被拒绝。这里每一步都走真实入口：
+
+    真实训练落盘 → ``predict.main`` → ``compare.main``，并且核对预测文件里的
+    时间原点**确实是由检查点里冻结的 ``D`` 重建出来的**。
+
+    **不断言物理精度。** 这是一条冒烟尺度的小模型（预算见文件头），它的前沿
+    与参考剖面本来就不该对上；不拿误差大小当通过条件。但**"有没有真的比过"**
+    必须是条件：一个全部无效、一个可比点都没有的报告读起来像成功，实际上什么
+    都没比。所以要求 ``fields.available is True`` 且 ``comparable_points > 0``。
+
+    **为什么用 ``_compare_case`` 而不是训练那条链的 ``_synthetic_case``：**
+    后者的网格粗、介质带窄，启发式前沿检测器在上面把材料分区退化成一整片
+    "未受扰动"——拿它当对照的输入，``comparable_points`` 是 **0**，而"报告
+    生成了"会冒充成"对照成功"（本轮实测）。``_compare_case`` 写了一份
+    ``material.npz``，材料分区是**读数**而不是启发式判据。训练、预测、对照
+    用的是**同一份**这样的算例，链路自洽。
+    """
+    import torch
+
+    from spherical_blast_pinn.cli import compare as compare_module
+    from spherical_blast_pinn.cli import predict as predict_module
+    from spherical_blast_pinn.physics.similitude import SimilitudeScales
+    from spherical_blast_pinn.training.checkpoint import (
+        DETONATION_VELOCITY_FIELD,
+        PUBLISH_MARKER,
+        PUBLISH_OWNER_KEY,
+    )
+
+    root = out_dir / "prediction_chain"
+    root.mkdir(parents=True, exist_ok=True)
+    # 训练、预测、对照共用**同一份**算例；它必须是对照能真的比出东西的那一份
+    # （见 docstring）。这是脚本内的合成夹具，不碰正式数据。
+    case, _contact, _shock = _compare_case(root / "case")
+    radius = float(case.charge_radius)
+
+    # ① 训练并落盘。
+    trainer, _tiny = _trainer(case, root / "run")
+    trainer.run(max_updates=MAX_UPDATES, verbose=False)
+    checkpoint = trainer.output_dir / "last.pt"
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    frozen_d = float(payload[DETONATION_VELOCITY_FIELD])
+
+    case_directory = Path(case.source["directory"])
+    config_path = root / "config.yaml"
+    config_path.write_text(
+        "\n".join([
+            f"inherits: {(REPO / 'configs' / 'base.yaml').as_posix()}",
+            "",
+            "data:",
+            "  cases:",
+            f"    - case_id: {case.case_id}",
+            f"      charge_radius_m: {radius}",
+            f"      directory: {case_directory.as_posix()}",
+            "      split: train",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    # ② 预测入口——**不是**手写 NPZ。
+    n_times, n_radii = 6, 40
+    prediction_dir = root / "prediction"
+    started = time.time()
+    try:
+        predict_code = predict_module.main([
+            "--config", str(config_path),
+            "--checkpoint", str(checkpoint),
+            "--radius", str(radius),
+            "--output", str(prediction_dir),
+            "--n-times", str(n_times),
+            "--n-radii", str(n_radii),
+        ])
+        predict_error = None
+    except Exception as exc:  # noqa: BLE001 - 失败要如实记下来，不能让联检崩掉
+        predict_code, predict_error = None, f"{exc.__class__.__name__}: {exc}"
+    written = sorted(prediction_dir.glob("*.npz")) if prediction_dir.exists() else []
+
+    prediction_ok = False
+    start_time = None
+    valid_points = 0
+    fields_finite = False
+    if predict_code == 0 and written:
+        with np.load(written[0], allow_pickle=True) as handle:
+            result = {key: handle[key] for key in handle.files}
+        start_time = float(result["start_time"])
+        # 时间原点必须**由检查点里的 D 重建**，而不是默认常量补出来的：
+        # 独立算一遍 T_h = R_0/D + epsilon，逐位对上。
+        expected = SimilitudeScales.for_radius(
+            radius, time_scale=float(payload["time_scale"]), detonation_velocity=frozen_d
+        ).start_time()
+        # **有效查询点上的有限性。** 只查"退出码为零、文件出现了"是不够的：
+        # 一份形状对、字段齐、值全是 NaN 的预测同样能通过那两条。这里取预测
+        # 自己标出的可用区域（``region >= 0``），要求那里三个场都有限。
+        region = np.asarray(result["region"])
+        usable = region >= 0
+        valid_points = int(np.count_nonzero(usable))
+        fields_finite = valid_points > 0 and all(
+            bool(np.isfinite(np.asarray(result[name])[usable]).all())
+            for name in ("density", "velocity", "specific_energy")
+        )
+        prediction_ok = (
+            np.asarray(result["density"]).shape == (n_times, n_radii)
+            and float(result["charge_radius"]) == radius
+            and abs(start_time - expected) <= 1e-18
+            and np.isfinite(np.asarray(result["contact_radius"])).all()
+            # 有效查询点必须存在，而且那里的场值必须有限。
+            and valid_points > 0
+            and fields_finite
+        )
+    rec.check(
+        "prediction_entry_runs_from_a_training_checkpoint",
+        prediction_ok,
+        exit_code=predict_code, error=predict_error,
+        prediction_file=str(written[0]) if written else None,
+        frozen_detonation_velocity_m_s=frozen_d,
+        start_time_s=start_time,
+        valid_query_points=valid_points,
+        fields_finite_at_valid_points=fields_finite,
+        elapsed_s=round(time.time() - started, 2),
+    )
+
+    if not written:
+        rec.check(
+            "the_model_prediction_can_be_compared_against_the_reference",
+            False, reason="the prediction entry produced no file to compare",
+        )
+        return
+
+    # ③ 对照报告，输入是**模型产出的那一份**。
+    compare_out = root / "compare_out"
+    started = time.time()
+    try:
+        compare_code = compare_module.main([
+            "--config", str(config_path),
+            "--prediction", str(written[0]),
+            "--case", case.case_id,
+            "--output", str(compare_out),
+        ])
+        compare_error = None
+    except Exception as exc:  # noqa: BLE001
+        compare_code, compare_error = None, f"{exc.__class__.__name__}: {exc}"
+    report_path = compare_out / f"compare_{case.case_id}.json"
+    report = (
+        json.loads(report_path.read_text(encoding="utf-8"))
+        if report_path.exists() else {}
+    )
+    fields_report = report.get("fields", {}) if isinstance(report, dict) else {}
+    comparable_points = fields_report.get("comparable_points")
+    # **"报告生成了"不等于"对照做完了"。** 一个全部无效、全部跳过、一个可比点
+    # 都没有的空报告读起来像成功，实际上什么都没比（修前实测：模型预测那一份
+    # 报告的 ``comparable_points`` 是 0，而检查照样通过）。所以这里要求报告真的
+    # 比出了数据点。**不**对误差大小设阈值：冒烟模型的精度本来就不该被考核。
+    compare_ok = (
+        compare_code == 0
+        and report_path.exists()
+        and report.get("case_id") == case.case_id
+        and fields_report.get("available") is True
+        and isinstance(comparable_points, int)
+        and comparable_points > 0
+    )
+    rec.check(
+        "the_model_prediction_can_be_compared_against_the_reference",
+        compare_ok,
+        exit_code=compare_code, error=compare_error,
+        report=str(report_path), report_exists=report_path.exists(),
+        fields_available=fields_report.get("available"),
+        comparable_points=comparable_points,
+        compared_per_field={
+            key: entry.get("compared")
+            for key, entry in (fields_report.get("counts") or {}).items()
+        },
+        elapsed_s=round(time.time() - started, 2),
+    )
+
+    # ④ 发布标记必须由**两个入口**共同执行（复核 §2）。
+    #
+    # 先取**合法对照**：同一份检查点、**没有**标记时两个入口都接受。少了这一步，
+    # "两个入口都拒绝"可能来自配置错误、缺文件或别的无关异常——那样的"通过"
+    # 什么也没证明。再要求拒绝的报错**提到发布完整性**本身。
+    def _prediction_accepts() -> tuple[bool, str | None]:
+        try:
+            predict_module.load_model_from_checkpoint(checkpoint, charge_radius=radius)
+            return True, None
+        except Exception as exc:  # noqa: BLE001 - 原因要如实记下来
+            return False, f"{exc.__class__.__name__}: {exc}"
+
+    def _training_accepts(label: str) -> tuple[bool, str | None]:
+        fresh, _ = _trainer(case, root / label)
+        try:
+            fresh.load(checkpoint)
+            return True, None
+        except Exception as exc:  # noqa: BLE001
+            return False, f"{exc.__class__.__name__}: {exc}"
+
+    control_predict_ok, control_predict_error = _prediction_accepts()
+    control_train_ok, control_train_error = _training_accepts("control_fresh")
+
+    marker = trainer.output_dir / PUBLISH_MARKER
+    marker.write_text(
+        # 标记必须**点名被检查的这一份**，否则拒绝不是冲着它来的。
+        json.dumps({"artifacts": [checkpoint.name], PUBLISH_OWNER_KEY: "the-snake-check"}),
+        encoding="utf-8",
+    )
+    try:
+        predict_ok, predict_error = _prediction_accepts()
+        train_ok, train_error = _training_accepts("blocked_fresh")
+    finally:
+        marker.unlink(missing_ok=True)
+
+    refusal_wording = "left uncommitted"
+    rec.check(
+        "the_same_uncommitted_checkpoint_is_refused_by_both_entries",
+        control_predict_ok
+        and control_train_ok
+        and not predict_ok
+        and not train_ok
+        # 拒绝必须**来自发布完整性检查**：两个入口的报错都要提到它。
+        and refusal_wording in (predict_error or "")
+        and refusal_wording in (train_error or ""),
+        marker_artifact=checkpoint.name,
+        control_prediction_entry_accepts=control_predict_ok,
+        control_training_entry_accepts=control_train_ok,
+        control_prediction_error=control_predict_error,
+        control_training_error=control_train_error,
+        prediction_entry_refused=not predict_ok,
+        training_entry_refused=not train_ok,
+        prediction_error=predict_error,
+        training_error=train_error,
     )
 
 
@@ -1184,6 +1418,7 @@ def main(argv: list[str]) -> int:
             _check_impulse(recorder)
             _check_sample_reasons(recorder)
             _check_compare_cli(recorder, out_dir)
+            _check_prediction_chain(recorder, out_dir)
             _check_refinement_transaction(recorder, case, out_dir)
             _check_best_and_origin(recorder, case, out_dir)
             _check_data_identity(recorder, case, out_dir)

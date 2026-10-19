@@ -46,11 +46,14 @@ from .checkpoint import (
     PUBLISH_MARKER,
     PUBLISH_OWNER_KEY,
     TrainingError,
+    parameter_fingerprint_of,
     publish_marker_path,
     read_publish_marker,
     refuse_if_uncommitted,
     require_best_candidate_consistency,
     require_detonation_velocity,
+    validate_optimizer_state,
+    validate_state_snapshot,
 )
 from .schedule import (
     MAX_LBFGS_ITERATIONS,
@@ -455,6 +458,26 @@ class Trainer:
             )
         return velocity
 
+    def _instance_case_scales(self) -> dict[str, tuple[float, float]]:
+        """本实例**实际使用**的逐算例尺度：``{case_id: (R_0, T_h)}``。
+
+        半径与起始时间都取 ``scales_by_radius`` 里冻结的那一份，**不取**
+        ``cases`` 的元数据：冻结的尺度集合才是网络与时间轴真正用的东西。
+
+        恢复校验按 ``case_id`` 逐个对照检查点里的同一批记录，所以下面这份检查点
+        也会在这里被拦下：把 ``scales[case_id]`` 的 ``charge_radius`` 与
+        ``start_time`` 一起改掉、因而反算出的 ``D`` 不变的那种。只比一个全局
+        爆速时它是"合法"的（复核实测）。
+        """
+        resolved: dict[str, tuple[float, float]] = {}
+        for case in self.cases:
+            scales = self.scales_by_radius[float(case.charge_radius)]
+            resolved[str(case.case_id)] = (
+                float(scales.charge_radius),
+                float(scales.start_time()),
+            )
+        return resolved
+
     # -- 清单 -------------------------------------------------------------
     def _data_identity(self) -> dict[str, Any]:
         """这批数据的**内容**身份，用来回答"是不是同一批数据"。
@@ -634,14 +657,176 @@ class Trainer:
 
         ``step`` 不变但参数变过的情况是真实存在的：L-BFGS 精修就是。用 step 当
         "检查过没有"的键，会让精修后的报告沿用精修前的结论。
-        """
-        import hashlib
 
-        digest = hashlib.sha256()
-        for name, value in sorted(self.model.state_dict().items()):
-            digest.update(name.encode("utf-8"))
-            digest.update(np.ascontiguousarray(value.detach().cpu().numpy()).tobytes())
-        return digest.hexdigest()
+        算法只有一份（``checkpoint.parameter_fingerprint_of``）：候选校验要从
+        **候选里那份** ``state_dict`` 重算同一个指纹，两处各写一套会让它们在某个
+        细节上分道扬镳，而那种分歧正是要防的东西。
+        """
+        return parameter_fingerprint_of(self.model.state_dict())
+
+    def _optimizer_reference(self) -> tuple[list[list[int]], dict[int, tuple[int, ...]]]:
+        """这套优化器的参数组标识与逐参数形状，供快照校验比对。
+
+        ``state_dict()['param_groups'][i]['params']`` 里的是**全局参数序号**，它
+        按参数组顺序编号，与 ``[p for group in opt.param_groups for p in
+        group['params']]`` 一一对应（实测确认）。形状从这里取，是因为"这份状态
+        属于哪些参数"只有优化器自己说得准，照 ``model.parameters()`` 的顺序另算
+        一份会在参数组顺序不同的那天静默错位。
+        """
+        live = [p for group in self.optimizer.param_groups for p in group["params"]]
+        groups = [
+            [int(index) for index in group["params"]]
+            for group in self.optimizer.state_dict()["param_groups"]
+        ]
+        shapes: dict[int, tuple[int, ...]] = {}
+        for group in groups:
+            for index in group:
+                if 0 <= index < len(live):
+                    shapes[index] = tuple(live[index].shape)
+        return groups, shapes
+
+    def _probe_optimizer_step(self, optimizer: Mapping[str, Any], *, where: str) -> None:
+        """在一份**隔离的**探针优化器上真走一步，并**检查这一步的结果**。
+
+        ``load_state_dict`` 没抛错**不是**相容性的全部证明：实测把某参数的
+        ``exp_avg`` 改成 ``(1,)``（参数是 ``(4, 3)``）时它照收不误，直到真正
+        ``step()`` 才抛 ``output with shape [1] doesn't match the broadcast
+        shape [4, 3]``。所以这里把恢复之后**实际会跑的那一步**也跑一遍。
+
+        **"跑完了"同样不是"结果是好的"。** ``step()`` 完全可以不抛异常、安静地
+        把 NaN 写进参数和动量——负的二阶动量就是一条实测过的路。所以更新之后还要
+        显式看：探针参数的每个元素有限吗？探针优化器的每个浮点状态有限吗？
+        只看"有没有异常"会漏掉这一整类，而它正是"损坏的运行状态通过了校验、
+        恢复之后污染模型"这条链的最后一环。
+
+        隔离有三层，缺一层就会污染真身：参数是**克隆**的（不共享真模型的张量）、
+        优化器是**新建**的同类实例、状态字典是**深拷贝**的——``load_state_dict``
+        在同 dtype/同设备时会把张量**原样接过去**，不深拷贝的话探针那一步的原地
+        更新就改到了候选自己的动量上。校验也**不碰全局随机状态**：整段只读入参。
+        """
+        if torch is None:  # pragma: no cover
+            return
+        import copy as _copy
+
+        name_of = {id(p): name for name, p in self.model.named_parameters()}
+        cloned: list[list[Any]] = []
+        labels: list[list[str]] = []
+        for group in self.optimizer.param_groups:
+            row: list[Any] = []
+            row_labels: list[str] = []
+            for parameter in group["params"]:
+                row.append(torch.nn.Parameter(parameter.detach().clone()))
+                row_labels.append(name_of.get(id(parameter), f"<unnamed {id(parameter)}>"))
+            cloned.append(row)
+            labels.append(row_labels)
+        specs = [
+            dict(
+                {key: value for key, value in group.items() if key != "params"},
+                params=params,
+            )
+            for group, params in zip(self.optimizer.param_groups, cloned)
+        ]
+        isolated = _copy.deepcopy(
+            {"state": dict(optimizer["state"]), "param_groups": list(optimizer["param_groups"])}
+        )
+        try:
+            probe = type(self.optimizer)(specs)
+        except Exception as exc:  # noqa: BLE001 - 保留优化器给的**实际**原因
+            raise TrainingError(
+                f"{where}: a fresh optimiser of this kind cannot even be built from "
+                f"this state: {exc}"
+            ) from exc
+        try:
+            probe.load_state_dict(isolated)
+        except Exception as exc:  # noqa: BLE001
+            raise TrainingError(
+                f"{where}: the optimizer state is not compatible with this model's "
+                f"optimiser: {exc}"
+            ) from exc
+        for parameter in (p for group in cloned for p in group):
+            parameter.grad = torch.zeros_like(parameter)
+        try:
+            probe.step()
+        except Exception as exc:  # noqa: BLE001
+            raise TrainingError(
+                f"{where}: the state loads, but the update it would drive fails "
+                f"({exc.__class__.__name__}: {exc}); a checkpoint whose optimiser "
+                "cannot take a step cannot be resumed from"
+            ) from exc
+
+        self._require_probe_results_finite(probe, cloned, labels, where=where)
+
+    @staticmethod
+    def _require_probe_results_finite(
+        probe: Any, cloned: Sequence[Sequence[Any]], labels: Sequence[Sequence[str]],
+        *, where: str,
+    ) -> None:
+        """探针更新**之后**的结果检查：参数与优化器浮点状态都要有限。
+
+        与上一步的分工："跑得动"和"结果有效"是两件事，只查前者会漏掉
+        "``step()`` 不抛错、直接产出 NaN"这一整类。
+        """
+        poisoned = [
+            label
+            for row, row_labels in zip(cloned, labels)
+            for parameter, label in zip(row, row_labels)
+            if not bool(torch.isfinite(parameter.detach()).all())
+        ]
+        if poisoned:
+            raise TrainingError(
+                f"{where}: the restored optimiser would drive {len(poisoned)} "
+                f"parameter(s) to a non-finite value on the very next update "
+                f"({poisoned[:4]}). The step ran without raising, which is not the "
+                "same as the update being valid; publishing this candidate would put "
+                "a best.pt on disk whose first resumed update poisons the model"
+            )
+
+        broken: list[str] = []
+        probe_state = probe.state_dict().get("state", {})
+        for parameter_id in sorted(probe_state, key=lambda value: int(value)):
+            entry = probe_state[parameter_id]
+            if not isinstance(entry, Mapping):  # pragma: no cover - 结构已查过
+                continue
+            for key, value in sorted(entry.items(), key=lambda item: str(item[0])):
+                if not hasattr(value, "is_floating_point") or not value.is_floating_point():
+                    continue
+                if not bool(torch.isfinite(value).all()):
+                    broken.append(f"state[{int(parameter_id)}][{key!r}]")
+        if broken:
+            raise TrainingError(
+                f"{where}: the update leaves the optimiser's own floating-point state "
+                f"non-finite ({broken[:4]}); every subsequent update would then operate "
+                "on NaN moments, so this state cannot be resumed from either"
+            )
+
+    def _validate_optimizer_state(self, optimizer: Any, where: str) -> None:
+        """快照校验交给我们的那一项：优化器结构与本次更新相容。"""
+        groups, shapes = self._optimizer_reference()
+        validate_optimizer_state(
+            optimizer,
+            reference_param_groups=groups,
+            parameter_shapes=shapes,
+            where=where,
+        )
+        self._probe_optimizer_step(optimizer, where=where)
+
+    def _snapshot_rules(self) -> dict[str, Any]:
+        """校验一份状态快照所需的、**只有本实例知道**的那几样。
+
+        每个子系统"能不能被接受"要问那个子系统本身；日程窗口与"某一步属于哪个
+        阶段"也只有这里说得准。调用点用 ``**self._snapshot_rules()`` 展开，好让
+        顶层载荷与候选走的是同一份上下文。
+        """
+        return {
+            "expected_model_state": self.model.state_dict(),
+            "sampler_rng_validator": self.sampler.validate_rng_state,
+            "optimizer_validator": self._validate_optimizer_state,
+            "rng_state_validator": _validate_global_rng_state,
+            "stage_windows": {
+                stage.name: float(stage.time_window_fraction) for stage in self.schedule
+            },
+            "window_at_step": lambda step: time_window_fraction_at(step, self.schedule),
+        }
 
     def _check_set_identity(self) -> str:
         """固定检查集的**内容**身份，短哈希。
@@ -1136,6 +1321,23 @@ class Trainer:
         # 它自己的来源属于选出它的那次运行，不该被这次的状态改写。
         # 多份产物**不是**一次原子操作：先写下未提交标记，发布完再删。进程在
         # 两次写入之间被杀掉时，``load`` 能看到标记并拒绝把半套产物当成正常检查点。
+        # **候选必须在任何发布副作用之前自证一致。** 走的是与 ``load`` **同一条**
+        # 规则：一旦它被写进 ``best.pt``，那份文件就会一直声称"这就是被选中的那组
+        # 参数"。等发布完再发现问题，坏文件已经在盘上了——而且恢复出来的候选在下游
+        # 被改坏之后同样会走到这里，所以这条检查不能只在读入端有。
+        #
+        # 放在 ``_begin_publish`` 之前：写标记是这次发布的**第一个**副作用，检查要
+        # 在它之前完成。
+        if self._best_dirty and self._best_candidate is not None:
+            require_best_candidate_consistency(
+                {
+                    "pending_best_candidate": self._best_candidate,
+                    "best_dirty": True,
+                    "best_check": self.best,
+                },
+                self.output_dir / "best.pt",
+                **self._snapshot_rules(),
+            )
         self._begin_publish(["best.pt", "last.pt", "checks.json", "run_manifest.json"])
         if self._best_dirty and self._best_candidate is not None:
             # **用候选快照发布，不让通用保存路径去读当前模型。** 这份检查点属于
@@ -1893,25 +2095,6 @@ class Trainer:
                 "cannot be reconstructed from the file. Retrain, or import the weights "
                 "explicitly as an initialisation rather than as a resume."
             )
-        # 全局随机状态是**严格续跑**的一部分：少了它，"恢复到第 N 步"与"连跑
-        # N 步"的采样序列不同。以前缺这一项时 ``_restore_rng(None)`` 静默返回，
-        # 于是恢复出来的是一条不同的轨迹，而损失曲线看不出任何异常。
-        rng_payload = payload.get("rng")
-        if not isinstance(rng_payload, Mapping):
-            raise TrainingError(
-                f"{path} carries no global RNG state; resuming from it would continue "
-                "the global random sequence from somewhere else, so 'resume to step N' "
-                "would not reproduce 'run N steps'"
-            )
-        missing_rng = [
-            key for key in ("numpy", "torch")
-            if rng_payload.get(key) is None and torch is not None
-        ]
-        if missing_rng:
-            raise TrainingError(
-                f"{path}: the global RNG record has no {missing_rng}; a partial record "
-                "cannot restore the sequence it claims to"
-            )
         if abs(float(payload.get("time_scale", 0.0)) - self.time_scale) > 1.0e-12:
             raise TrainingError(
                 "the checkpoint was trained with a different hat T_*; resuming would "
@@ -1926,30 +2109,17 @@ class Trainer:
         # ``expected`` 传的是本实例**实际使用**的尺度（``_frozen_detonation_velocity``
         # 读的是冻结的 ``scales_by_radius``，不是 ``cases`` 的元数据）：只查"文件
         # 内部自洽"拦不住一份自洽的检查点被另一个爆速的实例恢复。
-        require_detonation_velocity(
-            payload, path, expected=self._frozen_detonation_velocity()
-        )
-        if "sampler_rng" not in payload:
-            raise TrainingError(
-                f"{path} has no sampler RNG state. Restoring training from it would "
-                "continue the data-sampling sequence from somewhere else, so 'resume to "
-                "step N' would not reproduce 'run N steps'. Retrain from a checkpoint "
-                "written by this version."
-            )
-
-        # -- 第一阶段：只读检查。**一个字节都不改** --------------------------
         #
-        # 上一轮只把"窗口检查"挪到了前面，于是窗口之外的失败点仍然会半加载：
-        # 非法采样器 RNG、缺 ``window_fraction``、模型/优化器键不匹配，全都在
-        # 模型、优化器、步数与全局 RNG 已经改掉之后才报错。下面把**全部**前置
-        # 条件一次查完，任何一条不成立都在提交之前退出。
-        if not isinstance(payload["step"], (int, np.integer)):
-            raise TrainingError(
-                f"the checkpoint's step is {payload['step']!r}, not an integer"
-            )
-        if int(payload["step"]) < 0:
-            raise TrainingError(f"the checkpoint's step is negative: {payload['step']!r}")
-
+        # ``expected_cases`` 同理但更细：**按 case_id 逐个**对照本实例实际使用的
+        # 算例半径与尺度起始时间。只比一个全局爆速是不够的——一份把
+        # ``scales[case_id].charge_radius`` 与 ``start_time`` 一起改掉、因而反算出
+        # 同一个 ``D`` 的检查点，在"只比爆速"下完全合法（复核实测）。
+        require_detonation_velocity(
+            payload,
+            path,
+            expected=self._frozen_detonation_velocity(),
+            expected_cases=self._instance_case_scales(),
+        )
         # -- 日程、检查集与数据身份：**必须是同一件事** ----------------------
         #
         # 只比"当前窗口"远远不够。同名阶段把预算从 2 改成 5、学习率与 PDE 权重
@@ -1995,19 +2165,6 @@ class Trainer:
                 "changing the data behind it is not"
             )
 
-        stored_origin = payload.get("run_origin")
-        if not isinstance(stored_origin, Mapping):
-            raise TrainingError(
-                f"{path} carries no 'run_origin'. Without it, a checkpoint written by an "
-                "explicit diagnostic run or by a refinement would come back looking like "
-                "a plain completed run"
-            )
-        for key in ("explicit_diagnostic", "refined"):
-            if not isinstance(stored_origin.get(key), (bool, np.bool_)):
-                raise TrainingError(
-                    f"the checkpoint's run_origin[{key!r}] is "
-                    f"{stored_origin.get(key)!r}, not a boolean"
-                )
         # 候选与"待发布"标志必须**在位**：一份中途写下的检查点如果丢了这两项，
         # 恢复出来的实例就只剩 ``self.best`` 那张分数表，找不到对应的参数。
         if "pending_best_candidate" not in payload:
@@ -2023,160 +2180,34 @@ class Trainer:
                 f"the checkpoint's 'best_dirty' flag is "
                 f"{payload.get('best_dirty')!r}, not a boolean"
             )
-        # **``best_dirty=True`` 必须对应一份完整的候选。** 少了这一步，一份
-        # "标志为真、候选为空"的检查点会**加载成功**：标志被悄悄清成 ``False``，
-        # 最佳记录的分数还在、参数却没有，再次运行也不再产出 ``best.pt``
-        # （复核实测）。这是**输入自相矛盾**，按本仓库的约定直接拒绝。
-        require_best_candidate_consistency(payload, path)
-        for key in ("last_update_loss", "last_update_loss_step"):
-            if key not in payload:
-                raise TrainingError(
-                    f"{path} carries no {key!r}. Without it a resumed run that performs "
-                    "no update would report a fabricated NaN loss at step 0"
-                )
-        stored_loss = payload["last_update_loss"]
-        if not isinstance(stored_loss, (int, float, np.floating)):
-            raise TrainingError(
-                f"the checkpoint's last update loss is {stored_loss!r}, not a number"
-            )
-        if not isinstance(payload["last_update_loss_step"], (int, np.integer)):
-            raise TrainingError(
-                "the checkpoint's last update loss step is "
-                f"{payload['last_update_loss_step']!r}, not an integer"
-            )
-        if int(payload["last_update_loss_step"]) > int(payload["step"]):
-            raise TrainingError(
-                f"the checkpoint records its last measured loss at step "
-                f"{payload['last_update_loss_step']}, beyond its own step "
-                f"{payload['step']}"
-            )
-        if not isinstance(payload.get("refinement", []), list):
-            raise TrainingError(
-                f"the checkpoint's 'refinement' record is "
-                f"{type(payload.get('refinement')).__name__}, not a list"
-            )
-        if not isinstance(payload.get("model"), Mapping) or not isinstance(
-            payload.get("optimizer"), Mapping
-        ):
-            raise TrainingError(
-                "the checkpoint must carry 'model' and 'optimizer' state dictionaries"
-            )
-        # 模型状态必须与本模型的键、形状完全对得上——先比，别等 load_state_dict
-        # 装到一半才发现。
-        current = self.model.state_dict()
-        stored_model = payload["model"]
-        missing = [key for key in current if key not in stored_model]
-        unexpected = [key for key in stored_model if key not in current]
-        if missing or unexpected:
-            raise TrainingError(
-                f"the checkpoint's model state does not match this model: missing "
-                f"{missing[:4]}, unexpected {unexpected[:4]}"
-            )
-        mismatched = [
-            key for key, value in current.items()
-            if tuple(stored_model[key].shape) != tuple(value.shape)
-        ]
-        if mismatched:
-            raise TrainingError(
-                f"the checkpoint's model state has the wrong shapes for {mismatched[:4]}"
-            )
-        if not isinstance(payload.get("balancing"), Mapping):
-            raise TrainingError(
-                "the checkpoint carries no adaptive-weight state; restoring without it "
-                "would silently fall back to the base weights"
-            )
-        # 采样器随机状态：结构、版本、每个算例的键一次查完。采样器抛的是
-        # ``SamplingError``；恢复的调用方要的是 ``TrainingError``，所以在这里
-        # 转一次，并保留它给出的**实际原因**（不把所有不兼容都说成"日程错误"）。
-        try:
-            self.sampler.validate_rng_state(payload["sampler_rng"])
-        except Exception as exc:
-            raise TrainingError(f"the checkpoint's sampler RNG state is not usable: {exc}") from exc
-
-        stage_payload = payload.get("stage")
-        if not isinstance(stage_payload, Mapping):
-            raise TrainingError(
-                "the checkpoint carries no 'stage' block; the training stage, its time "
-                "window and any pending stage verdict cannot be reconstructed"
-            )
-        for key in ("current", "window_fraction", "pending", "blocked"):
-            if key not in stage_payload:
-                raise TrainingError(
-                    f"the checkpoint's 'stage' block has no {key!r}. A missing record is "
-                    "not a pass: an older writer that omitted 'blocked' would be read as "
-                    "'no pending verdict', which is exactly the state this field exists "
-                    "to distinguish"
-                )
-        stored_step = int(payload["step"])
+        # **一份"训练状态快照"该有的东西，一次查完。**
+        #
+        # 顶层载荷与待发布候选**共用这一份**（``checkpoint.validate_state_snapshot``）。
+        # 以前顶层有一套逐条检查、候选只查了"是不是 Mapping、步号对不对"，于是
+        # 候选的模型结构、优化器、阶段、采样器与全局 RNG、平衡器、历史全都没人验
+        # ——复核实测：把候选 ``model`` 清空、删掉候选 ``optimizer``、改一个候选
+        # 参数，三种都能**加载成功**。两套规则各写各的，漏掉的正是候选那一路。
+        #
+        # 位置与原来自查模型/优化器/采样器/阶段那一批**相同**：日程、检查集、数据
+        # 身份与算例关联这些"更具体"的诊断仍然先说出口（既有测试依赖这个次序）。
+        # 只读、不改对象：任何一条不成立都在下面的提交之前退出。
+        validate_state_snapshot(payload, where=str(path), **self._snapshot_rules())
+        # **``best_dirty=True`` 必须对应一份完整、自证一致的候选。** 少了这一步，
+        # 一份"标志为真、候选为空"的检查点会**加载成功**：标志被悄悄清成 ``False``，
+        # 最佳记录的分数还在、参数却没有，再次运行也不再产出 ``best.pt``（复核实测）。
+        # 这是**输入自相矛盾**，按本仓库的约定直接拒绝。
+        #
+        # 候选必须走的**与顶层同一份**状态校验、指纹必须**从候选的实际参数重算**，
+        # 见 :func:`..training.checkpoint.require_best_candidate_consistency`。
+        require_best_candidate_consistency(payload, path, **self._snapshot_rules())
+        stage_payload = payload["stage"]
         stored_window = stage_payload["window_fraction"]
-        if not isinstance(stored_window, (int, float, np.floating)) or not np.isfinite(
-            float(stored_window)
-        ):
-            raise TrainingError(
-                f"the checkpoint's stage window is {stored_window!r}, not a finite number"
-            )
         recorded_stage = stage_payload["current"]
-        if recorded_stage is not None and recorded_stage not in {
-            stage.name for stage in self.schedule
-        }:
-            raise TrainingError(
-                f"the checkpoint was written in stage {recorded_stage!r}, which this "
-                "schedule does not define; refusing rather than guessing a stage"
-            )
-        # 允许的窗口**不是**"按步数算出的、或者任何一个记录过的阶段窗口"——那太松
-        # 了：任何阶段窗口都会被接受一次，等于把"窗口对不上"这件事放过去。真正的
-        # 一致性条件按**阻塞与否**分成两条：
-        #
-        # * 未阻塞：步数已经推进到下一阶段，窗口必须就是该步数所属阶段的窗口；
-        # * 已阻塞：步数停在边界上、阶段没切，窗口必须是**那个未切走的阶段**的窗口，
-        #   而且被阻塞的阶段必须正是它。
-        #
-        # 两条都是精确等值，不是"属于某个集合"。
-        blocked = stage_payload["blocked"]
-        pending = stage_payload["pending"]
-        # 类型先核：``bool("False")`` 是 ``True``，一个字符串 ``"false"`` 会被读成
-        # "已阻塞"，而它想说的正好相反。
-        if not isinstance(blocked, (bool, np.bool_)):
-            raise TrainingError(
-                f"the checkpoint's stage 'blocked' flag is {blocked!r}, which is not a "
-                "boolean; a truthy string would be read as 'blocked'"
-            )
-        blocked = bool(blocked)
-        if pending is not None and not isinstance(pending, str):
-            raise TrainingError(
-                f"the checkpoint's pending stage is {pending!r}, which is neither None "
-                "nor a stage name"
-            )
-        stage_window_of = {
-            stage.name: float(stage.time_window_fraction) for stage in self.schedule
-        }
-        if blocked:
-            if pending not in stage_window_of:
-                raise TrainingError(
-                    f"the checkpoint is marked blocked on stage {pending!r}, which this "
-                    "schedule does not define"
-                )
-            if recorded_stage != pending:
-                raise TrainingError(
-                    f"the checkpoint is blocked on {pending!r} but records its current "
-                    f"stage as {recorded_stage!r}; a blocked checkpoint must still be "
-                    "sitting in the stage whose criteria failed"
-                )
-            expected_window = stage_window_of[recorded_stage]
-        else:
-            if pending is not None:
-                raise TrainingError(
-                    f"the checkpoint records a pending stage {pending!r} but is not "
-                    "marked blocked; the two fields must agree"
-                )
-            expected_window = time_window_fraction_at(stored_step, self.schedule)
-        if abs(float(stored_window) - float(expected_window)) > 1.0e-12:
-            raise TrainingError(
-                f"the checkpoint's stage window is {stored_window}, but "
-                f"{'the blocked stage' if blocked else 'step'} "
-                f"{recorded_stage if blocked else stored_step} of this schedule requires "
-                f"{expected_window}; this is not the same schedule"
-            )
+        # 阶段、窗口与步号的一致性**不再在这里单独写一份**：它已经搬进
+        # :func:`..training.checkpoint.validate_state_snapshot`，由上面那次调用连同
+        # 类型、范围与字段之间的关系一起查。写两份的后果是实测过的——候选那一路
+        # 漏掉了整整一套规则("窗口对不上"不查、`current` 只查键在不在)。
+        # 这里只把已经核过的值取出来给下面的提交用。
 
         # ---- 第二阶段：真正提交。任何一步失败都要把对象还原回去 --------------
         #
@@ -2394,7 +2425,7 @@ class Trainer:
         # 一致性由 :func:`require_best_candidate_consistency` 负责，``load`` 的
         # 只读阶段已经查过；这里再查一次，任何绕过 ``load`` 的调用路径也拦得住。
         require_best_candidate_consistency(
-            payload, "the checkpoint about to be committed"
+            payload, "the checkpoint about to be committed", **self._snapshot_rules()
         )
         self._best_dirty = bool(payload.get("best_dirty"))
         self.stage_history = list(stage_payload.get("history", []))
@@ -2558,6 +2589,44 @@ def _restore_global_rng(payload: Mapping[str, Any] | None) -> None:
         np.random.set_state(payload["numpy"])
     if torch is not None and payload.get("torch") is not None:
         torch.set_rng_state(payload["torch"])
+
+
+def _validate_global_rng_state(payload: Any) -> None:
+    """这份全局随机状态能不能被**对应的生成器**接受。只读、隔离、不动全局。
+
+    原来只查了 ``numpy``/``torch`` 两项**不是 None**，于是整数 ``0`` 被放行，
+    然后在真正恢复时抛 ``TypeError: expected a torch.ByteTensor, but got int``
+    ——复核实测：这份坏候选能加载、能发布成 ``best.pt``，只有下一个实例恢复它
+    时才炸。
+
+    验证用的是**独立的临时生成器**（``RandomState()`` / ``Generator()`` /
+    ``Random()``），不是"改全局再改回来"：那种做法在验证失败时会把进程的随机
+    序列留在半路，而失败路径正是最需要它保持原样的时候。
+    """
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"the record is {type(payload).__name__}, not a mapping")
+
+    if payload.get("numpy") is not None:
+        try:
+            np.random.RandomState().set_state(payload["numpy"])
+        except Exception as exc:  # noqa: BLE001 - 保留 numpy 给的**实际**原因
+            raise ValueError(f"rng['numpy']: {exc}") from exc
+
+    if payload.get("torch") is not None:
+        if torch is None:  # pragma: no cover - 没有 torch 就不会写这一项
+            raise ValueError("rng['torch']: this environment has no torch to accept it")
+        try:
+            torch.Generator().set_state(payload["torch"])
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"rng['torch']: {exc}") from exc
+
+    if payload.get("python") is not None:
+        import random as _random
+
+        try:
+            _random.Random().setstate(payload["python"])
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"rng['python']: {exc}") from exc
 
 
 def _restore_rng(payload: Mapping[str, Any] | None) -> None:

@@ -158,6 +158,40 @@ def _fingerprint(payload) -> bytes:
 _MUTATION_COUNTER = [0]
 
 
+def _add_consistent_second_case(
+    payload, case_id: str = "second-case", radius: float = 0.08, velocity: float = DEFAULT_D
+) -> str:
+    """在**四份**逐算例记录里一致地加入一个算例。
+
+    多算例的正例必须四份记录一起构造；只往 ``case_ids`` 与 ``scales`` 里塞一条
+    会让"缺记录"成为拒绝理由，那样测的就不是"是否检查了每个算例"。
+    """
+    first_id = payload["case_ids"][0]
+    start_time = _expected_time_origin(radius, velocity)
+    first_radius = float(payload["scales"][first_id]["charge_radius"])
+
+    payload["case_ids"] = [first_id, case_id]
+
+    scales = dict(payload["scales"][first_id])
+    scales["charge_radius"] = radius
+    scales["radius_ratio"] = radius / REFERENCE_RADIUS
+    scales["start_time"] = start_time
+    payload["scales"][case_id] = scales
+
+    identity = dict(payload["data_identity"][first_id])
+    identity["charge_radius_m"] = radius
+    payload["data_identity"][case_id] = identity
+
+    provenance = payload["provenance"]
+    provenance["case_ids"] = [first_id, case_id]
+    provenance["charge_radii"] = [first_radius, radius]
+    provenance["start_times"][case_id] = start_time
+    provenance["valid_pinn_time_max"][case_id] = float(
+        provenance["valid_pinn_time_max"][first_id]
+    )
+    return case_id
+
+
 def _mutated(control: Path, tmp_path: Path, mutate):
     """把控制检查点复制一份，改指定字段，**并断言变异确实生效**。"""
     _MUTATION_COUNTER[0] += 1
@@ -469,14 +503,11 @@ def test_a_second_case_with_a_different_frozen_value_is_refused(monkeypatch, tmp
     _, control = _trained(monkeypatch, tmp_path, "second_case_bad")
 
     def add_second(payload):
-        first_id = payload["case_ids"][0]
-        payload["case_ids"] = [first_id, "second-case"]
-        record = dict(payload["scales"][first_id])
-        record["charge_radius"] = 0.08
-        # 0.08 上用 7000 算出来的时间原点，与顶层的 6930 不符。
-        record["start_time"] = _expected_time_origin(0.08, ALTERNATE_D)
-        payload["scales"]["second-case"] = record
-        return "second-case"
+        case_id = _add_consistent_second_case(payload)
+        # 只有这一个算例的时间原点被换掉：0.08 上用 7000 算出来的那个，
+        # 与顶层的 6930 不符。
+        payload["scales"][case_id]["start_time"] = _expected_time_origin(0.08, ALTERNATE_D)
+        return case_id
 
     target, case_id = _mutated(control, tmp_path, add_second)
     payload = torch.load(target, map_location="cpu", weights_only=False)
@@ -493,15 +524,11 @@ def test_a_second_case_that_agrees_is_accepted(monkeypatch, tmp_path):
     trainer, control = _trained(monkeypatch, tmp_path, "second_case_ok")
 
     def add_second(payload):
-        first_id = payload["case_ids"][0]
-        payload["case_ids"] = [first_id, "second-case"]
-        record = dict(payload["scales"][first_id])
-        record["charge_radius"] = 0.08
-        record["start_time"] = _expected_time_origin(0.08, DEFAULT_D)
-        payload["scales"]["second-case"] = record
+        _add_consistent_second_case(payload)
 
     target, _ = _mutated(control, tmp_path, add_second)
     payload = torch.load(target, map_location="cpu", weights_only=False)
+    assert len(payload["case_ids"]) == 2
     assert require_detonation_velocity(payload, target) == pytest.approx(DEFAULT_D)
 
 
@@ -529,7 +556,13 @@ def test_a_self_consistent_checkpoint_cannot_be_resumed_by_a_different_scale_ins
     with pytest.raises(TrainingError) as info:
         receiving.load(control)
     message = str(info.value)
-    assert "7000" in message and "6930" in message, message
+    # 拒绝来自**逐算例**核对：同一个 ``case_id``，两套起始时间（第 3 轮把它放到了
+    # 爆速比对之前——它更具体，两个值都报出来）。断言两个时间原点都出现在信息里，
+    # 而**不**锁死诊断来自哪一层。
+    radius = _radius(alternate)
+    assert "frame-check" in message, message
+    assert repr(_expected_time_origin(radius, ALTERNATE_D)) in message, message
+    assert repr(_expected_time_origin(radius, DEFAULT_D)) in message, message
 
     # 拒绝发生在改动任何状态之前，而且**不**为了让检查点通过而改自己。
     assert _state(receiving) == before, "拒绝之前就改了接收实例"

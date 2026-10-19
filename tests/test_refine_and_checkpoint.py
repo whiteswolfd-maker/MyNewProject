@@ -701,9 +701,15 @@ def test_moving_the_output_directory_does_not_change_data_identity(monkeypatch, 
     assert fresh.step == trainer.step
 
     # 同一份数据、不同的 case_id 标签也不行——身份是按算例记的。
+    #
+    # 第 3 轮起这条拒绝由**逐算例关联**先说出口（"checkpoint is for cases [...],
+    # but the receiving trainer holds [...]"），比"数据身份不同"更具体；两者都
+    # 是拒绝，所以这里接受任一诊断。
     renamed, _ = _tiny(monkeypatch, tmp_path, name="fresh_renamed")
     renamed.cases[0].case_id = "renamed"
-    with pytest.raises(TrainingError, match="different data"):
+    with pytest.raises(
+        TrainingError, match="different data|resuming across different cases"
+    ):
         renamed.load(moved)
 
 
@@ -1010,5 +1016,8 @@ def test_the_data_identity_ignores_the_case_id_label(monkeypatch, tmp_path):
     trainer.run(max_updates=_total(tiny), verbose=False)
     fresh, _ = _tiny(monkeypatch, tmp_path, name="id_label2")
     fresh.cases[0].case_id = "renamed"
-    with pytest.raises(TrainingError, match="different data"):
+    # 第 3 轮起逐算例关联先报出更具体的原因（见上一条测试的说明）。
+    with pytest.raises(
+        TrainingError, match="different data|resuming across different cases"
+    ):
         fresh.load(trainer.output_dir / "last.pt")
