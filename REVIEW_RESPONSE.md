@@ -220,7 +220,9 @@ $ python -m spherical_blast_pinn.cli.train --config configs/experiments/full.yam
 回归证据：`test_check_set_is_deterministic_and_separate_from_the_sampler`（同种子
 逐位相同、不同种子不同、帧集合与训练采样器不同）、
 `test_frame_split_holds_out_whole_frame_groups`（留出的是连续段）。
-实机：`outputs/smoke/checks.json` 含逐半径逐方程的完整指标与守恒诊断。
+实机：`outputs/_archive_scheme_a/smoke/checks.json` 含逐半径逐方程的完整指标与
+守恒诊断。该文件是**方案 A** 的历史运行，已原样移入归档（见
+`outputs/_archive_scheme_a/README.md`）；它不代表当前方案 B 的验收结果。
 
 ## 9. P2 `Rc>=R0` 是新增约束，关闭开关也不能完整退回 —— 已修
 
