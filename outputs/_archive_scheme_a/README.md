@@ -49,34 +49,59 @@
 数据本身没有损坏（23 份 Git blob 与基线 `2a74161` 完全一致），只是口径不一致。
 本清单已全部统一为 blob 字节口径。
 
-只读核验（在仓库根目录执行）。默认核对 `HEAD`；可用 `COMMIT=origin/main`
-核对远端实际提交。缺文件、路径重复、数量不是 23、blob 字节不同或 SHA256 不符，
-都会以非零状态退出：
+只读核验（在仓库根目录执行）。`COMMIT` 默认 `HEAD`，也可以是任意
+commit-ish；核验开始时先解析并**固定**为完整提交 SHA，之后**清单本身、归档文件
+集合与归档数据都只从这同一个 SHA 读取**——不读取工作区里的清单。基线固定为
+`2a74161c059c6d87f9eff5b4afb856cbf87f5c9b`。
+
+`origin/main` 是本地 `fetch` 得到的**远端跟踪引用**，本核验命令**不会**自动刷新它；
+要核对最新远端，请先自行 `git fetch origin`。
+
+缺文件、路径重复、数量不是 23、blob 字节不同或 SHA256 不符，都会以非零状态退出。
+核验是只读的，不会修改被核验的文件。
 
 ```bash
 COMMIT="${COMMIT:-HEAD}" python - <<'PY'
 import hashlib, os, subprocess, sys
-from pathlib import Path
 
-BASE = "2a74161"
-COMMIT = os.environ["COMMIT"]
-LIST = Path("outputs/_archive_scheme_a/MIGRATION_SHA256.txt")
+BASE = "2a74161c059c6d87f9eff5b4afb856cbf87f5c9b"
+LIST_PATH = "outputs/_archive_scheme_a/MIGRATION_SHA256.txt"
 DOCS = {"outputs/_archive_scheme_a/README.md",
         "outputs/_archive_scheme_a/MIGRATION_SHA256.txt"}
 
-def run(*args):
-    return subprocess.run(["git", *args], stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE)
+def git(*args):
+    return subprocess.check_output(["git", *args])
+
+def git_ok(*args):
+    return subprocess.run(["git", *args], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0
+
+def resolve(rev):
+    return git("rev-parse", "--verify", f"{rev}^{{commit}}").decode().strip()
 
 def blob(rev, path):
-    # 直接对 git cat-file 返回的 **bytes** 计算，不经文本管道。
-    return subprocess.check_output(["git", "cat-file", "blob", f"{rev}:{path}"])
+    # 归档数据：直接对 git cat-file 返回的 bytes 计算，绝不解码或转换。
+    return git("cat-file", "blob", f"{rev}:{path}")
 
-def exists(rev, path):
-    return run("cat-file", "-e", f"{rev}:{path}").returncode == 0
+# 核验开始时把 COMMIT 解析并固定为完整提交 SHA；清单、归档文件集合与
+# 归档数据全部只用这个 SHA。
+commit = resolve(os.environ.get("COMMIT", "HEAD"))
+base = resolve(BASE)
+print(f"commit = {commit}")
+print(f"baseline = {base}")
+print("note: origin/main is a local remote-tracking ref; run 'git fetch origin' "
+      "first to refresh it (this check never fetches)")
+
+if not git_ok("cat-file", "-e", f"{commit}:{LIST_PATH}"):
+    print(f"FAILED at commit {commit}")
+    print(f" - {commit}:{LIST_PATH} is missing")
+    sys.exit(1)
+
+# 清单本身也从**该提交**读取；只有解析文本时允许 UTF-8 解码。
+list_text = blob(commit, LIST_PATH).decode("utf-8")
 
 rows, errors = [], []
-for n, line in enumerate(LIST.read_text(encoding="utf-8").splitlines(), 1):
+for n, line in enumerate(list_text.splitlines(), 1):
     if not line.strip() or line.startswith("#"):
         continue
     try:
@@ -95,31 +120,33 @@ for label, values in (("original", [r[1] for r in rows]),
         errors.append(f"duplicate {label} path in list")
 
 listed = {r[2] for r in rows}
-actual = {p for p in subprocess.check_output(
-    ["git", "ls-tree", "-r", "--name-only", COMMIT,
-     "outputs/_archive_scheme_a"]).decode().splitlines()
-    if p not in DOCS}
+actual = {p for p in git("ls-tree", "-r", "--name-only", commit,
+                         "outputs/_archive_scheme_a").decode().splitlines()
+          if p not in DOCS}
 if listed != actual:
     errors.append(f"archive set mismatch: missing={sorted(actual - listed)} "
                   f"extra={sorted(listed - actual)}")
 
 for digest, original, archive in rows:
-    if not exists(BASE, original):
-        errors.append(f"{original}: missing in baseline {BASE}"); continue
-    if not exists(COMMIT, archive):
-        errors.append(f"{archive}: missing in {COMMIT}"); continue
-    a, b = blob(BASE, original), blob(COMMIT, archive)
+    if not git_ok("cat-file", "-e", f"{base}:{original}"):
+        errors.append(f"{original}: missing in baseline {base}")
+        continue
+    if not git_ok("cat-file", "-e", f"{commit}:{archive}"):
+        errors.append(f"{archive}: missing in {commit}")
+        continue
+    a, b = blob(base, original), blob(commit, archive)
     if a != b:
-        errors.append(f"{original} vs {archive}: blob bytes differ"); continue
+        errors.append(f"{original} vs {archive}: blob bytes differ")
+        continue
     if hashlib.sha256(a).hexdigest() != digest:
         errors.append(f"{archive}: sha256 mismatch")
 
 if errors:
-    print("FAILED")
+    print(f"FAILED at commit {commit}")
     for error in errors:
         print(" -", error)
     sys.exit(1)
-print(f"OK: {len(rows)} records; blob bytes identical; sha256 matches")
+print(f"OK: {len(rows)} records; commit {commit}; blob bytes identical; sha256 matches")
 PY
 ```
 
