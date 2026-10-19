@@ -29,12 +29,99 @@
 
 - 原路径 → 本目录下的同名相对路径（例如 `outputs/final/checks.json` →
   `outputs/_archive_scheme_a/final/checks.json`）。
-- 迁移前后 SHA256 见 [MIGRATION_SHA256.txt](MIGRATION_SHA256.txt)；两者逐位一致。
+- 迁移前后 SHA256 见 [MIGRATION_SHA256.txt](MIGRATION_SHA256.txt)。清单口径与
+  核验方法见下节；23 份数据的 Git blob 字节与基线 `2a74161` 中的原文件完全相同。
 - 其中 `outputs/final/run_manifest.json`、`outputs/final/train_result.json`、
   `outputs/full/reference/reference_field_report.json` 在后续提交 `faea39c`
   中已被删除；这里按基线 `2a74161` 的**原始 blob** 恢复到归档（Git blob 哈希
   与基线一致），没有修改其中任何字段。
 - 本迁移**不**改写历史 JSON 里的方案、数值或路径。
+
+## 哈希口径与核验
+
+`MIGRATION_SHA256.txt` 的统一口径是：
+
+> 对**指定提交中 Git blob 的原始内容字节**计算 SHA256。
+
+它不是 Git 对象 ID；不对工作区文本文件直接计算；不做换行归一化、文本解码再
+编码或空白清理。旧清单混用了工作区换行形式：在 `core.autocrlf=true` 的检出上，
+23 条里有 20 条是对 CRLF 工作区字节算的，另外 3 条是对 blob 字节算的——归档
+数据本身没有损坏（23 份 Git blob 与基线 `2a74161` 完全一致），只是口径不一致。
+本清单已全部统一为 blob 字节口径。
+
+只读核验（在仓库根目录执行）。默认核对 `HEAD`；可用 `COMMIT=origin/main`
+核对远端实际提交。缺文件、路径重复、数量不是 23、blob 字节不同或 SHA256 不符，
+都会以非零状态退出：
+
+```bash
+COMMIT="${COMMIT:-HEAD}" python - <<'PY'
+import hashlib, os, subprocess, sys
+from pathlib import Path
+
+BASE = "2a74161"
+COMMIT = os.environ["COMMIT"]
+LIST = Path("outputs/_archive_scheme_a/MIGRATION_SHA256.txt")
+DOCS = {"outputs/_archive_scheme_a/README.md",
+        "outputs/_archive_scheme_a/MIGRATION_SHA256.txt"}
+
+def run(*args):
+    return subprocess.run(["git", *args], stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE)
+
+def blob(rev, path):
+    # 直接对 git cat-file 返回的 **bytes** 计算，不经文本管道。
+    return subprocess.check_output(["git", "cat-file", "blob", f"{rev}:{path}"])
+
+def exists(rev, path):
+    return run("cat-file", "-e", f"{rev}:{path}").returncode == 0
+
+rows, errors = [], []
+for n, line in enumerate(LIST.read_text(encoding="utf-8").splitlines(), 1):
+    if not line.strip() or line.startswith("#"):
+        continue
+    try:
+        head, archive = line.split("  ->  ")
+        digest, original = head.split("  ", 1)
+    except ValueError:
+        errors.append(f"line {n}: malformed record")
+        continue
+    rows.append((digest, original, archive.strip()))
+
+if len(rows) != 23:
+    errors.append(f"expected 23 records, found {len(rows)}")
+for label, values in (("original", [r[1] for r in rows]),
+                      ("archive", [r[2] for r in rows])):
+    if len(set(values)) != len(values):
+        errors.append(f"duplicate {label} path in list")
+
+listed = {r[2] for r in rows}
+actual = {p for p in subprocess.check_output(
+    ["git", "ls-tree", "-r", "--name-only", COMMIT,
+     "outputs/_archive_scheme_a"]).decode().splitlines()
+    if p not in DOCS}
+if listed != actual:
+    errors.append(f"archive set mismatch: missing={sorted(actual - listed)} "
+                  f"extra={sorted(listed - actual)}")
+
+for digest, original, archive in rows:
+    if not exists(BASE, original):
+        errors.append(f"{original}: missing in baseline {BASE}"); continue
+    if not exists(COMMIT, archive):
+        errors.append(f"{archive}: missing in {COMMIT}"); continue
+    a, b = blob(BASE, original), blob(COMMIT, archive)
+    if a != b:
+        errors.append(f"{original} vs {archive}: blob bytes differ"); continue
+    if hashlib.sha256(a).hexdigest() != digest:
+        errors.append(f"{archive}: sha256 mismatch")
+
+if errors:
+    print("FAILED")
+    for error in errors:
+        print(" -", error)
+    sys.exit(1)
+print(f"OK: {len(rows)} records; blob bytes identical; sha256 matches")
+PY
+```
 
 ## 使用约束
 

@@ -1,25 +1,28 @@
-# 迁移前后 SHA256：这些文件从工作路径原样移到本归档，字节未改。
-# 格式：<sha256>  <原路径>  ->  <归档路径>
-e95f842a0a51175c38336c6ba546aaee53f7b6f98ccaad160fd7184521462fda  outputs/compare/compare_tnt_80mm.json  ->  outputs/_archive_scheme_a/compare/compare_tnt_80mm.json
-f078f060aaa28a48882e9b6e67965f7eb29385036d68f8b0c384766452f1543c  outputs/compare_final/compare_tnt_80mm.json  ->  outputs/_archive_scheme_a/compare_final/compare_tnt_80mm.json
-1e7c17c667ed877542f90139bc1e72df9dce2d59b056aa4bc62521e28e6beb51  outputs/final/checks.json  ->  outputs/_archive_scheme_a/final/checks.json
+# 归档哈希清单（统一口径）
+# 口径：SHA256 over the **raw bytes of the Git blob** at the named commit.
+#       不是 Git 对象 ID；不对工作区文本直接计算。
+#       不做换行归一化、文本解码再编码或空白清理。
+# 每行：<sha256>  <基线 2a74161 中的原路径>  ->  <当前提交中的归档路径>
+3dabc87ff294a286af576610f249fdc486a948889895bc6203f23320a1b9b910  outputs/compare/compare_tnt_80mm.json  ->  outputs/_archive_scheme_a/compare/compare_tnt_80mm.json
+879d64e1441a7cb600472a7fee631af8e0aa4701c5a7c4883aaa4e14c3dcfbc6  outputs/compare_final/compare_tnt_80mm.json  ->  outputs/_archive_scheme_a/compare_final/compare_tnt_80mm.json
+452636aa30d091060195138b982402518790df4d5e000c380276df52caac67a5  outputs/final/checks.json  ->  outputs/_archive_scheme_a/final/checks.json
 cf115dc60fdfacc1e95fb524d284d2df77d8528ab80c91a744fab31a23bcbb35  outputs/final/run_manifest.json  ->  outputs/_archive_scheme_a/final/run_manifest.json
 cf115dc60fdfacc1e95fb524d284d2df77d8528ab80c91a744fab31a23bcbb35  outputs/final/train_result.json  ->  outputs/_archive_scheme_a/final/train_result.json
 117d12d6683633c578284be9fa750f70a204ca6a1f0d314d3d5f7fefe64cf0ca  outputs/full/reference/reference_field_report.json  ->  outputs/_archive_scheme_a/full/reference/reference_field_report.json
-ac03c951b47137efa6c5309bc160541f2fee8e3791e479fd5a4be98969a44d6e  outputs/predict/80mm.json  ->  outputs/_archive_scheme_a/predict/80mm.json
-ea4bc9eadb51fdf97a2ff959587d8c1e7c9bf689460c389bba20a5f9aaa22f70  outputs/predict/final.json  ->  outputs/_archive_scheme_a/predict/final.json
-181eecd7c6cb43b5e8fb58c6a9ef94f5f0074851486d11f4989044980e66cadb  outputs/predict/p80.json  ->  outputs/_archive_scheme_a/predict/p80.json
-0da824889403a03b9c65e196847e7db72c303cc2d4b897e9a889c9c35ca692fa  outputs/predict/predict_R0080mm.json  ->  outputs/_archive_scheme_a/predict/predict_R0080mm.json
-8e9d3517bf88622cd3aa9154a70d15e00b42a611400b6350b31f77192c6feaf0  outputs/resume_a/checks.json  ->  outputs/_archive_scheme_a/resume_a/checks.json
-f8e1c80f2c1fecfaf66ac12e25ce678912ae4e5cc71dba690eb496d3e2ca8f19  outputs/resume_a/run_manifest.json  ->  outputs/_archive_scheme_a/resume_a/run_manifest.json
-f8e1c80f2c1fecfaf66ac12e25ce678912ae4e5cc71dba690eb496d3e2ca8f19  outputs/resume_a/train_result.json  ->  outputs/_archive_scheme_a/resume_a/train_result.json
-8e9d3517bf88622cd3aa9154a70d15e00b42a611400b6350b31f77192c6feaf0  outputs/resume_b/checks.json  ->  outputs/_archive_scheme_a/resume_b/checks.json
-56671dda635d3f6471c2e7468151cb1acc142d61c477dd3f65936fa3436ee928  outputs/resume_b/run_manifest.json  ->  outputs/_archive_scheme_a/resume_b/run_manifest.json
-56671dda635d3f6471c2e7468151cb1acc142d61c477dd3f65936fa3436ee928  outputs/resume_b/train_result.json  ->  outputs/_archive_scheme_a/resume_b/train_result.json
-b4c64130465a603902f3e2d9ff022faa51cfb23a315864b1ece5b9771ac73cdb  outputs/scaled/checks.json  ->  outputs/_archive_scheme_a/scaled/checks.json
-42ac6d3204b950783a823f3997d6b4cf3503d8771583e528244723307e598280  outputs/scaled/run_manifest.json  ->  outputs/_archive_scheme_a/scaled/run_manifest.json
-42ac6d3204b950783a823f3997d6b4cf3503d8771583e528244723307e598280  outputs/scaled/train_result.json  ->  outputs/_archive_scheme_a/scaled/train_result.json
-74a40414dc45dbe536a08b25c18679a78984112167e3a300e8a6dd9d564c1814  outputs/smoke/checks.json  ->  outputs/_archive_scheme_a/smoke/checks.json
-62d22603fc66dd2eea63f49b10ef6dd12e3ceb232bff18d44021ff39b606cb97  outputs/smoke/reference/reference_field_report.json  ->  outputs/_archive_scheme_a/smoke/reference/reference_field_report.json
-4f966bf85071153e33356babcb5e8370b0190215e1f2c99f60d5a86f1cb80488  outputs/smoke/run_manifest.json  ->  outputs/_archive_scheme_a/smoke/run_manifest.json
-4f966bf85071153e33356babcb5e8370b0190215e1f2c99f60d5a86f1cb80488  outputs/smoke/train_result.json  ->  outputs/_archive_scheme_a/smoke/train_result.json
+771b74e722ebe755784734d4a6021f6191057afd898f8f66790ee8035271a0cc  outputs/predict/80mm.json  ->  outputs/_archive_scheme_a/predict/80mm.json
+db8ab05e0f290d135d3bfd2aabc9702cc3357d6b7a01b48c87fce20d261faaf6  outputs/predict/final.json  ->  outputs/_archive_scheme_a/predict/final.json
+4566c81f7504c4c50b5d657a552d6bd57e285b5178ea52ddf0d6fe814f6fdbd2  outputs/predict/p80.json  ->  outputs/_archive_scheme_a/predict/p80.json
+754ad8b52499f5bdfc6c92a21459176cf98b8312eaa02c4ed1b22eb1b9d68807  outputs/predict/predict_R0080mm.json  ->  outputs/_archive_scheme_a/predict/predict_R0080mm.json
+cbfb464a49ad6c5cf4b2afcabfec10abeeaca97859b7925dbe494b5bb12bcfd4  outputs/resume_a/checks.json  ->  outputs/_archive_scheme_a/resume_a/checks.json
+e700f39dc572f42cd97824be0838ab6def0aec8def60d05e430984e4d9d6f1c2  outputs/resume_a/run_manifest.json  ->  outputs/_archive_scheme_a/resume_a/run_manifest.json
+e700f39dc572f42cd97824be0838ab6def0aec8def60d05e430984e4d9d6f1c2  outputs/resume_a/train_result.json  ->  outputs/_archive_scheme_a/resume_a/train_result.json
+cbfb464a49ad6c5cf4b2afcabfec10abeeaca97859b7925dbe494b5bb12bcfd4  outputs/resume_b/checks.json  ->  outputs/_archive_scheme_a/resume_b/checks.json
+ffccd7fba376559937f5036da5f7f2d3e7651b3af1a9fdc6178c59a51afd30d6  outputs/resume_b/run_manifest.json  ->  outputs/_archive_scheme_a/resume_b/run_manifest.json
+ffccd7fba376559937f5036da5f7f2d3e7651b3af1a9fdc6178c59a51afd30d6  outputs/resume_b/train_result.json  ->  outputs/_archive_scheme_a/resume_b/train_result.json
+497ead680f58cd7ed910c11d1c8889c7ececcb3325ed807655c9c7d619f707d0  outputs/scaled/checks.json  ->  outputs/_archive_scheme_a/scaled/checks.json
+ecd91cce0b9c5c0f8055e1089a671ca288ceb952e5829fa2cb66e71e4ad07346  outputs/scaled/run_manifest.json  ->  outputs/_archive_scheme_a/scaled/run_manifest.json
+ecd91cce0b9c5c0f8055e1089a671ca288ceb952e5829fa2cb66e71e4ad07346  outputs/scaled/train_result.json  ->  outputs/_archive_scheme_a/scaled/train_result.json
+24e14d75f8d0d38363e6908d344149398614f76686a87e56ae22c818f5afaa40  outputs/smoke/checks.json  ->  outputs/_archive_scheme_a/smoke/checks.json
+fbf0cba4b32fdb8841c60d061a71271d5fb0bc49c2b4f7f2f84d648c40890dd8  outputs/smoke/reference/reference_field_report.json  ->  outputs/_archive_scheme_a/smoke/reference/reference_field_report.json
+4971cb916d052b8ac4e42efdf15bcda13e5b38ca745c31b3f1baf616dbbf13e5  outputs/smoke/run_manifest.json  ->  outputs/_archive_scheme_a/smoke/run_manifest.json
+4971cb916d052b8ac4e42efdf15bcda13e5b38ca745c31b3f1baf616dbbf13e5  outputs/smoke/train_result.json  ->  outputs/_archive_scheme_a/smoke/train_result.json
