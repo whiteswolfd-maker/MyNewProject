@@ -42,18 +42,3 @@ elout*
 *.7z
 *.mp4
 *.avi
-
-# 新的运行产物不再入库。
-# 注意：忽略规则**不会**取消已经跟踪的文件——本轮已把确认属于方案 A 的历史
-# 结果移到 outputs/_archive_scheme_a/（那里必须保持可提交）。
-# 数据审查证据（audit_data / dyna_audit / eos_validation）不在此列，继续跟踪。
-outputs/**/run_manifest.json
-outputs/**/train_result.json
-outputs/**/checks.json
-outputs/**/reference_field_report.json
-outputs/predict/
-outputs/compare/
-outputs/compare_final/
-
-# 历史归档必须保持可提交
-!outputs/_archive_scheme_a/**
