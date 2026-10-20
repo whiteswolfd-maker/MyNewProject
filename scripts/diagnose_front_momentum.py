@@ -88,6 +88,26 @@
 一个是物理残差（离散值与连续预测之差），另一个是诊断自检（恒等式 2+3 是否精确）。
 两者都写进输出。
 
+全域几何源项的压力时间重构（本轮新增，B 口径）
+----------------------------------------------
+
+原来的 ``geometric_time_integral`` 只对几何因子 ``∫r²dt`` 做时间积分，压力冻结在
+步前值（A 口径）。本轮增加 B 口径：始终对齐本步**原有活动单元 0..k**（跨节点时
+排除新播种的单元 k+1），两端压力分别由步前/步后状态经**同一个 JWL EOS** 算出，
+压力在步内线性，节点仍按本步已有的同一条线性轨迹运动，对乘积解析积分：
+
+    J_G^B = Σ_i ∫_0^1 [p0_i + (p1_i-p0_i)s] [r_{i+1}(s)² - r_i(s)²] ds · dt
+
+其中 ``r_j(s) = r0_j + s(r1_j-r0_j)``。A 口径是 ``p1_i = p0_i`` 的特例。
+**B 只是基于数值端点的时间重构，不是连续真解；残差更小也不代表更正确。**
+
+B 只替换 ``J_G``；``ΔP``、``I_q``、``J_exact``、``Δm·u_f`` 与 A 完全相同。因此
+
+    R_B - R_A = -(J_G^B - J_G^A)
+
+脚本逐步核对这个恒等式。另有两项退化核对：压力恒定时 B 退化为现有冻结压力的
+几何时间积分；几何恒定时 B 退化为压力梯形积分。
+
 自检与退出码
 ------------
 
@@ -192,6 +212,42 @@ def geometric_impulse(dt_actual: float, geometric_source: float) -> float:
     return float(dt_actual) * float(geometric_source)
 
 
+def geometric_source_time_integral(
+    radii_before: np.ndarray,
+    radii_after: np.ndarray,
+    pressure_before: np.ndarray,
+    pressure_after: np.ndarray,
+    dt_actual: float,
+) -> float:
+    """``∫∫ 2 r p dr dt`` 的离散时间积分：线性压力 × 线性节点轨迹。
+
+    单元 ``i`` 贡献 ``∫ p_i(t) [r_{i+1}(t)² - r_i(t)²] dt``。节点按本步已有的
+    线性运动 ``r_j(s) = r0_j + s(r1_j-r0_j)``（``s∈[0,1]``），压力在步前/步后
+    端点值之间线性 ``p_i(s) = p0_i + s(p1_i-p0_i)``。两个积分都解析求出：
+
+        ∫_0^1 r_j(s)² ds       = (r0² + r0 r1 + r1²)/3
+        ∫_0^1 s r_j(s)² ds     = r0²/2 + 2 r0 Δr/3 + Δr²/4
+
+    所以单元贡献是 ``dt·[p0_i·ΔM0_i + (p1_i-p0_i)·ΔM1_i]``。
+    ``p1 = p0`` 时退化为冻结压力的几何时间积分；``r1 = r0`` 时退化为压力
+    梯形积分。这只是端点数值重构，不是连续真解。
+    """
+    r0 = np.asarray(radii_before, dtype=np.float64)
+    r1 = np.asarray(radii_after, dtype=np.float64)
+    p0 = np.asarray(pressure_before, dtype=np.float64)
+    p1 = np.asarray(pressure_after, dtype=np.float64)
+    if not (r0.shape == r1.shape and p0.shape == p1.shape == (r0.size - 1,)):
+        raise ValueError(
+            "geometric_source_time_integral: 需要节点数组长 n+1、压力数组长 n"
+        )
+    delta_r = r1 - r0
+    moment0 = (r0**2 + r0 * r1 + r1**2) / 3.0
+    moment1 = 0.5 * r0**2 + (2.0 / 3.0) * r0 * delta_r + 0.25 * delta_r**2
+    cell0 = float(dt_actual) * (moment0[1:] - moment0[:-1])
+    cell1 = float(dt_actual) * (moment1[1:] - moment1[:-1])
+    return float(np.sum(p0 * cell0 + (p1 - p0) * cell1))
+
+
 def run_case(
     *,
     cells: int,
@@ -248,6 +304,11 @@ def run_case(
         m1 = solver.cell_mass[:count].copy()
         u1 = solver.velocity[: count + 1].copy()
         r1 = solver.radii[: count + 1].copy()
+        # 单元 0..k 的步后热力学状态；跨节点时 k+1 是新播种单元，已被 count
+        # 切片排除。两端压力都用同一个 JWL EOS，不借用推进过程里的数组。
+        v1 = solver.specific_volume[:count].copy()
+        e1 = solver.specific_energy[:count].copy()
+        p_after = jwl_pressure_numpy(1.0 / v1, e1, solver.jwl)
         mass_after = node_masses(m1)
         momentum_after = float(np.sum(mass_after * u1))
         delta_momentum = momentum_after - momentum_before
@@ -354,6 +415,33 @@ def run_case(
             residual_geom_time - residual_exact_boundary
             - geometric_quadrature_difference
         )
+
+        # ---- 4d) 几何源项的时间积分（**压力在步前/步后 EOS 值之间线性重构**）----
+        # 单元仍取原有活动单元 0..k（跨节点时新播种的 k+1 已被 count 排除），
+        # 节点仍用同一条线性轨迹。B 只替换 J_G，ΔP、I_q、J_exact、Δm*u_f 与 A
+        # 完全相同；所以 R_B - R_A 必须精确等于 -(J_G^B - J_G^A)。
+        # 这是端点数值重构，不是连续真解；残差更小不代表更正确。
+        geometric_time_integral_linear = geometric_source_time_integral(
+            r0[: count + 1], r1[: count + 1], p[:count], p_after, dt_actual
+        )
+        geometric_time_difference = (
+            geometric_time_integral_linear - geometric_time_integral
+        )
+        prediction_geom_time_linear = (
+            geometric_time_integral_linear
+            - boundary_impulse_exact
+            + accreted_momentum
+        )
+        residual_geom_time_linear = (
+            (delta_momentum - impulse_q) - prediction_geom_time_linear
+        )
+        residual_geom_time_change = (
+            residual_geom_time_linear - residual_geom_time
+        )
+        # 独立核对：R_linear - R_frozen = -(J_G_linear - J_G_frozen)。
+        residual_linear_check = (
+            residual_geom_time_change + geometric_time_difference
+        )
         # 核对物质节点确实按 r(t2) = r(t1) + u_old*dt 运动（j = 1..k）。
         if count > 1:
             node_motion_check = float(np.max(np.abs(
@@ -405,6 +493,13 @@ def run_case(
             "continuous_prediction_geom_time": prediction_geom_time,
             "residual_geom_time": residual_geom_time,
             "residual_geom_check": residual_geom_check,
+            # ---- 本轮：压力线性重构（B 口径）----
+            "geometric_time_integral_linear": geometric_time_integral_linear,
+            "geometric_time_difference": geometric_time_difference,
+            "continuous_prediction_geom_time_linear": prediction_geom_time_linear,
+            "residual_geom_time_linear": residual_geom_time_linear,
+            "residual_geom_time_change": residual_geom_time_change,
+            "residual_linear_check": residual_linear_check,
             "node_motion_check": node_motion_check,
             "r_front": r_f,
             "r_front_before": r_f_before,
@@ -481,10 +576,15 @@ def aggregate(meta: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any
             "continuous_prediction_exact", "residual_exact_boundary",
             "residual_shift_check", "residual_exact_closed_form",
             "closed_form_check_exact",
-            # 本轮：几何源项的时间积分（冻结步前压力）
+            # 上一轮：几何源项的时间积分（冻结步前压力，A 口径）
             "geometric_time_integral", "geometric_quadrature_difference",
             "continuous_prediction_geom_time", "residual_geom_time",
             "residual_geom_check",
+            # 本轮：压力线性重构（B 口径）与两者对照
+            "geometric_time_integral_linear", "geometric_time_difference",
+            "continuous_prediction_geom_time_linear",
+            "residual_geom_time_linear", "residual_geom_time_change",
+            "residual_linear_check",
         )
         out = {"steps": len(subset)}
         for key in keys_signed:
@@ -540,6 +640,9 @@ def aggregate(meta: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any
     result["front_motion_max_abs"] = total.get("front_motion_check_max_abs", 0.0)
     # 本轮：几何源项时间积分的自洽核对与节点运动假设核对
     result["residual_geom_check_max_abs"] = total.get("residual_geom_check_max_abs", 0.0)
+    # 本轮：B 口径与 A 口径的差，及其恒等式核对
+    result["residual_linear_check_max_abs"] = total.get("residual_linear_check_max_abs", 0.0)
+    result["geometric_time_difference_abs_sum"] = total.get("geometric_time_difference_abs", 0.0)
     result["node_motion_max_abs"] = (
         max(abs(float(row["node_motion_check"])) for row in rows) if rows else 0.0
     )
@@ -611,6 +714,51 @@ def _relation_check(
     return record
 
 
+def degenerate_time_integral_checks() -> list[dict[str, Any]]:
+    """线性重构公式的两个退化核对（用合成数组，不依赖真实算例）。
+
+    1. 压力恒定（``p1 = p0``）：必须恢复**现有冻结压力**的几何时间积分。
+    2. 几何恒定（``r1 = r0``）：必须恢复**压力梯形积分**
+       ``dt·Σ (p0+p1)/2·(r_{i+1}²-r_i²)``。
+
+    这两项检查的是积分公式本身。真实算例里 ``p`` 与 ``r`` 都在变，无法直接
+    退化，所以用确定性的合成端点。它们**不**说明真实算例更正确。
+    """
+    r0 = np.array([0.0, 0.013, 0.031, 0.052, 0.079, 0.110], dtype=np.float64)
+    r1 = np.array([0.0, 0.016, 0.037, 0.060, 0.090, 0.124], dtype=np.float64)
+    p0 = np.array([3.0e10, 2.1e10, 1.2e10, 6.0e9, 2.0e9], dtype=np.float64)
+    p1 = np.array([2.7e10, 1.8e10, 1.05e10, 5.2e9, 1.7e9], dtype=np.float64)
+    dt = 2.0e-9
+
+    # 现有 A 口径的几何时间积分（与 run_case 里的表达式相同）。
+    moment0 = (r0**2 + r0 * r1 + r1**2) / 3.0
+    frozen = float(np.sum(p0 * dt * (moment0[1:] - moment0[:-1])))
+    # 压力恒定：B 公式输入 p1=p0。
+    constant_pressure = geometric_source_time_integral(r0, r1, p0, p0, dt)
+    # 几何恒定：B 公式输入 r1=r0，对照压力梯形积分。
+    trapezoid = float(np.sum(
+        dt * 0.5 * (p0 + p1) * (r0[1:] ** 2 - r0[:-1] ** 2)
+    ))
+    constant_geometry = geometric_source_time_integral(r0, r0, p0, p1, dt)
+
+    return [
+        _relation_check(
+            "degenerate_constant_pressure",
+            [constant_pressure - frozen],
+            [abs(constant_pressure) + abs(frozen)],
+            atol=1.0e-12, rtol=1.0e-12, unit="N*s/sr",
+            basis="p1=p0 时，B 应退化为 A（冻结压力的几何时间积分）",
+        ),
+        _relation_check(
+            "degenerate_constant_geometry",
+            [constant_geometry - trapezoid],
+            [abs(constant_geometry) + abs(trapezoid)],
+            atol=1.0e-12, rtol=1.0e-12, unit="N*s/sr",
+            basis="r1=r0 时，B 应退化为压力梯形积分",
+        ),
+    ]
+
+
 def run_self_checks(
     meta: dict[str, Any],
     rows: list[dict[str, Any]],
@@ -639,6 +787,9 @@ def run_self_checks(
     residual_lumping = col("residual_velocity_lumping")
 
     residual_new = col("residual_exact_boundary")
+    residual_geom_frozen = col("residual_geom_time")
+    residual_geom_linear = col("residual_geom_time_linear")
+    geometric_time_difference = col("geometric_time_difference")
     p_k = col("p_k")
     r_front = col("r_front")
     exact_minus_accreted = col("exact_minus_accreted")
@@ -685,6 +836,17 @@ def run_self_checks(
             + np.abs(boundary_quadrature_error),
             atol=1.0e-10, rtol=1.0e-10, unit=momentum_unit,
             basis="R_new - R_old = -ΔJ_quad；尺度取三项绝对值之和（逐 step）",
+        ),
+        _relation_check(
+            "residual_linear_shift",
+            col("residual_linear_check"),
+            np.abs(residual_geom_linear) + np.abs(residual_geom_frozen)
+            + np.abs(geometric_time_difference),
+            atol=1.0e-10, rtol=1.0e-10, unit=momentum_unit,
+            basis=(
+                "R_linear - R_frozen = -(J_G_linear - J_G_frozen)；"
+                "尺度取三项绝对值之和（逐 step）"
+            ),
         ),
         _relation_check(
             "exact_impulse_vs_accreted",
@@ -797,6 +959,8 @@ def main(argv: list[str] | None = None) -> int:
     summary = aggregate(meta, rows)
     # 自检只看记账可信度；residual / residual_exact_boundary 的大小不参与判定。
     summary["self_checks"] = run_self_checks(meta, rows, summary)
+    # 线性重构公式的两个退化核对（合成端点，与真实算例无关）。
+    summary["self_checks"].extend(degenerate_time_integral_checks())
     summary["self_checks_passed"] = all(
         check["passed"] for check in summary["self_checks"]
     )
@@ -812,6 +976,10 @@ def main(argv: list[str] | None = None) -> int:
         "保留作对照；residual_exact_boundary/continuous_prediction_exact 是"
         "**解析时间积分**口径（p_f*∫r_f^2 dt = p_f*(r_f2^3-r_f1^3)/(3D)）。"
         "新残差仍含几何源项求积误差，不是纯边界误差。"
+        "geometric_time_integral 是 A 口径（压力冻结在步前值）；"
+        "geometric_time_integral_linear 是 B 口径（压力在步前/步后 EOS 值之间线性，"
+        "节点仍按同一条线性轨迹）；B 只是端点数值重构，不是连续真解。"
+        "两种口径只替换 J_G，故 R_linear-R_frozen=-(J_G_linear-J_G_frozen)。"
         "self_checks 只判**记账关系是否可信**（恒等式/闭式/差值/冲量一致/波前运动/"
         "分组可加性）；residual 非零是诊断要报告的对象，不是失败条件。"
         "JSON 输出使用 allow_nan=False；非有限字段写成 null，并在 "
@@ -882,6 +1050,27 @@ def main(argv: list[str] | None = None) -> int:
         "residual_geom_time_abs": a.get("residual_geom_time_abs"),
         "residual_geom_check_max_abs": summary["residual_geom_check_max_abs"],
         "node_motion_max_abs": summary["node_motion_max_abs"],
+        # ---- 本轮：两种 J_G 与两种 R（A 冻结 / B 压力线性重构）----
+        "geometric_time_integral_frozen_signed": a.get("geometric_time_integral"),
+        "geometric_time_integral_linear_signed": a.get("geometric_time_integral_linear"),
+        "geometric_time_integral_difference_signed": a.get("geometric_time_difference"),
+        "geometric_time_integral_difference_abs": a.get("geometric_time_difference_abs"),
+        "residual_geom_time_frozen_signed": a.get("residual_geom_time"),
+        "residual_geom_time_frozen_abs": a.get("residual_geom_time_abs"),
+        "residual_geom_time_linear_signed": a.get("residual_geom_time_linear"),
+        "residual_geom_time_linear_abs": a.get("residual_geom_time_linear_abs"),
+        "residual_geom_time_change_signed": a.get("residual_geom_time_change"),
+        "residual_geom_time_change_abs": a.get("residual_geom_time_change_abs"),
+        "residual_linear_check_max_abs": summary.get("residual_linear_check_max_abs"),
+        "geometric_time_difference_abs_sum": summary.get("geometric_time_difference_abs_sum"),
+        "ordinary_geometric_time_integral_frozen": summary["ordinary_steps"].get("geometric_time_integral"),
+        "ordinary_geometric_time_integral_linear": summary["ordinary_steps"].get("geometric_time_integral_linear"),
+        "ordinary_residual_geom_time_frozen": summary["ordinary_steps"].get("residual_geom_time"),
+        "ordinary_residual_geom_time_linear": summary["ordinary_steps"].get("residual_geom_time_linear"),
+        "crossing_geometric_time_integral_frozen": summary["crossing_steps"].get("geometric_time_integral"),
+        "crossing_geometric_time_integral_linear": summary["crossing_steps"].get("geometric_time_integral_linear"),
+        "crossing_residual_geom_time_frozen": summary["crossing_steps"].get("residual_geom_time"),
+        "crossing_residual_geom_time_linear": summary["crossing_steps"].get("residual_geom_time_linear"),
         "ordinary_steps": summary["ordinary_steps"].get("steps"),
         "crossing_steps": summary["crossing_steps"].get("steps"),
         "ordinary_residual_signed": summary["ordinary_steps"].get("residual"),
