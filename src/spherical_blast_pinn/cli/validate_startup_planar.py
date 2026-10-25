@@ -109,6 +109,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     checks["spherical_product_mass_residual"]
                 ),
                 "spherical_energy_residual": float(checks["spherical_energy_residual"]),
+                "initial_product_internal_energy_per_sr": float(
+                    checks["initial_product_internal_energy_per_sr"]
+                ),
+                "spherical_energy_change_signed_j_per_sr": float(
+                    checks["spherical_energy_change_signed_j_per_sr"]
+                ),
+                "spherical_energy_change_abs_j_per_sr": float(
+                    checks["spherical_energy_change_abs_j_per_sr"]
+                ),
+                "spherical_energy_change_abs_over_initial_product_internal": float(
+                    checks["spherical_energy_change_abs_over_initial_product_internal"]
+                ),
                 "planar_mass_residual": float(checks["planar_mass_residual"]),
                 "planar_energy_residual": float(checks["planar_energy_residual"]),
                 "grid_vs_dense_spherical_mass_residual": float(
@@ -168,6 +180,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Rc-R0, Rs-R0 and the disturbed product length scale linearly with delta",
             "p_star, u_star and D_s are properties of the initial pressure jump, not of delta",
             "spherical mass/energy residuals are the local-planar geometric approximation",
+            "spherical_energy_residual keeps the original global denominator (includes ambient air; depends on outer boundary)",
+            "spherical_energy_change_abs_over_initial_product_internal is the supplemental product-energy normalization",
             "planar mass/energy residuals check the Riemann fan itself",
             "no training is started and training_qualified remains false",
         ],
@@ -187,6 +201,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"disturbed/R0={record['product_disturbed_length_over_r0']:.6g}  "
             f"spherical mass={record['spherical_mass_residual']:.3e} "
             f"energy={record['spherical_energy_residual']:.3e}  "
+            f"dE={record['spherical_energy_change_signed_j_per_sr']:.6g} J/sr  "
+            f"|dE|/U_product={record['spherical_energy_change_abs_over_initial_product_internal']:.3e}  "
             f"planar mass={record['planar_mass_residual']:.3e} "
             f"energy={record['planar_energy_residual']:.3e}"
         )

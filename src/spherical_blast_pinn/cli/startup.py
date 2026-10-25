@@ -163,6 +163,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"mass={checks['planar_mass_residual']:.3e}, "
         f"energy={checks['planar_energy_residual']:.3e}"
     )
+    print(
+        "energy metric      : "
+        f"dE={checks['spherical_energy_change_signed_j_per_sr']:.6g} J/sr, "
+        f"|dE|/U_product={checks['spherical_energy_change_abs_over_initial_product_internal']:.3e} "
+        f"(U_product={checks['initial_product_internal_energy_per_sr']:.6g} J/sr); "
+        f"global residual={checks['spherical_energy_residual']:.3e} "
+        "(global denominator includes ambient air; supplemental diagnostic only)"
+    )
     print(f"cells              : {field.n_cells} ({field.n_inside} product)")
     print(f"checks             : {'PASS' if checks['passed'] else 'FAIL'}")
     print(f"training qualified : {field.training_qualified} (not wired)")

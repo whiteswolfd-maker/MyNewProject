@@ -67,6 +67,10 @@
   质量/能量与残差。`training_qualified=False`，不是旧 `ReferenceField`。
 - 局部平面场嵌入球面会产生几何近似误差：球对称质量与总能量残差由独立高分辨率
   积分报告，不做全局缩放或阈值放行。平面质量/能量残差用来单独检查黎曼扇本身。
+- 能量误差保留原有 `spherical_energy_residual`（分母为全域初始能量，包含环境
+  空气，随远场外边界变化）。另报有符号的球面总能量变化 `ΔE`、`|ΔE|` 和
+  `|ΔE|/初始产物内能`；后者只作补充诊断，不赋予训练资格。不同 `delta` 对应
+  不同物理时刻，不能称为同一物理时刻的时间收敛。
 - 入口：`python -m spherical_blast_pinn.cli.startup`；`delta` 敏感性诊断：
   `python -m spherical_blast_pinn.cli.validate_startup_planar`；测试：
   `tests/test_two_medium_riemann.py`、`tests/test_two_medium_startup_planar.py`。

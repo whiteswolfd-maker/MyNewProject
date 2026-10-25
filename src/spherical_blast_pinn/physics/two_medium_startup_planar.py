@@ -73,6 +73,7 @@ from .eos import (
 )
 from .two_medium_initial import AIR, PRODUCT, TwoMediumInitialField
 from .two_medium_riemann import (
+    ProductIsentrope,
     RiemannError,
     RiemannSolution,
     solve_jwl_air_riemann,
@@ -100,6 +101,13 @@ REGION_NAMES = {
 
 _GEOMETRY_REL_TOL = 1.0e-12
 _EOS_REL_TOL = 1.0e-10
+#: Saved physical arrays must equal the analytic sampler.  The builder uses
+#: the same functions, so a legitimate field has bitwise-equal values; this
+#: tolerance only absorbs a JSON/float round trip.
+_STATE_REL_TOL = 1.0e-10
+#: Scalar motion relations (Rc, Rs, head/tail, delta, epsilon).
+_MOTION_REL_TOL = 1.0e-10
+_MOTION_ABS_TOL = 1.0e-15
 
 
 class PlanarStartupError(ValueError):
@@ -204,9 +212,18 @@ class PlanarStartupField:
     """A small-positive-time two-medium field built from a local Riemann fan.
 
     All arrays are per unit solid angle.  ``velocity`` is cell centred;
-    ``node_velocity`` is the one-sided node representation.  The object is a
-    **startup/handoff** object, not an accepted ReferenceField: it sets
-    ``reference_field=False`` and ``training_qualified=False``.
+    ``node_velocity`` is the one-sided node representation: the centre node is
+    zero, nodes with ``r <= Rc`` take the product-side analytic velocity,
+    nodes with ``Rc < r <= Rs`` take ``u_star`` (post-shock side at ``Rs``), and
+    nodes with ``r > Rs`` are zero.
+
+    Supported branch: the product and air start at rest with
+    ``p_product > p_air``, giving a product rarefaction, a contact and an air
+    shock.  The fan tail speed is *not* assumed positive in general; the
+    default project state happens to have a positive tail.
+
+    The object is a **startup/handoff** object, not an accepted ReferenceField:
+    it sets ``reference_field=False`` and ``training_qualified=False``.
     """
 
     model_id: str
@@ -281,6 +298,16 @@ class PlanarStartupField:
         if not isinstance(self.product_eos, JWLParameters):
             raise PlanarStartupError("product_eos must be a JWLParameters instance")
         self.product_eos.validate()
+        if not isinstance(self.solution, RiemannSolution):
+            raise PlanarStartupError(
+                "solution must be a RiemannSolution instance"
+            )
+        if not isinstance(self.solution.isentrope, ProductIsentrope):
+            raise PlanarStartupError(
+                "solution.isentrope must be a ProductIsentrope instance"
+            )
+        if not isinstance(self.initial_state, Mapping):
+            raise PlanarStartupError("initial_state must be a mapping")
         gamma = float(self.air_gamma)
         if not math.isfinite(gamma) or gamma <= 1.0:
             raise PlanarStartupError(f"air_gamma must be finite and > 1, got {gamma!r}")
@@ -348,15 +375,36 @@ class PlanarStartupField:
             < self.contact_radius < self.shock_radius < arrays["radii"][-1]
         ):
             raise PlanarStartupError("wave positions are not strictly ordered inside the domain")
-        if not (self.epsilon > 0.0 and math.isfinite(self.epsilon)):
-            raise PlanarStartupError(f"epsilon must be finite and positive, got {self.epsilon!r}")
-        if not math.isclose(self.time, self.epsilon, rel_tol=0.0, abs_tol=0.0):
+        r0 = _require_positive_scalar("charge_radius", self.charge_radius)
+        epsilon = _require_positive_scalar("epsilon", self.epsilon)
+        delta = _require_positive_scalar("delta", self.delta)
+        contact_speed = _require_finite_scalar("contact_speed", self.contact_speed)
+        shock_speed = _require_finite_scalar("shock_speed", self.shock_speed)
+        head_speed = _require_finite_scalar(
+            "rarefaction_head_speed", self.rarefaction_head_speed
+        )
+        tail_speed = _require_finite_scalar(
+            "rarefaction_tail_speed", self.rarefaction_tail_speed
+        )
+        contact = _require_positive_scalar("contact_radius", self.contact_radius)
+        shock = _require_positive_scalar("shock_radius", self.shock_radius)
+        head = _require_positive_scalar(
+            "rarefaction_head_radius", self.rarefaction_head_radius
+        )
+        tail = _require_positive_scalar(
+            "rarefaction_tail_radius", self.rarefaction_tail_radius
+        )
+        if not math.isclose(self.time, epsilon, rel_tol=0.0, abs_tol=0.0):
             raise PlanarStartupError("time must equal epsilon for this startup field")
         if self.pin_time != 0.0:
             raise PlanarStartupError("pin_time must be exactly zero at the startup handoff")
-        if not (self.shock_speed > self.contact_speed > 0.0):
+        # Supported branch: a product rarefaction, a contact, and an air shock.
+        # The tail speed is not assumed positive in general; the default state
+        # happens to have a positive tail.  Ordering is required for the
+        # sampler's fan/plateau partition.
+        if not (shock_speed > contact_speed > 0.0):
             raise PlanarStartupError("front speeds must satisfy D_s > u_star > 0")
-        if not (self.rarefaction_head_speed < 0.0 < self.rarefaction_tail_speed < self.contact_speed):
+        if not (head_speed < tail_speed < contact_speed):
             raise PlanarStartupError("rarefaction fan speeds are not ordered")
 
         # Mass and geometry.
@@ -396,6 +444,187 @@ class PlanarStartupField:
         _require_rel_match("product sound speed", arrays["sound_speed"][product], c_product)
         _require_rel_match("air pressure", arrays["pressure"][air], p_air)
         _require_rel_match("air sound speed", arrays["sound_speed"][air], c_air)
+
+        # -- source consistency: the Riemann solution is the reference ----
+        solution = self.solution
+        _require_close_scalar("contact_speed", contact_speed, solution.u_star)
+        _require_close_scalar("shock_speed", shock_speed, solution.shock_speed)
+        _require_close_scalar(
+            "rarefaction_head_speed", head_speed, solution.rarefaction_head_speed
+        )
+        _require_close_scalar(
+            "rarefaction_tail_speed", tail_speed, solution.rarefaction_tail_speed
+        )
+        _require_close_scalar(
+            "contact_radius motion", contact, r0 + solution.u_star * epsilon
+        )
+        _require_close_scalar(
+            "shock_radius motion", shock, r0 + solution.shock_speed * epsilon
+        )
+        _require_close_scalar(
+            "rarefaction_head_radius motion",
+            head,
+            r0 + solution.rarefaction_head_speed * epsilon,
+        )
+        _require_close_scalar(
+            "rarefaction_tail_radius motion",
+            tail,
+            r0 + solution.rarefaction_tail_speed * epsilon,
+        )
+        _require_close_scalar("delta definition", delta, (shock - contact) / r0)
+        _require_close_scalar(
+            "epsilon definition",
+            epsilon,
+            delta * r0 / (solution.shock_speed - solution.u_star),
+        )
+
+        if self.product_eos.as_dict() != solution.isentrope.eos_params.as_dict():
+            raise PlanarStartupError(
+                "product_eos does not match the EOS stored with the Riemann solution"
+            )
+
+        def state_value(key: str) -> float:
+            if key not in self.initial_state:
+                raise PlanarStartupError(f"initial_state is missing {key!r}")
+            return _require_finite_scalar(f"initial_state[{key!r}]", self.initial_state[key])
+
+        _require_close_scalar(
+            "initial_state charge_radius", state_value("charge_radius"), r0
+        )
+        _require_close_scalar(
+            "initial_state outer_radius", state_value("outer_radius"), float(arrays["radii"][-1])
+        )
+        _require_close_scalar(
+            "initial_state product_density",
+            state_value("product_density"),
+            solution.product_initial_density,
+        )
+        _require_close_scalar(
+            "initial_state product_specific_energy",
+            state_value("product_specific_energy"),
+            solution.product_initial_specific_energy,
+        )
+        _require_close_scalar(
+            "initial_state product_pressure",
+            state_value("product_pressure"),
+            solution.product_initial_pressure,
+        )
+        _require_close_scalar(
+            "initial_state product_sound_speed",
+            state_value("product_sound_speed"),
+            solution.product_initial_sound_speed,
+        )
+        _require_close_scalar(
+            "initial_state air_density",
+            state_value("air_density"),
+            solution.air_initial_density,
+        )
+        _require_close_scalar(
+            "initial_state air_specific_energy",
+            state_value("air_specific_energy"),
+            solution.air_initial_specific_energy,
+        )
+        _require_close_scalar(
+            "initial_state air_pressure",
+            state_value("air_pressure"),
+            solution.air_initial_pressure,
+        )
+        _require_close_scalar(
+            "initial_state air_sound_speed",
+            state_value("air_sound_speed"),
+            solution.air_initial_sound_speed,
+        )
+        _require_close_scalar(
+            "initial_state air_gamma", state_value("air_gamma"), gamma
+        )
+        _require_close_scalar(
+            "isentrope rho_ref", solution.isentrope.rho_ref, solution.product_initial_density
+        )
+        _require_close_scalar(
+            "isentrope e_ref", solution.isentrope.e_ref, solution.product_initial_specific_energy
+        )
+        _require_close_scalar(
+            "isentrope p_ref", solution.isentrope.p_ref, solution.product_initial_pressure
+        )
+        _require_close_scalar(
+            "isentrope c_ref", solution.isentrope.c_ref, solution.product_initial_sound_speed
+        )
+        p_air_from_gamma = (gamma - 1.0) * state_value("air_density") * state_value(
+            "air_specific_energy"
+        )
+        _require_close_scalar(
+            "air pressure from initial (rho, e, gamma)",
+            state_value("air_pressure"),
+            p_air_from_gamma,
+        )
+
+        # -- saved arrays must match the common analytic sampler -----------
+        # The sampler below reads only scalar geometry, solution and initial
+        # state; it does not read density/velocity/e/p/c/material/region.
+        # Thus this check cannot certify itself from the arrays under test.
+        view = _PlanarSampler(
+            {
+                "charge_radius": r0,
+                "epsilon": epsilon,
+                "contact_radius": contact,
+                "shock_radius": shock,
+                "rarefaction_head_radius": head,
+                "rarefaction_tail_radius": tail,
+                "radii": arrays["radii"],
+                "initial_state": self.initial_state,
+                "solution": solution,
+                "product_eos": self.product_eos,
+                "air_gamma": gamma,
+            }
+        )
+        centres = (0.5 * (arrays["radii"][1:] ** 3 + arrays["radii"][:-1] ** 3)) ** (
+            1.0 / 3.0
+        )
+        expected = view.sample(centres, side="right")
+        for key in ("density", "velocity", "specific_energy", "pressure", "sound_speed"):
+            _require_array_close(key, arrays[key], expected[key])
+        if not np.array_equal(material, expected["material"]):
+            raise PlanarStartupError(
+                "material tags do not match the analytic wave-region sampler"
+            )
+        if not np.array_equal(region, expected["region"]):
+            raise PlanarStartupError(
+                "region tags do not match the analytic wave-region sampler"
+            )
+
+        expected_node_velocity = _expected_node_velocity(
+            arrays["radii"],
+            contact_radius=contact,
+            shock_radius=shock,
+            u_star=solution.u_star,
+            view=view,
+        )
+        _require_array_close(
+            "node_velocity",
+            arrays["node_velocity"],
+            expected_node_velocity,
+            reference="declared one-sided node-velocity rule",
+        )
+
+        contact_faces = np.flatnonzero(
+            np.isclose(arrays["radii"], contact, rtol=0.0, atol=1.0e-15 * max(contact, 1.0))
+        )
+        if contact_faces.size != 1:
+            raise PlanarStartupError(
+                "contact_radius must be exactly one grid face"
+            )
+        n_inside = int(np.count_nonzero(material == PRODUCT))
+        if n_inside != int(contact_faces[0]):
+            raise PlanarStartupError(
+                "the product/air material boundary is not the contact face"
+            )
+        shock_faces = np.flatnonzero(
+            np.isclose(arrays["radii"], shock, rtol=0.0, atol=1.0e-15 * max(shock, 1.0))
+        )
+        if shock_faces.size != 1:
+            raise PlanarStartupError(
+                "shock_radius must be exactly one grid face"
+            )
 
     @property
     def n_cells(self) -> int:
@@ -713,6 +942,24 @@ class PlanarStartupField:
                 "product_disturbed_length_m": float(self.product_disturbed_length),
                 "product_disturbed_length_over_r0": float(self.product_disturbed_length_over_r0),
                 "fan_length_m": float(self.fan_length),
+                "spherical_energy_residual": float(
+                    self.checks.get("spherical_energy_residual", float("nan"))
+                ),
+                "initial_product_internal_energy_per_sr": float(
+                    self.integrals.get("initial_product_internal_energy_per_sr", float("nan"))
+                ),
+                "spherical_energy_change_signed_j_per_sr": float(
+                    self.integrals.get("spherical_energy_change_signed_j_per_sr", float("nan"))
+                ),
+                "spherical_energy_change_abs_j_per_sr": float(
+                    self.integrals.get("spherical_energy_change_abs_j_per_sr", float("nan"))
+                ),
+                "spherical_energy_change_abs_over_initial_product_internal": float(
+                    self.integrals.get(
+                        "spherical_energy_change_abs_over_initial_product_internal",
+                        float("nan"),
+                    )
+                ),
                 "n_cells": int(self.n_cells),
                 "n_product_cells": int(self.n_inside),
                 "grid_integrals": dict(self.integrals.get("grid", {})),
@@ -784,6 +1031,7 @@ def _initial_integrals(initial_field: TwoMediumInitialField) -> dict[str, float]
         "initial_mass_air": air_mass,
         "initial_mass_total": product_mass + air_mass,
         "initial_internal_energy": internal,
+        "initial_product_internal_energy": float(initial_field.product_internal_energy),
         "initial_kinetic_energy": 0.0,
         "initial_total_energy": internal,
         "initial_planar_mass_product": rho_p * r0,
@@ -795,6 +1043,103 @@ def _initial_integrals(initial_field: TwoMediumInitialField) -> dict[str, float]
 
 def _relative_difference(value: float, reference: float) -> float:
     return float(abs(value - reference) / max(abs(reference), 1.0e-300))
+
+
+def _require_finite_scalar(name: str, value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise PlanarStartupError(f"{name} must be a real number, got {value!r}") from exc
+    if not math.isfinite(number):
+        raise PlanarStartupError(f"{name} must be finite, got {value!r}")
+    return number
+
+
+def _require_positive_scalar(name: str, value: Any) -> float:
+    number = _require_finite_scalar(name, value)
+    if number <= 0.0:
+        raise PlanarStartupError(f"{name} must be positive, got {value!r}")
+    return number
+
+
+def _require_close_scalar(
+    name: str,
+    actual: Any,
+    expected: Any,
+    *,
+    rel_tol: float = _MOTION_REL_TOL,
+    abs_tol: float = _MOTION_ABS_TOL,
+) -> None:
+    a = _require_finite_scalar(name, actual)
+    b = _require_finite_scalar(f"{name} reference", expected)
+    if not math.isclose(a, b, rel_tol=rel_tol, abs_tol=abs_tol):
+        raise PlanarStartupError(
+            f"{name} is inconsistent: got {a!r}, expected {b!r}"
+        )
+
+
+def _require_array_close(
+    name: str,
+    actual: np.ndarray,
+    expected: np.ndarray,
+    *,
+    reference: str = "analytic sampler",
+) -> None:
+    actual = np.asarray(actual, dtype=np.float64)
+    expected = np.asarray(expected, dtype=np.float64)
+    if actual.shape != expected.shape:
+        raise PlanarStartupError(
+            f"{name} shape {actual.shape} does not match the {reference} "
+            f"{expected.shape}"
+        )
+    if not np.all(np.isfinite(actual)) or not np.all(np.isfinite(expected)):
+        raise PlanarStartupError(f"{name} contains non-finite values")
+    scale = max(
+        1.0,
+        float(np.max(np.abs(actual))) if actual.size else 0.0,
+        float(np.max(np.abs(expected))) if expected.size else 0.0,
+    )
+    difference = np.abs(actual - expected)
+    worst = float(np.max(difference)) if difference.size else 0.0
+    if worst > _STATE_REL_TOL * scale:
+        index = int(np.argmax(difference))
+        raise PlanarStartupError(
+            f"{name} does not match the {reference}: max |difference| "
+            f"{worst:.3e} at cell {index} (stored {float(actual[index])!r}, "
+            f"expected {float(expected[index])!r})"
+        )
+
+
+def _expected_node_velocity(
+    radii: np.ndarray,
+    *,
+    contact_radius: float,
+    shock_radius: float,
+    u_star: float,
+    view: Any,
+) -> np.ndarray:
+    """The declared one-sided node-velocity rule.
+
+    * ``r = 0``: zero;
+    * ``0 < r <= Rc``: the product-side analytic velocity (``u_star`` at Rc);
+    * ``Rc < r <= Rs``: ``u_star`` (air star plateau, post-shock side at Rs);
+    * ``r > Rs``: zero (ambient air).
+
+    The node at the shock is assigned the post-shock value, not an average.
+    """
+    radii = np.asarray(radii, dtype=np.float64)
+    result = np.empty_like(radii)
+    for index, radius in enumerate(radii):
+        if radius <= contact_radius:
+            result[index] = float(
+                view.sample_product(np.array([radius]))["velocity"][0]
+            )
+        elif radius <= shock_radius:
+            result[index] = float(u_star)
+        else:
+            result[index] = 0.0
+    result[0] = 0.0
+    return result
 
 
 def build_planar_startup_field(
@@ -898,6 +1243,12 @@ def build_planar_startup_field(
         "riemann_method_version": solution.method_version,
         "delta_candidate": float(cfg.delta),
         "delta_status": "candidate value, not a validated constant",
+        "energy_normalization_note": (
+            "spherical_energy_residual keeps the original global definition "
+            "(denominator includes ambient air and depends on the outer boundary); "
+            "the supplemental abs(delta E)/initial product internal energy is "
+            "reported separately and does not grant training qualification"
+        ),
         "grid_config": {
             "inner_cells": int(cfg.inner_cells),
             "fan_cells": int(cfg.fan_cells),
@@ -971,17 +1322,13 @@ def build_planar_startup_field(
     material = np.where(region <= REGION_PRODUCT_STAR, PRODUCT, AIR).astype(np.int64)
     mass = density * volume
 
-    node_velocity = np.empty(edges.size, dtype=np.float64)
-    for index, radius in enumerate(edges):
-        if radius <= contact:
-            node_velocity[index] = float(
-                sampler.sample_product(np.array([radius]))["velocity"][0]
-            )
-        elif radius < shock or math.isclose(radius, shock, rel_tol=0.0, abs_tol=0.0):
-            node_velocity[index] = solution.u_star
-        else:
-            node_velocity[index] = 0.0
-    node_velocity[0] = 0.0
+    node_velocity = _expected_node_velocity(
+        edges,
+        contact_radius=contact,
+        shock_radius=shock,
+        u_star=solution.u_star,
+        view=sampler,
+    )
 
     # Construct the validated field first; then use it for the independent
     # integrals and checks (the sampler is analytic, so this is not circular
@@ -1026,6 +1373,16 @@ def build_planar_startup_field(
     initial = _initial_integrals(initial_field)
     contact_states = field.contact_states()
     shock_states = field.shock_states()
+    product_initial_energy = float(initial["initial_product_internal_energy"])
+    if not math.isfinite(product_initial_energy) or product_initial_energy <= 0.0:
+        raise PlanarStartupError(
+            "initial product internal energy must be finite and positive"
+        )
+    spherical_energy_change = float(dense["total_energy"] - initial["initial_total_energy"])
+    spherical_energy_change_abs = abs(spherical_energy_change)
+    spherical_energy_change_over_product = (
+        spherical_energy_change_abs / product_initial_energy
+    )
 
     checks: dict[str, Any] = {
         "wave_pattern": solution.wave_pattern,
@@ -1072,6 +1429,12 @@ def build_planar_startup_field(
         "spherical_energy_residual": _relative_difference(
             dense["total_energy"], initial["initial_total_energy"]
         ),
+        "initial_product_internal_energy_per_sr": product_initial_energy,
+        "spherical_energy_change_signed_j_per_sr": spherical_energy_change,
+        "spherical_energy_change_abs_j_per_sr": spherical_energy_change_abs,
+        "spherical_energy_change_abs_over_initial_product_internal": (
+            spherical_energy_change_over_product
+        ),
         "planar_mass_residual": _relative_difference(
             dense["planar_mass_total"], initial["initial_planar_mass_total"]
         ),
@@ -1114,6 +1477,18 @@ def build_planar_startup_field(
         "spherical_product_mass_residual": checks["spherical_product_mass_residual"],
         "spherical_air_mass_residual": checks["spherical_air_mass_residual"],
         "spherical_energy_residual": checks["spherical_energy_residual"],
+        "initial_product_internal_energy_per_sr": checks[
+            "initial_product_internal_energy_per_sr"
+        ],
+        "spherical_energy_change_signed_j_per_sr": checks[
+            "spherical_energy_change_signed_j_per_sr"
+        ],
+        "spherical_energy_change_abs_j_per_sr": checks[
+            "spherical_energy_change_abs_j_per_sr"
+        ],
+        "spherical_energy_change_abs_over_initial_product_internal": checks[
+            "spherical_energy_change_abs_over_initial_product_internal"
+        ],
         "planar_mass_residual": checks["planar_mass_residual"],
         "planar_energy_residual": checks["planar_energy_residual"],
         "grid_vs_dense_spherical_mass_residual": checks[
@@ -1126,6 +1501,13 @@ def build_planar_startup_field(
             "spherical: integrate rho*r^2 dr (per steradian); "
             "planar: integrate rho*dr (per unit area); "
             "initial spherical values are per steradian"
+        ),
+        "energy_normalization": (
+            "spherical_energy_residual uses the total initial energy (including "
+            "ambient air) and therefore depends on the far outer boundary; "
+            "spherical_energy_change_abs_over_initial_product_internal uses only "
+            "the initial product internal energy and is the supplemental metric. "
+            "Neither grants training qualification."
         ),
     }
     # Rebuild with the final checks/integrals: the validated field is frozen,

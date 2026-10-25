@@ -1,11 +1,13 @@
 import json
 import math
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
 from spherical_blast_pinn.physics import material as mat
 from spherical_blast_pinn.physics.eos import (
+    JWLParameters,
     ideal_gas_pressure_numpy,
     ideal_gas_sound_speed_numpy,
     jwl_pressure_numpy,
@@ -271,6 +273,199 @@ def test_delta_sensitivity_scales_epsilon_and_wave_lengths():
         assert field.solution.shock_speed == pytest.approx(
             base.solution.shock_speed, rel=1.0e-10
         )
+
+
+def _assert_replace_rejected(field, **changes):
+    with pytest.raises(PlanarStartupError):
+        replace(field, **changes)
+
+
+def test_consistency_validation_rejects_inconsistent_replacements():
+    field = _field(dense_samples=1024)
+    _assert_replace_rejected(field, delta=float("nan"))
+    _assert_replace_rejected(field, delta=float("inf"))
+    _assert_replace_rejected(field, delta=0.0)
+    _assert_replace_rejected(field, delta=-DELTA)
+    _assert_replace_rejected(field, charge_radius=0.06)
+    _assert_replace_rejected(field, epsilon=field.epsilon * 1.01)
+    _assert_replace_rejected(field, time=field.time + 1.0e-9)
+    _assert_replace_rejected(field, pin_time=1.0e-9)
+    _assert_replace_rejected(field, contact_radius=field.contact_radius + 1.0e-6)
+    _assert_replace_rejected(field, shock_radius=field.shock_radius + 1.0e-6)
+    _assert_replace_rejected(
+        field, rarefaction_head_radius=field.rarefaction_head_radius + 1.0e-6
+    )
+    _assert_replace_rejected(
+        field, rarefaction_tail_radius=field.rarefaction_tail_radius + 1.0e-6
+    )
+    _assert_replace_rejected(field, contact_speed=field.contact_speed + 1.0)
+    _assert_replace_rejected(field, shock_speed=field.shock_speed + 1.0)
+    _assert_replace_rejected(
+        field, rarefaction_head_speed=field.rarefaction_head_speed + 1.0
+    )
+    _assert_replace_rejected(
+        field, rarefaction_tail_speed=field.rarefaction_tail_speed + 1.0
+    )
+    _assert_replace_rejected(field, velocity=field.velocity + 100.0)
+
+    node_velocity = field.node_velocity.copy()
+    node_velocity[1:] += 100.0
+    _assert_replace_rejected(field, node_velocity=node_velocity)
+
+    _assert_replace_rejected(
+        field, material=np.where(field.material == PRODUCT, AIR, PRODUCT).astype(np.int64)
+    )
+    region = field.region.copy()
+    region[0] = 1
+    _assert_replace_rejected(field, region=region)
+
+    _assert_replace_rejected(field, density=field.density * 1.01)
+    _assert_replace_rejected(field, specific_energy=field.specific_energy * 1.01)
+    _assert_replace_rejected(field, pressure=field.pressure * 1.01)
+    _assert_replace_rejected(field, sound_speed=field.sound_speed * 1.01)
+    _assert_replace_rejected(field, cell_volume=field.cell_volume * 1.01)
+    _assert_replace_rejected(field, mass=field.mass * 1.01)
+
+    bad_initial = dict(field.initial_state)
+    bad_initial["product_density"] = bad_initial["product_density"] + 1.0
+    _assert_replace_rejected(field, initial_state=bad_initial)
+    bad_initial = dict(field.initial_state)
+    bad_initial["outer_radius"] = bad_initial["outer_radius"] + 0.1
+    _assert_replace_rejected(field, initial_state=bad_initial)
+    bad_initial = dict(field.initial_state)
+    bad_initial.pop("air_pressure")
+    _assert_replace_rejected(field, initial_state=bad_initial)
+
+    changed_eos = replace(field.product_eos, A=field.product_eos.A * 1.01)
+    _assert_replace_rejected(field, product_eos=changed_eos)
+    _assert_replace_rejected(field, air_gamma=1.5)
+    _assert_replace_rejected(field, solution=object())
+    _assert_replace_rejected(
+        field, solution=replace(field.solution, u_star=field.solution.u_star + 1.0)
+    )
+
+
+def test_noop_replace_and_custom_material_field_still_pass():
+    field = _field(dense_samples=1024)
+    noop = replace(field)
+    for name in (
+        "radii",
+        "cell_volume",
+        "density",
+        "velocity",
+        "specific_energy",
+        "pressure",
+        "sound_speed",
+        "material",
+        "region",
+        "mass",
+        "node_velocity",
+    ):
+        assert np.array_equal(getattr(noop, name), getattr(field, name))
+    assert noop.epsilon == field.epsilon
+    assert noop.contact_radius == field.contact_radius
+    assert noop.shock_radius == field.shock_radius
+    assert replace(field, delta=field.delta).checks["passed"] is True
+
+    base = mat.product_jwl()
+    custom = JWLParameters(
+        A=base.A * 1.01,
+        B=base.B,
+        R1=base.R1,
+        R2=base.R2,
+        omega=base.omega,
+        rho0=base.rho0,
+        energy_shift=base.energy_shift,
+    )
+    initial = build_two_medium_initial_field(
+        charge_radius=R0, outer_radius=2.0, jwl=custom
+    )
+    custom_field = build_planar_startup_field(initial, config=_config(dense_samples=1024))
+    assert custom_field.checks["passed"] is True
+    assert custom_field.product_eos.as_dict() == custom.as_dict()
+
+
+def test_energy_normalization_keeps_global_and_adds_product_metric():
+    field = _field(dense_samples=8192)
+    checks = field.checks
+    dense = field.dense_integrals()
+    initial = field.integrals["initial"]
+    delta_e = dense["total_energy"] - initial["initial_total_energy"]
+    product_u = initial["initial_product_internal_energy"]
+
+    assert product_u == pytest.approx(250000.0, rel=1.0e-9)
+    assert checks["initial_product_internal_energy_per_sr"] == pytest.approx(product_u)
+    assert checks["spherical_energy_change_signed_j_per_sr"] == pytest.approx(delta_e)
+    assert checks["spherical_energy_change_abs_j_per_sr"] == pytest.approx(abs(delta_e))
+    assert checks[
+        "spherical_energy_change_abs_over_initial_product_internal"
+    ] == pytest.approx(abs(delta_e) / product_u)
+    # The prompt's rounded reference values.
+    assert abs(delta_e) == pytest.approx(230.10, rel=1.0e-2)
+    assert checks[
+        "spherical_energy_change_abs_over_initial_product_internal"
+    ] == pytest.approx(9.20e-4, rel=1.0e-2)
+    # The original global metric and its definition are retained.
+    assert checks["spherical_energy_residual"] == pytest.approx(
+        abs(delta_e) / initial["initial_total_energy"]
+    )
+    report = field.as_dict()
+    for key in (
+        "spherical_energy_residual",
+        "initial_product_internal_energy_per_sr",
+        "spherical_energy_change_signed_j_per_sr",
+        "spherical_energy_change_abs_j_per_sr",
+        "spherical_energy_change_abs_over_initial_product_internal",
+    ):
+        assert key in report
+    # Product mass is still reported separately.
+    assert "spherical_product_mass_residual" in checks
+
+
+def test_energy_metric_is_stable_to_far_outer_boundary():
+    def build(outer):
+        initial = build_two_medium_initial_field(
+            charge_radius=R0, outer_radius=outer
+        )
+        return build_planar_startup_field(
+            initial, config=_config(dense_samples=4096)
+        )
+
+    near = build(2.0)
+    far = build(4.0)
+    near_metric = near.checks[
+        "spherical_energy_change_abs_over_initial_product_internal"
+    ]
+    far_metric = far.checks[
+        "spherical_energy_change_abs_over_initial_product_internal"
+    ]
+    assert near.checks["initial_product_internal_energy_per_sr"] == pytest.approx(
+        far.checks["initial_product_internal_energy_per_sr"], rel=1.0e-12
+    )
+    assert near_metric == pytest.approx(far_metric, rel=1.0e-8)
+    # The original global metric is allowed to change with the outer boundary.
+    assert not math.isclose(
+        near.checks["spherical_energy_residual"],
+        far.checks["spherical_energy_residual"],
+        rel_tol=1.0e-2,
+    )
+
+
+def test_node_velocity_one_sided_rule():
+    field = _field(dense_samples=1024)
+    expected = np.empty_like(field.node_velocity)
+    for index, radius in enumerate(field.radii):
+        if radius <= field.contact_radius:
+            expected[index] = field.sample_product(np.array([radius]))["velocity"][0]
+        elif radius <= field.shock_radius:
+            expected[index] = field.solution.u_star
+        else:
+            expected[index] = 0.0
+    expected[0] = 0.0
+    assert np.array_equal(field.node_velocity, expected)
+    assert field.node_velocity[0] == 0.0
+    assert np.all(field.node_velocity[field.radii > field.shock_radius] == 0.0)
+    assert np.any(field.node_velocity > 0.0)
 
 
 def test_handoff_report_cache_and_absent_legacy_fields():
