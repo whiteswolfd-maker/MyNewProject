@@ -15,7 +15,7 @@ Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现
   时刻输出两侧的 ``rho, u, e, p`` 与 ``R_c, R_s`` 作为 PINN 初值。**不求解化学反应**，
   两个网络同时启动、全程保留。
 
-  **方案 A 的整球均匀初值已经删掉，而且没有回退分支。** ``u = 0``、
+  **方案 A 的整球均匀初值（没有外部空气的那一套）已经删掉，而且没有回退分支。** ``u = 0``、
   ``e = E0/rho0``、``p = 8.220 GPa`` 那一套只属于 A。``E0`` 保留，但它现在的
   身份是**能量尺度** ``e_* = E0/rho0``，不是初值。``SphericalPrecursor`` 现在
   **必须**接收一个 ``DetonationProfile``，省略就报错——一个可以省略的初值参数
@@ -29,15 +29,28 @@ Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现
 > 1. 原方案 B 的构造、缓存与验收要求继续适用于**旧参考场链路**；它们不用于
 >    强制新初值模块调用旧前置求解器。
 > 2. 新初值**不是**通过验收的 ``ReferenceField``，不能据此打开旧参考场闸门。
-> 3. 短时推进已实现：``physics/two_medium_startup.py`` 用球对称拉格朗日 +
->    相容能量更新（力—功配对、时间中心速度、实际边界功）推进这套初值，输出
->    ``TwoMediumHandoff``（同一时刻双侧场 + ``Rc, Rs, \dot Rc, \dot Rs``）。
->    显式入口为 ``python -m spherical_blast_pinn.cli.startup``。
-> 4. **尚未接入正式训练**：``cli._common.build_context`` 仍以旧
+> 3. **2026-10-25 小正时间启动改为局部平面黎曼近似**：
+>    ``physics/two_medium_riemann.py`` 用实际 JWL 等熵线积分 + 空气激波 RH
+>    求解产物稀疏波/接触面/空气激波；``physics/two_medium_startup_planar.py``
+>    把该自相似扇嵌入球面，得到 ``t_phys = epsilon`` 的
+>    ``PlanarStartupField``（不是旧 ``ReferenceField``，也不是旧 Lagrangian
+>    ``TwoMediumHandoff``）。显式入口仍是
+>    ``python -m spherical_blast_pinn.cli.startup``；``delta`` 敏感性诊断用
+>    ``python -m spherical_blast_pinn.cli.validate_startup_planar``。
+> 4. **旧 Lagrangian 启动已退出新链路**：``physics/two_medium_startup.py`` 的
+>    ``TwoMediumStartup.run_to`` 不再被 ``cli.startup`` 调用；它保留是因为旧测试
+>    和 ``cli/validate_startup.py``/``cli/diagnose_startup.py`` 仍直接引用它。
+>    新链路不导入 ``ProductsDetonation``、``SphericalPrecursor`` 或旧
+>    ``run_to``，也不做网格有限体积/差分/拉格朗日逐步推进。
+> 5. ``delta = (Rs-Rc)/R0 = 1/200`` 只是本轮候选值，不是已验证常数；
+>    ``epsilon = delta R0/(D_s-u_star)``。不同 ``epsilon`` 对应不同物理时刻，
+>    不能相减后称为时间收敛。
+> 6. **尚未接入正式训练**：``cli._common.build_context`` 仍以旧
 >    ``ReferenceField``（含 ``T_h = R_0/D + epsilon`` 时间原点）构造模型与尺度。
->    在把它切换到 ``TwoMediumHandoff`` 之前，旧 ``physics/detonation.py``、
+>    在把它切换到 ``PlanarStartupField`` 之前，旧 ``physics/detonation.py``、
 >    ``cli/reference_field.py`` 与旧参考场验收**必须保留**，否则会产生悬空导入。
->    它们只是过渡期依赖，不再是新初值的来源。
+>    它们只是过渡期依赖，不再是新初值的来源。新启动场的
+>    ``training_qualified`` 固定为 false。
 >
 > 下面关于“B 初场由 ``physics/detonation.py`` 构造”的要求只约束旧参考场；
 > 它不再定义新链路。

@@ -9,7 +9,11 @@
 * :mod:`pde` —— §8 的强形式残差；
 * :mod:`precursor` —— §5 的参考初始场，由独立的拉格朗日双材料求解给出；
 * :mod:`two_medium_initial` —— 2026-10-21 新决策的分段常数两介质初值
-  （均匀产物球 + 静止空气；不调用旧爆轰求解器，不写参考场缓存）。
+  （均匀产物球 + 静止空气；不调用旧爆轰求解器，不写参考场缓存）；
+* :mod:`two_medium_riemann` —— 局部平面 JWL—空气双介质黎曼问题（标量等熵线
+  积分 + 空气激波 RH；不推进网格）；
+* :mod:`two_medium_startup_planar` —— 把该黎曼扇嵌入球面的小正时间启动场与
+  交接对象（不调用旧 Lagrangian ``TwoMediumStartup.run_to``）。
 """
 from __future__ import annotations
 
@@ -84,6 +88,15 @@ from .two_medium_initial import (
     TwoMediumInitialField,
     build_two_medium_initial_field,
 )
+from .two_medium_riemann import (
+    RIEMANN_METHOD_VERSION,
+    IdealGasRiemannSolution,
+    ProductIsentrope,
+    RiemannError,
+    RiemannSolution,
+    solve_ideal_gas_riemann,
+    solve_jwl_air_riemann,
+)
 from .two_medium_startup import (
     METHOD_VERSION,
     STARTUP_MODEL_ID,
@@ -95,6 +108,14 @@ from .two_medium_startup import (
     TwoMediumStartup,
     build_handoff,
     build_startup_mesh,
+)
+from .two_medium_startup_planar import (
+    PLANAR_STARTUP_METHOD_VERSION,
+    PLANAR_STARTUP_MODEL_ID,
+    PlanarStartupConfig,
+    PlanarStartupError,
+    PlanarStartupField,
+    build_planar_startup_field,
 )
 from .similitude import (
     REFERENCE_RADIUS,
@@ -152,14 +173,27 @@ __all__ = [
     "TwoMediumHandoff",
     "TwoMediumInitialField",
     "TwoMediumStartup",
+    "RIEMANN_METHOD_VERSION",
+    "IdealGasRiemannSolution",
+    "ProductIsentrope",
+    "RiemannError",
+    "RiemannSolution",
+    "PLANAR_STARTUP_METHOD_VERSION",
+    "PLANAR_STARTUP_MODEL_ID",
+    "PlanarStartupConfig",
+    "PlanarStartupError",
+    "PlanarStartupField",
     "air_chain_factors",
     "air_coordinate",
     "ambient_air",
     "ambient_air_state",
     "build_handoff",
     "build_lagrangian_mesh",
+    "build_planar_startup_field",
     "build_startup_mesh",
     "build_two_medium_initial_field",
+    "solve_ideal_gas_riemann",
+    "solve_jwl_air_riemann",
     "chain_factors",
     "check_linear_polynomial_is_ideal_gas",
     "check_moving_frame",

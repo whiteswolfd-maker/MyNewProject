@@ -347,6 +347,67 @@ def jwl_sound_speed_numpy(rho, e, params: JWLParameters) -> np.ndarray:
     return np.sqrt(np.maximum(jwl_sound_speed_squared_numpy(rho, e, params), 0.0))
 
 
+# -- scalar implementation ------------------------------------------------
+#
+# The scalar twins are used by the local JWL--air Riemann solver, which
+# integrates the product isentrope with a few thousand scalar RK4 steps.
+# Calling the NumPy functions there would allocate an array per RK stage.
+# They deliberately use the *same* closed forms as the NumPy path; the
+# Riemann tests compare the two paths at the initial state and at the star
+# state so the scalar copy cannot drift.
+
+
+def _jwl_volume_ratio_scalar(rho: float, params: JWLParameters) -> float:
+    rho_safe = max(float(rho), TINY_DENSITY)
+    return min(params.rho0_safe / rho_safe, _MAX_VOLUME_RATIO)
+
+
+def jwl_pressure_scalar(rho: float, e: float, params: JWLParameters) -> float:
+    """Scalar twin of :func:`jwl_pressure_numpy`."""
+    v = _jwl_volume_ratio_scalar(rho, params)
+    e_eff = float(e) + params.energy_shift
+    return float(
+        params.A * (1.0 - params.omega / (params.R1 * v)) * math.exp(-params.R1 * v)
+        + params.B * (1.0 - params.omega / (params.R2 * v)) * math.exp(-params.R2 * v)
+        + params.omega * float(rho) * e_eff
+    )
+
+
+def jwl_pressure_derivatives_scalar(
+    rho: float, e: float, params: JWLParameters
+) -> tuple[float, float]:
+    """Scalar twin of :func:`jwl_pressure_derivatives`, unclamped."""
+    rho_safe = max(float(rho), TINY_DENSITY)
+    v = _jwl_volume_ratio_scalar(rho_safe, params)
+
+    def d_cold_dv(coefficient: float, rate: float) -> float:
+        return float(
+            coefficient
+            * math.exp(-rate * v)
+            * (params.omega / (rate * v * v) - rate + params.omega / v)
+        )
+
+    d_cold_drho = (d_cold_dv(params.A, params.R1) + d_cold_dv(params.B, params.R2)) * (
+        -v / rho_safe
+    )
+    dp_drho = d_cold_drho + params.omega * (float(e) + params.energy_shift)
+    dp_de = params.omega * rho_safe
+    return float(dp_drho), float(dp_de)
+
+
+def jwl_sound_speed_squared_scalar(rho: float, e: float, params: JWLParameters) -> float:
+    """Scalar twin of :func:`jwl_sound_speed_squared_numpy`, unclamped."""
+    rho_safe = max(float(rho), TINY_DENSITY)
+    p = jwl_pressure_scalar(rho_safe, e, params)
+    dp_drho, dp_de = jwl_pressure_derivatives_scalar(rho_safe, e, params)
+    return float(dp_drho + dp_de * p / (rho_safe * rho_safe))
+
+
+def jwl_sound_speed_scalar(rho: float, e: float, params: JWLParameters) -> float:
+    """Scalar twin of :func:`jwl_sound_speed_numpy` (clamped to zero)."""
+    return math.sqrt(max(jwl_sound_speed_squared_scalar(rho, e, params), 0.0))
+
+
 # ==========================================================================
 # Ideal gas (air)
 # ==========================================================================

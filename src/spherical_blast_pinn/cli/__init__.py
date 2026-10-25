@@ -7,6 +7,7 @@ COMMANDS = (
     "reference_field",
     "startup",
     "validate_startup",
+    "validate_startup_planar",
     "diagnose_startup",
     "train",
     "predict",

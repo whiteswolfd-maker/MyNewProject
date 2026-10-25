@@ -60,9 +60,8 @@ from .eos import (
     JWLParameters,
     ideal_gas_pressure_numpy,
     ideal_gas_specific_energy_numpy,
-    ideal_gas_sound_speed_numpy,
     jwl_pressure_numpy,
-    jwl_sound_speed_numpy,
+    jwl_sound_speed_squared_numpy,
 )
 
 #: 新初值模型的唯一标识。不能与旧方案 B 的 ``REFERENCE_CONSTRUCTION`` 相同。
@@ -458,29 +457,43 @@ class TwoMediumInitialField:
             jwl_pressure_numpy(rho_p, e_p, self.product_eos),
             "general JWL",
         )
+        c2_product = jwl_sound_speed_squared_numpy(rho_p, e_p, self.product_eos)
+        if np.any(~np.isfinite(c2_product)) or np.any(c2_product <= 0.0):
+            raise TwoMediumInitialError(
+                "product sound_speed_squared recomputed from the general JWL EOS "
+                "is not finite and positive; the stored sound speed would hide an "
+                "inadmissible state"
+            )
         _require_eos_field(
             "product",
             "sound_speed",
             self.sound_speed[product],
-            jwl_sound_speed_numpy(rho_p, e_p, self.product_eos),
+            np.sqrt(c2_product),
             "general JWL",
         )
 
         rho_a = self.density[air]
         e_a = self.specific_energy[air]
         air_eos = f"ideal gas with gamma = {self.air_gamma!r}"
+        p_air = ideal_gas_pressure_numpy(rho_a, e_a, self.air_gamma)
         _require_eos_field(
             "air",
             "pressure",
             self.pressure[air],
-            ideal_gas_pressure_numpy(rho_a, e_a, self.air_gamma),
+            p_air,
             air_eos,
         )
+        c2_air = self.air_gamma * p_air / rho_a
+        if np.any(~np.isfinite(c2_air)) or np.any(c2_air <= 0.0):
+            raise TwoMediumInitialError(
+                "air sound_speed_squared recomputed from the ideal-gas EOS is not "
+                "finite and positive"
+            )
         _require_eos_field(
             "air",
             "sound_speed",
             self.sound_speed[air],
-            ideal_gas_sound_speed_numpy(rho_a, e_a, self.air_gamma),
+            np.sqrt(c2_air),
             air_eos,
         )
 
@@ -536,6 +549,34 @@ class TwoMediumInitialField:
     def total_energy(self) -> float:
         return self.internal_energy + self.kinetic_energy
 
+    # -- full-sphere values ------------------------------------------------
+    # The arrays are per unit solid angle.  These properties make the
+    # convention explicit at the point where a full-sphere number is wanted;
+    # they do not change any stored field.
+    @property
+    def full_sphere_product_mass(self) -> float:
+        return float(4.0 * math.pi * self.product_mass)
+
+    @property
+    def full_sphere_air_mass(self) -> float:
+        return float(4.0 * math.pi * self.air_mass)
+
+    @property
+    def full_sphere_product_internal_energy(self) -> float:
+        return float(4.0 * math.pi * self.product_internal_energy)
+
+    @property
+    def full_sphere_internal_energy(self) -> float:
+        return float(4.0 * math.pi * self.internal_energy)
+
+    @property
+    def full_sphere_kinetic_energy(self) -> float:
+        return float(4.0 * math.pi * self.kinetic_energy)
+
+    @property
+    def full_sphere_total_energy(self) -> float:
+        return float(4.0 * math.pi * self.total_energy)
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "model_id": self.metadata.get("model_id", TWO_MEDIUM_MODEL_ID),
@@ -545,12 +586,25 @@ class TwoMediumInitialField:
             "n_cells": self.n_cells,
             "n_product_cells": self.n_inside,
             "n_air_cells": self.n_cells - self.n_inside,
-            "product_mass": self.product_mass,
-            "air_mass": self.air_mass,
-            "product_internal_energy": self.product_internal_energy,
-            "internal_energy": self.internal_energy,
-            "kinetic_energy": self.kinetic_energy,
-            "total_energy": self.total_energy,
+            # Stored arrays and the first five integrals are per unit solid
+            # angle.  The full_sphere_* entries multiply by 4*pi and are
+            # labelled separately.
+            "integration_convention": (
+                "mass_energy_per_unit_solid_angle; full_sphere_* are 4*pi times "
+                "the per-steradian values"
+            ),
+            "product_mass_per_sr": self.product_mass,
+            "air_mass_per_sr": self.air_mass,
+            "product_internal_energy_per_sr": self.product_internal_energy,
+            "internal_energy_per_sr": self.internal_energy,
+            "kinetic_energy_per_sr": self.kinetic_energy,
+            "total_energy_per_sr": self.total_energy,
+            "full_sphere_product_mass_kg": self.full_sphere_product_mass,
+            "full_sphere_air_mass_kg": self.full_sphere_air_mass,
+            "full_sphere_product_internal_energy_j": self.full_sphere_product_internal_energy,
+            "full_sphere_internal_energy_j": self.full_sphere_internal_energy,
+            "full_sphere_kinetic_energy_j": self.full_sphere_kinetic_energy,
+            "full_sphere_total_energy_j": self.full_sphere_total_energy,
             "product_pressure_pa": self.product_state.get("pressure"),
             "air_pressure_pa": self.air_state.get("pressure"),
             "pressure_jump_pa": (
@@ -739,20 +793,28 @@ def build_two_medium_initial_field(
             f"rho={rho_product!r}, e={e_product!r}, p={p_product!r}"
         )
 
-    c_product = float(
-        jwl_sound_speed_numpy(
+    c2_product = float(
+        jwl_sound_speed_squared_numpy(
             np.array([rho_product]), np.array([e_product]), params
         )[0]
     )
-    c_air = float(
-        ideal_gas_sound_speed_numpy(
+    if not math.isfinite(c2_product) or c2_product <= 0.0:
+        raise TwoMediumInitialError(
+            "product sound_speed_squared from the general JWL EOS is inadmissible: "
+            f"{c2_product!r}"
+        )
+    c_product = math.sqrt(c2_product)
+    p_air_eos = float(
+        ideal_gas_pressure_numpy(
             np.array([rho_air]), np.array([e_air]), gamma
         )[0]
     )
-    if not math.isfinite(c_product) or c_product <= 0.0:
-        raise TwoMediumInitialError(f"product sound speed is inadmissible: {c_product!r}")
-    if not math.isfinite(c_air) or c_air <= 0.0:
-        raise TwoMediumInitialError(f"air sound speed is inadmissible: {c_air!r}")
+    c2_air = gamma * p_air_eos / rho_air
+    if not math.isfinite(c2_air) or c2_air <= 0.0:
+        raise TwoMediumInitialError(
+            f"air sound_speed_squared from the ideal-gas EOS is inadmissible: {c2_air!r}"
+        )
+    c_air = math.sqrt(c2_air)
 
     specific_energy = np.concatenate(
         [np.full(n_in, e_product), np.full(n_out, e_air)]
@@ -840,6 +902,14 @@ def build_two_medium_initial_field(
         ),
         "units": (
             "SI (m, kg, s, Pa, J/kg); mass and energy are per unit solid angle"
+        ),
+        "integration_convention": (
+            "stored arrays and product_mass/internal_energy are per unit solid "
+            "angle; full_sphere_* multiply by 4*pi"
+        ),
+        "full_sphere_product_mass_kg": float(4.0 * math.pi * mass[:n_in].sum()),
+        "full_sphere_product_internal_energy_j": float(
+            4.0 * math.pi * np.sum(mass[:n_in] * e_product)
         ),
         "cell_volume_rule": "(r_{i+1}^3 - r_i^3)/3 (spherical, per unit solid angle)",
     }

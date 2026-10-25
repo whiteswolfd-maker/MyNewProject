@@ -176,7 +176,8 @@ L   = (L_50 + L_80 + L_100) / 3
 
 ## 六、参考初始场
 
-初值的**唯一来源**是一个独立的拉格朗日球对称双材料前置求解器：
+**旧参考场**的初值来源是一个独立的拉格朗日球对称双材料前置求解器（新初值
+链路见本节末尾）：
 
 * 交错网格，节点带速度，单元带质量、比容、比内能；
 * 单元的材料身份固定，接触面永远是单元边界，两种材料不会被数值扩散混进同一
@@ -186,6 +187,28 @@ L   = (L_50 + L_80 + L_100) / 3
 
 `q_R0(r, t) = q_ref(r/k, t/k)`：只缩放长度与时间，状态量不乘 `k`，质量与能量
 随 `k^3`。
+
+### 新初值链路：均匀产物球 + 局部平面黎曼启动（2026-10-25）
+
+上面“独立拉格朗日前置求解器”只描述**旧参考场**。2026-10-21 用户确认的零时刻
+初值，以及 2026-10-25 改为的小正时间启动，是另一条链路：
+
+* `physics/two_medium_initial.py`：`t_phys=0` 的均匀静止 JWL 产物球 + 静止空气，
+  `R0` 是单元界面；压力由 EOS 从 `(rho_p0, e_p0=E0/rho_ref)` 计算，不用整球
+  CJ 压力反推内能。质量/能量同时给出单位立体角与 `full_sphere_*` 两种口径。
+* `physics/two_medium_riemann.py`：局部平面 JWL—空气黎曼问题。产物侧用实际
+  JWL 等熵线积分（`de/dV=-p/rho0`、`du/dV=c/V`），空气侧用理想气体激波三条 RH；
+  求 `p_star,u_star`，不把常 gamma 产物公式替代 JWL。
+* `physics/two_medium_startup_planar.py`：把自相似扇嵌入球面，候选
+  `delta=(Rs-Rc)/R0=1/200`，`epsilon=delta R0/(D_s-u_star)`。没有网格时间推进，
+  不调用旧爆轰/前置/`TwoMediumStartup.run_to`。输出 `PlanarStartupField`，
+  `training_qualified=False`，不是旧 `ReferenceField`。
+* 入口：`python -m spherical_blast_pinn.cli.startup`。旧
+  `cli.reference_field` 与旧 Lagrangian `two_medium_startup.py` 保留给旧参考场/
+  旧测试，不属于新链路。
+
+局部平面场嵌入球面会产生几何近似误差；球对称质量/总能量残差由独立高分辨率
+积分报告，不用全局缩放或验收阈值掩盖。正式训练接入仍未完成。
 
 ## 七、命令
 
@@ -213,8 +236,15 @@ python -m spherical_blast_pinn.cli.audit_dyna \
   --deck tnt_50mm=F:/tnt/tnt_files/dp0/SYS/MECH/input.k \
   --data tnt_50mm=F:/2/extracted
 
-# 2. 参考初始场与 §5 要求的全部检查
+# 2. 参考初始场与 §5 要求的全部检查（旧参考场链路）
 python -m spherical_blast_pinn.cli.reference_field --config configs/experiments/full.yaml
+
+# 2b. 新初值链路：均匀产物球 + 局部平面黎曼启动场（不训练、不写旧参考场缓存）
+python -m spherical_blast_pinn.cli.startup --charge-radius 0.05 --delta 0.005
+
+# 2c. delta 敏感性/自相似缩放诊断（不同 delta 是不同物理时刻，不是时间收敛）
+python -m spherical_blast_pinn.cli.validate_startup_planar \
+  --charge-radius 0.05 --deltas 0.005,0.0025,0.00125
 
 # 3. 数据质量审查
 python -m spherical_blast_pinn.cli.audit_data --config configs/experiments/full.yaml

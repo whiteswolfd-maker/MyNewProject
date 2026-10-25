@@ -1,7 +1,11 @@
 # 初值决策：均匀高压产物球 + 静止空气（2026-10-21）
 
-**状态**：已由用户确认。适用于新的初值模块
+**状态**：已由用户确认。零时刻初值仍适用于
 `src/spherical_blast_pinn/physics/two_medium_initial.py`。
+
+**2026-10-25 更新**：小正时间启动已从旧 Lagrangian `TwoMediumStartup.run_to`
+改为**局部平面 JWL—空气黎曼近似**（见下文“2026-10-25”一节）。旧 Lagrangian
+实现只作为历史/旧测试依赖保留，不再属于新链路。
 
 ## 决策
 
@@ -43,7 +47,32 @@
   不是标准大气压 101325 Pa）、`gamma = 1.4`；`e_air` 由 `p_amb` 反解。
 - 质量与内能按球体积分 `(r_{i+1}^3-r_i^3)/3` 计算，单位立体角。
 
-## 2026-10-21 第二轮：短时推进与交接场（已实现）
+## 2026-10-25：局部平面黎曼启动（当前）
+
+- 零时刻仍是 `two_medium_initial.py` 的均匀静止产物球 + 静止空气；EOS、质量、
+  能量与几何校验未改。新增完整球口径字段：单位立体角数组与
+  `full_sphere_*` 明确分开。
+- `physics/two_medium_riemann.py`：局部平面双介质黎曼问题。产物侧用实际 JWL
+  等熵线 `de/dV=-p/rho0`、`du/dV=c/V` 的标量 RK4 积分；空气侧用理想气体激波
+  三条 RH；压力匹配求 `p_star, u_star`。没有把常 gamma 产物稀疏波公式替代
+  JWL，也没有用线性声学近似。
+- `physics/two_medium_startup_planar.py`：把自相似扇嵌入球面，分区为
+  未扰动产物、产物稀疏扇、产物星区、空气星区、环境空气。`epsilon =
+  delta*R0/(D_s-u_star)`，候选 `delta=1/200`；`Rc=R0+u_star*epsilon`、
+  `Rs=R0+D_s*epsilon`。没有网格时间推进，没有调用 `ProductsDetonation`、
+  `SphericalPrecursor` 或旧 `TwoMediumStartup.run_to`。
+- 输出 `PlanarStartupField`：同一物理时刻 `t_phys=epsilon`、`tau=0` 的
+  `rho,u,e,p,c, material`、`Rc/Rs`、`contact_speed/shock_speed`、稀疏波头尾
+  位置/速度、初始参数、完整 EOS、`epsilon/delta`、方法版本、单位/积分口径、
+  质量/能量与残差。`training_qualified=False`，不是旧 `ReferenceField`。
+- 局部平面场嵌入球面会产生几何近似误差：球对称质量与总能量残差由独立高分辨率
+  积分报告，不做全局缩放或阈值放行。平面质量/能量残差用来单独检查黎曼扇本身。
+- 入口：`python -m spherical_blast_pinn.cli.startup`；`delta` 敏感性诊断：
+  `python -m spherical_blast_pinn.cli.validate_startup_planar`；测试：
+  `tests/test_two_medium_riemann.py`、`tests/test_two_medium_startup_planar.py`。
+- **仍未接入正式训练**；旧 `ReferenceField`/`detonation` 链路保留，原因同上。
+
+## 2026-10-21 第二轮（历史）：旧 Lagrangian 短时推进
 
 - `physics/two_medium_startup.py`：球对称拉格朗日 + **相容能量更新**（力—功配对、
   时间中心速度、实际边界功）。第一步不会出现「内能不变、动能增加」；逐步恒等式
