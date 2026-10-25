@@ -1016,22 +1016,30 @@ def _require_rel_match(name: str, actual: np.ndarray, expected: np.ndarray) -> N
         )
 
 
-def _initial_integrals(initial_field: TwoMediumInitialField) -> dict[str, float]:
-    rho_p = float(initial_field.product_state["density"])
-    e_p = float(initial_field.product_state["specific_energy"])
-    rho_a = float(initial_field.air_state["density"])
-    e_a = float(initial_field.air_state["specific_energy"])
-    r0 = float(initial_field.charge_radius)
-    outer = float(initial_field.outer_radius)
-    product_mass = float(initial_field.product_mass)
-    air_mass = float(initial_field.air_mass)
-    internal = float(initial_field.internal_energy)
+def _initial_integrals(initial_state: Mapping[str, float]) -> dict[str, float]:
+    """Initial per-steradian integrals from the saved initial parameters.
+
+    This is the same formula used by the zero-time construction: the product
+    occupies ``0 <= r <= R0`` and the air occupies ``R0 <= r <= outer``.  It is
+    deliberately defined from the state, not read back from a saved
+    ``checks``/``integrals`` block.
+    """
+    rho_p = float(initial_state["product_density"])
+    e_p = float(initial_state["product_specific_energy"])
+    rho_a = float(initial_state["air_density"])
+    e_a = float(initial_state["air_specific_energy"])
+    r0 = float(initial_state["charge_radius"])
+    outer = float(initial_state["outer_radius"])
+    product_mass = rho_p * r0**3 / 3.0
+    air_mass = rho_a * (outer**3 - r0**3) / 3.0
+    product_internal = product_mass * e_p
+    internal = product_internal + air_mass * e_a
     return {
         "initial_mass_product": product_mass,
         "initial_mass_air": air_mass,
         "initial_mass_total": product_mass + air_mass,
         "initial_internal_energy": internal,
-        "initial_product_internal_energy": float(initial_field.product_internal_energy),
+        "initial_product_internal_energy": product_internal,
         "initial_kinetic_energy": 0.0,
         "initial_total_energy": internal,
         "initial_planar_mass_product": rho_p * r0,
@@ -1140,6 +1148,197 @@ def _expected_node_velocity(
             result[index] = 0.0
     result[0] = 0.0
     return result
+
+
+def compute_planar_startup_diagnostics(
+    field: PlanarStartupField,
+    *,
+    dense_samples: int | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Compute the startup checks and integrals from the physical field.
+
+    Both the constructor and the handoff loader call this function.  It reads
+    the cell/node arrays, the common analytic sampler, the initial parameters
+    and the reconstructed Riemann solution.  It never reads ``field.checks`` or
+    ``field.integrals``, so a saved diagnostic block cannot certify itself.
+
+    ``dense_samples`` defaults to the field's own grid configuration.  The
+    returned pair is exactly the data used by :meth:`PlanarStartupField.as_dict`.
+    """
+    if not isinstance(field, PlanarStartupField):
+        raise PlanarStartupError(
+            "diagnostics require a PlanarStartupField built from validated arrays"
+        )
+    r0 = float(field.charge_radius)
+    epsilon = float(field.epsilon)
+    delta = float(field.delta)
+    contact = float(field.contact_radius)
+    shock = float(field.shock_radius)
+    head = float(field.rarefaction_head_radius)
+    tail = float(field.rarefaction_tail_radius)
+    outer = float(field.radii[-1])
+
+    grid = field.grid_integrals()
+    dense = field.dense_integrals(samples=dense_samples)
+    initial = _initial_integrals(field.initial_state)
+    contact_states = field.contact_states()
+    shock_states = field.shock_states()
+    product_initial_energy = float(initial["initial_product_internal_energy"])
+    if not math.isfinite(product_initial_energy) or product_initial_energy <= 0.0:
+        raise PlanarStartupError(
+            "initial product internal energy must be finite and positive"
+        )
+    spherical_energy_change = float(
+        dense["total_energy"] - initial["initial_total_energy"]
+    )
+    spherical_energy_change_abs = abs(spherical_energy_change)
+    spherical_energy_change_over_product = (
+        spherical_energy_change_abs / product_initial_energy
+    )
+
+    checks: dict[str, Any] = {
+        "wave_pattern": field.solution.wave_pattern,
+        "riemann_checks": dict(field.solution.checks),
+        "epsilon_formula_residual": abs(
+            epsilon
+            * (field.solution.shock_speed - field.solution.u_star)
+            / (delta * r0)
+            - 1.0
+        ),
+        "d_s_gt_u_star": bool(field.solution.shock_speed > field.solution.u_star),
+        "epsilon_finite_positive": bool(math.isfinite(epsilon) and epsilon > 0.0),
+        "rarefaction_head_radius_positive": bool(head > 0.0),
+        "release_wave_does_not_reach_centre": bool(head > 0.0),
+        "fronts_ordered": bool(0.0 < head < tail < contact < shock < outer),
+        "centre_node_velocity_zero": bool(field.node_velocity[0] == 0.0),
+        "material_sorted": bool(
+            np.all(field.material[: field.n_inside] == PRODUCT)
+            and np.all(field.material[field.n_inside :] == AIR)
+        ),
+        "contact_face_is_grid_face": bool(
+            np.any(
+                np.isclose(
+                    field.radii,
+                    contact,
+                    rtol=0.0,
+                    atol=1.0e-15 * max(contact, 1.0),
+                )
+            )
+        ),
+        "shock_face_is_grid_face": bool(
+            np.any(
+                np.isclose(
+                    field.radii,
+                    shock,
+                    rtol=0.0,
+                    atol=1.0e-15 * max(shock, 1.0),
+                )
+            )
+        ),
+        "contact_pressure_relative": contact_states["pressure_relative"],
+        "contact_velocity_relative": contact_states["velocity_relative"],
+        "shock_post_to_ambient_pressure_ratio": (
+            shock_states["post_shock"]["pressure"]
+            / shock_states["ambient"]["pressure"]
+        ),
+        "product_disturbed_length_over_r0": field.product_disturbed_length_over_r0,
+        "fan_length_over_r0": field.fan_length / r0,
+        "air_layer_over_r0": field.air_layer_width / r0,
+        "grid_integrals": grid,
+        "dense_integrals": dense,
+        "initial_integrals": initial,
+        "spherical_mass_residual": _relative_difference(
+            dense["mass_total"], initial["initial_mass_total"]
+        ),
+        "spherical_product_mass_residual": _relative_difference(
+            dense["mass_product"], initial["initial_mass_product"]
+        ),
+        "spherical_air_mass_residual": _relative_difference(
+            dense["mass_air"], initial["initial_mass_air"]
+        ),
+        "spherical_energy_residual": _relative_difference(
+            dense["total_energy"], initial["initial_total_energy"]
+        ),
+        "initial_product_internal_energy_per_sr": product_initial_energy,
+        "spherical_energy_change_signed_j_per_sr": spherical_energy_change,
+        "spherical_energy_change_abs_j_per_sr": spherical_energy_change_abs,
+        "spherical_energy_change_abs_over_initial_product_internal": (
+            spherical_energy_change_over_product
+        ),
+        "planar_mass_residual": _relative_difference(
+            dense["planar_mass_total"], initial["initial_planar_mass_total"]
+        ),
+        "planar_energy_residual": _relative_difference(
+            dense["planar_total_energy"], initial["initial_planar_internal_energy"]
+        ),
+        "grid_vs_dense_spherical_mass_residual": _relative_difference(
+            grid["mass_total"], dense["mass_total"]
+        ),
+        "grid_vs_dense_spherical_energy_residual": _relative_difference(
+            grid["total_energy"], dense["total_energy"]
+        ),
+        "all_densities_positive": bool(np.all(field.density > 0.0)),
+        "all_internal_energies_positive": bool(np.all(field.specific_energy > 0.0)),
+        "all_sound_speed_squared_positive": bool(np.all(field.sound_speed > 0.0)),
+    }
+    checks["passed"] = bool(
+        checks["d_s_gt_u_star"]
+        and checks["epsilon_finite_positive"]
+        and checks["release_wave_does_not_reach_centre"]
+        and checks["fronts_ordered"]
+        and checks["centre_node_velocity_zero"]
+        and checks["material_sorted"]
+        and checks["contact_face_is_grid_face"]
+        and checks["shock_face_is_grid_face"]
+        and checks["contact_pressure_relative"] < 1.0e-6
+        and checks["contact_velocity_relative"] < 1.0e-8
+        and checks["all_densities_positive"]
+        and checks["all_internal_energies_positive"]
+        and checks["all_sound_speed_squared_positive"]
+    )
+
+    integrals = {
+        "grid": grid,
+        "dense": dense,
+        "initial": initial,
+        "spherical_mass_residual": checks["spherical_mass_residual"],
+        "spherical_product_mass_residual": checks["spherical_product_mass_residual"],
+        "spherical_air_mass_residual": checks["spherical_air_mass_residual"],
+        "spherical_energy_residual": checks["spherical_energy_residual"],
+        "initial_product_internal_energy_per_sr": checks[
+            "initial_product_internal_energy_per_sr"
+        ],
+        "spherical_energy_change_signed_j_per_sr": checks[
+            "spherical_energy_change_signed_j_per_sr"
+        ],
+        "spherical_energy_change_abs_j_per_sr": checks[
+            "spherical_energy_change_abs_j_per_sr"
+        ],
+        "spherical_energy_change_abs_over_initial_product_internal": checks[
+            "spherical_energy_change_abs_over_initial_product_internal"
+        ],
+        "planar_mass_residual": checks["planar_mass_residual"],
+        "planar_energy_residual": checks["planar_energy_residual"],
+        "grid_vs_dense_spherical_mass_residual": checks[
+            "grid_vs_dense_spherical_mass_residual"
+        ],
+        "grid_vs_dense_spherical_energy_residual": checks[
+            "grid_vs_dense_spherical_energy_residual"
+        ],
+        "convention": (
+            "spherical: integrate rho*r^2 dr (per steradian); "
+            "planar: integrate rho*dr (per unit area); "
+            "initial spherical values are per steradian"
+        ),
+        "energy_normalization": (
+            "spherical_energy_residual uses the total initial energy (including "
+            "ambient air) and therefore depends on the far outer boundary; "
+            "spherical_energy_change_abs_over_initial_product_internal uses only "
+            "the initial product internal energy and is the supplemental metric. "
+            "Neither grants training qualification."
+        ),
+    }
+    return checks, integrals
 
 
 def build_planar_startup_field(
@@ -1369,148 +1568,12 @@ def build_planar_startup_field(
         integrals={},
         metadata=probe_metadata,
     )
-    grid = field.grid_integrals()
-    dense = field.dense_integrals(samples=int(cfg.dense_samples))
-    initial = _initial_integrals(initial_field)
-    contact_states = field.contact_states()
-    shock_states = field.shock_states()
-    product_initial_energy = float(initial["initial_product_internal_energy"])
-    if not math.isfinite(product_initial_energy) or product_initial_energy <= 0.0:
-        raise PlanarStartupError(
-            "initial product internal energy must be finite and positive"
-        )
-    spherical_energy_change = float(dense["total_energy"] - initial["initial_total_energy"])
-    spherical_energy_change_abs = abs(spherical_energy_change)
-    spherical_energy_change_over_product = (
-        spherical_energy_change_abs / product_initial_energy
-    )
-
-    checks: dict[str, Any] = {
-        "wave_pattern": solution.wave_pattern,
-        "riemann_checks": dict(solution.checks),
-        "epsilon_formula_residual": abs(
-            epsilon * (solution.shock_speed - solution.u_star) / (float(cfg.delta) * r0) - 1.0
-        ),
-        "d_s_gt_u_star": bool(solution.shock_speed > solution.u_star),
-        "epsilon_finite_positive": bool(math.isfinite(epsilon) and epsilon > 0.0),
-        "rarefaction_head_radius_positive": bool(head > 0.0),
-        "release_wave_does_not_reach_centre": bool(head > 0.0),
-        "fronts_ordered": bool(0.0 < head < tail < contact < shock < outer),
-        "centre_node_velocity_zero": bool(node_velocity[0] == 0.0),
-        "material_sorted": bool(
-            np.all(material[: field.n_inside] == PRODUCT)
-            and np.all(material[field.n_inside :] == AIR)
-        ),
-        "contact_face_is_grid_face": bool(
-            np.any(np.isclose(edges, contact, rtol=0.0, atol=1.0e-15 * max(contact, 1.0)))
-        ),
-        "shock_face_is_grid_face": bool(
-            np.any(np.isclose(edges, shock, rtol=0.0, atol=1.0e-15 * max(shock, 1.0)))
-        ),
-        "contact_pressure_relative": contact_states["pressure_relative"],
-        "contact_velocity_relative": contact_states["velocity_relative"],
-        "shock_post_to_ambient_pressure_ratio": (
-            shock_states["post_shock"]["pressure"] / shock_states["ambient"]["pressure"]
-        ),
-        "product_disturbed_length_over_r0": field.product_disturbed_length_over_r0,
-        "fan_length_over_r0": field.fan_length / r0,
-        "air_layer_over_r0": field.air_layer_width / r0,
-        "grid_integrals": grid,
-        "dense_integrals": dense,
-        "initial_integrals": initial,
-        "spherical_mass_residual": _relative_difference(
-            dense["mass_total"], initial["initial_mass_total"]
-        ),
-        "spherical_product_mass_residual": _relative_difference(
-            dense["mass_product"], initial["initial_mass_product"]
-        ),
-        "spherical_air_mass_residual": _relative_difference(
-            dense["mass_air"], initial["initial_mass_air"]
-        ),
-        "spherical_energy_residual": _relative_difference(
-            dense["total_energy"], initial["initial_total_energy"]
-        ),
-        "initial_product_internal_energy_per_sr": product_initial_energy,
-        "spherical_energy_change_signed_j_per_sr": spherical_energy_change,
-        "spherical_energy_change_abs_j_per_sr": spherical_energy_change_abs,
-        "spherical_energy_change_abs_over_initial_product_internal": (
-            spherical_energy_change_over_product
-        ),
-        "planar_mass_residual": _relative_difference(
-            dense["planar_mass_total"], initial["initial_planar_mass_total"]
-        ),
-        "planar_energy_residual": _relative_difference(
-            dense["planar_total_energy"], initial["initial_planar_internal_energy"]
-        ),
-        "grid_vs_dense_spherical_mass_residual": _relative_difference(
-            grid["mass_total"], dense["mass_total"]
-        ),
-        "grid_vs_dense_spherical_energy_residual": _relative_difference(
-            grid["total_energy"], dense["total_energy"]
-        ),
-        "all_densities_positive": bool(np.all(density > 0.0)),
-        "all_internal_energies_positive": bool(np.all(specific_energy > 0.0)),
-        "all_sound_speed_squared_positive": bool(np.all(sound_speed > 0.0)),
-    }
-    checks["passed"] = bool(
-        checks["d_s_gt_u_star"]
-        and checks["epsilon_finite_positive"]
-        and checks["release_wave_does_not_reach_centre"]
-        and checks["fronts_ordered"]
-        and checks["centre_node_velocity_zero"]
-        and checks["material_sorted"]
-        and checks["contact_face_is_grid_face"]
-        and checks["shock_face_is_grid_face"]
-        and checks["contact_pressure_relative"] < 1.0e-6
-        and checks["contact_velocity_relative"] < 1.0e-8
-        and checks["all_densities_positive"]
-        and checks["all_internal_energies_positive"]
-        and checks["all_sound_speed_squared_positive"]
+    checks, integrals = compute_planar_startup_diagnostics(
+        field, dense_samples=int(cfg.dense_samples)
     )
     if not checks["passed"]:
         raise PlanarStartupError(f"planar startup checks failed: {checks}")
 
-    integrals = {
-        "grid": grid,
-        "dense": dense,
-        "initial": initial,
-        "spherical_mass_residual": checks["spherical_mass_residual"],
-        "spherical_product_mass_residual": checks["spherical_product_mass_residual"],
-        "spherical_air_mass_residual": checks["spherical_air_mass_residual"],
-        "spherical_energy_residual": checks["spherical_energy_residual"],
-        "initial_product_internal_energy_per_sr": checks[
-            "initial_product_internal_energy_per_sr"
-        ],
-        "spherical_energy_change_signed_j_per_sr": checks[
-            "spherical_energy_change_signed_j_per_sr"
-        ],
-        "spherical_energy_change_abs_j_per_sr": checks[
-            "spherical_energy_change_abs_j_per_sr"
-        ],
-        "spherical_energy_change_abs_over_initial_product_internal": checks[
-            "spherical_energy_change_abs_over_initial_product_internal"
-        ],
-        "planar_mass_residual": checks["planar_mass_residual"],
-        "planar_energy_residual": checks["planar_energy_residual"],
-        "grid_vs_dense_spherical_mass_residual": checks[
-            "grid_vs_dense_spherical_mass_residual"
-        ],
-        "grid_vs_dense_spherical_energy_residual": checks[
-            "grid_vs_dense_spherical_energy_residual"
-        ],
-        "convention": (
-            "spherical: integrate rho*r^2 dr (per steradian); "
-            "planar: integrate rho*dr (per unit area); "
-            "initial spherical values are per steradian"
-        ),
-        "energy_normalization": (
-            "spherical_energy_residual uses the total initial energy (including "
-            "ambient air) and therefore depends on the far outer boundary; "
-            "spherical_energy_change_abs_over_initial_product_internal uses only "
-            "the initial product internal energy and is the supplemental metric. "
-            "Neither grants training qualification."
-        ),
-    }
     # Rebuild with the final checks/integrals: the validated field is frozen,
     # so construct the final object once more with the same arrays.
     final = PlanarStartupField(
@@ -1587,4 +1650,5 @@ __all__ = [
     "PlanarStartupError",
     "PlanarStartupField",
     "build_planar_startup_field",
+    "compute_planar_startup_diagnostics",
 ]

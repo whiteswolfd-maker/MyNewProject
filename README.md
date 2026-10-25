@@ -209,7 +209,8 @@ L   = (L_50 + L_80 + L_100) / 3
 * 保存—加载：`cli.startup` 写出带版本号的 `handoff.npz` + `handoff.json`；
   `physics.two_medium_startup_handoff.load_planar_startup_handoff` 读取这一对文件，
   校验格式版本、必需字段、JSON/NPZ 标量、重建的黎曼解与保存状态、以及保存数组与
-  公共解析采样的一致性后才返回 `PlanarStartupField`。它不是旧 `ReferenceField`
+  公共解析采样的一致性；随后由实际数组、解析采样和初始参数独立重算质量/能量诊断，
+  并核对保存的 `checks`、`integrals` 及其报告顶层副本。它不是旧 `ReferenceField`
   加载器，也不跨间断面做普通插值。
 
 局部平面场嵌入球面会产生几何近似误差；球对称质量/总能量残差由独立高分辨率

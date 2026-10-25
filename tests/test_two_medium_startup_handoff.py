@@ -5,6 +5,8 @@ import json
 import numpy as np
 import pytest
 
+from spherical_blast_pinn.physics import material as mat
+from spherical_blast_pinn.physics.eos import JWLParameters
 from spherical_blast_pinn.physics.two_medium_initial import build_two_medium_initial_field
 from spherical_blast_pinn.physics.two_medium_startup_handoff import (
     HANDOFF_JSON_NAME,
@@ -151,6 +153,109 @@ def test_round_trip_preserves_all_region_sampling_and_one_sided_faces(field, tmp
     ambient = field.sample([shock], side="right")
     assert post["pressure"][0] > ambient["pressure"][0]
     assert post["density"][0] > ambient["density"][0]
+
+
+def _zero_check_energy(report):
+    report["checks"]["spherical_energy_residual"] = 0.0
+
+
+def _zero_integral_energy_change(report):
+    report["integrals"]["spherical_energy_change_signed_j_per_sr"] = 0.0
+
+
+def _zero_mass_residual(report):
+    report["checks"]["spherical_mass_residual"] = 0.0
+
+
+def _delete_energy_check(report):
+    del report["checks"]["spherical_energy_residual"]
+
+
+def _zero_top_level_energy(report):
+    report["spherical_energy_residual"] = 0.0
+
+
+def _wrong_dense_total_energy(report):
+    report["integrals"]["dense"]["total_energy"] = 1.0
+
+
+def _nan_mass_residual(report):
+    report["checks"]["spherical_mass_residual"] = float("nan")
+
+
+def _add_unexpected_check(report):
+    report["checks"]["spherical_mass_residual_unchecked"] = 0.0
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    (
+        (_zero_check_energy, r"checks\.spherical_energy_residual"),
+        (_zero_integral_energy_change, r"integrals\.spherical_energy_change_signed_j_per_sr"),
+        (_zero_mass_residual, r"checks\.spherical_mass_residual"),
+        (_delete_energy_check, r"missing required diagnostic field 'spherical_energy_residual'"),
+        (_zero_top_level_energy, r"handoff\.json\.spherical_energy_residual"),
+        (_wrong_dense_total_energy, r"integrals\.dense\.total_energy"),
+        (_nan_mass_residual, "must be finite"),
+        (_add_unexpected_check, r"unexpected diagnostic field.*spherical_mass_residual_unchecked"),
+    ),
+)
+def test_loading_rejects_tampered_diagnostics(field, tmp_path, mutate, message):
+    json_path, _ = _write(field, tmp_path)
+    _mutate_json(json_path, mutate)
+    with pytest.raises(PlanarStartupHandoffError, match=message):
+        load_planar_startup_handoff(json_path)
+
+
+def test_custom_material_and_solver_parameters_round_trip(tmp_path):
+    base = mat.product_jwl()
+    custom = JWLParameters(
+        A=base.A * 1.01,
+        B=base.B,
+        R1=base.R1,
+        R2=base.R2,
+        omega=base.omega,
+        rho0=base.rho0,
+        energy_shift=base.energy_shift,
+    )
+    initial = build_two_medium_initial_field(
+        charge_radius=R0, outer_radius=2.0 * R0, jwl=custom
+    )
+    config = PlanarStartupConfig(
+        delta=DELTA,
+        inner_cells=8,
+        fan_cells=16,
+        plateau_cells=2,
+        air_cells=4,
+        ambient_cells=8,
+        dense_samples=512,
+        integration_step_factor=0.004,
+        root_relative_tolerance=1.0e-12,
+    )
+    original = build_planar_startup_field(initial, config=config)
+    _write(original, tmp_path)
+    loaded = load_planar_startup_handoff(tmp_path)
+
+    assert loaded.product_eos == custom
+    assert loaded.metadata["grid_config"]["integration_step_factor"] == 0.004
+    assert loaded.metadata["grid_config"]["root_relative_tolerance"] == 1.0e-12
+    assert loaded.checks == original.checks
+    assert loaded.integrals == original.integrals
+    assert loaded.cache_key() == original.cache_key()
+    for name in (
+        "radii",
+        "cell_volume",
+        "density",
+        "velocity",
+        "specific_energy",
+        "pressure",
+        "sound_speed",
+        "material",
+        "region",
+        "mass",
+        "node_velocity",
+    ):
+        assert np.array_equal(getattr(loaded, name), getattr(original, name))
 
 
 def test_loading_rejects_a_modified_saved_velocity(field, tmp_path):

@@ -13,8 +13,12 @@ initial state and solver settings, checks that reconstruction against every
 saved solution scalar/table summary, and only then builds a
 :class:`~spherical_blast_pinn.physics.two_medium_startup_planar.PlanarStartupField`.
 The field constructor then replays the normal consistency validation against
-the saved arrays.  A mismatch is rejected; reconstructed values are never
-silently substituted for conflicting saved content.
+the saved arrays, and the loader recomputes the mass/energy checks and
+integrals from those arrays, the analytic sampler and the initial parameters.
+Saved ``checks``, ``integrals`` and their top-level copies must match the
+recomputation; missing, non-finite or inconsistent diagnostics are rejected.
+A mismatch is rejected; reconstructed values are never silently substituted
+for conflicting saved content.
 
 Nothing here starts training, writes a ``ReferenceField`` cache, or changes
 the startup physics.
@@ -39,6 +43,7 @@ from .two_medium_startup_planar import (
     PLANAR_STARTUP_MODEL_ID,
     PlanarStartupError,
     PlanarStartupField,
+    compute_planar_startup_diagnostics,
 )
 
 #: Serialization schema, independent of the physics method version.
@@ -52,6 +57,31 @@ _JSON_REL_TOL = 1.0e-12
 _JSON_ABS_TOL = 1.0e-15
 _SCALAR_MATCH_REL_TOL = 1.0e-14
 _SCALAR_MATCH_ABS_TOL = 0.0
+
+#: Saved diagnostics are recomputed from the same arrays and sampler.  A new
+#: legal file is therefore bitwise equal after the JSON round trip; the only
+#: known legal difference is the last-bit change from the initial-field mass
+#: sums to the closed-form sphere integrals (about 2e-16 relative).  This
+#: tolerance is far below any meaningful change in a reported mass/energy
+#: residual, while absorbing that roundoff and cross-platform libm differences.
+_DIAGNOSTIC_REL_TOL = 1.0e-11
+_DIAGNOSTIC_ABS_TOL = 1.0e-14
+
+#: Top-level copies of the diagnostics, checked against the independently
+#: recomputed ``checks``/``integrals`` rather than trusted from the report.
+_TOP_LEVEL_DIAGNOSTICS = (
+    ("spherical_energy_residual", "checks", "spherical_energy_residual"),
+    ("initial_product_internal_energy_per_sr", "checks", "initial_product_internal_energy_per_sr"),
+    ("spherical_energy_change_signed_j_per_sr", "checks", "spherical_energy_change_signed_j_per_sr"),
+    ("spherical_energy_change_abs_j_per_sr", "checks", "spherical_energy_change_abs_j_per_sr"),
+    (
+        "spherical_energy_change_abs_over_initial_product_internal",
+        "checks",
+        "spherical_energy_change_abs_over_initial_product_internal",
+    ),
+    ("grid_integrals", "integrals", "grid"),
+    ("dense_integrals", "integrals", "dense"),
+)
 
 _REQUIRED_REPORT_KEYS = (
     "handoff_format",
@@ -72,6 +102,13 @@ _REQUIRED_REPORT_KEYS = (
     "rarefaction_tail_radius_m",
     "rarefaction_head_speed_m_s",
     "rarefaction_tail_speed_m_s",
+    "spherical_energy_residual",
+    "initial_product_internal_energy_per_sr",
+    "spherical_energy_change_signed_j_per_sr",
+    "spherical_energy_change_abs_j_per_sr",
+    "spherical_energy_change_abs_over_initial_product_internal",
+    "grid_integrals",
+    "dense_integrals",
     "cache_key",
     "product_eos",
     "initial_state",
@@ -269,6 +306,88 @@ def _require_tree_close(name: str, expected: Any, actual: Any) -> None:
         return
     raise PlanarStartupHandoffError(  # pragma: no cover - internal schema error
         f"{name} has unsupported saved type {type(expected).__name__}"
+    )
+
+
+def _require_diagnostics_match(name: str, saved: Any, recomputed: Any) -> None:
+    """Compare saved diagnostics with an independent recomputation.
+
+    Required fields must exist.  Numeric fields are finite and equal within
+    ``_DIAGNOSTIC_REL_TOL``/``_DIAGNOSTIC_ABS_TOL``; booleans and counts are
+    exact.  Descriptive strings must be present and have the right type, but
+    their wording is not a numerical acceptance condition.
+    """
+    if isinstance(recomputed, Mapping):
+        if not isinstance(saved, Mapping):
+            raise PlanarStartupHandoffError(f"{name} must be a JSON object")
+        unexpected = sorted(set(saved) - set(recomputed))
+        if unexpected:
+            raise PlanarStartupHandoffError(
+                f"{name} has unexpected diagnostic field(s): {unexpected}"
+            )
+        for key in sorted(recomputed):
+            path = f"{name}.{key}"
+            if key not in saved:
+                raise PlanarStartupHandoffError(
+                    f"{name} is missing required diagnostic field {key!r}"
+                )
+            _require_diagnostics_match(path, saved[key], recomputed[key])
+        return
+    if isinstance(recomputed, bool):
+        if not isinstance(saved, bool) or saved is not recomputed:
+            raise PlanarStartupHandoffError(
+                f"{name} is inconsistent: got {saved!r}, recomputed {recomputed!r}"
+            )
+        return
+    if isinstance(recomputed, (int, np.integer)):
+        if isinstance(saved, bool) or not isinstance(saved, int):
+            raise PlanarStartupHandoffError(f"{name} must be an integer")
+        if int(saved) != int(recomputed):
+            raise PlanarStartupHandoffError(
+                f"{name} is inconsistent: got {saved!r}, recomputed {int(recomputed)!r}"
+            )
+        return
+    if isinstance(recomputed, (float, np.floating)):
+        expected = float(recomputed)
+        if not math.isfinite(expected):
+            raise PlanarStartupHandoffError(
+                f"{name} cannot be certified: recomputed value is not finite"
+            )
+        if isinstance(saved, bool) or not isinstance(saved, (int, float)):
+            raise PlanarStartupHandoffError(f"{name} must be a real number")
+        actual = float(saved)
+        if not math.isfinite(actual):
+            raise PlanarStartupHandoffError(f"{name} must be finite")
+        if not math.isclose(
+            actual,
+            expected,
+            rel_tol=_DIAGNOSTIC_REL_TOL,
+            abs_tol=_DIAGNOSTIC_ABS_TOL,
+        ):
+            raise PlanarStartupHandoffError(
+                f"{name} is inconsistent: got {actual!r}, recomputed {expected!r}"
+            )
+        return
+    if isinstance(recomputed, str):
+        if not isinstance(saved, str):
+            raise PlanarStartupHandoffError(f"{name} must be a string")
+        return
+    if isinstance(recomputed, (list, tuple)):
+        if not isinstance(saved, (list, tuple)):
+            raise PlanarStartupHandoffError(f"{name} must be a JSON array")
+        if len(saved) != len(recomputed):
+            raise PlanarStartupHandoffError(
+                f"{name} length is {len(saved)}, recomputed {len(recomputed)}"
+            )
+        for index, (left, right) in enumerate(zip(saved, recomputed)):
+            _require_diagnostics_match(f"{name}[{index}]", left, right)
+        return
+    if recomputed is None:
+        if saved is not None:
+            raise PlanarStartupHandoffError(f"{name} must be null")
+        return
+    raise PlanarStartupHandoffError(  # pragma: no cover - internal schema error
+        f"{name} has unsupported recomputed type {type(recomputed).__name__}"
     )
 
 
@@ -523,8 +642,9 @@ def load_planar_startup_handoff(path: Path | str) -> PlanarStartupField:
 
     ``path`` may be the output directory, ``handoff.json`` or ``handoff.npz``.
     Missing fields, an unsupported version, inconsistent JSON/NPZ scalars, a
-    Riemann reconstruction that disagrees with the saved solution, and any
-    saved array that disagrees with the common analytic sampler are rejected
+    Riemann reconstruction that disagrees with the saved solution, any saved
+    array that disagrees with the common analytic sampler, and any saved
+    diagnostic that disagrees with an independent recomputation are rejected
     explicitly.
     """
     json_path, npz_path = _resolve_handoff_paths(path)
@@ -599,10 +719,6 @@ def load_planar_startup_handoff(path: Path | str) -> PlanarStartupField:
     _require_tree_close("handoff.json.riemann", solution.as_dict(), saved_riemann)
 
     checks = dict(_required_mapping(report, "checks", "handoff.json"))
-    if checks.get("passed") is not True:
-        raise PlanarStartupHandoffError(
-            "handoff.json.checks.passed is not true; refusing a failed startup report"
-        )
     integrals = dict(_required_mapping(report, "integrals", "handoff.json"))
 
     try:
@@ -657,6 +773,35 @@ def load_planar_startup_handoff(path: Path | str) -> PlanarStartupField:
         raise PlanarStartupHandoffError(
             f"handoff arrays are not a valid startup field: {exc}"
         ) from exc
+
+    try:
+        recomputed_checks, recomputed_integrals = compute_planar_startup_diagnostics(
+            field
+        )
+    except PlanarStartupError as exc:
+        raise PlanarStartupHandoffError(
+            f"could not recompute the handoff diagnostics: {exc}"
+        ) from exc
+    if recomputed_checks.get("passed") is not True:
+        raise PlanarStartupHandoffError(
+            "recomputed startup diagnostics do not pass; refusing the handoff"
+        )
+    _require_diagnostics_match(
+        "handoff.json.checks", checks, recomputed_checks
+    )
+    _require_diagnostics_match(
+        "handoff.json.integrals", integrals, recomputed_integrals
+    )
+    recomputed_groups = {
+        "checks": recomputed_checks,
+        "integrals": recomputed_integrals,
+    }
+    for report_key, group, key in _TOP_LEVEL_DIAGNOSTICS:
+        _require_diagnostics_match(
+            f"handoff.json.{report_key}",
+            report[report_key],
+            recomputed_groups[group][key],
+        )
 
     saved_cache_key = _required_string(report, "cache_key", "handoff.json")
     if field.cache_key() != saved_cache_key:

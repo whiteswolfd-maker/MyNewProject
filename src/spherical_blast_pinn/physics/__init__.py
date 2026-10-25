@@ -125,6 +125,7 @@ from .two_medium_startup_planar import (
     PlanarStartupError,
     PlanarStartupField,
     build_planar_startup_field,
+    compute_planar_startup_diagnostics,
 )
 from .similitude import (
     REFERENCE_RADIUS,
@@ -204,6 +205,7 @@ __all__ = [
     "build_handoff",
     "build_lagrangian_mesh",
     "build_planar_startup_field",
+    "compute_planar_startup_diagnostics",
     "build_startup_mesh",
     "build_two_medium_initial_field",
     "solve_ideal_gas_riemann",
