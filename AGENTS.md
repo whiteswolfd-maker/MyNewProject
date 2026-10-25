@@ -21,6 +21,27 @@ Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现
   **必须**接收一个 ``DetonationProfile``，省略就报错——一个可以省略的初值参数
   迟早会被省略，而省略之后算出来的场仍然定常、为正、量纲正确。
 
+> **2026-10-21 初值方案变更（用户确认）**：新增模型
+> ``uniform_product_sphere_air_v1``——由均匀静止产物球与静止空气组成的
+> 分段常数初值，物理时间为零；实现见 ``physics/two_medium_initial.py``，
+> 决策记录见 ``DECISION_2026-10-21_UNIFORM_PRODUCT_SPHERE.md``。
+>
+> 1. 原方案 B 的构造、缓存与验收要求继续适用于**旧参考场链路**；它们不用于
+>    强制新初值模块调用旧前置求解器。
+> 2. 新初值**不是**通过验收的 ``ReferenceField``，不能据此打开旧参考场闸门。
+> 3. 短时推进已实现：``physics/two_medium_startup.py`` 用球对称拉格朗日 +
+>    相容能量更新（力—功配对、时间中心速度、实际边界功）推进这套初值，输出
+>    ``TwoMediumHandoff``（同一时刻双侧场 + ``Rc, Rs, \dot Rc, \dot Rs``）。
+>    显式入口为 ``python -m spherical_blast_pinn.cli.startup``。
+> 4. **尚未接入正式训练**：``cli._common.build_context`` 仍以旧
+>    ``ReferenceField``（含 ``T_h = R_0/D + epsilon`` 时间原点）构造模型与尺度。
+>    在把它切换到 ``TwoMediumHandoff`` 之前，旧 ``physics/detonation.py``、
+>    ``cli/reference_field.py`` 与旧参考场验收**必须保留**，否则会产生悬空导入。
+>    它们只是过渡期依赖，不再是新初值的来源。
+>
+> 下面关于“B 初场由 ``physics/detonation.py`` 构造”的要求只约束旧参考场；
+> 它不再定义新链路。
+
 * **B 初场由 ``physics/detonation.py`` 构造**，不能改成别的做法：
   * **只解产物区**。卡片只给产物的 JWL 与爆速，**没有未反应 EOS**；JWL 在
     ``V=1, e=0`` 给 ``f(1) = 6.42 GPa`` 而不是零，拿它当未反应态会凭空造出一个
