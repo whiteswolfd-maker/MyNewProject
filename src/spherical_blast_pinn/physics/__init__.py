@@ -7,7 +7,9 @@
 * :mod:`similitude` —— §5、§6 的时间原点、参考尺度与 ``hat T_*``；
 * :mod:`moving_frame` —— §6 的 ``xi``/``eta`` 与链式法则；
 * :mod:`pde` —— §8 的强形式残差；
-* :mod:`precursor` —— §5 的参考初始场，由独立的拉格朗日双材料求解给出。
+* :mod:`precursor` —— §5 的参考初始场，由独立的拉格朗日双材料求解给出；
+* :mod:`two_medium_initial` —— 2026-10-21 新决策的分段常数两介质初值
+  （均匀产物球 + 静止空气；不调用旧爆轰求解器，不写参考场缓存）。
 """
 from __future__ import annotations
 
@@ -76,6 +78,24 @@ from .precursor import (
     build_lagrangian_mesh,
     solve_reference_field,
 )
+from .two_medium_initial import (
+    TWO_MEDIUM_CONSTRUCTION,
+    TWO_MEDIUM_MODEL_ID,
+    TwoMediumInitialField,
+    build_two_medium_initial_field,
+)
+from .two_medium_startup import (
+    METHOD_VERSION,
+    STARTUP_MODEL_ID,
+    StartupConfig,
+    StartupError,
+    StartupMesh,
+    StartupState,
+    TwoMediumHandoff,
+    TwoMediumStartup,
+    build_handoff,
+    build_startup_mesh,
+)
 from .similitude import (
     REFERENCE_RADIUS,
     REFERENCE_START_TIME,
@@ -121,11 +141,25 @@ __all__ = [
     "SimilitudeError",
     "SimilitudeScales",
     "SphericalPrecursor",
+    "METHOD_VERSION",
+    "STARTUP_MODEL_ID",
+    "StartupConfig",
+    "StartupError",
+    "StartupMesh",
+    "StartupState",
+    "TWO_MEDIUM_CONSTRUCTION",
+    "TWO_MEDIUM_MODEL_ID",
+    "TwoMediumHandoff",
+    "TwoMediumInitialField",
+    "TwoMediumStartup",
     "air_chain_factors",
     "air_coordinate",
     "ambient_air",
     "ambient_air_state",
+    "build_handoff",
     "build_lagrangian_mesh",
+    "build_startup_mesh",
+    "build_two_medium_initial_field",
     "chain_factors",
     "check_linear_polynomial_is_ideal_gas",
     "check_moving_frame",

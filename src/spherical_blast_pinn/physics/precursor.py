@@ -55,18 +55,35 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 import numpy as np
 
 from . import material as mat
-from .detonation import DetonationProfile
 from .eos import (
     JWLParameters,
     ideal_gas_pressure_numpy,
     jwl_pressure_numpy,
     jwl_sound_speed_numpy,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - 仅类型注解使用，避免运行期耦合旧爆轰模块
+    from .detonation import DetonationProfile
+
+
+def __getattr__(name: str):
+    """按需解析 ``DetonationProfile``。
+
+    旧代码里有 ``from .precursor import DetonationProfile`` 的写法；这里保留该
+    名字，但**不在导入期**加载 ``detonation``。新链路（初值 + 启动求解器）因此
+    不再因为导入 ``physics`` 而拉起旧爆轰模块。
+    """
+    if name == "DetonationProfile":
+        from .detonation import DetonationProfile
+
+        return DetonationProfile
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 PRODUCT = 0
 AIR = 1

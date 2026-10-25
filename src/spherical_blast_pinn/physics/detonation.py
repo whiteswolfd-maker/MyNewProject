@@ -1,5 +1,15 @@
 """方案 B 的核心：中心起爆、有限爆速传播的球对称产物场。
 
+.. warning::
+
+   **遗留链路（2026-10-21 起）**。新初值是
+   ``physics/two_medium_initial.py`` 的均匀产物球 + 静止空气，短时推进是
+   ``physics/two_medium_startup.py``；它们都不导入本模块。本模块现在只服务
+   旧参考场链路（``cli/reference_field.py`` →
+   ``precursor.solve_reference_field`` → ``cli._common.build_context``）。
+   在 ``build_context`` 切换到 ``TwoMediumHandoff`` 之前不能删除，否则会留下
+   悬空导入；删除顺序见 ``DECISION_2026-10-21_UNIFORM_PRODUCT_SPHERE.md``。
+
 这个模块回答提示词 §2 的那一问——"B 的产物场到底是怎么来的"。它**不是**把某个
 仿真帧改名，也不是把一个均匀状态铺满装药球。
 
