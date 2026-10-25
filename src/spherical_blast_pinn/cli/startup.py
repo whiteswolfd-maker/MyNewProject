@@ -20,13 +20,11 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 from typing import Sequence
 
-import numpy as np
-
 from ..physics.two_medium_initial import build_two_medium_initial_field
+from ..physics.two_medium_startup_handoff import write_planar_startup_handoff
 from ..physics.two_medium_startup_planar import (
     PLANAR_STARTUP_MODEL_ID,
     PlanarStartupConfig,
@@ -96,34 +94,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         root_relative_tolerance=args.root_tolerance,
     )
     field = build_planar_startup_field(initial, config=config)
-    report = field.as_dict()
-
     out_dir = Path(args.output_dir) / PLANAR_STARTUP_MODEL_ID / field.cache_key()[:16]
-    out_dir.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        out_dir / "handoff.npz",
-        radii=field.radii,
-        cell_volume=field.cell_volume,
-        density=field.density,
-        velocity=field.velocity,
-        specific_energy=field.specific_energy,
-        pressure=field.pressure,
-        sound_speed=field.sound_speed,
-        material=field.material,
-        region=field.region,
-        mass=field.mass,
-        node_velocity=field.node_velocity,
-        epsilon=np.array(field.epsilon),
-        delta=np.array(field.delta),
-        contact_radius=np.array(field.contact_radius),
-        shock_radius=np.array(field.shock_radius),
-        contact_speed=np.array(field.contact_speed),
-        shock_speed=np.array(field.shock_speed),
-    )
-    (out_dir / "handoff.json").write_text(
-        json.dumps(report, indent=2, ensure_ascii=False, default=float),
-        encoding="utf-8",
-    )
+    json_path, npz_path = write_planar_startup_handoff(field, out_dir)
 
     checks = field.checks
     print(f"model_id          : {field.model_id}")
@@ -175,8 +147,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"checks             : {'PASS' if checks['passed'] else 'FAIL'}")
     print(f"training qualified : {field.training_qualified} (not wired)")
     print(f"cache_key          : {field.cache_key()}")
-    print(f"written            : {out_dir / 'handoff.npz'}")
-    print(f"                     {out_dir / 'handoff.json'}")
+    print(f"written            : {npz_path}")
+    print(f"                     {json_path}")
     return 0
 
 

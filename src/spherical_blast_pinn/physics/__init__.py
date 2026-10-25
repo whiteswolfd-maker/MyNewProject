@@ -13,7 +13,9 @@
 * :mod:`two_medium_riemann` —— 局部平面 JWL—空气双介质黎曼问题（标量等熵线
   积分 + 空气激波 RH；不推进网格）；
 * :mod:`two_medium_startup_planar` —— 把该黎曼扇嵌入球面的小正时间启动场与
-  交接对象（不调用旧 Lagrangian ``TwoMediumStartup.run_to``）。
+  交接对象（不调用旧 Lagrangian ``TwoMediumStartup.run_to``）；
+* :mod:`two_medium_startup_handoff` —— 该启动场的版本化 ``handoff.npz`` +
+  ``handoff.json`` 保存/加载与重建一致性校验（不是旧 ``ReferenceField`` 缓存）。
 """
 from __future__ import annotations
 
@@ -109,6 +111,13 @@ from .two_medium_startup import (
     build_handoff,
     build_startup_mesh,
 )
+from .two_medium_startup_handoff import (
+    PLANAR_STARTUP_HANDOFF_FORMAT,
+    PLANAR_STARTUP_HANDOFF_FORMAT_VERSION,
+    PlanarStartupHandoffError,
+    load_planar_startup_handoff,
+    write_planar_startup_handoff,
+)
 from .two_medium_startup_planar import (
     PLANAR_STARTUP_METHOD_VERSION,
     PLANAR_STARTUP_MODEL_ID,
@@ -178,11 +187,16 @@ __all__ = [
     "ProductIsentrope",
     "RiemannError",
     "RiemannSolution",
+    "PLANAR_STARTUP_HANDOFF_FORMAT",
+    "PLANAR_STARTUP_HANDOFF_FORMAT_VERSION",
     "PLANAR_STARTUP_METHOD_VERSION",
     "PLANAR_STARTUP_MODEL_ID",
     "PlanarStartupConfig",
     "PlanarStartupError",
     "PlanarStartupField",
+    "PlanarStartupHandoffError",
+    "load_planar_startup_handoff",
+    "write_planar_startup_handoff",
     "air_chain_factors",
     "air_coordinate",
     "ambient_air",

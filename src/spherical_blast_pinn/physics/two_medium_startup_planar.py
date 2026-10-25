@@ -1257,6 +1257,7 @@ def build_planar_startup_field(
             "ambient_cells": int(cfg.ambient_cells),
             "dense_samples": int(cfg.dense_samples),
             "integration_step_factor": float(cfg.integration_step_factor),
+            "root_relative_tolerance": float(cfg.root_relative_tolerance),
         },
     }
     initial_state = {
