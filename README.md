@@ -212,6 +212,14 @@ L   = (L_50 + L_80 + L_100) / 3
   公共解析采样的一致性；随后由实际数组、解析采样和初始参数独立重算质量/能量诊断，
   并核对保存的 `checks`、`integrals` 及其报告顶层副本。它不是旧 `ReferenceField`
   加载器，也不跨间断面做普通插值。
+* 初值批次适配：`sampling.planar_startup_initial.build_planar_startup_initial_batch`
+  把一个通过校验的 `PlanarStartupField` 转成现有 `SampleBatch` 的初值字段
+  （`xi/eta/rho/u/e` 两组、`contact_ic/shock_ic`），产物用 `sample_product`、
+  空气压缩层用 `sample_air`，自动加入球心、接触面两侧和激波波后锚点。它只做一次
+  `xi=r/Rc`、`eta=(r-Rc)/(Rs-Rc)` 的坐标无量纲化，`rho/u/e` 保持 SI，返回
+  `(N,1)` 张量。现有全局 `SimilitudeScales.start_time()`（`T_h=R0/D+epsilon`）
+  没有被改写；该适配层的初值批在 `s=0` 评价，并在 `diagnostics` 中记录启动场的
+  `t_phys=epsilon`、`tau=0`。完整训练接入仍未完成。
 
 局部平面场嵌入球面会产生几何近似误差；球对称质量/总能量残差由独立高分辨率
 积分报告，不用全局缩放或验收阈值掩盖。原有 `spherical_energy_residual` 的分母
