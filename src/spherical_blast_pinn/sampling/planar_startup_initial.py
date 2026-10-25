@@ -55,9 +55,25 @@ PLANAR_STARTUP_IC_ADAPTER_VERSION = "planar_startup_initial_batch_v1"
 #: The existing sampler contract uses one column per sample.
 _COLUMN_SHAPE_DESCRIPTION = "(N, 1)"
 
+#: Only real floating-point targets are meaningful for the IC loss.  float64
+#: is the existing sampler default; float32 is the only optional precision.
+_SUPPORTED_DTYPES = (torch.float64, torch.float32) if torch is not None else ()
+
 
 class PlanarStartupBatchError(ValueError):
     """The planar-startup field cannot be adapted to the IC batch contract."""
+
+
+def _resolve_dtype(dtype: Any) -> Any:
+    """Return a supported torch floating dtype or fail before tensor creation."""
+    if dtype is None:
+        return torch.float64
+    if not isinstance(dtype, torch.dtype) or dtype not in _SUPPORTED_DTYPES:
+        raise PlanarStartupBatchError(
+            "unsupported dtype: "
+            f"{dtype!r}; supported dtypes are torch.float64 (default) and torch.float32"
+        )
+    return dtype
 
 
 def _validate_positive_int(name: str, value: Any) -> int:
@@ -183,8 +199,10 @@ def build_planar_startup_initial_batch(
     case_id:
         Optional case label.  Defaults to a startup cache-key label.
     dtype, device:
-        Torch tensor placement.  The default dtype is ``torch.float64``, the
-        existing sampler's default.
+        Torch tensor placement.  Only ``torch.float64`` (default) and
+        ``torch.float32`` are supported.  Integer, boolean, complex, float16,
+        bfloat16 and non-torch dtypes are rejected before any tensor is built;
+        all eight converted tensors must also remain finite.
 
     Returns
     -------
@@ -208,10 +226,7 @@ def build_planar_startup_initial_batch(
             "the startup field has no passed consistency report; refusing to sample it"
         )
     _validate_scales(field, scales)
-    if dtype is None:
-        dtype = torch.float64
-    if not isinstance(dtype, torch.dtype):
-        raise PlanarStartupBatchError(f"dtype must be a torch dtype, got {dtype!r}")
+    dtype = _resolve_dtype(dtype)
     if case_id is None:
         case_id = f"planar_startup:{field.cache_key()[:16]}"
     if not isinstance(case_id, str) or not case_id:
@@ -287,6 +302,22 @@ def build_planar_startup_initial_batch(
     rho_a = _column(air_states["density"], dtype=dtype, device=device)
     u_a = _column(air_states["velocity"], dtype=dtype, device=device)
     e_a = _column(air_states["specific_energy"], dtype=dtype, device=device)
+    converted = (
+        ("xi_ic_product", xi_column),
+        ("rho_ic_product", rho_p),
+        ("u_ic_product", u_p),
+        ("e_ic_product", e_p),
+        ("eta_ic_air", eta_column),
+        ("rho_ic_air", rho_a),
+        ("u_ic_air", u_a),
+        ("e_ic_air", e_a),
+    )
+    for name, tensor in converted:
+        if not bool(torch.isfinite(tensor).all()):
+            raise PlanarStartupBatchError(
+                f"{name} contains non-finite values after conversion to {dtype}; "
+                "refusing to clip or replace them"
+            )
     xi_shape = _COLUMN_SHAPE_DESCRIPTION.replace("N", str(xi.size))
     eta_shape = _COLUMN_SHAPE_DESCRIPTION.replace("N", str(eta.size))
 

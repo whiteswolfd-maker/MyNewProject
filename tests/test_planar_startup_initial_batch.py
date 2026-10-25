@@ -311,6 +311,118 @@ def test_both_groups_use_the_same_epsilon_and_zero_network_time(field):
     assert torch.equal(seen["air_s"], torch.zeros_like(batch.eta_ic_air))
 
 
+def test_default_and_explicit_float64_batches_are_identical(field):
+    product, air = _sample_points(field)
+    default = build_planar_startup_initial_batch(
+        field, scales=_scales(field), product_radii=product, air_radii=air
+    )
+    explicit = build_planar_startup_initial_batch(
+        field,
+        scales=_scales(field),
+        product_radii=product,
+        air_radii=air,
+        dtype=torch.float64,
+    )
+    for name in (
+        "xi_ic_product",
+        "rho_ic_product",
+        "u_ic_product",
+        "e_ic_product",
+        "eta_ic_air",
+        "rho_ic_air",
+        "u_ic_air",
+        "e_ic_air",
+    ):
+        assert torch.equal(getattr(default, name), getattr(explicit, name))
+    assert default.contact_ic == explicit.contact_ic
+    assert default.shock_ic == explicit.shock_ic
+    assert default.diagnostics == explicit.diagnostics
+
+
+def test_float32_is_supported_finite_and_close(field):
+    product, air = _sample_points(field)
+    default = build_planar_startup_initial_batch(
+        field, scales=_scales(field), product_radii=product, air_radii=air
+    )
+    half = build_planar_startup_initial_batch(
+        field,
+        scales=_scales(field),
+        product_radii=product,
+        air_radii=air,
+        dtype=torch.float32,
+    )
+    for name in (
+        "xi_ic_product",
+        "rho_ic_product",
+        "u_ic_product",
+        "e_ic_product",
+        "eta_ic_air",
+        "rho_ic_air",
+        "u_ic_air",
+        "e_ic_air",
+    ):
+        actual = getattr(half, name)
+        expected = getattr(default, name)
+        assert actual.dtype == torch.float32
+        assert bool(torch.isfinite(actual).all())
+        torch.testing.assert_close(
+            actual.double(), expected, rtol=1.0e-6, atol=1.0e-6
+        )
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    (
+        torch.int64,
+        torch.bool,
+        torch.complex128,
+        torch.float16,
+        torch.bfloat16,
+        np.float64,
+    ),
+)
+def test_unsupported_dtypes_are_rejected_with_supported_list(field, dtype):
+    with pytest.raises(PlanarStartupBatchError, match="unsupported dtype") as exc:
+        build_planar_startup_initial_batch(field, scales=_scales(field), dtype=dtype)
+    message = str(exc.value)
+    assert "torch.float64" in message
+    assert "torch.float32" in message
+
+
+def test_unsupported_dtype_is_rejected_before_any_tensor_is_built(field, monkeypatch):
+    calls = []
+    original = torch.as_tensor
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "as_tensor", spy)
+    with pytest.raises(PlanarStartupBatchError, match="unsupported dtype"):
+        build_planar_startup_initial_batch(
+            field, scales=_scales(field), dtype=torch.int64
+        )
+    assert calls == []
+
+
+def test_float32_conversion_overflow_is_rejected_without_clipping(field, monkeypatch):
+    original = type(field).sample_product
+
+    def huge_product(self, radius):
+        states = dict(original(self, radius))
+        states["density"] = np.full_like(states["density"], 1.0e300)
+        return states
+
+    monkeypatch.setattr(type(field), "sample_product", huge_product)
+    with pytest.raises(
+        PlanarStartupBatchError,
+        match=r"rho_ic_product contains non-finite values after conversion to torch.float32",
+    ):
+        build_planar_startup_initial_batch(
+            field, scales=_scales(field), dtype=torch.float32
+        )
+
+
 def test_default_uniform_points_stay_inside_and_include_anchors(field):
     batch = build_planar_startup_initial_batch(
         field, scales=_scales(field), n_ic_product=11, n_ic_air=7
@@ -332,7 +444,7 @@ def test_default_uniform_points_stay_inside_and_include_anchors(field):
         ({"air_radii": [0.99 * R0]}, "closed interval"),
         ({"product_radii": [float("nan")]}, "non-finite"),
         ({"n_ic_product": 0}, "n_ic_product"),
-        ({"dtype": np.float64}, "torch dtype"),
+        ({"dtype": np.float64}, "unsupported dtype"),
     ),
 )
 def test_bad_dimensions_ranges_and_counts_fail_explicitly(field, kwargs, message):
