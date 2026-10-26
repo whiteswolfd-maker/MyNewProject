@@ -26,7 +26,13 @@ from ..training.trainer import (
     Trainer,
     TrainingError,
 )
-from ._common import add_common_arguments, build_context, configure_stdout, write_json
+from ._common import (
+    TrainingNotConnected,
+    add_common_arguments,
+    build_context,
+    configure_stdout,
+    write_json,
+)
 
 #: 退出码。**四档终态各自可区分**：以前只有 0/1，"跑完了但判据没过"和"截断"
 #: 拿到同一个非零码，调用方分不清哪一种。
@@ -40,6 +46,16 @@ EXIT_CODES: dict[str, int] = {
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """正式入口：新启动场的训练接口尚未接入，明确失败而不是回退旧方案。"""
+    try:
+        return _run(argv)
+    except TrainingNotConnected as exc:
+        print(f"\n** {exc} **\n", file=sys.stderr)
+        return 3
+
+
+def _run(argv: Sequence[str] | None = None) -> int:
+
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     add_common_arguments(parser)
     parser.add_argument("--resume", default=None, help="从检查点恢复")
@@ -92,8 +108,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise TrainingError("no model was built; check the configuration")
 
     # §15：正式训练入口必须**同时**检查初场、模型适用性、数据契约与验证隔离。
-    # 初场与物理由 ``build_reference`` → ``assert_reference_accepted`` 拦（缺任何
-    # 一项都会抛 ``ReferenceNotAccepted``）；数据这一侧在这里拦。
+    # 初场与物理：新启动场的训练接口尚未接入，``build_context`` 会先明确失败，
+    # 因此这里只保留数据侧与验证隔离的闸门。
     #
     # 数据未就绪**不是**可以靠改配置绕过的开关——它意味着监督标签本身不可信，
     # 那样跑出来的任何数字都没有意义。所以这里是硬失败，不是警告。
@@ -128,7 +144,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         trainer = Trainer(
             config=config,
             cases=context.training_cases,
-            reference=context.reference,
             model=context.model,
             scales_by_radius=context.scales,
             time_scale=context.time_scale,

@@ -151,13 +151,11 @@ class FrontNet(nn.Module if nn is not None else object):  # type: ignore[misc]
         seed: int = 0,
         dtype=None,
     ) -> None:
-        """``initial_contact_hat`` / ``initial_gap_hat`` 来自参考初值。
+        """``initial_contact_hat`` / ``initial_gap_hat`` 来自启动初值。
 
-        它们只设置输出层偏置，使未训练网络的初始前沿落在参考初值附近。参考
-        初值由 :mod:`spherical_blast_pinn.physics.precursor` 在
-        ``epsilon_ref`` 时刻给出，经 ``k`` 缩放到目标半径：
-
-        ``Rc_IC(R_0) = k Rc_ref(epsilon_ref)``，``Rs_IC`` 同理。
+        它们只设置输出层偏置，使未训练网络的初始前沿落在启动场附近。新链路
+        的初值由 :mod:`spherical_blast_pinn.physics.two_medium_startup_planar`
+        在 ``t_phys = epsilon`` 给出；把 handoff 接到网络的适配器尚未实现。
         """
         if nn is None:  # pragma: no cover
             raise ModelError("PyTorch is required")

@@ -213,31 +213,26 @@ def test_invalid_inputs_are_rejected(overrides):
 # --------------------------------------------------------------------------
 
 
-def test_build_does_not_depend_on_the_old_detonation_solver(monkeypatch):
-    import spherical_blast_pinn.physics.detonation as detonation
-    import spherical_blast_pinn.physics.precursor as precursor
+def test_the_old_detonation_and_precursor_modules_are_gone():
+    """旧爆轰/前置求解器已删除：新初值不可能再调用它们。"""
+    import importlib
+
     import spherical_blast_pinn.physics.two_medium_initial as module
 
-    # 模块自己的命名空间里没有旧求解器的符号。
     assert "ProductsDetonation" not in vars(module)
     assert "DetonationProfile" not in vars(module)
     assert "SphericalPrecursor" not in vars(module)
-
-    def _boom(*args, **kwargs):
-        raise AssertionError("the new initial field must not call the old solver")
-
-    monkeypatch.setattr(detonation, "ProductsDetonation", _boom)
-    monkeypatch.setattr(detonation, "detonation_product_profile", _boom)
-    monkeypatch.setattr(precursor, "SphericalPrecursor", _boom)
+    for name in (
+        "spherical_blast_pinn.physics.detonation",
+        "spherical_blast_pinn.physics.precursor",
+        "spherical_blast_pinn.physics.two_medium_startup",
+    ):
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(name)
 
     field = _field()
     assert field.product_mass > 0.0
     assert field.n_cells == 32
-
-
-# --------------------------------------------------------------------------
-# 9. 不写文件，也不会覆盖旧参考场
-# --------------------------------------------------------------------------
 
 
 def test_build_writes_no_files_and_cannot_target_the_reference_cache(tmp_path):

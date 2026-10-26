@@ -28,13 +28,13 @@ try:  # pragma: no cover
 except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
-from ..data.extracted_case import ExtractedCase
 from ..physics import material as mat
 from ..physics.moving_frame import AIR, PRODUCT
-from ..physics.precursor import ReferenceField
-from ..physics.similitude import SimilitudeScales
+from ..physics.similitude import PlanarStartupScales
+from ..physics.two_medium_startup_planar import PlanarStartupField
+from ..losses.objective import contact_pressure_scale
 from ..sampling.batch import SampleBatch, restrict_to_time_window
-from ..sampling.sampler import GroupedSampler, SamplingConfig
+from ..sampling.sampler import RadiusSampler, SamplingConfig
 
 #: 选模型标准的逐字定义。写进检查点，避免事后换一套说法。
 SELECTION_CRITERIA = (
@@ -56,9 +56,9 @@ class CheckSet:
     label: str
     batches: list[SampleBatch]
     definition: dict[str, Any]
-    #: 参考场，用来取与训练同源的 ``Pc_*``。不带着它就只能在检查里另造一个
-    #: 压力尺度，而两个不同的分母会让检查指标与训练损失不可比。
-    reference: ReferenceField | None = None
+    #: 与训练损失同源的 ``Pc_*``（启动场的 ``p_*``）。两个不同的分母会让检查
+    #: 指标与训练损失不可比，所以在建立检查集时就从场里取定、随检查集一起走。
+    contact_pressure: float = float("nan")
 
     @property
     def case_ids(self) -> list[str]:
@@ -82,72 +82,83 @@ class CheckSet:
         value = float(fraction)
         if not (0.0 < value <= 1.0):
             raise CheckError(f"time window fraction must lie in (0, 1], got {fraction!r}")
+        # ``pinn_time_max`` 是 tau（秒），窗口判据是 s（无量纲）：先经批次自己
+        # 的尺度换算，不把两个不同量纲的数直接相乘后当成 s 上界。
+        bounds = {
+            batch.case_id: float(
+                batch.scales.network_time(value * float(batch.pinn_time_max))
+            )
+            for batch in self.batches
+        }
         batches = [
-            restrict_to_time_window(batch, value * float(batch.pinn_time_max))
+            restrict_to_time_window(batch, bounds[batch.case_id])
             for batch in self.batches
         ]
         definition = dict(self.definition)
         definition["window"] = {
             "fraction": value,
-            "s_max": {
-                batch.case_id: float(batch.pinn_time_max) for batch in batches
-            },
+            "s_max": bounds,
             "note": "same fixed points, restricted to the stage window; never re-sampled",
         }
         return CheckSet(
             label=f"{self.label}@w{value:g}",
             batches=batches,
             definition=definition,
-            reference=self.reference,
+            contact_pressure=self.contact_pressure,
         )
 
 
 def build_check_set(
     *,
-    cases: Sequence[ExtractedCase],
-    scales_by_radius: Mapping[float, SimilitudeScales],
-    reference: ReferenceField,
+    field: PlanarStartupField,
+    scales: PlanarStartupScales,
+    tau_end: float,
     config: SamplingConfig | None = None,
     seed: int = 0,
     dtype=None,
     device=None,
     r_min_fraction: float = 1.0e-2,
-    dev_holdout_fraction: float = 0.1,
-    split_seed: int = 0,
+    case_id: str | None = None,
     label: str = "independent-check",
 ) -> CheckSet:
-    """建立固定检查集：一次采样，之后一直用这一套。
+    """建立一个固定检查集：一次采样，之后一直用这一套。
 
-    用的采样器**不参与梯度**，并且专门取**开发帧**（§11 的帧组留出）。因此它
-    与训练采样是两条独立的轨迹：同一个模型在同一步上，训练损失与检查指标不会
-    同步抖动。
+    采样器**不参与梯度**，用独立种子；它从新启动场采样，没有数据监督。
+    检查点的 ``Pc_*`` 在建立时从同一个启动场取定，因此训练与检查共用一条
+    归一化尺度。
     """
     if torch is None:  # pragma: no cover
         raise RuntimeError("PyTorch is required")
-    sampler = GroupedSampler.build(
-        cases=cases,
-        scales_by_radius=scales_by_radius,
-        reference=reference,
+    sampler = RadiusSampler(
+        field=field,
+        scales=scales,
+        tau_end=tau_end,
+        case_id=case_id,
         config=config,
-        base_seed=int(seed),
+        seed=int(seed),
         dtype=dtype,
         device=device,
         r_min_fraction=r_min_fraction,
-        use_development_frames=True,
-        dev_holdout_fraction=dev_holdout_fraction,
-        split_seed=split_seed,
     )
-    batches = sampler.batch()
+    batch = sampler.batch()
+    contact_pressure = contact_pressure_scale(field)
     definition = {
         "seed": int(seed),
-        "split_seed": int(split_seed),
-        "dev_holdout_fraction": float(dev_holdout_fraction),
         "purpose": "fixed physics verification and model selection; never in a gradient",
-        "sampler": sampler.as_dict(),
-        "points": {batch.case_id: batch.as_dict() for batch in batches},
+        "sampler": {
+            "case_id": batch.case_id,
+            "tau_end_s": float(tau_end),
+            "points": batch.as_dict(),
+        },
+        "contact_pressure_pa": float(contact_pressure),
         "selection_criteria": SELECTION_CRITERIA,
     }
-    return CheckSet(label=label, batches=batches, definition=definition, reference=reference)
+    return CheckSet(
+        label=label,
+        batches=[batch],
+        definition=definition,
+        contact_pressure=contact_pressure,
+    )
 
 
 @dataclass
@@ -299,7 +310,6 @@ def run_checks(
     """
     if torch is None:  # pragma: no cover
         raise RuntimeError("PyTorch is required")
-    from ..losses.objective import contact_pressure_scale
     from ..losses.terms import (
         contact_loss,
         data_loss,
@@ -319,19 +329,15 @@ def run_checks(
     physics_excess = 0.0
     nonphysical = 0.0
 
-    if check_set.reference is None:
+    if not (math.isfinite(check_set.contact_pressure) and check_set.contact_pressure > 0.0):
         raise CheckError(
-            "the check set carries no reference field, so Pc_* cannot be taken from the "
-            "same source the training loss uses"
+            "the check set carries no finite positive contact-pressure scale; the "
+            "startup field's p_star must be captured when the set is built"
         )
+    contact_pressure = float(check_set.contact_pressure)
 
     for batch in check_set.batches:
         entry: dict[str, float] = {}
-        contact_pressure = contact_pressure_scale(
-            check_set.reference.scale_to(batch.charge_radius),
-            charge_radius=batch.charge_radius,
-            detonation_velocity=batch.detonation_velocity,
-        )
 
         # -- PDE：逐材料、逐方程 ------------------------------------------
         for medium in (PRODUCT, AIR):
@@ -397,9 +403,17 @@ def run_checks(
          if key.startswith("pde_") and key.endswith("_rms")),
         default=float("nan"),
     )
-    metrics["development_prediction_error"] = float(
-        np.nanmean([entry.get("data_development_rms", float("nan"))
-                    for entry in per_radius_values])
+    development_values = [
+        float(value)
+        for entry in per_radius_values
+        if math.isfinite(
+            value := float(entry.get("data_development_rms", float("nan")))
+        )
+    ]
+    # 没有数据监督时这一项**没有定义**，不是 0：把"没有观测"写成 0 会让选模型
+    # 偏序在一个不存在的指标上比较。
+    metrics["development_prediction_error"] = (
+        float(np.mean(development_values)) if development_values else float("nan")
     )
     metrics["physics_violation_score"] = float(physics_excess)
     metrics["nonphysical_violation_count"] = float(nonphysical)

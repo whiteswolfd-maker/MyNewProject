@@ -4,20 +4,25 @@
 ``AirNet`` 在 ``R_c < r < R_s`` 上给出受扰动空气；``FrontNet`` 由统一时间 ``s``
 直接预测两条前沿。``r >= R_s`` 是解析的环境态，没有网络也没有标签。
 
-时间约定是 ``t_PINN = t_phys - epsilon(R_0)``，其中
-``epsilon(R_0) = (R_0/R_ref) epsilon_ref``，只依赖半径。参考初始场由
-:mod:`spherical_blast_pinn.physics.precursor` 独立求解，不由任何仿真帧改名而来。
+初值只有一个来源（2026-10-21 决策、2026-10-25 改为局部平面黎曼启动）：
+``t_phys = 0`` 时均匀静止的 JWL 产物球 + 静止空气，经 JWL 等熵释放与空气激波
+RH 的局部平面黎曼匹配，在小的正时间 ``epsilon`` 得到
+:class:`~spherical_blast_pinn.physics.two_medium_startup_planar.PlanarStartupField`。
+新链路的时间约定是 ``tau = t_phys - epsilon``，``s = 0`` 对应该场自己的
+``epsilon``（:class:`~spherical_blast_pinn.physics.similitude.PlanarStartupScales`）。
+旧的爆轰产物 + 拉格朗日双材料前置参考场已经删除。
 
 快速开始
 --------
 
 .. code-block:: bash
 
-    python -m spherical_blast_pinn.cli.audit_dyna   --config configs/experiments/smoke.yaml
-    python -m spherical_blast_pinn.cli.reference_field --config configs/experiments/smoke.yaml
-    python -m spherical_blast_pinn.cli.train        --config configs/experiments/smoke.yaml
-    python -m spherical_blast_pinn.cli.predict      --config configs/base.yaml --radius 0.08
-    python -m spherical_blast_pinn.cli.compare      --config configs/base.yaml --radius 0.08
+    python -m spherical_blast_pinn.cli.startup                 # 写出 handoff.npz/json
+    python -m spherical_blast_pinn.cli.validate_startup_planar # delta 敏感性诊断
+    python -m spherical_blast_pinn.cli.audit_dyna --config configs/experiments/smoke.yaml
+
+正式训练/预测/检查点的接线尚未实现；``train``/``predict``/``compare`` 会明确报
+“新启动场的训练接口尚未接入”，不会回退旧方案。
 """
 
 from __future__ import annotations

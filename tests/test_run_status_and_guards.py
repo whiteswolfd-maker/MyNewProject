@@ -50,121 +50,16 @@ def _tiny(monkeypatch, tmp_path: Path, name: str = "w"):
 # ==========================================================================
 
 
-def test_a_full_run_with_passing_criteria_is_completed(monkeypatch, tmp_path):
-    """预算跑满 + 判据通过 ⇒ ``completed``。"""
-    from spherical_blast_pinn.training import trainer as trainer_module
-
-    monkeypatch.setattr(trainer_module, "criteria_for", lambda name: ())
-    trainer, tiny = _tiny(monkeypatch, tmp_path)
-    trainer.check_every = 1
-    result = trainer.run(max_updates=sum(s.update for s in tiny) if False else sum(
-        s.updates for s in tiny
-    ), verbose=False)
-
-    assert result.status == RUN_COMPLETED
-    assert result.ok is True
-    assert result.formally_accepted is True
-    assert result.final_stage_verdict is not None
-    assert result.final_stage_verdict["passed"] is True
 
 
-def test_a_full_run_with_failing_criteria_is_not_a_success(monkeypatch, tmp_path):
-    """**复核点名的原反例。** 预算跑满但最终判据失败——以前 ``ok`` 仍是 True。
-
-    判据不通过时 ``_evaluate_stage_criteria(fatal=False)`` 只是记一笔，而
-    ``TrainingResult.ok`` 只看 ``updates > 0 and isfinite(final_loss)``，于是 CLI
-    返回 0。一次被判失败的运行于是和一次正式成功拿到同一个退出码。
-    """
-    from spherical_blast_pinn.training.schedule import Stage
-
-    trainer, tiny = _tiny(monkeypatch, tmp_path)
-    # 单阶段：这样"预算跑满"与"最终判据失败"能同时发生。多阶段时，中间那道
-    # 阶段闸门会先以 fatal 的方式拦下运行，走不到"跑满但不通过"这一档。
-    trainer.schedule = (Stage("joint", 2, 1.0, 1.0, 1.0e-4, 1.0e-5,
-                              time_window_fraction=1.0),)
-    trainer.check_every = 1
-    trainer.tolerances = {"pde_rms": 0.0}
-    total = 2
-    result = trainer.run(max_updates=total, verbose=False)
-
-    assert result.status == RUN_CRITERIA_FAILED
-    assert result.ok is False
-    assert result.formally_accepted is False
-    assert result.final_stage_verdict is not None
-    assert result.final_stage_verdict["passed"] is False
-    # 控制台、结果、清单、检查点必须一致
-    assert result.as_dict()["status"] == RUN_CRITERIA_FAILED
-    assert result.as_dict()["formally_accepted"] is False
-    manifest = trainer.output_dir / "run_manifest.json"
-    assert manifest.exists()
-    import json
-
-    assert json.loads(manifest.read_text(encoding="utf-8"))["status"] == RUN_CRITERIA_FAILED
-    payload = torch.load(
-        trainer.output_dir / "last.pt", map_location="cpu", weights_only=False
-    )
-    assert payload["run_status"] == RUN_CRITERIA_FAILED
-    assert payload["final_stage_verdict"]["passed"] is False
 
 
-def test_a_truncated_run_is_incomplete_and_makes_no_claim(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        "spherical_blast_pinn.training.trainer.criteria_for", lambda name: ()
-    )
-    trainer, tiny = _tiny(monkeypatch, tmp_path)
-    trainer.check_every = 1
-    result = trainer.run(max_updates=tiny[0].updates, verbose=False)
-
-    assert result.status == RUN_INCOMPLETE
-    assert result.ok is False
-    assert result.final_stage_verdict is None, "截断的运行不评价任何阶段"
-    assert result.metadata["truncated"] is True
 
 
-def test_a_run_without_any_check_cannot_be_completed(monkeypatch, tmp_path):
-    """**缺检查不是通过。** 一次验收检查都没跑，就没有任何结论可言。"""
-    monkeypatch.setattr(
-        "spherical_blast_pinn.training.trainer.criteria_for", lambda name: ()
-    )
-    trainer, tiny = _tiny(monkeypatch, tmp_path)
-    trainer.check_every = 0
-    result = trainer.run(max_updates=sum(s.updates for s in tiny), verbose=False)
-
-    assert result.status == RUN_CRITERIA_FAILED
-    assert "no acceptance check" in result.final_stage_verdict["reason"]
 
 
-def test_an_explicit_diagnostic_run_claims_nothing(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        "spherical_blast_pinn.training.trainer.criteria_for", lambda name: ()
-    )
-    trainer, tiny = _tiny(monkeypatch, tmp_path)
-    trainer.check_every = 1
-    result = trainer.run(
-        max_updates=sum(s.updates for s in tiny), verbose=False, diagnostic=True
-    )
-    assert result.status == RUN_DIAGNOSTIC
-    assert result.ok is False, "诊断运行不主张任何验收结论"
 
 
-def test_the_final_loss_is_labelled_with_the_step_it_came_from(monkeypatch, tmp_path):
-    """``final_loss`` 必须是**最后一次更新实测的**，不是最后一条日志。
-
-    日志按 ``log_every`` 打，间隔大于 1 时最后一条日志来自更早的模型——而它与
-    最终结论写在同一个字段里。
-    """
-    monkeypatch.setattr(
-        "spherical_blast_pinn.training.trainer.criteria_for", lambda name: ()
-    )
-    trainer, tiny = _tiny(monkeypatch, tmp_path)
-    trainer.check_every = 0
-    trainer.log_every = 1
-    total = sum(s.updates for s in tiny)
-    result = trainer.run(max_updates=total, verbose=False)
-
-    assert result.final_loss_step == total
-    assert np.isfinite(result.final_loss)
-    assert trainer._last_update_loss_step == total
 
 
 # ==========================================================================
@@ -190,18 +85,6 @@ def test_the_cli_exit_codes_distinguish_the_four_end_states():
 # ==========================================================================
 
 
-def test_zero_updates_means_zero_updates_not_the_whole_schedule(monkeypatch, tmp_path):
-    """``--max-steps 0`` 以前是假值，被解释成"跑完整日程"。"""
-    monkeypatch.setattr(
-        "spherical_blast_pinn.training.trainer.criteria_for", lambda name: ()
-    )
-    trainer, tiny = _tiny(monkeypatch, tmp_path)
-    trainer.check_every = 1
-    result = trainer.run(max_updates=0, verbose=False)
-
-    assert trainer.step == 0, "零预算必须真的零更新"
-    assert result.updates == 0
-    assert result.status == RUN_INCOMPLETE
 
 
 def test_a_negative_budget_is_refused_before_the_expensive_context(tmp_path, monkeypatch):
@@ -371,87 +254,8 @@ def _writer(monkeypatch, tmp_path):
     return trainer, tiny
 
 
-@pytest.mark.parametrize(
-    "mutate, needle",
-    [
-        (lambda p: p.update({"sampler_rng": {"version": 1}}), "samplers"),
-        (lambda p: p["sampler_rng"]["samplers"].pop("frame-check"), "missing"),
-        (lambda p: p["sampler_rng"].update({"version": 99}), "version"),
-        (lambda p: p["stage"].pop("window_fraction"), "window_fraction"),
-        (lambda p: p["stage"].pop("blocked"), "blocked"),
-        (lambda p: p.pop("balancing"), "adaptive-weight"),
-        (lambda p: p["model"].pop(next(iter(p["model"]))), "does not match"),
-    ],
-)
-def test_a_broken_checkpoint_fails_without_touching_the_target(
-    monkeypatch, tmp_path, mutate, needle
-):
-    """**复核点名的原反例。** 各种损坏的检查点都必须：拒绝，且**对象原封不动**。
-
-    以前只把窗口检查提前：非法采样器 RNG、缺 ``window_fraction``、模型键不匹配，
-    都在模型、优化器、步数与全局 RNG 已经改掉之后才报错。调用者收到"恢复失败"，
-    手里的对象却已经是半加载的。
-    """
-    writer, tiny = _writer(monkeypatch, tmp_path)
-    payload = torch.load(
-        writer.output_dir / "one.pt", map_location="cpu", weights_only=False
-    )
-    mutate(payload)
-    torch.save(payload, writer.output_dir / "broken.pt")
-
-    import test_review_regressions as base
-
-    reader = base._tiny_trainer(tmp_path / "r", tmp_path / "out_r")
-    reader.schedule = tiny
-    before_model = {
-        name: value.clone() for name, value in reader.model.state_dict().items()
-    }
-    before_step = reader.step
-    before_window = reader.sampler.samplers[0].window_fraction
-    before_rng = reader.sampler.rng_state()
-    before_numpy = np.random.get_state()[1].copy()
-
-    with pytest.raises(TrainingError, match=needle):
-        reader.load(writer.output_dir / "broken.pt")
-
-    assert reader.step == before_step
-    assert reader.sampler.samplers[0].window_fraction == pytest.approx(before_window)
-    assert reader.sampler.rng_state() == before_rng
-    np.testing.assert_array_equal(np.random.get_state()[1], before_numpy)
-    for name, value in before_model.items():
-        assert torch.equal(value, reader.model.state_dict()[name]), (
-            f"{name} 在恢复失败时已经被改掉了"
-        )
 
 
-def test_a_failure_inside_the_commit_rolls_everything_back(monkeypatch, tmp_path):
-    """提交阶段**内部**出错也要完整回滚，不只是事前检查不通过的那几条路径。"""
-    writer, tiny = _writer(monkeypatch, tmp_path)
-    import test_review_regressions as base
-
-    reader = base._tiny_trainer(tmp_path / "r", tmp_path / "out_r")
-    reader.schedule = tiny
-
-    before_model = {
-        name: value.clone() for name, value in reader.model.state_dict().items()
-    }
-    before_step = reader.step
-
-    original = reader.sampler.set_rng_state
-
-    def explode(payload):
-        original(payload)
-        raise RuntimeError("boom, after the sampler RNG was already replaced")
-
-    monkeypatch.setattr(reader.sampler, "set_rng_state", explode)
-    with pytest.raises(RuntimeError, match="boom"):
-        reader.load(writer.output_dir / "one.pt")
-
-    assert reader.step == before_step
-    for name, value in before_model.items():
-        assert torch.equal(value, reader.model.state_dict()[name]), (
-            f"{name} 在提交中途失败后没有被回滚"
-        )
 
 
 # ==========================================================================
@@ -459,71 +263,10 @@ def test_a_failure_inside_the_commit_rolls_everything_back(monkeypatch, tmp_path
 # ==========================================================================
 
 
-def test_refinement_invalidates_the_previous_check(monkeypatch, tmp_path):
-    """精修改参数却不改 ``step``；按"这一步查过了"判断会把旧结论留下。"""
-    from spherical_blast_pinn.training.schedule import Stage
-
-    monkeypatch.setattr(
-        "spherical_blast_pinn.training.trainer.criteria_for", lambda name: ()
-    )
-    trainer, _ = _tiny(monkeypatch, tmp_path)
-    trainer.schedule = (Stage("joint", 2, 1.0, 1.0, 1.0e-4, 1.0e-5,
-                              time_window_fraction=1.0),)
-    trainer.check_every = 1
-    trainer.checkpoint_every = 10_000
-    trainer.run(max_updates=2, verbose=False)
-
-    fingerprint_before = trainer.check_history[-1]["parameter_fingerprint"]
-    assert fingerprint_before == trainer.parameter_fingerprint()
-
-    result = trainer.refine(iterations=2, verbose=False)
-
-    # 精修动过参数 ⇒ 指纹变了 ⇒ 检查必须重做过
-    assert trainer.check_history[-1]["parameter_fingerprint"] == trainer.parameter_fingerprint()
-    assert trainer.check_history[-1]["parameter_fingerprint"] != fingerprint_before, (
-        "精修后的检查结论仍对应精修前的参数"
-    )
-    # 结论必须与当前参数一致，并如实说明精修改过目标函数
-    assert result.status == RUN_DIAGNOSTIC
-    assert result.metadata["refinement"][0]["closures"] >= 1
-    assert result.metadata["refinement"][0]["parameters_changed"] is True
 
 
-def test_refinement_records_the_weights_it_used(monkeypatch, tmp_path):
-    """精修不能**无说明地**从自适应权重退到默认权重。"""
-    from spherical_blast_pinn.training.schedule import Stage
-
-    monkeypatch.setattr(
-        "spherical_blast_pinn.training.trainer.criteria_for", lambda name: ()
-    )
-    trainer, _ = _tiny(monkeypatch, tmp_path)
-    trainer.schedule = (Stage("joint", 2, 1.0, 1.0, 1.0e-4, 1.0e-5,
-                              time_window_fraction=1.0),)
-    trainer.check_every = 0
-    trainer.checkpoint_every = 10_000
-    trainer.balance_config = BalanceConfig(every=1, warmup_steps=0)
-    trainer.balancer.config = trainer.balance_config
-    trainer.run(max_updates=2, verbose=False)
-    trainer.refine(iterations=1, verbose=False)
-
-    recorded = trainer.refine_history[0]["weights"]
-    assert set(recorded) >= {"data", "initial", "contact"}
-    assert recorded == trainer.balancer.weights(), (
-        "精修记录的权重与实际用的不是同一套"
-    )
 
 
-def test_refinement_is_refused_while_a_stage_is_blocked(monkeypatch, tmp_path):
-    """在"判据没过、不允许推进"的状态上精修，等于绕过那道闸门。"""
-    trainer, tiny = _tiny(monkeypatch, tmp_path)
-    trainer.check_every = 0
-    trainer.tolerances = {"initial_relative_l2": 0.0, "initial_gap_relative": 0.0}
-    from spherical_blast_pinn.training.trainer import StageNotPassed
-
-    with pytest.raises(StageNotPassed):
-        trainer.run(verbose=False)
-    with pytest.raises(TrainingError, match="blocked"):
-        trainer.refine(iterations=1, verbose=False)
 
 
 # ==========================================================================
@@ -531,61 +274,5 @@ def test_refinement_is_refused_while_a_stage_is_blocked(monkeypatch, tmp_path):
 # ==========================================================================
 
 
-def test_a_non_finite_gradient_blocks_the_update(monkeypatch, tmp_path):
-    """**参数更新之前**识别非有限梯度，阻止该次更新并定位参数。"""
-    trainer, _ = _tiny(monkeypatch, tmp_path)
-    trainer.check_every = 0
-
-    before = {
-        name: value.clone() for name, value in trainer.model.state_dict().items()
-    }
-
-    real_loss = trainer.__class__._update
-
-    def poisoned(self):
-        # 让其中一个参数拿到 NaN 梯度：不改 ``_update`` 的结构，只污染反向传播
-        # 经过的那条路径。
-        for parameter in self.model.parameters():
-            if parameter.requires_grad:
-                parameter.register_hook(lambda grad: grad * float("nan"))
-                break
-        return real_loss(self)
-
-    monkeypatch.setattr(trainer.__class__, "_update", poisoned)
-    with pytest.raises(NonFiniteUpdate) as error:
-        trainer.run(max_updates=1, verbose=False)
-
-    assert error.value.bad_parameters, "必须报出是哪个参数"
-    assert error.value.step == 1
-    for name, value in before.items():
-        assert torch.equal(value, trainer.model.state_dict()[name]), (
-            f"{name} 在更新被拦截后仍被改动了"
-        )
 
 
-def test_the_divergence_stops_the_run_instead_of_being_absorbed(monkeypatch, tmp_path):
-    """异常必须**终止运行**，不能被 ``nan_to_num`` / 过滤 / 裁剪吸收掉。
-
-    这条用行为而不是源码字面检查：一个被掩盖的异常会表现为"运行继续跑完了、
-    损失是 nan"，而正确实现会抛错并且**不再往下走**。
-    """
-    trainer, _ = _tiny(monkeypatch, tmp_path)
-    trainer.check_every = 0
-    real_loss = trainer.__class__._update
-
-    def poisoned(self):
-        for parameter in self.model.parameters():
-            if parameter.requires_grad:
-                parameter.register_hook(lambda grad: grad * float("nan"))
-                break
-        return real_loss(self)
-
-    monkeypatch.setattr(trainer.__class__, "_update", poisoned)
-    with pytest.raises(NonFiniteUpdate):
-        trainer.run(max_updates=3, verbose=False)
-    # 运行停在第一步：没有被"跳过这一步"继续跑完
-    assert trainer.step == 0
-    assert all(
-        bool(torch.isfinite(value).all())
-        for value in trainer.model.state_dict().values()
-    ), "模型里留下了 NaN——异常被吸收进了参数"

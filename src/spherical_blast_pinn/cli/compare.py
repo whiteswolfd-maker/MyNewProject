@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -28,6 +29,8 @@ from ..evaluation.waveform import compare_gauge
 from ..physics import material as mat
 from ._common import (
     SetupError,
+    TRAINING_NOT_CONNECTED_MESSAGE,
+    TrainingNotConnected,
     add_common_arguments,
     configure_stdout,
     load_config_from_args,
@@ -856,6 +859,16 @@ def _region_at(prediction, radii, physical_time: float) -> np.ndarray:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """正式入口：新启动场的训练接口尚未接入，明确失败而不是回退旧方案。"""
+    try:
+        return _run(argv)
+    except TrainingNotConnected as exc:
+        print(f"\n** {exc} **\n", file=sys.stderr)
+        return 3
+
+
+def _run(argv: Sequence[str] | None = None) -> int:
+
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     add_common_arguments(parser)
     parser.add_argument("--prediction", required=True, help="predict 命令写出的 npz")
@@ -864,6 +877,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output", default=None)
     args = parser.parse_args(argv)
     configure_stdout()
+    raise TrainingNotConnected(TRAINING_NOT_CONNECTED_MESSAGE)
     config = load_config_from_args(args)
 
     section = config.section("data")

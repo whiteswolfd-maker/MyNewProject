@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
@@ -28,6 +29,7 @@ try:  # pragma: no cover
 except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
+from ..physics.two_medium_startup_planar import PlanarStartupField
 from ..sampling.batch import SampleBatch
 from .terms import (
     TermBreakdown,
@@ -83,30 +85,31 @@ class LossBreakdown:
         }
 
 
-def contact_pressure_scale(
-    reference, *, charge_radius: float, detonation_velocity: float
-) -> float:
-    """``Pc_*``：参考 1 µs 初值场在接触面上的正值压力，Pa。
+def contact_pressure_scale(field: PlanarStartupField) -> float:
+    """``Pc_*``：启动场的接触面压力尺度，Pa。
 
-    提取方法固定为：取参考场在**交接时刻** ``T_h = T_b + epsilon`` 时刻、接触面
-    **产物侧**最后一个单元的状态，用一般 JWL 算出压力。它不来自验证真值，也不沿用
-    任何其它时刻的界面压力。
+    来源固定为**新启动场**的局部黎曼解在接触面上的匹配压力 ``p_*``。它来自
+    已通过一致性校验的 :class:`PlanarStartupField`，不来自验证真值、实验数据，
+    也不来自任何旧参考场的 ``T_h`` 查询。
 
-    方案 B 下 ``T_h`` 才是 PINN 的起点：A 用的 ``epsilon``（50 mm 时 1 µs）对应
-    "整球已经是均匀产物"，而真实算例到 ``T_b``（7.215 µs）爆轰波才走到表面。
-
-    为什么必须有一个共用尺度：两条前沿的压力尺度相差三个数量级（产物
-    ``rho_*,p U_*^2 = 6.0e9``，空气 ``rho_*,a U_*^2 = 4.5e6``），直接令两个
-    无量纲压力输出相等是没有意义的。
+    这个值**只是损失归一化尺度**：接触面压力连续条件仍是 ``p_p = p_a``，不会把
+    后续接触压力固定成 ``p_*``，也不改变任何损失权重。
     """
-    from ..physics.similitude import handover_time
-
-    start = handover_time(charge_radius, detonation_velocity=detonation_velocity)
-    value = float(reference.contact_pressure_at(start))
-    if not (value > 0.0):
+    if not isinstance(field, PlanarStartupField):
+        raise TypeError(
+            "contact_pressure_scale takes the planar startup field itself; got "
+            f"{type(field).__name__}"
+        )
+    if field.checks.get("passed") is not True:
         raise ValueError(
-            f"the reference contact pressure came out non-positive ({value} Pa); "
-            "the reference field is not usable as an initial-condition source"
+            "the startup field has no passed consistency report, so its p_star is not "
+            "usable as a loss scale"
+        )
+    value = float(field.solution.p_star)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(
+            f"the startup field's p_star is {value!r} Pa; it must be finite and strictly "
+            "positive to normalize the contact pressure residual"
         )
     return value
 

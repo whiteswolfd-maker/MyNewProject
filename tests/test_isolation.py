@@ -23,9 +23,8 @@ from spherical_blast_pinn.data.isolation import (
 )
 
 
-def _config(cases: list[dict], *, strict_blind: bool = True, reference_m: float = 0.05) -> Config:
+def _config(cases: list[dict], *, strict_blind: bool = True) -> Config:
     return Config.from_mapping({
-        "reference_field": {"charge_radius_m": reference_m},
         "data": {"cases": cases},
         "splits": {"strict_blind_test": strict_blind},
     })
@@ -93,8 +92,7 @@ def test_calibrating_the_initial_field_on_the_protected_radius_breaks_isolation(
 
 def test_strict_blind_test_needs_a_real_blind_counterpart():
     """声明了盲测却没有盲测对象，是一句空话。"""
-    config = _config([_case("tnt_50mm", 0.05, "train")], strict_blind=True,
-                     reference_m=0.05)
+    config = _config([_case("tnt_50mm", 0.05, "train")], strict_blind=True)
     config = Config.from_mapping({
         **config.values,
         "splits": {"strict_blind_test": True, "final_validation_radii_mm": [500.0]},
@@ -123,7 +121,6 @@ def test_an_empty_protected_list_makes_the_whole_check_vacuous(strict_blind):
     要求，否则它只防误用，不防自相矛盾。
     """
     config = Config.from_mapping({
-        "reference_field": {"charge_radius_m": 0.05},
         "data": {"cases": [_case("tnt_500mm", 0.5, "train")]},
         "splits": {"strict_blind_test": strict_blind, "final_validation_radii_mm": []},
     })
@@ -137,7 +134,6 @@ def test_an_empty_protected_list_makes_the_whole_check_vacuous(strict_blind):
 def test_a_non_positive_protected_radius_is_refused():
     """``final_validation_radii_mm: [0.0]`` 不是"保护了一个半径"，是一个错误。"""
     config = Config.from_mapping({
-        "reference_field": {"charge_radius_m": 0.05},
         "data": {"cases": []},
         "splits": {"strict_blind_test": True, "final_validation_radii_mm": [0.0]},
     })
@@ -148,7 +144,6 @@ def test_a_non_positive_protected_radius_is_refused():
 
 def test_the_declared_radii_can_be_overridden_in_the_config():
     config = Config.from_mapping({
-        "reference_field": {"charge_radius_m": 0.05},
         "data": {"cases": []},
         "splits": {"strict_blind_test": False, "final_validation_radii_mm": [250.0, 500.0]},
     })
@@ -166,9 +161,9 @@ def test_the_repository_base_config_declares_the_isolation_it_claims():
         _stub_case(spec["case_id"], float(spec["charge_radius_m"]))
         for spec in specs if str(spec.get("split")) == "train"
     ]
-    reference_m = float(config.get("reference_field.charge_radius_m"))
+    # 旧参考场已经删除，参考半径不再是隔离判据的一部分；数据侧的规则不变。
     verdict = evaluate_validation_isolation(
-        config, training, reference_radius_m=reference_m
+        config, training, reference_radius_m=None
     )
     assert verdict.ok, verdict.reasons
     assert 0.5 not in verdict.detail["training_radii_mm"], (

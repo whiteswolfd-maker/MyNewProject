@@ -11,7 +11,6 @@ from .planar_startup_initial import (
 from .sampler import (
     AIR,
     PRODUCT,
-    GroupedSampler,
     RadiusSampler,
     SamplingConfig,
     SamplingError,
@@ -20,7 +19,6 @@ from .sampler import (
 __all__ = [
     "AIR",
     "PRODUCT",
-    "GroupedSampler",
     "PLANAR_STARTUP_IC_ADAPTER_VERSION",
     "PlanarStartupBatchError",
     "RadiusSampler",

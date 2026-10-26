@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,7 +19,10 @@ try:  # pragma: no cover
 except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
-from ..physics.similitude import SimilitudeScales
+from ..physics.similitude import (
+    TIME_CONVENTION_PLANAR_STARTUP,
+    SimilitudeScales,
+)
 
 
 @dataclass
@@ -29,7 +33,11 @@ class SampleBatch:
     charge_radius: float
     #: 卡片爆速 ``D``，m/s。方案 B 的时间原点 ``T_h = R_0/D + epsilon`` 与接触面压力
     #: 尺度都要用它；从算例带上来，**不给默认值**。
-    detonation_velocity: float
+    #:
+    #: 平面黎曼启动场的时间原点是它自己的 ``epsilon``，不需要 ``D``。那条路径必须
+    #: 显式传 ``None``（"不适用"），不能用 1、6930 之类数值填满旧接口；方案 B 的
+    #: batch 仍要求有限正爆速。两种约定由 ``scales.time_convention`` 区分。
+    detonation_velocity: float | None
     scales: SimilitudeScales
     # 该半径的有效时间范围（``t_PINN``），s。
     pinn_time_min: float
@@ -100,6 +108,29 @@ class SampleBatch:
     geometry_delta_shock: float = float("nan")
 
     diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """爆速必须与时间约定一致：没有"恰好为零就当作不适用"的猜测。"""
+        convention = getattr(self.scales, "time_convention", None)
+        if self.detonation_velocity is None:
+            if convention != TIME_CONVENTION_PLANAR_STARTUP:
+                raise ValueError(
+                    "a batch may omit the detonation velocity only under the "
+                    f"planar-startup time convention ({TIME_CONVENTION_PLANAR_STARTUP!r}); "
+                    f"this batch carries {convention!r}"
+                )
+            return
+        velocity = float(self.detonation_velocity)
+        if not math.isfinite(velocity) or velocity <= 0.0:
+            raise ValueError(
+                "the detonation velocity must be finite and positive, got "
+                f"{self.detonation_velocity!r}"
+            )
+        if convention == TIME_CONVENTION_PLANAR_STARTUP:
+            raise ValueError(
+                "a planar-startup batch must not carry a detonation velocity: its "
+                "time origin is epsilon_field and has no R_0/D term"
+            )
 
     # -- 工具 -------------------------------------------------------------
     def tensor_fields(self) -> list[str]:
@@ -189,7 +220,12 @@ def restrict_to_time_window(batch: "SampleBatch", s_max: float) -> "SampleBatch"
         detonation_velocity=batch.detonation_velocity,
         scales=batch.scales,
         pinn_time_min=batch.pinn_time_min,
-        pinn_time_max=min(float(batch.pinn_time_max), limit),
+        # ``limit`` 是无量纲的 ``s`` 上界；批次的 ``pinn_time_max`` 是 ``tau``
+        # 秒。两者不能直接比大小——换算只经由批次自己的尺度。
+        pinn_time_max=min(
+            float(batch.pinn_time_max),
+            float(batch.scales.pinn_time_from_network(limit)),
+        ),
         contact_ic=batch.contact_ic,
         shock_ic=batch.shock_ic,
         geometry_delta_contact=batch.geometry_delta_contact,

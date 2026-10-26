@@ -4,169 +4,129 @@
 Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现整体保留在
 `_legacy_v1_backup/`，新路径**不**引用它，也不要恢复它。
 
-`README.md` 是方法、数据状态与已知限制的权威说明。改代码前先读它的第八节。
+`README.md` 是方法、数据状态与已知限制的权威说明。
 
 ## 不得改变的物理选择
 
-这些是规范定下来的，不是实现细节：
+* **唯一初始化方案（2026-10-21 决策，2026-10-25 定稿）**：
 
-* **方案 B**（2026-09-22 由 A 改来）：中心起爆、**有限爆速**传播形成非均匀爆后产物
-  场；爆轰波到达装药表面时接外部静止空气；短时球对称双介质前置求解；在共同交接
-  时刻输出两侧的 ``rho, u, e, p`` 与 ``R_c, R_s`` 作为 PINN 初值。**不求解化学反应**，
-  两个网络同时启动、全程保留。
+  ``t_phys = 0`` 时是**均匀静止的 JWL 产物球 + 静止空气**（``R_0`` 是材料界面，
+  不是爆轰波前）。产物用现行 JWL 与 ``E0``，空气用现行理想气体 EOS。它**不是**
+  CJ 表面突破，也不引入 Taylor 内场。
 
-  **方案 A 的整球均匀初值（没有外部空气的那一套）已经删掉，而且没有回退分支。** ``u = 0``、
-  ``e = E0/rho0``、``p = 8.220 GPa`` 那一套只属于 A。``E0`` 保留，但它现在的
-  身份是**能量尺度** ``e_* = E0/rho0``，不是初值。``SphericalPrecursor`` 现在
-  **必须**接收一个 ``DetonationProfile``，省略就报错——一个可以省略的初值参数
-  迟早会被省略，而省略之后算出来的场仍然定常、为正、量纲正确。
+  小正时间启动由**局部平面黎曼问题**给出：
 
-> **2026-10-21 初值方案变更（用户确认）**：新增模型
-> ``uniform_product_sphere_air_v1``——由均匀静止产物球与静止空气组成的
-> 分段常数初值，物理时间为零；实现见 ``physics/two_medium_initial.py``，
-> 决策记录见 ``DECISION_2026-10-21_UNIFORM_PRODUCT_SPHERE.md``。
->
-> 1. 原方案 B 的构造、缓存与验收要求继续适用于**旧参考场链路**；它们不用于
->    强制新初值模块调用旧前置求解器。
-> 2. 新初值**不是**通过验收的 ``ReferenceField``，不能据此打开旧参考场闸门。
-> 3. **2026-10-25 小正时间启动改为局部平面黎曼近似**：
->    ``physics/two_medium_riemann.py`` 用实际 JWL 等熵线积分 + 空气激波 RH
->    求解产物稀疏波/接触面/空气激波；``physics/two_medium_startup_planar.py``
->    把该自相似扇嵌入球面，得到 ``t_phys = epsilon`` 的
->    ``PlanarStartupField``（不是旧 ``ReferenceField``，也不是旧 Lagrangian
->    ``TwoMediumHandoff``）。显式入口仍是
->    ``python -m spherical_blast_pinn.cli.startup``；``delta`` 敏感性诊断用
->    ``python -m spherical_blast_pinn.cli.validate_startup_planar``。
-> 4. **旧 Lagrangian 启动已退出新链路**：``physics/two_medium_startup.py`` 的
->    ``TwoMediumStartup.run_to`` 不再被 ``cli.startup`` 调用；它保留是因为旧测试
->    和 ``cli/validate_startup.py``/``cli/diagnose_startup.py`` 仍直接引用它。
->    新链路不导入 ``ProductsDetonation``、``SphericalPrecursor`` 或旧
->    ``run_to``，也不做网格有限体积/差分/拉格朗日逐步推进。
-> 5. ``delta = (Rs-Rc)/R0 = 1/200`` 只是本轮候选值，不是已验证常数；
->    ``epsilon = delta R0/(D_s-u_star)``。不同 ``epsilon`` 对应不同物理时刻，
->    不能相减后称为时间收敛。
-> 6. **尚未接入正式训练**：``cli._common.build_context`` 仍以旧
->    ``ReferenceField``（含 ``T_h = R_0/D + epsilon`` 时间原点）构造模型与尺度。
->    在把它切换到 ``PlanarStartupField`` 之前，旧 ``physics/detonation.py``、
->    ``cli/reference_field.py`` 与旧参考场验收**必须保留**，否则会产生悬空导入。
->    它们只是过渡期依赖，不再是新初值的来源。新启动场的
->    ``training_qualified`` 固定为 false。
->
-> 下面关于“B 初场由 ``physics/detonation.py`` 构造”的要求只约束旧参考场；
-> 它不再定义新链路。
+  1. 产物侧用实际 JWL 等熵线积分（``de/dV = -p/rho0``、``du/dV = c/V``）；
+  2. 空气侧用理想气体激波的三条 RH 关系；
+  3. 压力/速度匹配得到 ``p_*``、``u_*``，并保留完整自相似稀疏波与星区；
+  4. 把该自相似扇嵌入球面，得到 ``t_phys = epsilon`` 的
+     :class:`~spherical_blast_pinn.physics.two_medium_startup_planar.PlanarStartupField`；
+  5. 版本化保存为 ``handoff.npz`` + ``handoff.json``，可重新加载并逐项核对。
 
-* **B 初场由 ``physics/detonation.py`` 构造**，不能改成别的做法：
-  * **只解产物区**。卡片只给产物的 JWL 与爆速，**没有未反应 EOS**；JWL 在
-    ``V=1, e=0`` 给 ``f(1) = 6.42 GPa`` 而不是零，拿它当未反应态会凭空造出一个
-    6.4 GPa 的静止炸药。凭空补一个未反应 EOS 属于"偷改材料卡"。所以波前之外
-    什么都不建模，产物的外边界就是波前本身。
-  * 波前位置 ``r_f = D t``，紧邻波后的状态由**跨波前的质量/动量/能量关系**
-    与 JWL 联立得到，即 ``p_H(V) = [f(V) + omega E0/V] / [1 - omega(1-V)/(2V)]``、
-    ``D_RH(V)^2 = p_H(V)/(rho_ref(1-V))``。
-  * **选支判据是 ``c/(D-u) > 1``（相对波前亚声速），不是 CJ。** 卡片
-    ``D = 6930 > D_CJ = 6883.14``，所以有两个根，取亚声速那支
-    （``V_f = 0.6897577``，``p_f = 2.4285949e10``）。**它不是 CJ 状态**：把 CJ
-    状态放在波前等于在一个不满足 CJ 声速条件的模型里强行施加那个条件。
-    理想 CJ 相切解只在 ``ideal_cj_state()`` 里作为诊断量存在。
-  * 数值上是一维球对称拉格朗日有限体积 + **质量吸积的前端单元**。跨节点是一个
-    **离散事件**，判据必须把事件吸附到节点上再比（见 ``_advance`` 里的注释）：
-    写成 ``front_new >= 节点 - 1e-18`` 会偶发漏掉整次事件，而漏掉之后质量永远
-    长不满，剖面会出现与网格相关的台阶，看起来很像数值振荡。
-  * 两条**精确**积分不变量是它的验收依据（``M = rho_ref r_f^3/3``、
-    ``E = E0 r_f^3/3``，与 ``D`` 无关）。质量那条是构造性精确；能量那条已修，
-    当前实测偏差 500/1000/2000 单元分别是 4.06e-3 / 3.35e-3 / 2.94e-3（容差
-    1.0e-2），**在同一半径下随分辨率变化**、按装药半径不变。
-    **旧文本里的 ``7.86e-2`` 是历史值，没有随版本留下可核验产物，按"据报告、
-    待复验"对待**；旧文本由"三个半径相同"推出"与分辨率无关"是**推错的**——
-    半径不是分辨率。详见 README 第八节。
-* 初始压力由**各位置自己的** `(rho, e)` 经一般 JWL 得到，不是一个独立常量，也不是
-  整球一个数。方案 A 那个"按 `(rho_0, E0/rho_0)` 算出的 8.220 GPa 均匀初压"已经
-  **不存在**（§4：B 初态各位置内能不同）。
-* `B = 3.7471e9 Pa`。旧项目里的 `3.231e9` 不是本规范的值，不要引入。
-* 时间零点（**方案 B**）：`T_b = R_0/D`、`epsilon(R_0) = (R_0/R_ref) epsilon_ref`、
-  **`T_h = T_b + epsilon`**、`tau = T - T_h`。`R_ref = 0.05 m`、`epsilon_ref = 1e-6 s`；
-  50/80/100/500 mm 的 `T_h` 是 8.215007/13.144012/16.430014/82.150072 µs。
-  **`D` 必须来自材料卡**，所以 `detonation_velocity` 是必填参数，没有默认值——
-  省略它等于悄悄退回 A 的时间轴（只减 `epsilon`），而两条轴都只有秒的量纲。
-  表面到达后的时间另记 `t_surface = T - T_b = tau + epsilon`，不要再平移一次。
-* 场网络共用同一套尺度化网络，`R_0` 不进入任何网络。
-* 两个场网络全程并发，没有阶段切换，没有分离时刻，没有关闭产物网络的逻辑。
-* 接触面直接施加 `p_p = p_a`、`u_p = u_a = dR_c/dt`。不引入独立局部黎曼求解层。
-* 接触面用平滑正值构造 `hat_Rc = a softplus(z_c)`、`hat_h = b softplus(z_h)`，
-  初始位置由初值损失约束。**不默认**施加 `hat_Rc >= 1`：那是把"候选轨迹还没
-  满足初值"升级成"全时域物理假设"。它作为一档可选的早时段锚定存在于
-  `networks.front.contact_anchor`，默认关闭，开启时带适用时段与书面依据。
-* 主激波用完整三条 RH 约束，不用强激波常数密度比替代，不用经验波速公式。
-* 强形式 PDE 残差，不加弱形式或全局积分守恒训练项。
-* 不用 RK 推进前沿，也不用独立积分轨迹替换预测轨迹。
-* 不加地面反射、壁面反射、后燃，或 KB/Brode/Sedov 经验损失。
-* 不加 CJ 等熵线、Taylor–Sadovsky 解，或单点相位耦合。
+  实现：``physics/two_medium_initial.py``、``physics/two_medium_riemann.py``、
+  ``physics/two_medium_startup_planar.py``、``physics/two_medium_startup_handoff.py``、
+  ``sampling/planar_startup_initial.py``；决策记录见
+  ``DECISION_2026-10-21_UNIFORM_PRODUCT_SPHERE.md``。
+
+  **不做任何网格时间推进**：新链路里没有有限体积/差分/拉格朗日逐步推进，也没有
+  旧的爆轰产物场与拉格朗日双材料前置求解器。
+
+* ``delta = (R_s-R_c)/R_0 = 1/200`` 是当前候选值，**不是**已验证常数；
+  ``epsilon = delta R_0/(D_s-u_*)``。不同 ``epsilon`` 对应不同物理时刻，
+  不能相减后称为时间收敛。
+* 新启动场固定 ``reference_field=False``、``training_qualified=False``，
+  不是旧 ``ReferenceField`` 的替代品。
 
 ## 时间
 
-* `T` 是 LS-DYNA 的原始物理时间（本项目的卡片 `*INITIAL_DETONATION lt = 0`，
-  所以数据的零就是起爆时刻）。
-* `T_b = R_0/D` 是理论爆轰渡越时间，`epsilon(R_0)` 是交接延迟，**`T_h = T_b + epsilon`
-  才是 PINN 的启动时刻**。``T_b`` 必须按算例自己的卡片爆速算。
-* `tau = T - T_h` 是本仓库对 PINN 时间的**唯一**记号。谁要在别处看到 `t_PINN`，
-  它指的就是这个量，不是 ``T - epsilon``。
-* `hat_t = U_* t_PINN/R_0`，`s = hat_t/hat_T_*`；`hat_T_*` 由训练半径冻结，
-  训练前确定，之后不许再变。
-* 训练与验证的查询默认按**物理时间**给出（`cli.predict` 的 `--time-end` 就是
-  物理秒），换算只经由 `physics.similitude`，而且**只做一次**。两个时间数组都
-  只有秒的量纲，多平移一次不会报错，只会把轨迹整体错开。
-* `solve_reference_field` 的 `sample_times` 是**相对 `T_b`** 的时间。PINN 的初值
-  在 `tau = 0`，即 `T = T_h`，所以它对应的相对时间是 **`epsilon`**（50 mm 时
-  1 µs），不是 `T_h`（8.215 µs）。`cli._common.handover_relative_time` 是唯一
-  的算法。
-* `SimilitudeScales.start_time()` 返回 **`T_h = T_b + epsilon`**；
-  **`start_delay()` 才返回 `epsilon`**。方案 A 时代 `start_time()` 返回的就是
-  `epsilon`，所以任何沿用旧名字的调用点在迁移后会静默地差 8.2 倍
-  （`sampling/sampler.py` 的 `hat_t_epsilon` 踩过这个坑）。
-* 外推判据在**无量纲时间 ``s``** 上做，不在秒数上做：同样的 `s` 在大半径上对应
-  更长的物理时间。
+* 新链路的时间约定**只有一个**：
 
-## 坐标
+  ``tau = t_phys - epsilon``，``s = U_* tau / (R_0 hat T_*)``，
+  ``s = 0 ⇔ tau = 0 ⇔ t_phys = epsilon_field``。
 
-* 参考场是**拉格朗日**解，每个快照带自己那一帧的当前单元中心
-  （`ReferenceField.cell_radii`，形状 `(n_t, n_cells)`）。把初始单元中心当成
-  固定的空间坐标、再拿当前物理半径去插值，会读出另一个位置的状态——两个数
-  都"看起来像那么回事"。改动参考场的坐标或查询语义时必须把
-  `REFERENCE_FIELD_VERSION` 加一，否则旧缓存会被参数签名判为可复用。
-* 查询在**当前物理坐标**上分材料插值，接触面两侧各取单侧状态；接触面在两帧
-  之间扫过查询点时不做时间线性混合（两帧的状态属于不同的场）。
-* 链式法则只实现一次，在 `physics/moving_frame.py`。时间项系数是
-  `U_*/(R_0 hat_T_*)`，而 `R_0` **随算例变**——所以 `CoupledModel.chain_factors`
-  的 `scales` 是必填参数。一个可以省略的参数，迟早会被省略。
+  由 :class:`~spherical_blast_pinn.physics.similitude.PlanarStartupScales` 显式
+  表达：``start_time()`` 就是该场自己的 ``epsilon``，``detonation_velocity=None``
+  （新原点不含 ``R_0/D``）。它只能由
+  ``PlanarStartupScales.for_startup_field(field, time_scale=...)`` 构造。
+* 旧方案 B 的 ``SimilitudeScales.start_time() = T_h = R_0/D + epsilon(R_0)``
+  仍保留在**旧对象**里，但新链路不使用、也不得把它传给初值批次
+  （``build_planar_startup_initial_batch`` 会明确拒绝）。
+* ``hat_t = U_* tau/R_0``，``s = hat_t/hat_T_*``；``hat_T_*`` 仍由**训练半径**
+  冻结。外推判据在无量纲 ``s`` 上做，不在秒数上做。
+* 物理时间与网络时间的换算只经由 ``physics.similitude``，而且只平移一次
+  （``physical_time_from_network`` / ``network_time_from_physical`` 配对）。
+* LS-DYNA 的原始时间轴 ``T`` 属于数据侧；它还没有迁移到新链路的时间原点
+  （见"尚未接入"）。
 
-## 验收闸门
+## 坐标与 PDE
 
-* **未通过 §5 验收的参考场不得进入正式初值入口与训练入口。** 这句话由
-  ``cli._common.assert_reference_accepted`` 执行，它是一个会抛
-  ``ReferenceNotAccepted`` 的函数，不是一句元数据注释。``reference_field.metadata``
-  里带 ``acceptance_status`` 与 ``acceptance_reason``，随缓存文件一起走。
-* 诊断命令（``cli.reference_field``）要生成试算产物，必须显式传
-  ``build_reference(..., allow_unaccepted=True)``，产物里保留未验收的标记。
-* 参考场缓存的签名里带 ``construction``（初值**物理方案**），与格式版本分开记。
-  方案 A 时代写下的缓存没有这个键，因此不会命中——**不能靠文件名或时间戳判断
-  缓存属于哪个方案**。
-* 签名里**不**放验收状态：验收是场自己的属性，每次加载后重新判。
+* 网络输入坐标一律是 ``(s, xi)`` 或 ``(s, eta)``；物理半径只在需要 ``1/r``
+  几何源项、EOS 与数据标签的地方出现。
+* 链式法则只实现一次，在 ``physics/moving_frame.py``。时间项系数是
+  ``U_*/(R_0 hat_T_*)``，``R_0`` 随算例变，所以 ``scales`` 是必填参数。
+* 接触面与激波在采样与损失里各取**单侧**状态；不在两帧之间做时间线性混合，
+  不跨材料插值。
+* Torch 与 NumPy 两条 EOS 路径必须给同一个数，包括声速；声速平方用**未裁剪**
+  的函数判断有效性。
 
 ## 硬失败，不是警告
 
-下面每一条都会让运行停下来。它们在规范里是硬失败，改成警告就等于把"方程已满足"
-写成"残差恰为零"：
+下面每一条都会让运行停下来。改成警告就等于把"方程已满足"写成"残差恰为零"：
 
-* `R_s <= R_c`、前沿或前沿速度非有限、配置点半径到达轴心（`R_c <= 0`）；
+* ``R_s <= R_c``、前沿或前沿速度非有限、配置点半径到达轴心（``R_c <= 0``）；
 * 零个产物配置点，或大部分请求的产物点被丢弃；
-* 产物 PDE 残差在**零个点**上求值（`mean` 会把 `nan` 吞掉，零个点读起来和
-  完美收敛一样）；
-* 检查点里的 `hat_T_*` 与当前运行不同（恢复训练会悄悄换掉网络的时间输入）；
-* 检查点里没有采样器的 RNG 状态（恢复出来的不是一条连续的采样轨迹）；
+* 产物 PDE 残差在**零个点**上求值（``mean`` 会把 ``nan`` 吞掉）；
+* 检查点里的 ``hat_T_*`` 与当前运行不同；
+* 检查点里没有采样器的 RNG 状态；
 * 训练半径缺数据；
-* 训练算例的数据兼容性不是 `compatible`（见下）。
+* 训练算例的数据兼容性不是 ``compatible``。
 
-**`R_c < R_0` 不在这一列**：它是监控量，不是非法移动域。`R_c` 到达轴心才是。
+**``R_c < R_0`` 不在这一列**：它是监控量，不是非法移动域。
+
+## 正式命令的当前状态
+
+* 可运行：``python -m spherical_blast_pinn.cli.startup``（写出 handoff）、
+  ``python -m spherical_blast_pinn.cli.validate_startup_planar``（delta 敏感性）、
+  ``python -m spherical_blast_pinn.cli.check_startup_chain``（装配 + 一次反向传播），
+  以及数据侧的 ``audit_dyna`` / ``audit_data`` / ``extract_profiles`` /
+  ``validate_eos``。
+* **已接入新启动场**：``sampling.sampler.RadiusSampler(field, scales, tau_end)``
+  直接生成 IC / PDE / 接触面 / 激波点；IC 复用
+  ``build_planar_startup_initial_batch``。``losses.objective.contact_pressure_scale(field)``
+  取场自己的 ``p_*``。``evaluation.checks.build_check_set(field, scales, tau_end)``
+  用同一启动场与同一压力尺度建立固定检查集。无数据监督时数据与几何批次为空，
+  **不构造假算例**；把真实算例传给采样器会明确报未支持（数据时间轴尚未迁移）。
+* **尚未接入**：``train`` / ``predict`` / ``compare``。它们会明确报
+  “新启动场的训练接口尚未接入”并以退出码 3 结束，**不会**回退旧参考场。
+  ``Trainer`` 构造时直接抛 ``TrainingNotConnected``：训练执行层仍按旧的多半径
+  / 检查点语义，迁移它属于下一轮。不得用伪造的 ``ReferenceField``、伪造爆速或
+  ``training_qualified=True`` 绕过。
+* **检查点（新契约）**：``training.checkpoint`` 只读写
+  ``spherical_blast_pinn.startup_checkpoint`` v1，绑定启动场的
+  ``model_id`` / ``method_version`` / ``cache_key``、完整的
+  ``PlanarStartupScales`` 参数、模型结构/EOS/dtype、模型参数、可选的优化器
+  状态、步数、全局+采样器随机状态，以及**采样配置与动态时间窗口**
+  （``tau_end``、各类点数、分层比例、``r_min_fraction``、当前窗口分数与
+  历史）。恢复端必须逐项相同：``tau_end``/点数/分层不同，或接收采样器站在
+  另一个启动场/尺度上，都会在修改模型、优化器和采样器**之前**明确拒绝——
+  换一套采样设置继续跑不能称为精确续训。保存用
+  ``save_startup_checkpoint(path, field=..., scales=..., model=..., optimizer=..., sampler=...)``，
+  读取用 ``load_startup_checkpoint(path, handoff_json=..., model=..., sampler=...)``。
+  旧检查点（format ``spherical_blast_pinn.checkpoint``、version ≤ 8、带爆速与
+  ``T_h``）按格式/版本**明确拒绝**，不迁移、不猜测旧时间原点。
+* 保留但未接线的通用组件：``models/``、``physics/pde.py``、
+  ``physics/moving_frame.py``、``losses/terms.py``、``sampling/batch.py``、
+  ``training/schedule.py``、``training/balancing.py``、``training/trainer.py``。
+
+## 已退出的旧方案（只作历史）
+
+2026-09-22 至 2026-10-21 之间使用的“方案 B”是：中心起爆、有限爆速传播形成
+非均匀爆后产物场，波前到达装药表面后接空气，再用短时球对称拉格朗日双材料
+前置求解到 ``T_h = R_0/D + epsilon``。对应的 ``physics/detonation.py``、
+``physics/precursor.py``（含 ``ReferenceField`` 与验收缓存）、
+``physics/two_medium_startup.py``、``cli/reference_field.py``、
+``cli/validate_startup.py``、``cli/diagnose_startup.py`` 及其专属测试已删除。
+旧缓存文件（``reference_field.npz``）不再被任何代码读取，也不得当成新启动场。
 
 ## 剖面提取
 
@@ -300,292 +260,20 @@ pytest -q
 测试通过不等于完整爆炸预测通过。哪些项"已执行"、哪些"仅实现"、哪些"参考数据
 不足以判断"，必须逐项说明，不能只报一个通过率。
 
-## 运行终态与检查点（2026-10-10 起）
+## 规范
 
-* 一次运行有**四档互不替代**的终态：`completed`（预算跑满且最终阶段判据通过）、
-  `criteria_failed`（跑满但判据没过）、`incomplete`（预算被截断）、`diagnostic`
-  （显式诊断）。`TrainingResult.ok` 只在 `completed` 时为真；CLI 的退出码按这四档
-  区分。**"跑完了"与"通过了"不是一回事**，以前它们共用一个布尔量。
-* 截断的运行**不评价**任何阶段：没跑到的阶段既不算通过也不算失败。一次检查都没
-  执行（`check_every <= 0`）同样不能算通过——缺检查不是通过。
-* 检查结论绑定**参数指纹**，不只绑定步数：L-BFGS 精修改参数却不改 `step`，只用
-  步数判断"这一步查过了"会把精修前的结论留在报告里。精修过的运行一律记
-  `diagnostic`，因为它中途换过一次目标函数。
-* 检查点格式版本 **4**。`stage` 块必须带 `pending` 与 `blocked`，加载端**要求它们
-  存在**（缺失即拒绝，不默认通过）；`sampler_rng` 必须是带版本、含每个算例键的完整
-  记录，空字典与缺算例都拒绝。恢复是**事务性**的：任何一步失败都完整回滚，包括
-  模型、优化器、步数、阶段、平衡器、各采样器与全局随机状态。
-* 数据契约要求材料分区带**结构化来源记录**（`data/provenance.py`）：方法取自封闭
-  枚举、带生产端与版本、带输入标识，且必须与布尔声明一致。自由文本、数字、任意
-  非空字典都不是机器证据。契约对**任何**对象做同一套结构检查，不信任"据说读取过"。
-* 对象级检查与读取端必须**共用同一条规则与同一份清单**：`validate_case_object()`
-  对对象上出现的每一个数组都过一遍，`contract._structural_problems` 直接调用它。
-  **不得**在契约里再手写一份"要查哪些数组"的列表——以前就是这么漏的：只列了七个
-  名字，于是改坏 `specific_energy`、`material`、`valid`、逐字段掩码或前沿资格数组
-  照样判就绪。相应的回归测试**只断言 `ready` 不够**，每条都要 `structural_problems`
-  非空：有几项以前是被别的原因顺带拦住的，"碰巧拦住"不是覆盖率。
+```bash
+python -m pytest -q
+```
 
-## 精修、终态与检查点（2026-10-11 起）
+干净环境安装与运行：
 
-* **精修一律是诊断性的，而且这个身份随模型来源持久化**：精修改参数不改 `step`，
-  目标函数中途换过一次，所以 `run()` 只要看到来源里带精修记录就报 `diagnostic`。
-  终态在**写任何产物之前**算出来，返回值、`run_manifest.json`、`train_result.json`
-  与 `last.pt` 引用同一个结论。"判据通过"（`final_stage_verdict_passed`）与
-  "正式接受"（`formally_accepted`）分开记。
-* **精修是事务性的**：动参数**之前**（且在 `sampler.batch()` **之前**——取批次会推进
-  采样器 RNG）取全状态快照；闭包内反传前查损失、更新前查梯度；失败时完整回滚，
-  并把失败写在**独立**的 `refinement_failures.json` 里，**不**碰可恢复检查点。
-* **收尾要不要复查看"参数变没变"，不看"步数涨没涨"**。精修不改步数，用步数判断会把
-  精修前的结论留在报告里。检查记录带 `scope`（full/windowed）与 `check_set_identity`，
-  两者都不能靠"步数与指纹相同"互相顶替。
-* 检查点版本 **5**。写：最后一次实测损失与步号、精修历史、日程签名、固定检查集、
-  数据身份（按内容哈希，**不含目录字符串**，搬迁输出目录不该失效）。读：**无迁移路径**，
-  旧版本明确拒绝；`rng` 缺失或残缺、日程/检查集/数据身份不符，一律拒绝。
-* 回滚**不得制造历史事件**（`restore_time_window(..., history=)`）；回滚本身失败时把
-  实例标成不可用，后续 `run`/`refine`/`save`/`load` 一律拒绝。
-* `resume_refinement()` **明确拒绝**："用精修后的权重推理"与"从它开始新的优化阶段"
-  支持，"继续中断的 L-BFGS"不支持——线搜索状态不进检查点，而且它不能在半途停下。
+```bash
+python -m venv .venv
+.venv/Scripts/python -m pip install .          # 或 pip install -r requirements.txt
+.venv/Scripts/python -c "import spherical_blast_pinn, sys; print(spherical_blast_pinn.__file__)"
+.venv/Scripts/python -m spherical_blast_pinn.cli.startup --output-dir outputs/planar_startup
+```
 
-## 对照（compare）
-
-* 预测文件的**必需键**在 `REQUIRED_PREDICTION_KEYS` 里，缺一个就报出文件名与字段名；
-  **不得**用仓库里的常数顶替（`ambient_pressure` 曾经就是这么被顶替的）。
-  入口还核对轴序、帧数、`physical_time == pinn_time + start_time`，以及环境压必须是
-  **101320 Pa** 而不是标准大气压 101325。
-* 场量与测点压力走**同一个核心** `sample_field()`。零权重的支撑点不参与（`nan * 0`
-  是 `nan`）；参与插值的支撑点必须同区域，跨接触面/激波**不插值**；域外与缺前沿
-  各有原因码。每个候选点恰好落进一个互斥类别。
-* 顶层 `available` 与逐字段可用性必须由**同一个事实**决定：一个可比点都没有时，
-  顶层也说"不可评价"，不能只报"某些字段空缺"。
-* `gauge_metrics` 的积分节点必须严格递增：首个负压点**不**留在正相节点里，过零点
-  插值后接在**末端**而不是追加到数组尾部。**相位起点与相位终点是两件事**：阈值取 0
-  时上穿点就在零点上，找终点必须先定位**严格正**的区间再往下找下穿。零阈值是合法
-  输入，不能靠禁止它来绕开这个区别。
-* **``positive_phase_complete`` = 整段正相都被记录覆盖**（左端 **且** 右端）。
-  两个端点各自的事实分别记在 ``arrival_observed`` 与 ``phase_end_observed``，
-  分类在 ``positive_phase_coverage``（``full`` / ``start_missing`` /
-  ``end_truncated`` / ``start_missing_and_end_truncated`` / ``no_positive_phase``）。
-  * 左端是否观测到看**首点相对阈值**的位置，不看 ``arrival > times[0]``：
-    阈值为 0 时首点恰在零点上，那一刻**是**观测到的起点。
-  * 任意一侧缺任意一端，完整正相时长与冲量**不判分**，原因写进 ``notes``；
-    已覆盖区间上的积分值保留，并由 ``positive_impulse_is_partial`` 标明是部分积分。
-    不可用误差不填 0。
-* 前沿插值（`_fronts_at`）与场量插值**同一条规则**：只有权重非零的帧才需要有效。
-  精确命中某一帧时，邻帧缺测不得把一次可用的查询判成不可用。
-* `compare_gauge` 按**可用性标志**决定判分：到达时间误差要求两边 `arrival_observed`；
-  正相时长与冲量要求两边 `positive_phase_complete`。不满足时把原因写进 `notes`，
-  已覆盖区间上的部分积分仍然留在各自指标里，**不**用 0 顶替缺失。
-
-## 精修的事务边界（2026-10-11 起）
-
-* **整条精修流程是一个事务**：采样 → 优化 → 最终求值 → 指纹 → **历史提交** →
-  **复检与写盘**。``try`` 只罩住前半段时，"收尾 `verify()` 抛错"会留下"参数改了、
-  历史多了一条、没有诊断文件"的半改状态。
-* 快照要在 `sampler.batch()` **之前**取（取批次会推进采样器 RNG）；回滚同时还原
-  **内存**与**盘上**的检查点字节（`_capture_artifacts`/`_restore_artifacts`）；
-  当时不存在的检查点要**删掉**，不能把一次从未成功的状态发布出去。
-* 回滚本身失败 → 标记 `_unusable`，保留原始异常与回滚异常，后续 `run`/`refine`/
-  `save`/`load` 一律拒绝。
-* **候选与落盘分开**：``verify()`` 只登记最佳候选（``_best_dirty``），``run()`` 在
-  算完终态之后才写 ``best.pt``。保留旧最佳时**不重写**它——它自己的来源属于选出
-  它的那次运行。
-* **候选必须连带它入选那一刻的整个状态一起快照**（``_best_candidate``）：
-  模型张量**克隆**、优化器/平衡器/历史深拷贝。只记一个分数是不够的——发布时
-  通用保存路径读的是**当前**模型，中途选出的最佳会被写成末步参数，而
-  ``best_check.parameter_fingerprint`` 与文件里的实际参数对不上。
-  保存拆成三层：``_checkpoint_state()`` 取状态 / ``_build_payload()`` 拼载荷 /
-  ``_write_payload()`` 原子写出。未发布的候选随检查点一起存
-  （``pending_best_candidate`` + ``best_dirty``），中断后不会只剩一个分数。
-* **``best_dirty=True`` 必须对应一份完整、自证一致的候选**，加载端**不一致就
-  拒绝**。以前是"没有候选就把标志悄悄清成 ``False``"：一份自相矛盾的检查点会
-  **加载成功**，最佳记录的分数还在、参数却没有，再次运行也不再产出 ``best.pt``。
-  这是输入自相矛盾，不是可以自动纠正的缺省值。具体查四件事（`checkpoint.py`）：
-
-  1. **候选要走与顶层载荷同一份状态校验**（`validate_state_snapshot`）。以前顶层
-     有一套逐条检查、候选只查了"是不是 Mapping、步号对不对"，于是候选的模型结构、
-     优化器、阶段、采样器与全局 RNG、平衡器、历史全都没人验——实测把候选 `model`
-     清空、删候选 `optimizer`、改一个候选参数，三种都能**加载成功**。
-  2. **指纹从候选的实际参数重算**，等于记录里的值（算法只有一份：
-     `parameter_fingerprint_of`，`Trainer.parameter_fingerprint()` 也调它）。
-     只查"记录里那个指纹是非空字符串"时，"改参数、指纹不动"无人能发现——而
-     `best.pt` 的 `candidate.parameter_fingerprint` 正是靠它声称"这一份就是被选中
-     的那组参数"。**不把记录改成重算值来"修复"**：那会让坏文件看起来是好的。
-  3. **步号三处各自合法、且表示同一步**：候选的 `step`、候选内部
-     `best_check.step`、顶层 `best_check.step`。三处**分别**走
-     `require_step_value()`——缺失、`None`、字符串、浮点、布尔（Python 与 NumPy）
-     与非负范围**都明确拒绝**，而且**不先 `int()`**：`int("1")`、`int(1.0)`、
-     `int(True)` 全都得到 `1`，正好把"合法记录"与"损坏记录"的差别抹掉。以前这里
-     对非整数直接 `return`/`continue`，注释说"后续状态校验会负责"，但后续只查了
-     快照自身的 `step`——另外两处根本没人验，删掉或写成 `"broken"` 都能一路发布
-     （复核实测）。**不修补**：缺的不拿顶层步号补，不一致的不拿当前训练步号覆盖。
-     * **快照自带的 `best_check` 也要验**（`validate_state_snapshot`）：已发布的
-       `best.pt` 没有待发布候选，`require_best_candidate_consistency()` 会在第一道
-       判据就返回，文件**自身**的最佳记录必须由共享只读校验查。
-       `best_check=None`（还没产生过最佳）仍是**合法**初始状态。
-  4. **选择依据不矛盾**：候选内部的 `best_check` 与顶层最佳记录的指纹、`score`、
-     `check_set_identity` 相同。比 `score` 时 **NaN 要当作等于自己**——`score`
-     里带 NaN 是合法的（某个分量没有可测值），直接比会把正常候选判成矛盾。
-
-  **候选参数可以与顶层当前参数不同**（它本来就可能来自更早的一步），不得要求二者
-  数值相同。**必需字段**的依据是"写入端写了、恢复端读了"（`_checkpoint_state()`
-  产生、`_commit_checkpoint()` 消费）：`model`/`optimizer`/`balancing`/`rng`/
-  `sampler_rng`/`stage`/`run_origin`/`last_update_loss`(+`_step`)/`history`/
-  `checks`/`refinement`。写而不读的字段（`learning_rates`）**不在此列**。
-  **合法初始状态要保留**：空优化器状态（尚未更新）、未测损失 `nan` 都不能判成损坏。
-
-  **非模型状态也要真查，不能只查"键在不在、是不是 Mapping"。** 实测四种都能
-  **加载成功并发布成 `best.pt`**，直到**下一个**实例恢复它时才炸：
-
-  | 变异 | 何时才发现 | 真实报错 |
-  |---|---|---|
-  | 候选 `optimizer = {}` | 恢复 `best.pt` 时 | `KeyError: 'param_groups'` |
-  | 候选 `rng['torch'] = 0` | 恢复 `best.pt` 时 | `TypeError: expected a torch.ByteTensor` |
-  | 候选 `stage.window_fraction = 0.123` | 恢复 `best.pt` 时 | 窗口与步号对应的日程不符 |
-  | 候选 `state[pid].exp_avg_sq = -1` | **下一次更新之后** | 参数变 NaN，再下一次 `NonFiniteUpdate` |
-
-  最后一行是最隐蔽的一条：`-1` 是**有限**值，所以"张量有限性"那条放它过去；
-  `load` 通过、`best.pt` 写下、新实例恢复也通过——污染发生在**继续训练的第一
-  步**，那时坏文件已经在盘上了。
-
-  * **优化器结构**（`validate_optimizer_state`）：`param_groups`/`state` 必须都在
-    （`state` 为**空**是合法的初始状态，`{}` 不是）；参数组数量、参数标识与
-    当前优化器的对应关系逐组相等；已存在的逐参数状态要形状对得上参数、
-    数值有限。
-  * **优化器状态的数值语义**：`OPTIMIZER_NON_NEGATIVE_FIELDS`
-    （`exp_avg_sq`/`max_exp_avg_sq`）是**梯度的平方**的估计，必须逐元素非负——
-    Adam 要开它的平方根再除，负值开方得 NaN。`exp_avg` 是**一阶矩，允许为负**，
-    不能套同一条规则（那会把正常训练历史判成损坏）。**不许**用取绝对值、截断到
-    零、清空动量、重建状态或 `nan_to_num` 把坏记录"修"成能过。
-  * **"跑得动"与"结果是好的"是两件事**（`_probe_optimizer_step` →
-    `_require_probe_results_finite`）：探针在**隔离的**优化器上（克隆参数、
-    新建实例、深拷贝状态——`load_state_dict` 在同 dtype 下会把张量原样接过去，
-    不深拷贝就改到了候选自己的动量上）真走一步之后，还要检查**探针参数**与
-    **探针优化器的浮点状态**是否全部有限。`step()` 完全可以不抛异常、直接产出
-    NaN。实测：`exp_avg = 1e308` 配 `exp_avg_sq = 0` 两个值都有限且非负，
-    更新量放大约 `1e6` 倍直接把参数推成 `inf`，全程不抛异常。
-  * **全局随机状态**（`_validate_global_rng_state`）：`numpy`/`torch` 非空只说明
-    "写了东西"。要用**独立的临时生成器**（`RandomState()`/`Generator()`/
-    `Random()`）验证它真能被接受；**不**改全局再恢复——失败路径正是最需要全局
-    序列保持原样的时候。`python` 一项按契约可选，给了就要能用。
-  * **阶段与窗口**：一律按**这份快照自己的** `step`/`current`/`pending`/`blocked`
-    判断（见下），**不是**接收实例的步号——候选来自更早一步是合法情形，照着
-    接收实例去算会把正常候选整批判成损坏。
-  * **顶层载荷与待发布候选走同一条规则**（`_snapshot_rules()` 是上下文的唯一
-    构造点）：不得只在某一个加载入口追加特判。
-  * 校验上下文（模型结构、采样器/优化器/全局随机的验证器、`stage_windows`、
-    `window_at_step`）**全部必填**：给默认值等于"调用方忘了传就静默不查"，
-    而这一项要修的正是那种静默。
-
-* **阶段、窗口与步号的三条一致性规则**（`validate_state_snapshot`，顶层载荷与
-  候选**共用**；`load()` 里原来那份**已删除**，同一份规则不留两处）：
-  阶段名要么是 `None`、要么必须在这套日程里（`stage_windows` 的键）；
-  **未阻塞**时窗口必须等于该**快照自己的**步号所属阶段的窗口；
-  **已阻塞**时 `pending` 与 `current` 必须是同一个阶段、窗口属于该阶段，
-  且 `pending` 非空与 `blocked` 必须同时成立。两条都是**精确等值**，不是
-  "属于某个集合"——那太松，任何阶段窗口都会被接受一次。
-* **``best.pt`` 发布之前**就要查完候选（`run()` 在 `_begin_publish` 之前调同一条
-  规则）：候选一旦落盘就一直声称"这就是被选中的那组参数"，等发布完再发现坏了，
-  坏文件已经在盘上。恢复出来的候选在下游被改坏后同样会走到这里。
-* ``best.pt`` 的 ``run_status`` 是**选中它的那次运行**的状态；它的
-  ``final_stage_verdict`` 为 ``None``（判据是在整次运行自己最后那组参数上评出来
-  的，不套在中途候选身上）。``candidate`` 块给出候选的步号与指纹。
-
-## 事务边界：内存、磁盘与多文件发布（2026-10-11 起）
-
-* 一次事务要保护的**盘上**产物按 ``run()`` 的**实际调用链**列：
-  ``last.pt``、``best.pt``、``checks.json``、``run_manifest.json``。
-  只列两份检查点时，"``checks.json`` 已经发布、``run_manifest.json`` 才失败"
-  这一档只回滚了一半。``cli/train.py`` 另写的 ``train_result.json`` 不在其中：
-  它在 ``run()`` 返回之后由外层写下，责任属于外层。
-* 事务快照还要覆盖 ``_final_check_state``、终态与判据、**候选快照**与
-  ``_best_dirty``——只覆盖模型和历史，回滚之后下一次发布就会拿当前模型去补
-  ``best.pt``。
-* **内存恢复与磁盘恢复分别受保护、独立尝试**。写在一个 ``try`` 里时，内存恢复
-  一失败磁盘恢复就不执行，失败事务写出的检查点留在盘上，**另一个实例照样能
-  加载成功**。磁盘恢复逐个文件尝试，结果逐项写进失败诊断；不用一个总布尔值
-  代替事实。
-* **多文件发布不是原子的**：发布前写下 ``.publish_in_progress.json``（列出即将
-  写入的产物），成功后删除。标记在**被加载检查点旁边**找，不是在自己的输出目录
-  里找——读它的往往是新建的实例。
-* **标记的结构有明确契约**，由 ``training.checkpoint.require_publish_marker_contract``
-  一处定义并强制：必须是一个 JSON 对象，带**非空** ``artifacts`` 列表（每项是
-  合法、非空的**文件名**字符串）与**非空字符串** ``owner``。缺字段、类型不对、
-  空列表、空名字、带路径分隔符的名字一律**拒绝**，不做"缺省即无害"的解读，
-  也不许用 ``str()`` 把错误类型转成合法输入。只问"顶层是不是字典"是不够的：
-  ``{}``、``{"artifacts": []}`` 会被当成"没有未提交产物"，``{"artifacts":
-  "last.pt"}`` 会被**逐字符**遍历——三个坏标记让训练恢复与预测双双放行
-  （复核实测）。
-* **标记有归属**，事务**只能清理自己写的那个**（``owner`` 记在标记里）。
-  无条件删除是错的：一次失败的 ``refine()`` 会把上一次失败的 ``run()`` 留下的
-  标记一起删掉，而它回滚到的是那次的半套产物——目录由"拒绝加载"变成"加载成功"。
-  ``refine()`` 还要求**开始之前目录里没有未完成的发布**：它的事务语义建立在
-  "开始那一刻的盘上状态"上，若那个状态本身就是新旧混合的，留底-还原只是把不一致
-  原样恢复。恢复路径是 ``run()``（重写全部四份产物），被覆盖的那份记进
-  ``supersedes`` 并写进运行清单的 ``superseded_uncommitted_publish``。
-* **这条读取规则由两个入口共同执行**：``Trainer.load()`` 与
-  ``cli.predict.load_model_from_checkpoint()`` 都调
-  ``training.checkpoint.refuse_if_uncommitted``。只在一处检查时，"恢复被拒绝"
-  与"可以用来预测"会同时成立，而预测同样把一套混合产物当真值用。
-  标记存在却读不出来时**保守拒绝**，不能当成"没有标记"；结构不合法（见上一条）
-  同样拒绝。两边**不得各写一套判断**，也不得只加函数而漏接调用方。
-* 回滚**全部成功**时撤掉本次事务自己的标记，否则留下：目录里可能是一套新旧混合
-  的产物。标记只描述**盘上**的一致性，所以内存恢复失败不影响它。
-* 失败诊断文件写不进去时，原始异常与恢复异常都要在最终错误里看得见——
-  不能被最后一条日志写入异常盖掉。
-* **模型来源随参数走**：``_run_origin = {explicit_diagnostic, refined}`` 进检查点、
-  进 `load`（在**只读**阶段核对），``run()`` 用**合并**而不是覆盖。刻意**不**持久化
-  `_final_status`：阶段失败、预算截断这些必须在恢复之后**重新评价**。
-* **数据身份覆盖真正参与训练的东西**：四个场量、逐点 `material`、`valid`、
-  逐字段有效性、前沿资格，按 `名字 | 形状 | dtype | 字节` 混合；`None` 写显式
-  `missing`，与"空数组"分开；**路径不参与**（搬目录允许，同路径换内容拒绝）。
-  **检查点版本 8**，旧版本明确拒绝、无迁移路径。版本 7 起加载端要求候选快照与
-  发布事务字段（``pending_best_candidate`` / ``best_dirty`` / ``run_origin``）；
-  版本 8 起顶层带 ``detonation_velocity``（冻结的卡片爆速，预测入口在**新半径**上
-  重建 ``T_h = R_0/D + epsilon`` 要用它）。**字段名、版本号与读取规则只有一份
-  定义**，在 ``training/checkpoint.py``——保存端与读取端各维护一份清单时，
-  ``predict`` 要求了一个 ``_build_payload`` 从来没写过的字段，一整类方案 B 的
-  检查点被误判成旧方案文件（复核实测）。
-* **冻结爆速 ``D`` 的契约是三层**，由 ``training.checkpoint.require_detonation_velocity``
-  一处定义。保存端写（``_build_payload`` 取 ``_frozen_detonation_velocity()``），
-  恢复端与预测端读，**恢复端传 ``expected=``**：
-  ① 顶层 ``detonation_velocity`` 必须是合法的**有限正实数**——布尔、字符串、
-  列表一律拒绝，不许 ``float()`` 把 ``True`` / ``"6930"`` 悄悄变成合法输入；
-  ② 顶层值必须与 ``case_ids`` 列出的**每一个**算例的 ``scales[case_id]`` 记录一致。
-  ``SimilitudeScales.as_dict()`` **不写** ``D``，写的是 ``start_time = T_h``，所以按
-  ``D = R_0 / (T_h - epsilon(R_0))`` 反解再比；缺记录、缺键、值不可用一律拒绝，
-  **忽略缺少记录的算例**或**只取第一个算例**都是错的；
-  ③ 恢复端还要顶层值与**接收实例实际使用的**尺度一致（``scales_by_radius``，不是
-  ``cases`` 的元数据）。只查"文件内部自洽"拦不住一份自洽的检查点被另一个爆速的
-  实例恢复。
-  修前只有预测端读它、且只查①的"是不是数"，于是同一份检查点被两个入口解释成
-  两条时间轴：50 mm 上恢复端 ``T_h = 8.21500721501 µs``、预测端 ``41.5186385737 µs``
-  （复核实测：顶层改成 1234，``scales`` 记录仍是 6930 那条）。**不**为这个校验
-  升级检查点版本：``D`` 已由既有字段唯一确定，加字段反而要迁移。
-* **逐算例记录必须互相绑定**，由
-  ``training.checkpoint.require_case_scales_association`` 一处校验。同一个算例在
-  检查点里写了四遍——``case_ids``、``scales``、``data_identity``、``provenance``
-  （``case_ids``/``charge_radii`` 是平行列表，``start_times``/``valid_pinn_time_max``
-  按 ``case_id`` 取键）。要求：``case_ids`` 非空不重复；``scales`` 与 ``data_identity``
-  的键集**恰好**等于 ``case_ids``（缺记录与来源不明的多记录都拒绝）；
-  ``scales[case_id].charge_radius`` == ``data_identity[case_id].charge_radius_m``；
-  ``scales[case_id].time_scale`` == 顶层 ``time_scale``；
-  ``provenance['charge_radii']`` 按平行下标与 ``case_ids`` 对齐；
-  ``provenance['start_times'][case_id]`` == ``scales[case_id].start_time``；
-  ``valid_pinn_time_max`` 覆盖同一批算例且是有限非负数。
-  每个算例的 ``start_time`` 还要**按定义**等于 ``T_h = R_0/D + epsilon(R_0)``
-  （用顶层冻结 ``D`` 与该算例自己的半径正向算），恢复端再按 ``case_id`` 与
-  **接收实例实际使用的**半径与起始时间逐项对照（``_instance_case_scales()``）。
-  只比爆速拦不住下面这种副本：``charge_radius`` 0.05→0.10、``start_time`` 同乘 2，
-  反算出的 ``D`` 一模一样，而尺度记录已经不属于那个算例——修前共享校验、
-  ``Trainer.load()``、预测加载**全部通过**、预测 CLI 返回 0，只是默认结束时间从
-  300 µs 变成 154.108 µs、``s_max`` 从 5.59815 变成 2.79908（复核实测）。
-  ``case_ids``/``scales`` 改名而 ``data_identity``/``provenance`` 不改名同样必须拒绝。
-  **不**为这个校验升级检查点版本：四份记录本来就都在文件里。
-* 场量布局**声明**在 `metadata.json` 的 `profile_layout = {version, layout}` 里，
-  不靠形状推断。`frames_by_radius` 是逐帧二维 `(n_t, n_x)`（缺省，与既有导出
-  一致），`single_frame_1d` 是单帧的一维 `(n_x,)`。读取器里**不得**再出现
-  `np.atleast_2d` 之类的顺手提升：那会让布局变成读取器的猜测，而且校验拿到的
-  是读取器造出来的形状，"一维场配多帧"这种格式错误会被报成一个文件里不存在的
-  形状。对象上永远只有规范形状 `(n_t, n_x)`；读的是哪一档记在
-  `source["profile_layout"]`，其中 `declared` 区分"文件里写过"与"读取器推断的
-  缺省"。
+测试通过不等于完整爆炸预测通过。哪些项"已执行"、哪些"仅实现"、哪些"参考数据
+不足以判断"，必须逐项说明，不能只报一个通过率。

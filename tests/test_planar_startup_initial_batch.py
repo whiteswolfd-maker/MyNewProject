@@ -1,5 +1,6 @@
 """Contract tests for PlanarStartupField -> SampleBatch initial conditions."""
 
+import dataclasses
 import math
 
 import numpy as np
@@ -13,7 +14,11 @@ from spherical_blast_pinn.models.coupled_model import CoupledModel
 from spherical_blast_pinn.models.front_net import FrontNet
 from spherical_blast_pinn.models.product_net import ProductNet
 from spherical_blast_pinn.physics import material as mat
-from spherical_blast_pinn.physics.similitude import SimilitudeScales
+from spherical_blast_pinn.physics.similitude import (
+    TIME_CONVENTION_PLANAR_STARTUP,
+    PlanarStartupScales,
+    SimilitudeScales,
+)
 from spherical_blast_pinn.physics.two_medium_initial import (
     AIR,
     PRODUCT,
@@ -50,11 +55,8 @@ def field():
 
 
 def _scales(field):
-    return SimilitudeScales.for_radius(
-        field.charge_radius,
-        time_scale=2.0,
-        detonation_velocity=mat.DETONATION_VELOCITY_REFERENCE,
-    )
+    """The batch carries the startup field's own time origin, not scheme B."""
+    return PlanarStartupScales.for_startup_field(field, time_scale=2.0)
 
 
 def _sample_points(field):
@@ -266,15 +268,23 @@ def test_both_groups_use_the_same_epsilon_and_zero_network_time(field):
     assert batch.diagnostics["initial_tau_s"] == 0.0
     assert batch.diagnostics["initial_tau_product_s"] == 0.0
     assert batch.diagnostics["initial_tau_air_s"] == 0.0
-    assert batch.diagnostics["initial_network_time_s"] == 0.0
-    assert batch.diagnostics["initial_network_time_product_s"] == 0.0
-    assert batch.diagnostics["initial_network_time_air_s"] == 0.0
-    # The old global time origin is left untouched and is recorded rather than
-    # silently substituted for the startup's physical time.
-    assert batch.diagnostics["similitude_start_time_s"] == pytest.approx(
-        batch.scales.start_time()
+    assert batch.diagnostics["initial_network_time"] == 0.0
+    assert batch.diagnostics["initial_network_time_product"] == 0.0
+    assert batch.diagnostics["initial_network_time_air"] == 0.0
+    assert batch.diagnostics["initial_network_time_is_dimensionless"] is True
+    # The batch carries the planar-startup convention, so the scales' own
+    # conversion of s=0 is the field's epsilon -- the scheme-B T_h is not here.
+    assert batch.diagnostics["time_convention"] == TIME_CONVENTION_PLANAR_STARTUP
+    assert batch.scales.time_convention == TIME_CONVENTION_PLANAR_STARTUP
+    assert batch.scales.startup_epsilon == field.epsilon
+    assert batch.diagnostics["similitude_startup_epsilon_s"] == field.epsilon
+    assert batch.diagnostics["similitude_start_time_s"] == field.epsilon
+    assert batch.scales.start_time() == field.epsilon
+    assert float(batch.scales.physical_time_from_network(0.0)) == pytest.approx(
+        field.epsilon, rel=1.0e-15, abs=0.0
     )
-    assert "does not redefine" in batch.diagnostics["similitude_time_origin_note"]
+    assert batch.detonation_velocity is None
+    assert batch.scales.detonation_velocity is None
 
     model = CoupledModel(
         product=ProductNet(scales=batch.scales, width=8, depth=1, seed=0),
@@ -455,13 +465,21 @@ def test_bad_dimensions_ranges_and_counts_fail_explicitly(field, kwargs, message
 def test_wrong_field_type_or_wrong_radius_scales_fail_explicitly(field):
     with pytest.raises(PlanarStartupBatchError, match="PlanarStartupField"):
         build_planar_startup_initial_batch(object(), scales=_scales(field))
-    wrong_scales = SimilitudeScales.for_radius(
+    scheme_b = SimilitudeScales.for_radius(
         0.08,
         time_scale=2.0,
         detonation_velocity=mat.DETONATION_VELOCITY_REFERENCE,
     )
+    with pytest.raises(PlanarStartupBatchError, match="planar-startup time convention"):
+        build_planar_startup_initial_batch(field, scales=scheme_b)
+    wrong_radius = dataclasses.replace(_scales(field), charge_radius=0.08)
     with pytest.raises(PlanarStartupBatchError, match="R_0"):
-        build_planar_startup_initial_batch(field, scales=wrong_scales)
+        build_planar_startup_initial_batch(field, scales=wrong_radius)
+    wrong_epsilon = dataclasses.replace(
+        _scales(field), startup_epsilon=2.0 * field.epsilon
+    )
+    with pytest.raises(PlanarStartupBatchError, match="epsilon"):
+        build_planar_startup_initial_batch(field, scales=wrong_epsilon)
     with pytest.raises(PlanarStartupBatchError, match="closed interval"):
         build_planar_startup_initial_batch(
             field,

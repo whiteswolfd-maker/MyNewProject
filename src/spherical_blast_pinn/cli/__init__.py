@@ -4,11 +4,9 @@ from __future__ import annotations
 COMMANDS = (
     "audit_dyna",
     "audit_data",
-    "reference_field",
     "startup",
-    "validate_startup",
     "validate_startup_planar",
-    "diagnose_startup",
+    "check_startup_chain",
     "train",
     "predict",
     "compare",

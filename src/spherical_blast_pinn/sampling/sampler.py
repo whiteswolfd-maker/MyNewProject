@@ -1,28 +1,34 @@
-"""按提示词 §12 采样。
+"""按提示词 §12 采样：新启动场上的物理点批次。
 
-三条规则，逐条对应规范里的条目。
+采样器的输入只有三样：一个通过校验的 :class:`PlanarStartupField`、它的
+:class:`PlanarStartupScales`，以及从网络启动时刻算起的持续时间 ``tau_end``
+（秒）。**没有参考场参数，也没有数据监督。**
 
-**时间**：半数样本覆盖该半径的整个有效时间区间 ``[0, T_last_valid]``，
-半数在 ``log(1 + hat_t / hat_t_eps)`` 上均匀采样，其中
+**时间**：半数样本覆盖 ``[0, tau_end]``，半数在
+``log(1 + hat_t / hat_t_eps)`` 上均匀采样，其中
 
-.. math::  \\hat t_\\epsilon = \\frac{U_* \\epsilon(R_0)}{R_0}
+.. math::  \\hat t_\\epsilon = \\frac{U_* \\epsilon_{\\rm field}}{R_0}
 
-是一个**与半径无关的固定值**——把 ``epsilon(R_0) = k epsilon_ref`` 代进去就
-看到 ``k`` 约掉了。早期时间对数分布把采样密度放在激波刚形成、梯度最陡的
-那一段，而不是均匀地浪费在整个区间上。
+``epsilon_field`` 是启动场自己的物理时刻，经**新尺度** ``hat_time`` 换算；
+它不是时间原点，不再与 ``T_h`` 相加。``tau_end`` 是相对网络启动时刻的时长，
+所以 ``pinn_time_max`` 与批次的 ``s`` 上限都从 ``tau = 0`` 起算。
 
 **空间**：产物与空气各 70% 均匀覆盖移动坐标内部，15% 取靠近左端的 10% 区间，
-15% 取靠近右端的 10% 区间。PDE 点只在**开区间**内采样。
+15% 取靠近右端的 10% 区间。PDE 点只在**开区间**内采样，物理半径
+``r = R_c(s) xi`` 在损失里用模型自己的前沿算出来。
 
-**不依赖模型**：所有 PDE 点直接采在 ``xi ∈ (0,1)``、``eta ∈ (0,1)`` 上。
-好处是采样永远落在合法域内：一个还没训练好的前沿网络不可能把配置点采到域外，
-因而也不可能出现"空域上的残差恰好是零、读起来像方程已满足"那种假收敛。
-物理半径 ``r = R_c(s) xi`` 在损失里用模型自己的前沿算出来。
+**初始条件**：复用 :func:`build_planar_startup_initial_batch`，不复制解析采样
+和单侧边界规则。产物/空气的初值半径由本采样器的分层规则给出，锚点（球心、
+接触面两侧、波后）由适配器补齐。
+
+**数据监督**：尚未迁移到 ``tau = t_phys - epsilon``。传入 ``case`` 会在构造时
+明确报未支持，而不是继续沿用 ``case.pinn_times``（旧 ``T_h`` 时间轴）。不构造
+假算例、不伪造观测：无数据时数据与几何监督批次为空，其它物理点照常生成。
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -33,25 +39,17 @@ except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
 from ..data.extracted_case import ExtractedCase
-from ..physics.precursor import ReferenceField
-from ..physics.similitude import SimilitudeScales
+from ..physics.similitude import PlanarStartupScales
+from ..physics.two_medium_startup_planar import PlanarStartupField
 from .batch import SampleBatch
+from .planar_startup_initial import build_planar_startup_initial_batch
 
 PRODUCT = "product"
 AIR = "air"
 
-#: 数据监督的字段：``(采样批次里的键, 算例上的逻辑字段名)``。
-#: 逻辑字段名同时也用作 ``field_validity`` 的键，所以这一张表把"取数"、
-#: "逐字段有效性"和"损失里的标签名"三处绑在同一个来源上。
-_DATA_FIELDS: tuple[tuple[str, str], ...] = (
-    ("rho", "density"),
-    ("u", "velocity"),
-    ("e", "specific_energy"),
-)
-
 
 class SamplingError(ValueError):
-    """采样配置或数据不合法。"""
+    """采样配置、启动场或输入不合法。"""
 
 
 @dataclass
@@ -64,9 +62,6 @@ class SamplingConfig:
     n_ic_air: int = 256
     n_contact: int = 128
     n_shock: int = 128
-    n_data_product: int = 256
-    n_data_air: int = 256
-    n_data_front: int = 64
 
     #: 空间分层的比例：内侧 10% 区间、外侧 10% 区间各占多少。
     near_fraction: float = 0.15
@@ -78,7 +73,7 @@ class SamplingConfig:
     def validate(self) -> None:
         for name in (
             "n_pde_product", "n_pde_air", "n_ic_product", "n_ic_air",
-            "n_contact", "n_shock", "n_data_product", "n_data_air", "n_data_front",
+            "n_contact", "n_shock",
         ):
             if int(getattr(self, name)) < 0:
                 raise SamplingError(f"{name} must be non-negative")
@@ -99,121 +94,233 @@ class SamplingConfig:
         return settings
 
 
+def _positive_finite(name: str, value: Any) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 0.0:
+        raise SamplingError(f"{name} must be finite and positive, got {value!r}")
+    return number
+
+
+def _close(left: float, right: float) -> bool:
+    return abs(float(left) - float(right)) <= 1.0e-12 * max(
+        abs(float(left)), abs(float(right)), 1.0e-30
+    )
+
+
+def validate_time_window_record(state: Any) -> dict[str, Any]:
+    """校验一份窗口记录**内部自洽**，返回归一化后的字段。
+
+    只查记录本身：分数在 ``(0, 1]``、窗口上端等于分数乘完整时段、历史非空且
+    只增不减、最后一项等于当前分数、"未提交"时仍是完整时段。它**不**知道
+    ``tau_end`` 是多少——那是采样器的属性，由 :meth:`RadiusSampler.validate_window_state`
+    再核对。检查点的静态配置与动态窗口都用这一份定义。
+    """
+    if not isinstance(state, Mapping):
+        raise SamplingError(
+            f"the time window state must be a mapping, got {type(state).__name__}"
+        )
+    for key in ("fraction", "pinn_time_max", "full_pinn_time_max", "history", "committed"):
+        if key not in state:
+            raise SamplingError(f"the time window state has no {key!r}")
+
+    def number(key: str) -> float:
+        value = state[key]
+        if isinstance(value, (bool, np.bool_)):
+            raise SamplingError(f"time window {key!r} is {value!r}, not a number")
+        try:
+            result = float(value)
+        except (TypeError, ValueError) as exc:
+            raise SamplingError(
+                f"time window {key!r} is {value!r}, not a number"
+            ) from exc
+        if not math.isfinite(result):
+            raise SamplingError(f"time window {key!r} is not finite ({value!r})")
+        return result
+
+    fraction = number("fraction")
+    if not (0.0 < fraction <= 1.0):
+        raise SamplingError(
+            f"time window fraction must lie in (0, 1], got {fraction!r}"
+        )
+    full = number("full_pinn_time_max")
+    if full <= 0.0:
+        raise SamplingError(f"the full time window must be positive, got {full!r}")
+    pinn_time_max = number("pinn_time_max")
+    if not _close(pinn_time_max, fraction * full):
+        raise SamplingError(
+            f"the saved window top is {pinn_time_max!r} s, but fraction {fraction!r} "
+            f"of {full!r} s is {fraction * full!r} s"
+        )
+
+    committed = state["committed"]
+    if not isinstance(committed, (bool, np.bool_)):
+        raise SamplingError(
+            f"time window 'committed' is {committed!r}, not a boolean"
+        )
+    history = state["history"]
+    if isinstance(history, (str, bytes)) or not isinstance(history, (list, tuple)):
+        raise SamplingError(
+            f"the time window history is {type(history).__name__}, not a list"
+        )
+    if not history:
+        raise SamplingError("the time window history is empty")
+    values: list[float] = []
+    for index, entry in enumerate(history):
+        if isinstance(entry, (bool, np.bool_)):
+            raise SamplingError(f"time window history[{index}] is {entry!r}, not a number")
+        try:
+            value = float(entry)
+        except (TypeError, ValueError) as exc:
+            raise SamplingError(
+                f"time window history[{index}] is {entry!r}, not a number"
+            ) from exc
+        if not math.isfinite(value) or not (0.0 < value <= 1.0):
+            raise SamplingError(
+                f"time window history[{index}] is {entry!r}, outside (0, 1]"
+            )
+        values.append(value)
+    # 首项是 `[1.0]` 的占位（"尚未设定"），第一次 ``set_time_window`` 允许把它
+    # 改成阶段 1 的较小值；**从第二项起**只许扩大。
+    if any(later < earlier - 1.0e-12 for earlier, later in zip(values[1:], values[2:])):
+        raise SamplingError(
+            f"the time window history {values!r} shrinks after it was committed; §14 "
+            "requires the window to expand while keeping early samples"
+        )
+    if not _close(values[-1], fraction):
+        raise SamplingError(
+            f"the last window history entry is {values[-1]!r}, but the current fraction "
+            f"is {fraction!r}"
+        )
+    if not bool(committed) and (
+        len(values) != 1 or not _close(values[0], 1.0) or not _close(fraction, 1.0)
+    ):
+        raise SamplingError(
+            "an uncommitted time window must still be the full period (fraction 1.0, "
+            f"history [1.0]), got fraction {fraction!r} and history {values!r}"
+        )
+    return {
+        "fraction": fraction,
+        "pinn_time_max": pinn_time_max,
+        "full_pinn_time_max": full,
+        "history": values,
+        "committed": bool(committed),
+    }
+
+
 class RadiusSampler:
-    """一个半径的采样器。"""
+    """一个半径的物理点采样器（新启动场，无数据监督）。
+
+    参数
+    ----
+    field:
+        通过一致性校验的 :class:`PlanarStartupField`。
+    scales:
+        与 ``field`` 同半径、同 ``epsilon`` 的 :class:`PlanarStartupScales`。
+    tau_end:
+        从网络启动时刻（``s = 0``，``t_phys = epsilon_field``）算起的持续时间，
+        秒。必须是有限正数；**不**从任何数据帧隐式推导。
+    case:
+        只有 ``None`` 受支持。真实数据的时间轴还没有迁移到
+        ``tau = t_phys - epsilon``，传入算例会明确报未支持。
+    """
 
     def __init__(
         self,
         *,
-        case: ExtractedCase,
-        scales: SimilitudeScales,
-        reference: ReferenceField | "_ScaledReference",
+        field: PlanarStartupField,
+        scales: PlanarStartupScales,
+        tau_end: float,
+        case: ExtractedCase | None = None,
+        case_id: str | None = None,
         config: SamplingConfig | None = None,
         seed: int = 0,
         dtype=None,
         device=None,
         r_min_fraction: float = 1.0e-2,
-        use_development_frames: bool = False,
-        dev_holdout_fraction: float = 0.1,
-        split_seed: int = 0,
     ) -> None:
         if torch is None:  # pragma: no cover
             raise RuntimeError("PyTorch is required")
+        if not isinstance(field, PlanarStartupField):
+            raise SamplingError(
+                f"field must be a PlanarStartupField, got {type(field).__name__}"
+            )
+        if not isinstance(scales, PlanarStartupScales):
+            raise SamplingError(
+                "scales must be PlanarStartupScales (time origin = the field's own "
+                f"epsilon), got {type(scales).__name__}"
+            )
+        if field.checks.get("passed") is not True:
+            raise SamplingError(
+                "the startup field has no passed consistency report; refusing to sample it"
+            )
+        if case is not None:
+            raise SamplingError(
+                "real-data supervision is not supported yet: the data time axis is still "
+                "t_phys, not tau = t_phys - epsilon, so case.pinn_times cannot be reused. "
+                "Pass case=None for the physics-only batch; re-extraction onto the new "
+                "origin is a later task."
+            )
+
+        self.field = field
+        self.scales = scales
         self.config = config or SamplingConfig()
         self.config.validate()
-        self.case = case
-        self.scales = scales
-        self.reference = reference
+        if self.config.n_ic_product < 1 or self.config.n_ic_air < 1:
+            raise SamplingError(
+                "n_ic_product and n_ic_air must both be >= 1: the initial condition is "
+                "taken from the startup field and is always part of the batch"
+            )
+        self.case_id = self._case_label(case_id)
+        self.tau_end = _positive_finite("tau_end", tau_end)
         self.dtype = dtype or torch.float64
         self.device = device
         self.seed = int(seed)
         self.rng = np.random.default_rng(int(seed))
-        self.r_min = float(r_min_fraction) * float(scales.charge_radius)
-        self.use_development_frames = bool(use_development_frames)
-        #: 数据监督用的是哪一张有效性掩码。逐字段记录缺失时退回联合掩码，这件事
-        #: 必须能被读出来——"退化"和"等价"在报表上不能长得一样。
-        self.validity_source = "unknown (no data sampled yet)"
+        fraction = float(r_min_fraction)
+        if not math.isfinite(fraction) or not (0.0 < fraction < 1.0):
+            raise SamplingError(
+                f"r_min_fraction must lie in (0, 1), got {r_min_fraction!r}"
+            )
+        self.r_min_fraction = fraction
+        self.r_min = fraction * float(scales.charge_radius)
 
-        if abs(float(scales.charge_radius) - float(case.charge_radius)) > 1.0e-12:
+        if abs(float(scales.charge_radius) - float(field.charge_radius)) > 1.0e-12 * max(
+            abs(float(field.charge_radius)), 1.0
+        ):
             raise SamplingError(
-                f"case {case.case_id!r} has R_0 = {case.charge_radius}, but the scales "
-                f"were built for R_0 = {scales.charge_radius}"
+                f"the scales belong to R_0 = {scales.charge_radius!r} m, but the startup "
+                f"field has R_0 = {field.charge_radius!r} m"
+            )
+        if abs(float(scales.startup_epsilon) - float(field.epsilon)) > 1.0e-12 * max(
+            abs(float(field.epsilon)), 1.0e-30
+        ):
+            raise SamplingError(
+                f"the scales start at epsilon = {scales.startup_epsilon!r} s, but the "
+                f"startup field is at epsilon = {field.epsilon!r} s"
             )
 
-        usable = case.supervisable_frames()
-        if not np.any(usable):
-            raise SamplingError(
-                f"case {case.case_id!r} has no supervisable frame; it cannot supervise "
-                "a model"
-            )
-        # 数据划分只影响**数据监督**抽哪些帧：时间范围仍然由全部可监督帧给出
-        # （提示词要求每个半径取自己的最后有效帧作为终止时间，那与开发集划分
-        # 是两件事）。
-        self.all_supervisable_frames = np.flatnonzero(usable)
-        train_frames, dev_frames = case.frame_split(
-            holdout_fraction=dev_holdout_fraction, seed=split_seed
-        )
-        chosen = dev_frames if self.use_development_frames else train_frames
-        if chosen.size == 0:
-            raise SamplingError(
-                f"case {case.case_id!r} has no {'development' if self.use_development_frames else 'training'} "
-                "frames after the data split; the data/development partition removed "
-                "everything usable"
-            )
-        self.usable_frames = chosen
-        self.development_frames = dev_frames
-        # **完整**目标时段：本半径最后一个有效帧。它在构造时冻结，是这台采样器
-        # 能覆盖的最大范围，也是阶段推进的上限。
-        self.full_pinn_time_max = float(case.pinn_times[usable].max())
+        # 阶段窗口（§14.2）：区间恒为 ``[0, W]``，扩大只把右端往外推。
+        # ``window_fraction`` 的初值是完整时段，但**尚未提交**；第一次
+        # ``set_time_window`` 是"设定"，此后的每一次才是"推进"，只许扩大。
+        self.full_pinn_time_max = self.tau_end
         self.pinn_time_min = 0.0
-        # 当前**阶段窗口**（§14.2）。区间恒为 ``[0, window_pinn_time_max]``：
-        # 扩大窗口只把右端往外推，**不动左端**，所以早期采样点永远留在池子里
-        # ——这正是"保留早期采样"的可执行含义。左端若也随之移动，就等于把早期
-        # 区间丢掉了，而表面上"时间范围在扩大"看不出问题。
-        # ``window_fraction`` 的初值是完整时段，但**尚未提交**：采样器刚建好时
-        # 不属于任何阶段。第一次 :meth:`set_time_window` 是"设定"，可以往任一
-        # 方向；此后的每一次才是"推进"，只许扩大。若不区分，训练一开始把窗口设成
-        # 阶段 1 的 25 % 会被当成"从 100 % 收窄"而拒绝。
         self.window_fraction = 1.0
-        self.window_pinn_time_max = self.full_pinn_time_max
+        self.window_pinn_time_max = self.tau_end
         self._window_committed = False
         self._window_history: list[float] = [1.0]
-        #: 最近一次采样里落在窗口内的可监督帧数（诊断用）。
-        self._window_frame_count = int(usable.size)
 
-        # ``hat t_epsilon`` 与半径无关（见模块文档）。
-        #
-        # 这里要的是**交接延迟 epsilon** 的无量纲形式，所以必须调 ``start_delay()``。
-        # 方案 A 时代没有 ``start_delay``，``start_time()`` 返回的就是 epsilon；
-        # 改成方案 B 之后 ``start_time()`` 返回 ``T_h = T_b + epsilon``，在 50 mm 上
-        # 是 epsilon 的 8.215 倍。两者都是正数、都是秒，写错了不会报错，只会把
-        # 早期时间的对数分层刻度整体挪走。
-        self.hat_time_epsilon = (
-            scales.reference_velocity * scales.start_delay() / scales.charge_radius
-        )
+        # 早期对数分层用的特征时间：启动场自己的 epsilon。``hat_time`` 只做
+        # ``U_* tau / R_0``，不加任何时间原点，所以这里不会重复平移。
+        self.hat_time_epsilon = float(self.scales.hat_time(float(field.epsilon)))
         if not math.isfinite(self.hat_time_epsilon) or self.hat_time_epsilon <= 0.0:
-            raise SamplingError("hat_t_epsilon must be positive")
+            raise SamplingError("hat_t_epsilon must be finite and positive")
 
-    # -- 逐字段有效性（§11.1）----------------------------------------------
-    def _field_valid(self, case, frame: int, logical: str):
-        """某个字段在第 ``frame`` 帧上可用的位置。
-
-        有逐字段记录时用它；没有时退回联合掩码，并把这件事记在
-        ``self.validity_source`` 里——退回是**退化**，不是等价。
-        """
-        validity = getattr(case, "field_validity", None)
-        if validity is None:
-            self.validity_source = "joint `valid` mask (per-field validity not recorded)"
-            return np.asarray(case.valid[frame], dtype=bool)
-        if logical not in validity:
-            # 加载器要么给全四个字段、要么给 None；只给一半的映射说明它是别处
-            # 拼出来的，此时退回联合掩码会让缺失的那一半静默变成"都有效"。
-            raise SamplingError(
-                f"case {case.case_id!r} carries per-field validity without {logical!r}; "
-                f"it has {sorted(validity)}. A partial mapping is not a usable record"
-            )
-        self.validity_source = "per-field validity (field_validity)"
-        return np.asarray(validity[logical][frame], dtype=bool)
+    def _case_label(self, case_id: str | None) -> str:
+        if case_id is None:
+            return f"planar_startup:{self.field.cache_key()[:16]}"
+        if not isinstance(case_id, str) or not case_id:
+            raise SamplingError("case_id must be a non-empty string")
+        return case_id
 
     # -- 随机状态 ---------------------------------------------------------
     def rng_state(self) -> dict[str, Any]:
@@ -227,48 +334,41 @@ class RadiusSampler:
         return {"seed": self.seed, "bit_generator": self.rng.bit_generator.state}
 
     def validate_rng_state(self, state: Any) -> None:
-        """检查一份采样器随机状态**结构完整**，不修改任何东西。
-
-        以前 ``set_rng_state`` 是"没有就返回"：空字典、缺 ``bit_generator``、
-        类型不对——全都静默跳过。于是恢复出来的采样序列是**另一条轨迹**，而"恢复
-        到第 N 步"与"连跑 N 步"的差别在损失曲线上完全看不出来。
-        """
+        """检查一份采样器随机状态**结构完整**，不修改任何东西。"""
         if not isinstance(state, Mapping):
             raise SamplingError(
-                f"case {self.case.case_id!r}: sampler RNG state must be a mapping, got "
+                f"case {self.case_id!r}: sampler RNG state must be a mapping, got "
                 f"{type(state).__name__}"
             )
         if "seed" not in state:
             raise SamplingError(
-                f"case {self.case.case_id!r}: sampler RNG state has no 'seed'"
+                f"case {self.case_id!r}: sampler RNG state has no 'seed'"
             )
         payload = state.get("bit_generator")
         if not isinstance(payload, Mapping):
             raise SamplingError(
-                f"case {self.case.case_id!r}: sampler RNG state has no 'bit_generator' "
+                f"case {self.case_id!r}: sampler RNG state has no 'bit_generator' "
                 f"mapping (got {type(payload).__name__})"
             )
         if "state" not in payload or "bit_generator" not in payload:
             raise SamplingError(
-                f"case {self.case.case_id!r}: the bit-generator state must carry both "
+                f"case {self.case_id!r}: the bit-generator state must carry both "
                 f"'bit_generator' and 'state'; it carries {sorted(payload)}"
             )
 
     def set_rng_state(self, state: Mapping[str, Any] | None) -> None:
         self.validate_rng_state(state)
+        # ``seed`` 是状态记录的一部分：只恢复位发生器而留下另一个种子，会让
+        # ``rng_state()`` 与保存的那份不再相等，检查点往返就核对不上。
+        self.seed = int(state["seed"])
         self.rng.bit_generator.state = state["bit_generator"]
 
     # -- 时间窗口（§14.2）--------------------------------------------------
     def set_time_window(self, fraction: float) -> dict[str, float]:
-        """把尺度化时间窗口设为完整有效时段的 ``fraction``。
+        """把尺度化时间窗口设为完整时段的 ``fraction``。
 
         **只允许扩大**。窗口区间恒为 ``[0, W]``，所以 W 增大不会丢掉任何早期
-        区间——从阶段 1 到阶段 3，早期采样点一直在池子里，这正是 §14 说的
-        "保留早期采样"。
-
-        收窄在这里被拒绝，而不是"照做但记一笔"：收窄会让已经用过的时段重新退出
-        采样，早期样本被丢掉，而所有报表里只会看到一个更小的百分比，看起来一切
-        正常。
+        区间——从阶段 1 到阶段 3，早期采样点一直在池子里。
         """
         value = float(fraction)
         if not math.isfinite(value) or not (0.0 < value <= 1.0):
@@ -286,18 +386,6 @@ class RadiusSampler:
         return self.window_state()
 
     @property
-    def window_frames(self) -> np.ndarray:
-        """当前窗口内的可监督帧号。
-
-        窗口只扩大不缩小、且区间恒为 ``[0, W]``，所以这个集合随阶段**只增不减**
-        ——这正是"保留早期采样"可以逐帧核对的形式。
-        """
-        usable = self.usable_frames
-        return usable[
-            self.case.pinn_times[usable] <= self.window_pinn_time_max + 1.0e-12
-        ]
-
-    @property
     def window_history(self) -> list[float]:
         """窗口依次取过的值。回滚要连它一起还原（见 :meth:`restore_time_window`）。"""
         return list(self._window_history)
@@ -308,14 +396,8 @@ class RadiusSampler:
         """**无条件**把窗口设成 ``fraction``，用于回滚。
 
         与 :meth:`set_time_window` 的区别是它**允许收窄**——这正是回滚需要的：
-        一次失败的恢复要把窗口还原成加载前的值，而那个值可能比现在的小。所以它
-        只给回滚用，调用点必须能说清楚"这是在撤销一次未完成的修改"。
-
-        ``history`` 给出时连窗口历史一起还原。**回滚不得制造历史事件**：恢复流程
-        先按检查点里的值调一次 :meth:`set_time_window`（它会往历史里追一条），
-        随后某个后续步骤失败、再回滚——只还原窗口值而不还原历史，会在
-        ``[1.0, 0.25]`` 后面留下一个第三项，而那次变化从来没有真正生效过。
-        历史是"窗口实际取过哪些值"的记录，不是"曾经尝试过哪些值"。
+        一次失败的恢复要把窗口还原成加载前的值。``history`` 给出时连窗口历史
+        一起还原；**回滚不得制造历史事件**。
         """
         value = float(fraction)
         if not math.isfinite(value) or not (0.0 < value <= 1.0):
@@ -335,11 +417,78 @@ class RadiusSampler:
             "pinn_time_max": float(self.window_pinn_time_max),
             "full_pinn_time_max": float(self.full_pinn_time_max),
             "history": list(self._window_history),
+            # "还没设定过窗口"与"窗口恰好是 1.0"不是同一件事：前者第一次
+            # ``set_time_window`` 只是设定，后者之后只许扩大。恢复时必须保留。
+            "committed": bool(self._window_committed),
+        }
+
+    def _validated_window_record(self, state: Any) -> dict[str, Any]:
+        record = validate_time_window_record(state)
+        if not _close(record["full_pinn_time_max"], float(self.tau_end)):
+            raise SamplingError(
+                f"case {self.case_id!r}: the saved full window is "
+                f"{record['full_pinn_time_max']!r} s, but this sampler's tau_end is "
+                f"{self.tau_end!r} s; the same window fraction would cover a different "
+                "physical duration"
+            )
+        return record
+
+    def validate_window_state(self, state: Any) -> None:
+        """检查一份窗口状态**自洽**且属于这个采样器，不修改任何东西。
+
+        窗口是**动态状态**：它决定接下来采哪些时间点。只恢复 RNG 而不恢复窗口，
+        "从第 N 步继续"会换成另一段时间范围；只恢复窗口而不核对 ``tau_end``，
+        同一个分数会对应另一个物理时长。
+        """
+        self._validated_window_record(state)
+
+    def set_window_state(self, state: Mapping[str, Any]) -> None:
+        """按检查点**无条件**恢复窗口（允许相对当前值收窄）。
+
+        与 :meth:`set_time_window` 的区别：这里恢复的是"当时的状态"，不是推进
+        阶段。校验先做；校验失败时窗口保持原样。
+        """
+        record = self._validated_window_record(state)
+        self.restore_time_window(
+            record["fraction"], history=record["history"]
+        )
+        self._window_committed = record["committed"]
+
+    # -- 采样配置（检查点绑定用）------------------------------------------
+    def sampling_config_state(self) -> dict[str, Any]:
+        """**实际影响采样点**的配置，加上当前窗口。
+
+        检查点用它把"这一份是在什么采样设置下跑出来的"记录并核对。``tau_end``、
+        点数与分层比例任何一项不同，采样分布就不同；拿着另一套设置继续跑，不能
+        称为精确续训。
+        """
+        config = self.config
+        return {
+            "tau_end_s": float(self.tau_end),
+            "r_min_fraction": float(self.r_min_fraction),
+            "counts": {
+                "n_pde_product": int(config.n_pde_product),
+                "n_pde_air": int(config.n_pde_air),
+                "n_ic_product": int(config.n_ic_product),
+                "n_ic_air": int(config.n_ic_air),
+                "n_contact": int(config.n_contact),
+                "n_shock": int(config.n_shock),
+            },
+            "stratification": {
+                "near_fraction": float(config.near_fraction),
+                "near_span": float(config.near_span),
+                "xi_floor": float(config.xi_floor),
+            },
+            "window": self.window_state(),
         }
 
     # -- 时间 -------------------------------------------------------------
     def sample_network_time(self, count: int) -> np.ndarray:
-        """``count`` 个 ``s`` 值。半数均匀、半数在 ``log(1 + hat t/hat t_eps)`` 上均匀。"""
+        """``count`` 个 ``s`` 值。半数均匀、半数在 ``log(1 + hat t/hat t_eps)`` 上均匀。
+
+        ``hat_t`` 对应 ``tau``（从网络启动时刻算起的时长），上限是当前窗口；
+        ``hat_t_eps`` 来自启动场的 ``epsilon``，两者都是时长，不与时间原点相加。
+        """
         count = int(count)
         if count <= 0:
             return np.zeros(0, dtype=np.float64)
@@ -380,296 +529,57 @@ class RadiusSampler:
 
     # -- 初始条件 ---------------------------------------------------------
     def _initial_condition(self) -> dict[str, Any]:
-        """由参考场在 ``t_PINN = 0`` 取值。
-
-        ``t_PINN = tau = T - T_h``，所以这一点对应
-        ``t_phys = T_h = R_0/D + epsilon(R_0)``，**不是**方案 A 的 ``epsilon``。
-        """
-        reference = self.reference
-        start = self.scales.start_time()
-
-        # ``reference`` 已经是缩放到本半径的视图，所以这里**不再**传 ``k``：
-        # 传两次会把长度和时间各缩放一遍，而结果看起来仍然"像那么回事"。
-        contact, shock = reference.contact_and_shock_at(start)
-        contact = float(np.asarray(contact).reshape(-1)[0])
-        shock = float(np.asarray(shock).reshape(-1)[0])
-        if not (shock > contact > 0.0):
-            raise SamplingError(
-                f"the reference field gives R_c = {contact} m and R_s = {shock} m at "
-                f"t = {start} s for R_0 = {self.scales.charge_radius} m; the air layer "
-                "is not resolved"
-            )
-
-        rng = self.rng
+        """复用初值适配器，只提供本采样器的分层半径。"""
+        contact = float(self.field.contact_radius)
+        shock = float(self.field.shock_radius)
 
         def draw(lower: float, upper: float, count: int) -> np.ndarray:
             """在 ``(lower, upper)`` 上按同样的分层规则取半径。"""
-            if count <= 0 or not (upper > lower):
-                return np.zeros(0)
-            lo_fraction = self.config.xi_floor
             width = upper - lower
+            lo_fraction = self.config.xi_floor
             n_near = min(int(round(count * self.config.near_fraction)), count // 2)
             n_uniform = count - 2 * n_near
             parts = [
-                lower + width * (lo_fraction + (1.0 - lo_fraction) * rng.random(n_uniform)),
-                lower + width * lo_fraction + width * self.config.near_span * rng.random(n_near),
-                upper - width * self.config.near_span * rng.random(n_near),
+                lower + width * (lo_fraction + (1.0 - lo_fraction) * self.rng.random(n_uniform)),
+                lower + width * lo_fraction + width * self.config.near_span * self.rng.random(n_near),
+                upper - width * self.config.near_span * self.rng.random(n_near),
             ]
             return np.concatenate(parts)
 
         r_product = draw(self.r_min, contact, self.config.n_ic_product)
         r_air = draw(contact, shock, self.config.n_ic_air)
-
-        rho_p, u_p, e_p = reference.sample(r_product, np.full_like(r_product, start))
-        rho_a, u_a, e_a = reference.sample(r_air, np.full_like(r_air, start))
-
-        return {
-            "contact_ic": contact,
-            "shock_ic": shock,
-            "xi_ic_product": self._column(r_product / contact),
-            "rho_ic_product": self._column(rho_p),
-            "u_ic_product": self._column(u_p),
-            "e_ic_product": self._column(e_p),
-            "eta_ic_air": self._column((r_air - contact) / (shock - contact)),
-            "rho_ic_air": self._column(rho_a),
-            "u_ic_air": self._column(u_a),
-            "e_ic_air": self._column(e_a),
-        }
-
-    # -- 数据监督 ---------------------------------------------------------
-    def _data_points(self) -> dict[str, Any]:
-        """先按物理时间分层抽实际帧，再按材料抽点。
-
-        §14.2：数据监督也只看**当前窗口**内的帧。窗口只扩大不缩小，所以早期帧
-        一直留在池子里。窗口里一个可监督帧都没有时不是错误——阶段 1 是初值预
-        训练，本来就可以没有数据项；此时 ``data_loss`` 返回一个不带梯度的零，
-        有界梯度平衡会把它判为"本步不存在"并保持权重（§14）。
-        """
-        case = self.case
-        frames = self.usable_frames[
-            case.pinn_times[self.usable_frames] <= self.window_pinn_time_max + 1.0e-12
-        ]
-        self._window_frame_count = int(frames.size)
-        rng = self.rng
-
-        def pick_frames(count: int) -> np.ndarray:
-            """在有效帧上分层抽样，返回**真实帧号**。
-
-            把有效帧等分为 ``count`` 段、每段随机取一个**位置**，然后映射回
-            ``frames[position]``。返回位置本身是一个不会报错的错误：位置 0 与
-            帧号 0 都是合法的整数，于是它会静默地读第 0、1、2 帧——在前期帧被
-            过滤掉、或中间有无效帧的数据上，这会把无效的早期帧放进监督，同时
-            漏掉真正有效的后期帧。
-            """
-            if count <= 0 or frames.size == 0:
-                return np.zeros(0, dtype=np.int64)
-            count = min(int(count), int(frames.size))
-            edges = np.linspace(0, frames.size, count + 1).astype(int)
-            positions = []
-            for index in range(count):
-                low, high = int(edges[index]), int(edges[index + 1])
-                if high <= low:
-                    high = low + 1
-                positions.append(int(rng.integers(low, high)))
-            chosen = frames[np.asarray(positions, dtype=np.int64)]
-            if not np.all(np.isin(chosen, frames)):
-                # 结构上不可能：``frames`` 是自己的子集。留着是因为一旦有人把
-                # 这里换回"位置"，这条断言就是唯一会发现它的地方。
-                raise SamplingError("frame selection produced indices outside the usable set")
-            self._sampled_frames.extend(int(f) for f in chosen)
-            return np.asarray(chosen, dtype=np.int64)
-
-        #: 径向网格的半宽。观测的**支持区**就是被采样单元本身，不是它中心那个点。
-        half_width = 0.5 * float(np.median(np.diff(case.radius)))
-
-        def collect(medium: int, count: int) -> dict[str, Any]:
-            empty = {name: self._column(np.zeros(0)) for name in
-                     ("s", "r", "lo", "hi", "rho", "u", "e", "count")}
-            if count <= 0:
-                return empty
-            chosen = pick_frames(count)
-            per_frame = max(1, int(math.ceil(count / max(chosen.size, 1))))
-            s_values: list[float] = []
-            r_values: list[float] = []
-            lo_values: list[float] = []
-            hi_values: list[float] = []
-            count_values: list[float] = []
-            targets: dict[str, list[float]] = {"rho": [], "u": [], "e": []}
-            for frame in chosen:
-                # **逐字段**的有效性（§11.1）。以前这里用的是
-                # ``(case.material[frame] == medium) & case.valid[frame]``——那张
-                # ``valid`` 是"四项场量联合可用"的掩码，于是"某个字段缺失不丢掉其他
-                # 字段"这句承诺在**取数的地方**根本没兑现：一个位置只要 e 不可用就
-                # 整点消失，rho 与 u 一起被丢。提取器把逐字段掩码写出来了，这里必须
-                # 真的用它，否则那几张掩码只是让契约检查变绿。
-                medium_mask = case.material[frame] == medium
-                allowed = {
-                    key: medium_mask & self._field_valid(case, frame, logical)
-                    for key, logical in _DATA_FIELDS
-                }
-                union = np.zeros_like(medium_mask)
-                for mask in allowed.values():
-                    union |= mask
-                indices = np.flatnonzero(union)
-                if indices.size == 0:
-                    continue
-                take = min(per_frame, indices.size)
-                picked = rng.choice(indices, size=take, replace=False)
-                radii = case.radius[picked]
-                values = case.sample_at(int(frame), radii)
-                # 逐字段掩码：某个字段在这个位置上不可用时只把它置 NaN，位置与其余
-                # 字段照常保留。损失里的按字段掩码均值会跳过这些 NaN。
-                for key, logical in _DATA_FIELDS:
-                    here = np.asarray(allowed[key][picked], dtype=bool)
-                    if not here.all():
-                        values[logical] = np.where(
-                            here, np.asarray(values[logical], dtype=np.float64), np.nan
-                        )
-                physical_time = float(case.times[frame])
-                if physical_time < self.scales.start_time() - 1.0e-15:
-                    raise SamplingError(
-                        f"case {case.case_id!r} frame {int(frame)} is at t = "
-                        f"{physical_time:.6g} s, before the start time "
-                        f"{self.scales.start_time():.6g} s; a supervision sample may "
-                        "not precede the PINN time origin"
-                    )
-                s_here = self.scales.network_time(
-                    physical_time - self.scales.start_time()
-                )
-                n_here = radii.size
-                s_values.extend([s_here] * n_here)
-                r_values.extend(radii.tolist())
-                # 支持区 = 被采样单元本身（§12）。标签是**单元平均值**，不是中心点
-                # 值；模型侧必须在同一段支持上做同样的几何加权平均，否则两边比的
-                # 不是同一个观测。
-                lo_values.extend((radii - half_width).clip(case.radius[0]).tolist())
-                hi_values.extend((radii + half_width).clip(case.radius[-1]).tolist())
-                # 该观测由几个原始单元贡献。覆盖率用它，不拿"点了几个点"冒充。
-                count_values.extend([1.0] * n_here)
-                for key, field_name in _DATA_FIELDS:
-                    targets[key].extend(
-                        np.asarray(values[field_name], dtype=np.float64).tolist()
-                    )
-
-            if not r_values:
-                return empty
-
-            # 每个字段**独立**保留（§11.1）：一个字段缺失（NaN）不丢掉同一位置
-            # 其他可靠的字段。位置 (s, r) 保留"至少一个字段有限"的点，rho/u/e 各自
-            # 只保证自己的有限性——缺失处留 NaN，由损失里的按字段掩码均值跳过。
-            # 以前是 ``keep &= isfinite`` 对 rho/u/e **全部**做与，任一字段 NaN 就
-            # 把整点丢掉（"一个 nan 标签在均值里会被吞掉"的旧注释反过来把它当成了
-            # 需要整点删除的理由）。
-            rho = np.asarray(targets["rho"], dtype=np.float64)
-            u = np.asarray(targets["u"], dtype=np.float64)
-            e = np.asarray(targets["e"], dtype=np.float64)
-            s_values = np.asarray(s_values, dtype=np.float64)
-            r_values = np.asarray(r_values, dtype=np.float64)
-            keep = (
-                np.isfinite(s_values)
-                & np.isfinite(r_values)
-                & (np.isfinite(rho) | np.isfinite(u) | np.isfinite(e))
-            )
-            return {
-                "s": self._column(s_values[keep]),
-                "r": self._column(r_values[keep]),
-                "lo": self._column(np.asarray(lo_values)[keep]),
-                "hi": self._column(np.asarray(hi_values)[keep]),
-                "count": self._column(np.asarray(count_values)[keep]),
-                "rho": self._column(rho[keep]),
-                "u": self._column(u[keep]),
-                "e": self._column(e[keep]),
-            }
-
-        product = collect(0, self.config.n_data_product)
-        air = collect(1, self.config.n_data_air)
-
-        # 前沿标签：contact 与 shock **独立**采样（§11.1）。一个前沿有效不要求
-        # 另一个也有效——以前 ``contact_valid AND shock_valid`` 才留帧，等于把
-        # "只有接触面可用"或"只有激波可用"的整帧都丢掉，两套前沿被绑死。
-        contact_frames = pick_frames(self.config.n_data_front)
-        s_contact, contact = [], []
-        for frame in contact_frames:
-            if not case.contact_valid[frame]:
-                continue
-            physical_time = float(case.times[frame])
-            s_contact.append(
-                self.scales.network_time(physical_time - self.scales.start_time())
-            )
-            contact.append(float(case.contact_radius[frame]))
-        shock_frames = pick_frames(self.config.n_data_front)
-        s_shock, shock = [], []
-        for frame in shock_frames:
-            if not case.shock_valid[frame]:
-                continue
-            physical_time = float(case.times[frame])
-            s_shock.append(
-                self.scales.network_time(physical_time - self.scales.start_time())
-            )
-            shock.append(float(case.shock_radius[frame]))
-
-        # §11.2 的冻结位置不确定性。先算再验：delta 必须是**有限正数**，否则
-        # 由它定义的几何约束根本无从谈起。
-        contact_delta = float(case.contact_position_uncertainty())
-        shock_delta = float(case.shock_position_uncertainty())
-        for label, value in (("contact", contact_delta), ("shock", shock_delta)):
-            if not (math.isfinite(value) and value > 0.0):
-                raise SamplingError(
-                    f"case {case.case_id!r}: the {label} position uncertainty is {value!r}, "
-                    "so L_geometry (§11.2) has no defined tolerance. This comes from the "
-                    "radial grid spacing; a case with fewer than two usable radii cannot "
-                    "define it. Refusing rather than silently dropping the constraint."
-                )
-
-        return {
-            "s_data_product": product["s"],
-            "r_data_product": product["r"],
-            "rho_data_product": product["rho"],
-            "u_data_product": product["u"],
-            "e_data_product": product["e"],
-            # §12 观测支持区：标签是这一段半径上的**平均值**，不是中心点值。
-            "lo_data_product": product["lo"],
-            "hi_data_product": product["hi"],
-            "coverage_data_product": product["count"],
-            "s_data_air": air["s"],
-            "r_data_air": air["r"],
-            "rho_data_air": air["rho"],
-            "u_data_air": air["u"],
-            "e_data_air": air["e"],
-            "lo_data_air": air["lo"],
-            "hi_data_air": air["hi"],
-            "coverage_data_air": air["count"],
-            "s_data_contact": self._column(s_contact),
-            "contact_data": self._column(contact),
-            "s_data_shock": self._column(s_shock),
-            "shock_data": self._column(shock),
-            # §11.2 的 delta：来自冻结的位置不确定性，不随训练变化。
-            # 这里**当场校验**，不留到损失里再判。理由是：``geometry_loss`` 拿不
-            # 到有限 delta 时只能返回 0（它没有别的选择），于是一个被单独加权、
-            # 本该生效的约束会**无声消失**——正是提示词反复禁止的那种"约束被吞掉"。
-            # 而在源头它是有明确错误的：算例没有可用径向网格，位置不确定性无从
-            # 定义。宁可在这里硬失败。
-            "geometry_delta_contact": contact_delta,
-            "geometry_delta_shock": shock_delta,
-        }
+        ic = build_planar_startup_initial_batch(
+            self.field,
+            scales=self.scales,
+            product_radii=r_product,
+            air_radii=r_air,
+            case_id=self.case_id,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        names = (
+            "xi_ic_product", "rho_ic_product", "u_ic_product", "e_ic_product",
+            "eta_ic_air", "rho_ic_air", "u_ic_air", "e_ic_air",
+            "contact_ic", "shock_ic",
+        )
+        return {name: getattr(ic, name) for name in names}
 
     # -- 组装 -------------------------------------------------------------
     def batch(self) -> SampleBatch:
         config = self.config
-        self._sampled_frames: list[int] = []
         s_pde_product = self.sample_network_time(config.n_pde_product)
         s_pde_air = self.sample_network_time(config.n_pde_air)
         s_contact = self.sample_network_time(config.n_contact)
         s_shock = self.sample_network_time(config.n_shock)
 
         payload = {
-            "case_id": self.case.case_id,
+            "case_id": self.case_id,
             "charge_radius": float(self.scales.charge_radius),
-            "detonation_velocity": float(self.case.detonation_velocity),
+            # 新原点不含 R_0/D：显式记“不适用”，不填任何伪造爆速。
+            "detonation_velocity": None,
             "scales": self.scales,
             "pinn_time_min": self.pinn_time_min,
-            # 这是**本阶段窗口**的上端，不是完整时段：检查集与守恒诊断都用它，
-            # 若在这里写完整时段，窗口内的验收会被拿到窗口外的点上评价。
+            # 本阶段窗口的上端（tau，秒），不是完整时段。
             "pinn_time_max": self.window_pinn_time_max,
             "s_product": self._column(s_pde_product),
             "xi_product": self._column(self._stratified_coordinate(config.n_pde_product)),
@@ -679,188 +589,30 @@ class RadiusSampler:
             "s_shock": self._column(s_shock),
         }
         payload.update(self._initial_condition())
-        payload.update(self._data_points())
         payload["diagnostics"] = {
-            "r_min": self.r_min,
-            "hat_time_epsilon": self.hat_time_epsilon,
-            "n_supervisable_frames": int(self.all_supervisable_frames.size),
-            "n_sampled_frames": int(self.usable_frames.size),
-            "n_development_frames": int(self.development_frames.size),
-            "sampled_frames": sorted({int(f) for f in self._sampled_frames}),
-            "pinn_time_max": self.window_pinn_time_max,
-            "full_pinn_time_max": self.full_pinn_time_max,
+            "time_convention": self.scales.time_convention,
+            "startup_epsilon_s": float(self.field.epsilon),
+            "initial_physical_time_s": float(self.scales.physical_time_from_network(0.0)),
+            "tau_end_s": float(self.tau_end),
+            "window_tau_max_s": float(self.window_pinn_time_max),
             "time_window_fraction": self.window_fraction,
-            "n_window_frames": int(getattr(self, "_window_frame_count", 0)),
-            "data_split": "development" if self.use_development_frames else "train",
-            "data_validity_source": self.validity_source,
+            "hat_time_epsilon": self.hat_time_epsilon,
+            "r_min": self.r_min,
+            "n_pde_product": int(config.n_pde_product),
+            "n_pde_air": int(config.n_pde_air),
+            "n_ic_product": int(config.n_ic_product),
+            "n_ic_air": int(config.n_ic_air),
+            "n_contact": int(config.n_contact),
+            "n_shock": int(config.n_shock),
+            "planar_startup_cache_key": self.field.cache_key(),
+            "data_supervision": "disabled: real-data time axis is not migrated",
         }
         return SampleBatch(**payload)
-
-
-class GroupedSampler:
-    """三个半径各一个 :class:`RadiusSampler`，每次更新返回三个 batch。"""
-
-    def __init__(
-        self,
-        samplers: Sequence[RadiusSampler],
-        *,
-        base_seed: int = 0,
-    ) -> None:
-        if not samplers:
-            raise SamplingError("GroupedSampler needs at least one radius sampler")
-        self.samplers = list(samplers)
-        self.base_seed = int(base_seed)
-        self.step = 0
-
-    @classmethod
-    def build(
-        cls,
-        *,
-        cases: Sequence[ExtractedCase],
-        scales_by_radius: Mapping[float, SimilitudeScales],
-        reference: ReferenceField,
-        config: SamplingConfig | None = None,
-        base_seed: int = 0,
-        dtype=None,
-        device=None,
-        r_min_fraction: float = 1.0e-2,
-        use_development_frames: bool = False,
-        dev_holdout_fraction: float = 0.1,
-        split_seed: int = 0,
-    ) -> "GroupedSampler":
-        samplers = []
-        for case in cases:
-            scales = scales_by_radius[float(case.charge_radius)]
-            samplers.append(
-                RadiusSampler(
-                    case=case,
-                    scales=scales,
-                    reference=reference.scale_to(case.charge_radius),
-                    config=config,
-                    seed=base_seed + 1000 * (len(samplers) + 1),
-                    dtype=dtype,
-                    device=device,
-                    r_min_fraction=r_min_fraction,
-                    use_development_frames=use_development_frames,
-                    dev_holdout_fraction=dev_holdout_fraction,
-                    split_seed=split_seed,
-                )
-            )
-        return cls(samplers, base_seed=base_seed)
-
-    @property
-    def case_ids(self) -> list[str]:
-        return [sampler.case.case_id for sampler in self.samplers]
-
-    def batch(self) -> list[SampleBatch]:
-        self.step += 1
-        return [sampler.batch() for sampler in self.samplers]
-
-    # -- 时间窗口（§14.2）--------------------------------------------------
-    def set_time_window(self, fraction: float) -> dict[str, Any]:
-        """把**全部**半径的窗口一起设置。§14 要求"同一套网络同步扩展"。"""
-        per_case = {s.case.case_id: s.set_time_window(fraction) for s in self.samplers}
-        return {"fraction": float(fraction), "per_case": per_case}
-
-    def time_window_state(self) -> dict[str, Any]:
-        return {
-            "fraction": (
-                float(self.samplers[0].window_fraction) if self.samplers else 1.0
-            ),
-            "per_case": {
-                s.case.case_id: s.window_state() for s in self.samplers
-            },
-        }
-
-    # -- 随机状态 ---------------------------------------------------------
-    def rng_state(self) -> dict[str, Any]:
-        """每个采样器的发生器状态。检查点必须连它一起存，否则恢复训练会换掉
-        采样轨迹（见 :meth:`RadiusSampler.rng_state`）。"""
-        return {
-            "version": 1,
-            "samplers": {
-                sampler.case.case_id: sampler.rng_state() for sampler in self.samplers
-            },
-        }
-
-    #: 采样器随机状态的结构版本。
-    RNG_STATE_VERSION = 1
-
-    def validate_rng_state(self, payload: Any) -> None:
-        """整份采样器随机状态的**结构**校验，不改任何东西。
-
-        要求：是一个带版本的映射；带 ``samplers`` 子映射；**每一个**本组的算例
-        都在里面。缺一个算例就等于那台采样器会从别处继续——而它同样不会报错。
-        """
-        if not isinstance(payload, Mapping):
-            raise SamplingError(
-                f"the sampler RNG state must be a mapping, got {type(payload).__name__}"
-            )
-        if int(payload.get("version", -1)) != self.RNG_STATE_VERSION:
-            raise SamplingError(
-                f"the sampler RNG state has version {payload.get('version')!r}, "
-                f"expected {self.RNG_STATE_VERSION}"
-            )
-        stored = payload.get("samplers")
-        if not isinstance(stored, Mapping):
-            raise SamplingError(
-                "the sampler RNG state has no 'samplers' mapping; restoring from it "
-                "would leave every sampler on a different trajectory without saying so"
-            )
-        missing = [
-            sampler.case.case_id for sampler in self.samplers
-            if sampler.case.case_id not in stored
-        ]
-        if missing:
-            raise SamplingError(
-                f"the sampler RNG state is missing {missing}; every case that will be "
-                "sampled must carry its own state"
-            )
-        for sampler in self.samplers:
-            sampler.validate_rng_state(stored[sampler.case.case_id])
-
-    def set_rng_state(self, payload: Mapping[str, Any] | None) -> None:
-        self.validate_rng_state(payload)
-        stored = payload["samplers"]
-        for sampler in self.samplers:
-            sampler.set_rng_state(stored[sampler.case.case_id])
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "case_ids": self.case_ids,
-            "n_radii": len(self.samplers),
-            "pinn_time_max": {
-                sampler.case.case_id: sampler.window_pinn_time_max
-                for sampler in self.samplers
-            },
-            "full_pinn_time_max": {
-                sampler.case.case_id: sampler.full_pinn_time_max
-                for sampler in self.samplers
-            },
-            "time_window_fraction": (
-                float(self.samplers[0].window_fraction) if self.samplers else 1.0
-            ),
-            "data_split": (
-                "development" if self.samplers and self.samplers[0].use_development_frames
-                else "train"
-            ),
-            "frames": {
-                sampler.case.case_id: {
-                    "n_supervisable": int(sampler.all_supervisable_frames.size),
-                    "n_sampled": int(sampler.usable_frames.size),
-                    "n_development": int(sampler.development_frames.size),
-                    "sampled_frame_numbers": [int(f) for f in sampler.usable_frames],
-                    "development_frame_numbers": [int(f) for f in sampler.development_frames],
-                }
-                for sampler in self.samplers
-            },
-        }
 
 
 __all__ = [
     "AIR",
     "PRODUCT",
-    "GroupedSampler",
     "RadiusSampler",
     "SamplingConfig",
     "SamplingError",

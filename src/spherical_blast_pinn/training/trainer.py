@@ -27,12 +27,11 @@ except ImportError:  # pragma: no cover
 
 from ..data import compatibility as compat
 from ..data.extracted_case import ExtractedCase
-from ..evaluation.checks import CheckReport, build_check_set, run_checks
-from ..losses.objective import LossBreakdown, contact_pressure_scale, total_loss
+from ..evaluation.checks import CheckReport, run_checks
+from ..losses.objective import LossBreakdown, total_loss
 from ..models.coupled_model import CoupledModel
-from ..physics.precursor import ReferenceField
 from ..physics.similitude import SimilitudeScales
-from ..sampling.sampler import GroupedSampler, SamplingConfig
+from ..sampling.sampler import SamplingConfig
 from .balancing import (
     BalanceConfig,
     BoundedGradientBalancer,
@@ -42,7 +41,6 @@ from .balancing import (
 from .checkpoint import (
     CHECKPOINT_FORMAT,
     CHECKPOINT_VERSION,
-    DETONATION_VELOCITY_FIELD,
     PUBLISH_MARKER,
     PUBLISH_OWNER_KEY,
     TrainingError,
@@ -51,7 +49,6 @@ from .checkpoint import (
     read_publish_marker,
     refuse_if_uncommitted,
     require_best_candidate_consistency,
-    require_detonation_velocity,
     validate_optimizer_state,
     validate_state_snapshot,
 )
@@ -241,7 +238,6 @@ class Trainer:
         *,
         config,
         cases: Sequence[ExtractedCase],
-        reference: ReferenceField,
         model: CoupledModel,
         scales_by_radius: Mapping[float, SimilitudeScales],
         time_scale: float,
@@ -262,13 +258,24 @@ class Trainer:
         synthetic_smoke: bool | None = None,
         tolerances: Mapping[str, float] | None = None,
     ) -> None:
+        # 训练执行层尚未迁移到新启动场。这里**明确拒绝构造**，而不是带着旧的
+        # 多半径/参考场接口继续走下去：采样器、接触压力尺度与检查集都已换成
+        # 单半径的 PlanarStartupField 接口，旧的 args 会直接 TypeError，或者
+        # 更糟——悄悄采到另一条时间轴上。
+        from ..cli._common import TrainingNotConnected
+
+        raise TrainingNotConnected(
+            "Trainer 尚未迁移到新启动场：本轮只完成 "
+            "PlanarStartupField -> 物理批次 -> total_loss -> backward 的检查链路。"
+            "正式训练、检查点、恢复、predict/compare 仍是未接入状态。"
+        )
+
         if torch is None:  # pragma: no cover
             raise RuntimeError("PyTorch is required")
         if not cases:
             raise TrainingError("training needs at least one radius")
         self.config = config
         self.cases = list(cases)
-        self.reference = reference
         self.model = model
         self.scales_by_radius = dict(scales_by_radius)
         self.time_scale = float(time_scale)
@@ -305,42 +312,6 @@ class Trainer:
             self.compatibility,
             allow_unverified=bool(allow_unverified_data),
             require_compatible=not bool(synthetic_smoke),
-        )
-
-        self.sampler = GroupedSampler.build(
-            cases=self.cases,
-            scales_by_radius=self.scales_by_radius,
-            reference=self.reference,
-            config=sampling,
-            base_seed=self.seed,
-            dtype=self.dtype,
-            device=self.device,
-            r_min_fraction=r_min_fraction,
-            use_development_frames=False,
-            dev_holdout_fraction=float(
-                config.get("data.development_holdout_fraction", 0.1)
-            ),
-            split_seed=int(config.get("data.split_seed", self.seed)),
-        )
-        # 固定检查集：独立种子、开发帧、一次采样、全程复用、不进梯度（§12、§13）。
-        self.check_set = build_check_set(
-            cases=self.cases,
-            scales_by_radius=self.scales_by_radius,
-            reference=self.reference,
-            config=sampling,
-            seed=self.seed + 7919,
-            dtype=self.dtype,
-            device=self.device,
-            r_min_fraction=r_min_fraction,
-            dev_holdout_fraction=float(
-                config.get("data.development_holdout_fraction", 0.1)
-            ),
-            split_seed=int(config.get("data.split_seed", self.seed)),
-        )
-        self.contact_pressure = contact_pressure_scale(
-            self.reference.scale_to(self.cases[0].charge_radius),
-            charge_radius=self.cases[0].charge_radius,
-            detonation_velocity=self.cases[0].detonation_velocity,
         )
 
         self.check_history: list[dict[str, Any]] = []
@@ -430,54 +401,6 @@ class Trainer:
                 f"{self._unusable}"
             )
 
-    def _frozen_detonation_velocity(self) -> float:
-        """本次训练**实际使用**的卡片爆速 ``D``，从冻结的尺度集合里取。
-
-        取尺度集合、不取 ``cases[0]``：尺度集合是构造时就冻结下来的那份，
-        它才是网络与时间轴真正用的东西，而 ``cases`` 的元数据只是来源记录。
-
-        **四个算例必须给出同一个 ``D``。** 它们共用同一套尺度化网络，只有一个
-        ``D`` 时"预测端拿一个 ``D`` 重建 ``T_h``"才成立；不一致时这里硬失败，
-        而不是悄悄挑一个——挑错的后果是整条预测轨迹平移一个爆轰穿越时间，而
-        两个 ``D`` 都有 m/s 的量纲，错了不会报错。
-        """
-        values = {float(s.detonation_velocity) for s in self.scales_by_radius.values()}
-        if len(values) != 1:
-            raise TrainingError(
-                "the training scales carry more than one detonation velocity "
-                f"({sorted(values)}); a single checkpoint cannot describe what time "
-                "origin to rebuild, and picking one silently would shift the predicted "
-                "trajectory by R_0/D"
-            )
-        velocity = values.pop()
-        if not math.isfinite(velocity) or velocity <= 0.0:
-            raise TrainingError(
-                "the training scales carry detonation velocity "
-                f"{velocity!r}; it must be finite and positive because the scheme-B "
-                "time origin is T_h = R_0/D + epsilon"
-            )
-        return velocity
-
-    def _instance_case_scales(self) -> dict[str, tuple[float, float]]:
-        """本实例**实际使用**的逐算例尺度：``{case_id: (R_0, T_h)}``。
-
-        半径与起始时间都取 ``scales_by_radius`` 里冻结的那一份，**不取**
-        ``cases`` 的元数据：冻结的尺度集合才是网络与时间轴真正用的东西。
-
-        恢复校验按 ``case_id`` 逐个对照检查点里的同一批记录，所以下面这份检查点
-        也会在这里被拦下：把 ``scales[case_id]`` 的 ``charge_radius`` 与
-        ``start_time`` 一起改掉、因而反算出的 ``D`` 不变的那种。只比一个全局
-        爆速时它是"合法"的（复核实测）。
-        """
-        resolved: dict[str, tuple[float, float]] = {}
-        for case in self.cases:
-            scales = self.scales_by_radius[float(case.charge_radius)]
-            resolved[str(case.case_id)] = (
-                float(scales.charge_radius),
-                float(scales.start_time()),
-            )
-        return resolved
-
     # -- 清单 -------------------------------------------------------------
     def _data_identity(self) -> dict[str, Any]:
         """这批数据的**内容**身份，用来回答"是不是同一批数据"。
@@ -553,7 +476,6 @@ class Trainer:
             },
             "contact_pressure_scale_pa": float(self.contact_pressure),
             "schedule": describe_schedule(self.schedule),
-            "reference_field": self.reference.as_dict(),
             "material": {
                 "jwl": self.model.product_net.jwl.as_dict(),
                 "gamma_air": self.model.gamma_air,
@@ -1954,7 +1876,6 @@ class Trainer:
             # ``T_h = R_0/D + epsilon(R_0)``，而它读不到训练时的任何对象——只能读
             # 这个文件。以前保存端从不写它，于是预测入口把每一份方案 B 的训练
             # 检查点都当成"方案 A 的旧文件"拒掉（复核实测）。
-            DETONATION_VELOCITY_FIELD: self._frozen_detonation_velocity(),
             "contact_pressure_scale_pa": self.contact_pressure,
             "scales": {
                 c.case_id: self.scales_by_radius[float(c.charge_radius)].as_dict()
@@ -2100,26 +2021,6 @@ class Trainer:
                 "the checkpoint was trained with a different hat T_*; resuming would "
                 "silently change the network's time input"
             )
-        # **冻结爆速也要核。** 与 ``time_scale`` 同一个道理，但以前**完全没查**：
-        # 恢复端从不读顶层 ``detonation_velocity``，于是把它删掉或改成 ``-1``
-        # 都能照常恢复（复核实测）；而顶层与逐算例 ``scales`` 记录互相矛盾时，
-        # 恢复端用**接收实例的** D、预测端用**文件里的** D，同一份检查点被解释成
-        # 两条时间轴（50 mm 上实测 8.21500721501 µs 对 41.5186385737 µs）。
-        #
-        # ``expected`` 传的是本实例**实际使用**的尺度（``_frozen_detonation_velocity``
-        # 读的是冻结的 ``scales_by_radius``，不是 ``cases`` 的元数据）：只查"文件
-        # 内部自洽"拦不住一份自洽的检查点被另一个爆速的实例恢复。
-        #
-        # ``expected_cases`` 同理但更细：**按 case_id 逐个**对照本实例实际使用的
-        # 算例半径与尺度起始时间。只比一个全局爆速是不够的——一份把
-        # ``scales[case_id].charge_radius`` 与 ``start_time`` 一起改掉、因而反算出
-        # 同一个 ``D`` 的检查点，在"只比爆速"下完全合法（复核实测）。
-        require_detonation_velocity(
-            payload,
-            path,
-            expected=self._frozen_detonation_velocity(),
-            expected_cases=self._instance_case_scales(),
-        )
         # -- 日程、检查集与数据身份：**必须是同一件事** ----------------------
         #
         # 只比"当前窗口"远远不够。同名阶段把预算从 2 改成 5、学习率与 PDE 权重

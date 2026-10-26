@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -35,14 +36,10 @@ from ..physics.similitude import (
     physical_time_from_scaled,
     scaled_time_coverage,
 )
-from ..training.checkpoint import (
-    CHECKPOINT_FORMAT,
-    CHECKPOINT_VERSION,
-    refuse_if_uncommitted,
-    require_detonation_velocity,
-)
 from ._common import (
     SetupError,
+    TRAINING_NOT_CONNECTED_MESSAGE,
+    TrainingNotConnected,
     add_common_arguments,
     configure_stdout,
     load_config_from_args,
@@ -51,92 +48,16 @@ from ._common import (
 
 
 def load_model_from_checkpoint(path: Path, *, charge_radius: float, device=None) -> tuple[CoupledModel, dict[str, Any]]:
-    """由检查点在**新半径**上重建模型。
+    """预测入口尚未接入新启动场检查点。
 
-    两个场网络与前沿网络都不把 ``R_0`` 作为输入——半径的作用已经被尺度化吸收
-    ——所以同一个 ``state_dict`` 可以直接装进为另一个半径建立的模型里。这不是
-    近似：这正是"共用同一套尺度化网络"这句话的实现方式。
+    旧的参考场检查点（带爆速与 ``T_h``）已经退出；新格式按 ``startup`` /
+    ``scales`` 绑定启动场，而把预测网格、覆盖判据与前沿重建迁到
+    ``PlanarStartupScales`` 属于后续工作。这里明确拒绝，不猜测旧数据的时间原点。
     """
-    if torch is None:  # pragma: no cover
-        raise RuntimeError("PyTorch is required")
-    path = Path(path)
-    # **发布完整性：与 ``Trainer.load`` 用同一条规则。** 预测同样会拿一套"一部分新、
-    # 一部分旧"的产物当真值使用，所以"训练恢复被拒绝"不能是唯一的防线——以前只有
-    # 训练入口查这个标记，复核实测：一个被恢复拒绝的未提交检查点，预测照样读进去。
-    refuse_if_uncommitted(path, error=SetupError)
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    if payload.get("format") != CHECKPOINT_FORMAT:
-        raise SetupError(f"{path} is not a {CHECKPOINT_FORMAT} checkpoint")
-    if int(payload.get("version", -1)) != CHECKPOINT_VERSION:
-        raise SetupError(
-            f"checkpoint version {payload.get('version')} is not supported by this "
-            f"build, which reads version {CHECKPOINT_VERSION}; retrain rather than "
-            "reinterpreting an older field layout"
-        )
-
-    time_scale = float(payload["time_scale"])
-    # 爆速随检查点冻结：时间原点 T_h = R_0/D + epsilon 必须与训练时完全一致，
-    # 否则推理的整条轨迹会平移一个 T_b。读取与校验走**共用**的那条规则
-    # （``training.checkpoint``），保存端写什么、这边要求什么只有一个定义。
-    detonation_velocity = require_detonation_velocity(payload, path, error=SetupError)
-    scales = SimilitudeScales.for_radius(
-        charge_radius,
-        time_scale=time_scale,
-        detonation_velocity=detonation_velocity,
+    raise SetupError(
+        "predict 尚未接入新启动场检查点：旧的参考场检查点不再读取，"
+        "新的 startup/scales 契约还没有接到预测网格与前沿重建。"
     )
-    state = payload["model"]
-
-    # 架构从检查点清单里读，**不从 ``state_dict`` 的键名反推**。``nn.Sequential``
-    # 把每个 Linear 后面接一个激活，于是 Linear 落在偶数下标上；按 "最大下标除以
-    # 2 加一" 去猜会得到 depth+1，然后 state_dict 加载失败。清单里本来就记着
-    # width 与 depth，读它比猜它可靠。
-    provenance = payload["provenance"]
-    architecture = provenance["model"]
-    dtype = resolve_dtype(str(payload.get("config", {}).get("networks", {}).get("dtype", "float64")))
-
-    product = ProductNet(
-        scales=scales,
-        width=int(architecture["product"]["width"]),
-        depth=int(architecture["product"]["depth"]),
-        activation=str(architecture["product"]["activation"]),
-        dtype=dtype,
-    )
-    air = AirNet(
-        scales=scales,
-        width=int(architecture["air"]["width"]),
-        depth=int(architecture["air"]["depth"]),
-        activation=str(architecture["air"]["activation"]),
-        gamma_air=float(provenance["material"]["gamma_air"]),
-        dtype=dtype,
-    )
-    front = FrontNet(
-        scales=scales,
-        width=int(architecture["front"]["width"]),
-        depth=int(architecture["front"]["depth"]),
-        activation=str(architecture["front"]["activation"]),
-        initial_contact_hat=float(architecture["front"]["initial_contact_hat"]),
-        initial_gap_hat=float(architecture["front"]["initial_gap_hat"]),
-        anchor_contact_at_charge_surface=bool(
-            architecture["front"].get("anchored_contact", False)
-        ),
-        anchor_until_s=architecture["front"].get("anchor_until_s", None),
-        dtype=dtype,
-    )
-    model = CoupledModel(
-        product=product,
-        air=air,
-        front=front,
-        scales=scales,
-        gamma_air=float(payload["provenance"]["material"]["gamma_air"]),
-        ambient_density=float(payload["provenance"]["material"]["ambient"]["rho_ambient"]),
-        ambient_pressure=float(payload["provenance"]["material"]["ambient"]["p_ambient"]),
-    )
-    model.load_state_dict(state)
-    target = device if device is not None else resolve_device("cpu")
-    model.to(target)
-    model.eval()
-    return model, payload
-
 
 def predict_grid(
     model: CoupledModel,
@@ -290,6 +211,16 @@ def predict_grid(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """正式入口：新启动场的训练接口尚未接入，明确失败而不是回退旧方案。"""
+    try:
+        return _run(argv)
+    except TrainingNotConnected as exc:
+        print(f"\n** {exc} **\n", file=sys.stderr)
+        return 3
+
+
+def _run(argv: Sequence[str] | None = None) -> int:
+
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     add_common_arguments(parser)
     parser.add_argument("--checkpoint", required=True)
@@ -306,115 +237,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--n-radii", type=int, default=600)
     args = parser.parse_args(argv)
     configure_stdout()
-    config = load_config_from_args(args)
-
-    model, payload = load_model_from_checkpoint(Path(args.checkpoint), charge_radius=args.radius)
-
-    # 训练覆盖：在 ``s`` 上是**一个与半径无关的数**，由检查点里冻结的 ``hat T_*``
-    # 与各训练算例的最后有效 ``t_PINN`` 得到。目标半径的真值不参与。
-    time_scale = float(payload["time_scale"])
-    # 同一个冻结爆速，走同一条读取规则。默认 ``--time-end`` 要把 ``s_max`` 映回
-    # 物理时间，而那个映射里含 ``T_h = R_0/D + epsilon``，所以它也要这个值。
-    detonation_velocity = require_detonation_velocity(
-        payload, args.checkpoint, error=SetupError
-    )
-    valid = dict(payload.get("provenance", {}).get("valid_pinn_time_max", {}) or {})
-    # 检查点里 ``valid_pinn_time_max`` 以 case_id 为键；覆盖判据需要的是半径，
-    # 因为 hat_t = U_* t_PINN / R_0。半径从同一份检查点的 scales 里读，不猜。
-    radius_of_case = {
-        str(case_id): float(entry["charge_radius"])
-        for case_id, entry in (payload.get("scales") or {}).items()
-    }
-    coverage_provenance = None
-    if valid:
-        missing = [case_id for case_id in valid if case_id not in radius_of_case]
-        if missing:
-            raise SetupError(
-                f"the checkpoint records valid times for {missing} but no charge radius "
-                "for them; the scaled-time coverage cannot be formed"
-            )
-        s_max, coverage_provenance = scaled_time_coverage(
-            {radius_of_case[case_id]: float(value) for case_id, value in valid.items()},
-            time_scale=time_scale,
-        )
-    else:
-        s_max = None
-
-    if args.time_end is not None:
-        end_physical = float(args.time_end)
-        end_source = "--time-end (physical seconds, given explicitly)"
-        if end_physical < model.scales.start_time():
-            raise SetupError(
-                f"--time-end = {end_physical:.6g} s precedes the PINN time origin "
-                f"T_h = R_0/D + epsilon(R_0) = {model.scales.start_time():.6g} s for this radius"
-            )
-    elif s_max is not None:
-        # ``detonation_velocity`` 是必填的：``t_phys = s hat T_* R_0 / U_* + T_h``
-        # 里的 ``T_h`` 就是 ``R_0/D + epsilon``。以前这里没传它，于是**默认**
-        # ``--time-end`` 这条路一走到就 ``TypeError``——而它从来没被测过，因为
-        # 没有一条测试真的从训练检查点走到预测（复核指出的断链）。
-        end_physical = physical_time_from_scaled(
-            s_max,
-            args.radius,
-            time_scale=time_scale,
-            detonation_velocity=detonation_velocity,
-        )
-        end_source = (
-            "default: the end of the training scaled-time coverage, mapped to this "
-            "radius through t_phys = s hat T_* R_0 / U_* + T_h"
-        )
-    else:
-        raise SetupError(
-            "the checkpoint records no valid t_PINN range, so there is no training "
-            "coverage to default --time-end from; pass --time-end explicitly"
-        )
-
-    physical_times = np.linspace(
-        model.scales.start_time(), end_physical, int(args.n_times)
-    )
-    radii = np.linspace(
-        args.radius * 1.0e-3, args.radius * float(args.radius_max_factor), int(args.n_radii)
-    )
-    result = predict_grid(
-        model,
-        physical_times=physical_times,
-        radii=radii,
-        scaled_time_coverage=s_max,
-    )
-    out_dir = Path(args.output) if args.output else config.path_of(
-        "training.output_dir", default=Path("outputs/run")
-    ) / "predict"
-    out_path = Path(out_dir)
-    if out_path.suffix != ".npz":
-        out_path = out_path / f"predict_R{int(round(args.radius * 1000)):04d}mm.npz"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out_path, **result)
-    write_json(out_path.with_suffix(".json"), {
-        "charge_radius_m": args.radius,
-        "start_time_s": result["start_time"],
-        "time_origin": result["time_origin"],
-        "time_end_physical_s": end_physical,
-        "time_end_source": end_source,
-        "n_times": int(physical_times.size),
-        "n_radii": int(radii.size),
-        "scaled_time_coverage_s_max": s_max,
-        "scaled_time_coverage_provenance": coverage_provenance,
-        "n_extrapolated_times": int(result["extrapolated"].sum()),
-        "checkpoint": str(args.checkpoint),
-        "physics_parameters_source": "checkpoint provenance, not the target radius data",
-        "target_radius_truth_used": False,
-    })
-    print(f"predicted on {physical_times.size} times x {radii.size} radii")
-    print(f"physical time range: [{physical_times[0]:.6g}, {physical_times[-1]:.6g}] s")
-    print(f"R_c at t_end = {result['contact_radius'][-1]:.6g} m")
-    print(f"R_s at t_end = {result['shock_radius'][-1]:.6g} m")
-    if s_max is not None:
-        n_extra = int(result["extrapolated"].sum())
-        print(f"training scaled-time coverage: s_max = {s_max:.6g}"
-              + (f"; {n_extra} query time(s) beyond it are flagged extrapolated"
-                 if n_extra else "; all query times are inside it"))
-    print(f"written: {out_path}")
-    return 0
+    raise TrainingNotConnected(TRAINING_NOT_CONNECTED_MESSAGE)
 
 
 if __name__ == "__main__":  # pragma: no cover

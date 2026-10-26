@@ -20,11 +20,6 @@ data:
 splits:
   strict_blind_test: false
 
-reference_field:
-  detonation_cells: 400
-  cells_inside: 400
-  sample_count: 11
-
 sampling:
   n_pde_product: 64
   n_pde_air: 64
@@ -32,9 +27,6 @@ sampling:
   n_ic_air: 16
   n_contact: 8
   n_shock: 8
-  n_data_product: 32
-  n_data_air: 32
-  n_data_front: 8
 
 training:
   output_dir: outputs/geom_smoke

@@ -1,46 +1,33 @@
-"""检查点格式、冻结参数与"多文件发布"读取规则的**唯一定义**。
+"""检查点格式与读写规则的**唯一定义**（新启动场，单半径）。
 
-保存端（``training.trainer``）与读取端（``cli.predict``）都从这里取格式标识、
-版本号、字段名与读取规则。以前两边各维护一份清单，"保存端写了什么"与"读取端
-要求什么"就此脱节：``cli.predict`` 要求一个 :meth:`Trainer._build_payload`
-从来没写过的顶层字段 ``detonation_velocity``，于是一份**方案 B** 训练出来的
-检查点被预测入口当成方案 A 的旧文件拒绝（复核实测）。定义放在一处，这种
-不一致就没有藏身之处。
+这份检查点只服务一条链路：
 
-三条读取规则：
+.. code:: text
 
-* :func:`require_detonation_velocity` —— 爆速是**冻结的物理参数**，从检查点里
-  读出来、校验之后使用。缺失即拒绝，**不用默认常量补齐**：``D`` 决定方案 B 的
-  时间原点 ``T_h = R_0/D + epsilon``，补一个默认值不会报错，只会把整条轨迹平移
-  一个爆轰穿越时间 ``T_b``（50 mm 上是 7.2 µs）。
-  **三层**都要过：顶层是合法有限正**实数**（不许 ``float()`` 吞掉 ``True`` 或
-  ``"6930"``）；顶层与 ``case_ids`` 里**每一个**算例的 ``scales`` 记录一致
-  （记录里没有 ``D``，按 ``T_h`` 反解）；恢复端还要与**接收实例实际使用的**
-  尺度一致。以前只查第一层、且只有预测端调它，于是"同一份检查点被两个入口
-  解释成两条时间轴"（复核实测，见测试文件）。
-* :func:`refuse_if_uncommitted` —— 多文件发布不是原子的。发布前写下标记、成功后
-  删除，**两个入口都必须落实**这条规则。以前只有 ``Trainer.load`` 查它，于是
-  "恢复训练被拒绝的文件，仍能被预测入口读进去"（复核实测）。
-  标记的**结构**由 :func:`require_publish_marker_contract` 一处定义并强制：
-  存在就必须是一个带非空 ``artifacts`` 名字列表与 ``owner`` 的 JSON 对象。
-  以前只问"顶层是不是字典"，于是 ``{}``、``{"artifacts": []}`` 被当成"没有未提交
-  产物"，``{"artifacts": "last.pt"}`` 被逐字符遍历——**三个坏标记两个入口都放行**
-  （复核实测）。
-* :func:`require_best_candidate_consistency` —— ``best_dirty`` 与候选快照必须
-  互相印证：候选要走**与顶层载荷同一份** :func:`validate_state_snapshot`，
-  指纹要**从候选的实际参数重算**，步号与选择依据要与最佳记录对得上。
-  一个 ``best_dirty=True`` 却没有任何候选（或候选不完整）的检查点不能"加载成功
-  并把标志悄悄清掉"：那会让一次中断之后的最佳模型无声消失。
+    cli.startup -> handoff.json/npz -> PlanarStartupField
+    -> PlanarStartupScales -> 单半径物理批次 -> CoupledModel
 
-:func:`validate_state_snapshot` 覆盖的是**模型以外的**那部分状态：优化器结构
-（:func:`validate_optimizer_state`）、全局随机状态能不能真被生成器接受、阶段与
-窗口跟**这份快照自己的**步号对不对得上。这几项此前只查了"键在不在、是不是
-Mapping"，于是 ``optimizer = {}``、``rng['torch'] = 0``、
-``stage.window_fraction = 0.123`` 都能**加载成功、正常发布**，直到**下一个**
-实例恢复 ``best.pt`` 时才抛错（复核实测）。
+它绑定的初始化身份是**启动场**：``model_id`` / ``method_version`` /
+``cache_key``，以及 ``PlanarStartupScales`` 的完整参数（半径、``epsilon``、
+``time_scale`` 与各材料尺度）。时间约定固定为
+``t_phys = epsilon + tau``，``s = 0`` 对应 ``t_phys = epsilon``。
+
+检查点**不复制**初场数组：加载时用显式提供的 ``handoff.json``（或调用方
+自己的场与尺度）核对身份即可。
+
+旧检查点（reference-field / 方案 B，``format = "spherical_blast_pinn.checkpoint"``
+且带 ``detonation_velocity``、``start_time = T_h = R_0/D + epsilon``）在这里
+**明确拒绝**：格式与版本都不同，没有迁移路径，也不猜测旧数据的时间原点。
+新链路重新生成检查点。
+
+保留的通用读取规则：发布标记（:func:`refuse_if_uncommitted` 及结构契约）、
+模型状态结构/形状/有限性（:func:`validate_model_state`）、优化器状态
+（:func:`validate_optimizer_state`）、步号（:func:`require_step_value`）与
+模型参数指纹（:func:`parameter_fingerprint_of`）。
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 from pathlib import Path
@@ -48,74 +35,85 @@ from typing import Any, Callable, Mapping, NoReturn, Sequence
 
 import numpy as np
 
-# 时间原点的定义只有一份，在 ``physics/similitude.py``：``T_h = R_0/D + epsilon``。
-# 校验逐算例 ``start_time`` 时直接用这个函数，不在这里重写一遍公式
-# （``physics`` 不反向依赖 ``training``，无循环导入）。
-from ..physics.similitude import handover_time
+from ..physics.similitude import (
+    TIME_CONVENTION_PLANAR_STARTUP,
+    PlanarStartupScales,
+)
+from ..physics.two_medium_startup_handoff import load_planar_startup_handoff
+from ..physics.two_medium_startup_planar import PlanarStartupField
 
-#: 检查点格式标识与版本。加载时两者都必须匹配，否则拒绝。
-CHECKPOINT_FORMAT = "spherical_blast_pinn.checkpoint"
+#: 检查点格式标识与版本。旧格式的标识是
+#: ``"spherical_blast_pinn.checkpoint"``（版本 ≤ 8，带爆速与 ``T_h``），
+#: 读取端按格式与版本直接拒绝，不做迁移。
+CHECKPOINT_FORMAT = "spherical_blast_pinn.startup_checkpoint"
+CHECKPOINT_VERSION = 1
 
-#: 第 3 版起检查点必须带**采样器自己的** RNG 状态（第 2 版只存全局 NumPy 状态，
-#: 恢复出来的不是一个连续的采样轨迹），并且带固定检查集与兼容性闸门的结论。
-#:
-#: 第 4 版起 ``stage`` 块必须同时带 ``pending`` 与 ``blocked``，且加载端**要求
-#: 它们存在**（缺失即拒绝）。这两项记录的是"更新跑完了、判据没过、尚不允许推进"
-#: 这个中间状态；旧写法没有它们，读出来会被当成"没有待决判据"——那正是这两个
-#: 字段要区分的那件事。所以旧检查点按版本号直接拒绝，而不是"缺字段就默认通过"。
-#:
-#: 第 8 版起顶层带 ``detonation_velocity``（冻结的卡片爆速），供预测入口在**新
-#: 半径**上重建时间原点。旧版本没有它，方案 B 的时间轴无法重建——同样按版本号
-#: 拒绝，不做迁移：写入端当时保存的是另一套字段，读出来的东西我们无法核对。
-CHECKPOINT_VERSION = 8
+#: 用途标记。它不是版本号：同一版本下换用途（例如以后的多半径）必须换一个新值，
+#: 否则读取端会把另一种结构的文件当成这一种。
+CHECKPOINT_PURPOSE = "planar_startup_field_resume_single_radius"
 
-#: 冻结爆速的字段名。保存端与读取端共用这一个名字。
-DETONATION_VELOCITY_FIELD = "detonation_velocity"
-
-#: 逐算例记录的键名。名字全部来自**实际写入端**，只有一份定义：
-#: ``scales`` 来自 :meth:`..physics.similitude.SimilitudeScales.as_dict`，
-#: ``data_identity`` 与 ``provenance`` 来自 :meth:`..training.trainer.Trainer._data_identity`
-#: 与 :meth:`..training.trainer.Trainer._provenance`。
-#:
-#: ``as_dict()`` **不写** ``detonation_velocity``，写的是
-#: ``start_time = T_h = R_0/D + epsilon(R_0)``；``D`` 由 ``(charge_radius, start_time)``
-#: 唯一确定。所以"逐算例记录里的冻结值"就是这一对。
-SCALES_CHARGE_RADIUS_KEY = "charge_radius"
-SCALES_START_TIME_KEY = "start_time"
-SCALES_TIME_SCALE_KEY = "time_scale"
-
-#: 算例身份在各处记录中的键。同一个 ``case_id`` 必须串起这四份记录。
-CASE_IDS_KEY = "case_ids"
+#: 顶层字段名。
+STARTUP_KEY = "startup"
 SCALES_KEY = "scales"
-DATA_IDENTITY_KEY = "data_identity"
-PROVENANCE_KEY = "provenance"
+MODEL_STRUCTURE_KEY = "model_structure"
+MODEL_STATE_KEY = "model_state"
+OPTIMIZER_KEY = "optimizer"
+STEP_KEY = "step"
+RNG_KEY = "rng"
+SAMPLING_KEY = "sampling"
+CONTACT_PRESSURE_KEY = "contact_pressure_pa"
+FINGERPRINT_KEY = "parameter_fingerprint"
+CODE_VERSION_KEY = "code_version"
+PURPOSE_KEY = "purpose"
 
-#: ``data_identity`` 里逐算例的半径。
-DATA_IDENTITY_CHARGE_RADIUS_KEY = "charge_radius_m"
+#: 启动场的身份字段。这里**不**重复记录半径/epsilon/time_scale；那些只在
+#: ``scales`` 记录里保存一份，避免两份可相互矛盾的参数。
+STARTUP_MODEL_ID_KEY = "model_id"
+STARTUP_METHOD_VERSION_KEY = "method_version"
+STARTUP_CACHE_KEY = "cache_key"
+STARTUP_DELTA_KEY = "delta"
 
-#: ``provenance`` 里的逐算例记录。``charge_radii`` 与 ``case_ids`` 是**平行列表**
-#: （同一个 ``self.cases`` 顺序），``start_times`` 与 ``valid_pinn_time_max``
-#: 按 ``case_id`` 取键。
-PROVENANCE_CASE_IDS_KEY = "case_ids"
-PROVENANCE_CHARGE_RADII_KEY = "charge_radii"
-PROVENANCE_START_TIMES_KEY = "start_times"
-PROVENANCE_VALID_TIME_KEY = "valid_pinn_time_max"
+#: 采样配置与动态窗口。``tau_end``、点数与分层比例**实际改变样本分布**；窗口
+#: （当前分数与历史）决定接下来采哪段时间。拿着另一套设置继续，不是精确续训。
+SAMPLING_TAU_END_KEY = "tau_end_s"
+SAMPLING_R_MIN_FRACTION_KEY = "r_min_fraction"
+SAMPLING_COUNTS_KEY = "counts"
+SAMPLING_STRATIFICATION_KEY = "stratification"
+SAMPLING_WINDOW_KEY = "window"
+SAMPLING_RECORD_KEYS = (
+    SAMPLING_TAU_END_KEY,
+    SAMPLING_R_MIN_FRACTION_KEY,
+    SAMPLING_COUNTS_KEY,
+    SAMPLING_STRATIFICATION_KEY,
+    SAMPLING_WINDOW_KEY,
+)
+SAMPLING_COUNT_KEYS = (
+    "n_pde_product",
+    "n_pde_air",
+    "n_ic_product",
+    "n_ic_air",
+    "n_contact",
+    "n_shock",
+)
+SAMPLING_STRATIFICATION_KEYS = ("near_fraction", "near_span", "xi_floor")
 
-#: 比较两个**尺度**（半径、起始时间、``hat T_*``）时的相对容差。
-#:
-#: 这些值在写入端与读取端是同一个 ``float``，经 ``torch.save`` 往返**逐位不变**，
-#: 所以容差只需要覆盖浮点表示本身的舍入。它同时必须**远小于**任何真实矛盾：
-#: 本项复现的"半径 0.05 → 0.10"是 100% 的相对差。用 1e-9 而不是更松的值，
-#: 就是为了不靠"放宽容差"把明显矛盾掩盖过去。
+#: ``PlanarStartupScales`` 的完整参数。重建后的对象必须保留类型、epsilon 原点、
+#: ``time_scale`` 与 ``s <-> tau <-> t_phys`` 的换算。
+SCALES_RECORD_KEYS = (
+    "charge_radius",
+    "reference_velocity",
+    "reference_specific_energy",
+    "product_density",
+    "air_density",
+    "time_scale",
+    "startup_epsilon",
+    "time_convention",
+    "detonation_velocity",
+)
+
+#: 比较尺度记录时的相对容差。写入端与读取端是同一批 ``float``，往返逐位不变，
+#: 这里只放过浮点表示本身的舍入。
 SCALES_RELATIVE_TOLERANCE = 1.0e-9
-
-#: 比较两个爆速时的**相对**容差。
-#:
-#: 反解要经过 ``T_h - epsilon`` 这一步（两个约 1e-5 秒的数相减），float64 上的
-#: 往返误差量级在 1e-16，远小于这里。而任何**真实**的不一致——换了爆速、换了
-#: 材料卡——相对差都在 1e-3 以上。这条容差只放过"同一个数的舍入"，不放过
-#: "另一个数"。
-DETONATION_VELOCITY_RELATIVE_TOLERANCE = 1.0e-9
 
 #: 未提交标记的文件名。发布多份产物**不是**原子的：进程在两次写入之间被杀掉，
 #: 目录里会留下"一部分新、一部分旧"的状态，而每一份单看都是合法文件。
@@ -351,455 +349,798 @@ def _real_number(value: Any) -> float | None:
     return float(value)
 
 
-def _case_ids(payload: Mapping[str, Any], path: Path | str, error: type[Exception]) -> list[str]:
-    """``case_ids``：非空、不重复、每项是算例名的列表。"""
-    case_ids = payload.get(CASE_IDS_KEY)
-    if isinstance(case_ids, (str, bytes)) or not isinstance(case_ids, Sequence) or not case_ids:
-        raise error(
-            f"{path} carries no usable {CASE_IDS_KEY!r} ({case_ids!r}); without the list "
-            "of cases this checkpoint is for, the per-case records cannot be matched to "
-            "one another"
+# --------------------------------------------------------------------------
+# 新启动场检查点：尺度记录、身份、保存与恢复
+# --------------------------------------------------------------------------
+
+
+def _normalise(value: Any) -> Any:
+    """把结构里的 NumPy / Python 标量归一成可比较的普通类型。"""
+    if isinstance(value, Mapping):
+        return {str(key): _normalise(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalise(item) for item in value]
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        return float(value)
+    return value
+
+
+def _same_number(left: Any, right: Any) -> bool:
+    return abs(float(left) - float(right)) <= SCALES_RELATIVE_TOLERANCE * max(
+        abs(float(left)), abs(float(right)), 1.0e-30
+    )
+
+
+def _require_field(field: Any) -> PlanarStartupField:
+    if not isinstance(field, PlanarStartupField):
+        raise TrainingError(
+            f"a startup checkpoint needs a PlanarStartupField, got "
+            f"{type(field).__name__}"
         )
-    for case_id in case_ids:
-        if not isinstance(case_id, str) or not case_id:
-            raise error(
-                f"the checkpoint's {CASE_IDS_KEY!r} contains {case_id!r}, which is not a "
-                "case name"
+    if field.checks.get("passed") is not True:
+        raise TrainingError(
+            "the startup field has no passed consistency report; refusing to bind a "
+            "checkpoint to it"
+        )
+    if field.reference_field is not False:
+        raise TrainingError(
+            "the startup field claims reference_field=True; this checkpoint format is "
+            "only for the local planar startup field"
+        )
+    return field
+
+
+def startup_scale_record(scales: PlanarStartupScales) -> dict[str, Any]:
+    """把 ``PlanarStartupScales`` 的**全部**参数写成一条记录。"""
+    if not isinstance(scales, PlanarStartupScales):
+        raise TrainingError(
+            f"scales must be PlanarStartupScales, got {type(scales).__name__}"
+        )
+    record = {
+        "charge_radius": float(scales.charge_radius),
+        "reference_velocity": float(scales.reference_velocity),
+        "reference_specific_energy": float(scales.reference_specific_energy),
+        "product_density": float(scales.product_density),
+        "air_density": float(scales.air_density),
+        "time_scale": float(scales.time_scale),
+        "startup_epsilon": float(scales.startup_epsilon),
+        "time_convention": str(scales.time_convention),
+        "detonation_velocity": None,
+    }
+    for key in SCALES_RECORD_KEYS[:-2]:
+        value = _real_number(record[key])
+        if value is None or not math.isfinite(value) or value <= 0.0:
+            raise TrainingError(
+                f"the startup scale {key!r} is {record[key]!r}; it must be finite and "
+                "positive"
             )
-    seen: dict[str, int] = {}
-    for case_id in case_ids:
-        seen[case_id] = seen.get(case_id, 0) + 1
-    duplicated = sorted(name for name, count in seen.items() if count > 1)
-    if duplicated:
-        raise error(
-            f"the checkpoint's {CASE_IDS_KEY!r} lists {duplicated} more than once; a case "
-            "appearing twice cannot be matched to a single set of frozen scales"
+    if record["time_convention"] != TIME_CONVENTION_PLANAR_STARTUP:
+        raise TrainingError(
+            f"the startup scales carry time_convention={record['time_convention']!r}; "
+            f"this checkpoint format requires {TIME_CONVENTION_PLANAR_STARTUP!r}"
         )
-    return list(case_ids)
-
-
-def _associated_record(
-    mapping: Any,
-    key: str,
-    case_id: str,
-    *,
-    path: Path | str,
-    where: str,
-    error: type[Exception],
-) -> Mapping[str, Any]:
-    """从 ``mapping`` 里按 ``case_id`` 取一条逐算例记录，缺了就是硬失败。"""
-    if not isinstance(mapping, Mapping):
-        raise error(
-            f"{path} carries no {where} block ({type(mapping).__name__}); the per-case "
-            "records it should hold cannot be matched"
-        )
-    if case_id not in mapping:
-        raise error(
-            f"{path} records no {where} entry for case {case_id!r}, which its own "
-            f"{CASE_IDS_KEY!r} lists. A missing record is not a pass: that case is part "
-            "of the run"
-        )
-    record = mapping[case_id]
-    if not isinstance(record, Mapping):
-        raise error(
-            f"the checkpoint's {where} entry for case {case_id!r} is "
-            f"{type(record).__name__}, not a record"
+    if record["detonation_velocity"] is not None:
+        raise TrainingError(
+            "the planar-startup scales must carry detonation_velocity=None; the new time "
+            "origin is epsilon_field and has no R_0/D term"
         )
     return record
 
 
-def require_case_scales_association(
-    payload: Mapping[str, Any],
-    path: Path | str,
-    *,
-    expected_cases: Mapping[str, tuple[float, float]] | None = None,
-    error: type[Exception] = TrainingError,
-) -> dict[str, dict[str, float]]:
-    """**逐算例关联校验**：四份记录必须指同一批算例、同一个半径。
+def planar_scales_from_record(
+    record: Any, *, where: str = "scales", error: type[Exception] = TrainingError
+) -> PlanarStartupScales:
+    """从检查点记录**重建** ``PlanarStartupScales``（类型、epsilon 原点与换算）。"""
+    if not isinstance(record, Mapping):
+        raise error(f"{where}: {type(record).__name__}, not a scale record")
+    missing = [key for key in SCALES_RECORD_KEYS if key not in record]
+    if missing:
+        raise error(f"{where}: missing {missing}")
+    numbers: dict[str, float] = {}
+    for key in SCALES_RECORD_KEYS[:-2]:
+        value = _real_number(record[key])
+        if value is None or not math.isfinite(value) or value <= 0.0:
+            raise error(
+                f"{where}.{key}: {record[key]!r} is not a finite positive number"
+            )
+        numbers[key] = value
+    if record["time_convention"] != TIME_CONVENTION_PLANAR_STARTUP:
+        raise error(
+            f"{where}.time_convention: {record['time_convention']!r} is not "
+            f"{TIME_CONVENTION_PLANAR_STARTUP!r}"
+        )
+    if record["detonation_velocity"] is not None:
+        raise error(
+            f"{where}.detonation_velocity must be None for the planar-startup time origin"
+        )
+    try:
+        scales = PlanarStartupScales(
+            charge_radius=numbers["charge_radius"],
+            reference_velocity=numbers["reference_velocity"],
+            reference_specific_energy=numbers["reference_specific_energy"],
+            product_density=numbers["product_density"],
+            air_density=numbers["air_density"],
+            time_scale=numbers["time_scale"],
+            detonation_velocity=None,
+            startup_epsilon=numbers["startup_epsilon"],
+        )
+    except Exception as exc:  # noqa: BLE001 - re-raise with the record's context
+        raise error(f"{where}: the recorded scale parameters are inconsistent: {exc}") from exc
+    if not _same_number(scales.start_time(), numbers["startup_epsilon"]):
+        raise error(
+            f"{where}: the rebuilt scale starts at {scales.start_time()!r} s, not the "
+            f"recorded epsilon {numbers['startup_epsilon']!r} s"
+        )
+    if scales.time_convention != TIME_CONVENTION_PLANAR_STARTUP:
+        raise error(f"{where}: the rebuilt scale changed its time convention")
+    return scales
 
-    一份检查点里，同一个算例被写了四遍：
 
-    ==================  ==========================  ===============================
-    位置                键                          写入方
-    ==================  ==========================  ===============================
-    ``case_ids``        算例名列表                  ``Trainer._build_payload``
-    ``scales``          ``{case_id: as_dict()}``    ``_build_payload``
-    ``data_identity``   ``{case_id: {...}}``        ``Trainer._data_identity``
-    ``provenance``      ``{case_id: ...}`` 与平行列表  ``Trainer._provenance``
-    ==================  ==========================  ===============================
+def _check_scales_match(
+    record: Any, scales: PlanarStartupScales, *, where: str
+) -> PlanarStartupScales:
+    rebuilt = planar_scales_from_record(record, where=where)
+    if not isinstance(scales, PlanarStartupScales):
+        raise TrainingError(f"{where}: the receiving scales are {type(scales).__name__}")
+    left = _normalise(rebuilt.as_dict())
+    right = _normalise(scales.as_dict())
+    if left != right:
+        differing = sorted(
+            key for key in set(left) | set(right) if left.get(key) != right.get(key)
+        )
+        raise TrainingError(
+            f"{where}: the checkpoint's scales differ from the receiving scales in "
+            f"{differing}; resuming would change the network's time input or units"
+        )
+    return rebuilt
 
-    以前它们之间**没有任何核对**：把 ``scales[case_id].charge_radius`` 从 0.05 改成
-    0.10、同时把 ``start_time`` 乘 2，反算出的爆速仍然是 6930，于是共享校验、
-    ``Trainer.load()``、预测加载**全部通过**，实际预测 CLI 也返回 0——只是默认
-    结束时间从 300 µs 变成 154.108 µs、``s_max`` 从 5.59815 变成 2.79908
-    （复核实测）。尺度记录已经不属于那个算例了，却没人发现。
 
-    校验按 ``case_id`` 关联，逐项如下（**不排序、不取第一个、不跳过**）：
+# --------------------------------------------------------------------------
+# 采样配置与时间窗口
+# --------------------------------------------------------------------------
 
-    1. ``case_ids`` 非空、不重复；
-    2. ``scales`` 与 ``data_identity`` 的键集都**恰好等于** ``case_ids``
-       （缺记录与来源不明的多记录都是硬失败）；
-    3. ``scales[case_id].charge_radius`` == ``data_identity[case_id].charge_radius_m``；
-    4. ``scales[case_id].time_scale`` == 顶层 ``time_scale``；
-    5. ``provenance['case_ids']`` 与 ``case_ids`` 是同一批算例，
-       ``provenance['charge_radii']`` 按下标与它平行、且等于对应算例
-       ``scales`` 里的半径；
-    6. ``provenance['start_times'][case_id]`` 与
-       ``provenance['valid_pinn_time_max']`` 都按 ``case_id`` 覆盖同一批算例；
-    7. ``expected_cases``（恢复端传入接收实例的 ``{case_id: (半径, 起始时间)}``）
-       不为 ``None`` 时，算例集合、每个算例的半径与起始时间都要与它一致。
 
-    "起始时间符合当前时间定义"（``T_h = R_0/D + epsilon(R_0)``，用顶层冻结 ``D``）
-    由 :func:`require_detonation_velocity` 用反解出的半径与它自己的 ``D`` 检查——
-    这里只知道半径，不知道 ``D``。
+def _validate_sampling_record(
+    record: Any, *, where: str, error: type[Exception] = TrainingError
+) -> None:
+    """采样记录的**结构**校验，不依赖任何接收对象。
 
-    返回 ``{case_id: {"charge_radius": ..., "start_time": ...}}``。
+    覆盖四类实际改变样本分布的量：``tau_end``、点数、分层比例、``r_min_fraction``；
+    以及动态窗口（用采样器模块的同一份窗口定义校验，不另写一套）。类型与范围都
+    按原样检查：``bool`` 不算整数，字符串不转成数字。
     """
+    from ..sampling.sampler import SamplingError, validate_time_window_record
 
-    def fail(reason: str) -> NoReturn:
-        raise error(f"{path}: {reason}")
+    if not isinstance(record, Mapping):
+        raise error(
+            f"{where}: the sampling record is {type(record).__name__}, not a mapping"
+        )
+    missing = [key for key in SAMPLING_RECORD_KEYS if key not in record]
+    if missing:
+        raise error(f"{where}: the sampling record is missing {missing}")
 
-    def same(left: float, right: float) -> bool:
-        return abs(left - right) <= SCALES_RELATIVE_TOLERANCE * max(abs(left), abs(right))
+    tau_end = _real_number(record[SAMPLING_TAU_END_KEY])
+    if tau_end is None or not math.isfinite(tau_end) or tau_end <= 0.0:
+        raise error(
+            f"{where}.{SAMPLING_TAU_END_KEY}: {record[SAMPLING_TAU_END_KEY]!r} is not a "
+            "finite positive duration"
+        )
 
-    def require_scale(value: Any, case_id: str, where: str, field: str) -> float:
-        number = _real_number(value)
-        if number is None or not math.isfinite(number) or number <= 0.0:
-            fail(
-                f"its {where} for case {case_id!r} records {field} = {value!r}, which is "
-                "not a finite positive number"
+    r_min_fraction = _real_number(record[SAMPLING_R_MIN_FRACTION_KEY])
+    if r_min_fraction is None or not (0.0 < r_min_fraction < 1.0):
+        raise error(
+            f"{where}.{SAMPLING_R_MIN_FRACTION_KEY}: "
+            f"{record[SAMPLING_R_MIN_FRACTION_KEY]!r} is not in (0, 1)"
+        )
+
+    counts = record[SAMPLING_COUNTS_KEY]
+    if not isinstance(counts, Mapping):
+        raise error(
+            f"{where}.{SAMPLING_COUNTS_KEY}: {type(counts).__name__}, not a mapping"
+        )
+    for key in SAMPLING_COUNT_KEYS:
+        value = counts.get(key)
+        if not _is_int_like(value):
+            raise error(
+                f"{where}.{SAMPLING_COUNTS_KEY}.{key}: {value!r} is not an integer"
             )
-        return number
-
-    case_ids = _case_ids(payload, path, error)
-    scales = payload.get(SCALES_KEY)
-    identity = payload.get(DATA_IDENTITY_KEY)
-    if not isinstance(scales, Mapping):
-        fail(
-            f"it carries no {SCALES_KEY!r} block ({type(scales).__name__}); the per-case "
-            "frozen scales are what the training run actually used"
-        )
-    if not isinstance(identity, Mapping):
-        fail(
-            f"it carries no {DATA_IDENTITY_KEY!r} block ({type(identity).__name__}); "
-            "nothing ties the case names to the data they came from"
-        )
-    expected_ids = set(case_ids)
-    for where, mapping in ((SCALES_KEY, scales), (DATA_IDENTITY_KEY, identity)):
-        missing = [case_id for case_id in case_ids if case_id not in mapping]
-        if missing:
-            fail(
-                f"its {where!r} has no entry for {missing}, which its own "
-                f"{CASE_IDS_KEY!r} lists; a missing record is not a pass"
+        if int(value) < 0:
+            raise error(
+                f"{where}.{SAMPLING_COUNTS_KEY}.{key}: {value!r} is negative"
             )
-        unexpected = sorted(str(key) for key in mapping if key not in expected_ids)
-        if unexpected:
-            fail(
-                f"its {where!r} carries entries for {unexpected}, which its own "
-                f"{CASE_IDS_KEY!r} does not list; the two describe different sets of cases"
-            )
-
-    declared_time_scale = _real_number(payload.get(SCALES_TIME_SCALE_KEY))
-    if declared_time_scale is None or not math.isfinite(declared_time_scale):
-        fail(
-            f"it records no usable top-level {SCALES_TIME_SCALE_KEY!r} "
-            f"({payload.get(SCALES_TIME_SCALE_KEY)!r}) to match the per-case scales against"
-        )
-
-    resolved: dict[str, dict[str, float]] = {}
-    for case_id in case_ids:
-        record = _associated_record(
-            scales, case_id, case_id, path=path, where=SCALES_KEY, error=error
-        )
-        radius = require_scale(
-            record.get(SCALES_CHARGE_RADIUS_KEY), case_id, SCALES_KEY, SCALES_CHARGE_RADIUS_KEY
-        )
-        start_time = require_scale(
-            record.get(SCALES_START_TIME_KEY), case_id, SCALES_KEY, SCALES_START_TIME_KEY
-        )
-        time_scale = require_scale(
-            record.get(SCALES_TIME_SCALE_KEY), case_id, SCALES_KEY, SCALES_TIME_SCALE_KEY
-        )
-        if not same(time_scale, declared_time_scale):
-            fail(
-                f"its scales for case {case_id!r} carry {SCALES_TIME_SCALE_KEY} = "
-                f"{time_scale!r} but the checkpoint declares {SCALES_TIME_SCALE_KEY} = "
-                f"{declared_time_scale!r}; the same case is described with two different "
-                "hat T_*, so the network's time input is ambiguous"
+    for key in ("n_ic_product", "n_ic_air"):
+        if int(counts[key]) < 1:
+            raise error(
+                f"{where}.{SAMPLING_COUNTS_KEY}.{key}: {counts[key]!r}; the initial "
+                "condition is always part of the batch, so it cannot be zero"
             )
 
-        case_identity = _associated_record(
-            identity, case_id, case_id, path=path, where=DATA_IDENTITY_KEY, error=error
+    stratification = record[SAMPLING_STRATIFICATION_KEY]
+    if not isinstance(stratification, Mapping):
+        raise error(
+            f"{where}.{SAMPLING_STRATIFICATION_KEY}: "
+            f"{type(stratification).__name__}, not a mapping"
         )
-        identity_radius = require_scale(
-            case_identity.get(DATA_IDENTITY_CHARGE_RADIUS_KEY),
-            case_id,
-            DATA_IDENTITY_KEY,
-            DATA_IDENTITY_CHARGE_RADIUS_KEY,
-        )
-        if not same(radius, identity_radius):
-            fail(
-                f"its scales for case {case_id!r} record {SCALES_CHARGE_RADIUS_KEY} = "
-                f"{radius!r} m, but its {DATA_IDENTITY_KEY!r} for the same case records "
-                f"{DATA_IDENTITY_CHARGE_RADIUS_KEY} = {identity_radius!r} m. The scale "
-                "record no longer belongs to that case's data"
+    for key in SAMPLING_STRATIFICATION_KEYS:
+        if key not in stratification:
+            raise error(f"{where}.{SAMPLING_STRATIFICATION_KEY}: missing {key!r}")
+        value = _real_number(stratification[key])
+        if value is None or not math.isfinite(value):
+            raise error(
+                f"{where}.{SAMPLING_STRATIFICATION_KEY}.{key}: "
+                f"{stratification[key]!r} is not a finite number"
             )
-        resolved[case_id] = {
-            SCALES_CHARGE_RADIUS_KEY: radius,
-            SCALES_START_TIME_KEY: start_time,
-        }
-
-    # -- provenance 里的同一批逐算例记录 ------------------------------------
-    provenance = payload.get(PROVENANCE_KEY)
-    if not isinstance(provenance, Mapping):
-        fail(
-            f"it carries no {PROVENANCE_KEY!r} block ({type(provenance).__name__}); the "
-            "per-case records there are another description of the same run"
+    near_fraction = float(stratification["near_fraction"])
+    if not (0.0 <= near_fraction <= 1.0):
+        raise error(
+            f"{where}.{SAMPLING_STRATIFICATION_KEY}.near_fraction: {near_fraction!r} "
+            "is outside [0, 1]"
         )
-    provenance_ids = provenance.get(PROVENANCE_CASE_IDS_KEY)
-    if (
-        isinstance(provenance_ids, (str, bytes))
-        or not isinstance(provenance_ids, Sequence)
-        or not provenance_ids
-    ):
-        fail(
-            f"its {PROVENANCE_KEY}[{PROVENANCE_CASE_IDS_KEY!r}] is "
-            f"{provenance_ids!r}, not a non-empty list of case names"
-        )
-    if set(provenance_ids) != expected_ids:
-        fail(
-            f"its top-level {CASE_IDS_KEY!r} is {sorted(expected_ids)} but "
-            f"{PROVENANCE_KEY}[{PROVENANCE_CASE_IDS_KEY!r}] says "
-            f"{sorted(str(name) for name in provenance_ids)}; the run is described with "
-            "two different sets of cases"
-        )
-
-    radii = provenance.get(PROVENANCE_CHARGE_RADII_KEY)
-    if (
-        isinstance(radii, (str, bytes))
-        or not isinstance(radii, Sequence)
-        or len(radii) != len(provenance_ids)
-    ):
-        fail(
-            f"its {PROVENANCE_KEY}[{PROVENANCE_CHARGE_RADII_KEY!r}] is not a list running "
-            f"parallel to [{PROVENANCE_CASE_IDS_KEY!r}] "
-            f"({len(provenance_ids)} case names, radii = {radii!r})"
-        )
-    for index, case_id in enumerate(provenance_ids):
-        recorded = require_scale(
-            radii[index], str(case_id), PROVENANCE_KEY, PROVENANCE_CHARGE_RADII_KEY
-        )
-        if case_id not in resolved:
-            fail(
-                f"its {PROVENANCE_KEY}[{PROVENANCE_CASE_IDS_KEY!r}] names case "
-                f"{case_id!r}, which its top-level {CASE_IDS_KEY!r} does not"
-            )
-        if not same(recorded, resolved[case_id][SCALES_CHARGE_RADIUS_KEY]):
-            fail(
-                f"its {PROVENANCE_KEY}[{PROVENANCE_CHARGE_RADII_KEY!r}][{index}] = "
-                f"{recorded!r} m is for case {case_id!r}, whose scales record "
-                f"{SCALES_CHARGE_RADIUS_KEY} = "
-                f"{resolved[case_id][SCALES_CHARGE_RADIUS_KEY]!r} m; the parallel list no "
-                "longer lines up with the scales"
+    for key in ("near_span", "xi_floor"):
+        value = float(stratification[key])
+        if not (0.0 < value < 0.5):
+            raise error(
+                f"{where}.{SAMPLING_STRATIFICATION_KEY}.{key}: {value!r} is outside "
+                "(0, 0.5)"
             )
 
-    start_times = provenance.get(PROVENANCE_START_TIMES_KEY)
-    if not isinstance(start_times, Mapping):
-        fail(
-            f"its {PROVENANCE_KEY}[{PROVENANCE_START_TIMES_KEY!r}] is "
-            f"{type(start_times).__name__}, not a per-case record"
+    window = record[SAMPLING_WINDOW_KEY]
+    try:
+        validate_time_window_record(window)
+    except SamplingError as exc:
+        raise error(f"{where}.{SAMPLING_WINDOW_KEY}: {exc}") from exc
+    full = float(window["full_pinn_time_max"])
+    if not _same_number(full, tau_end):
+        raise error(
+            f"{where}.{SAMPLING_WINDOW_KEY}: the window's full duration is {full!r} s, "
+            f"but the recorded tau_end is {tau_end!r} s"
         )
-    valid_times = provenance.get(PROVENANCE_VALID_TIME_KEY)
-    if not isinstance(valid_times, Mapping):
-        fail(
-            f"its {PROVENANCE_KEY}[{PROVENANCE_VALID_TIME_KEY!r}] is "
-            f"{type(valid_times).__name__}, not a per-case record"
+
+
+def sampling_record(sampler: Any) -> dict[str, Any]:
+    """把采样器的静态配置与当前窗口写成一条记录。"""
+    if not hasattr(sampler, "sampling_config_state"):
+        raise TrainingError(
+            f"the checkpoint needs a RadiusSampler-like object, got "
+            f"{type(sampler).__name__}"
         )
-    for where, mapping in (
-        (PROVENANCE_START_TIMES_KEY, start_times),
-        (PROVENANCE_VALID_TIME_KEY, valid_times),
-    ):
-        missing = [case_id for case_id in case_ids if case_id not in mapping]
-        if missing:
-            fail(
-                f"its {PROVENANCE_KEY}[{where!r}] has no entry for {missing}, which its "
-                f"own {CASE_IDS_KEY!r} lists"
-            )
-        unexpected = sorted(str(key) for key in mapping if key not in expected_ids)
-        if unexpected:
-            fail(
-                f"its {PROVENANCE_KEY}[{where!r}] carries entries for {unexpected}, which "
-                f"its own {CASE_IDS_KEY!r} does not list"
-            )
-
-    # ``start_times`` 是同一件事的**第二份记录**：它与该算例 ``scales`` 里的
-    # ``start_time`` 必须逐位一致。只核对键集是不够的——那个值决定整条时间轴，
-    # 改掉它同样会让同一份检查点在两处被读出两个原点。
-    for case_id in case_ids:
-        recorded = _real_number(start_times[case_id])
-        if recorded is None or not math.isfinite(recorded) or recorded <= 0.0:
-            fail(
-                f"its {PROVENANCE_KEY}[{PROVENANCE_START_TIMES_KEY!r}][{case_id!r}] is "
-                f"{start_times[case_id]!r}, not a finite positive time"
-            )
-        if not same(recorded, resolved[case_id][SCALES_START_TIME_KEY]):
-            fail(
-                f"its {PROVENANCE_KEY}[{PROVENANCE_START_TIMES_KEY!r}][{case_id!r}] = "
-                f"{recorded!r} s disagrees with its scales for the same case, which "
-                f"record {SCALES_START_TIME_KEY} = "
-                f"{resolved[case_id][SCALES_START_TIME_KEY]!r} s: one case, two time "
-                "origins"
-            )
-    # ``valid_pinn_time_max`` 是数据里量出来的 ``t_PINN`` 上界，没有第二份记录可
-    # 对，但它进 ``s_max``——所以至少必须是一个有限的非负数，不能是 ``None``/字符串
-    # /负数那种"读起来像覆盖范围"的东西。
-    for case_id in case_ids:
-        value = _real_number(valid_times[case_id])
-        if value is None or not math.isfinite(value) or value < 0.0:
-            fail(
-                f"its {PROVENANCE_KEY}[{PROVENANCE_VALID_TIME_KEY!r}][{case_id!r}] is "
-                f"{valid_times[case_id]!r}, not a finite non-negative PINN time"
-            )
-
-    # -- 恢复端：与接收实例**实际使用的**算例半径和起始时间对照 ------------
-    if expected_cases is not None:
-        if set(expected_cases) != expected_ids:
-            fail(
-                f"the checkpoint is for cases {sorted(expected_ids)}, but the receiving "
-                f"trainer holds {sorted(expected_cases)}; resuming across different cases "
-                "is not a resume"
-            )
-        for case_id in case_ids:
-            radius, start_time = expected_cases[case_id]
-            if not same(resolved[case_id][SCALES_CHARGE_RADIUS_KEY], float(radius)):
-                fail(
-                    f"the checkpoint's scales for case {case_id!r} use "
-                    f"{SCALES_CHARGE_RADIUS_KEY} = "
-                    f"{resolved[case_id][SCALES_CHARGE_RADIUS_KEY]!r} m, but this "
-                    f"trainer's case {case_id!r} has radius {float(radius)!r} m"
-                )
-            if not same(resolved[case_id][SCALES_START_TIME_KEY], float(start_time)):
-                fail(
-                    f"the checkpoint's scales for case {case_id!r} put the time origin at "
-                    f"{resolved[case_id][SCALES_START_TIME_KEY]!r} s, but this trainer's "
-                    f"case {case_id!r} starts at {float(start_time)!r} s; resuming would "
-                    "shift that case's trajectory"
-                )
-    return resolved
+    record = _normalise(sampler.sampling_config_state())
+    _validate_sampling_record(record, where="save_startup_checkpoint: sampling")
+    return record
 
 
-def require_detonation_velocity(
-    payload: Mapping[str, Any],
-    path: Path | str,
+def _check_sampling_record(
+    record: Any, sampler: Any, *, where: str
+) -> None:
+    """核对接收采样器与检查点的采样设置**逐项相同**，不作任何修改。"""
+    _validate_sampling_record(record, where=where)
+    expected = _normalise(sampler.sampling_config_state())
+
+    for key in (SAMPLING_TAU_END_KEY, SAMPLING_R_MIN_FRACTION_KEY):
+        if not _same_number(record[key], expected[key]):
+            raise TrainingError(
+                f"{where}.{key}: the checkpoint recorded {record[key]!r}, but the "
+                f"receiving sampler uses {expected[key]!r}; the sampled time range or "
+                "radial floor would differ, so this is not an exact resume"
+            )
+
+    saved_counts = record[SAMPLING_COUNTS_KEY]
+    receiving_counts = expected[SAMPLING_COUNTS_KEY]
+    differing = [
+        key for key in SAMPLING_COUNT_KEYS
+        if int(saved_counts[key]) != int(receiving_counts[key])
+    ]
+    if differing:
+        raise TrainingError(
+            f"{where}.counts: the sampling point counts differ in {differing} "
+            f"(checkpoint { {key: saved_counts[key] for key in differing} }, "
+            f"receiving sampler { {key: receiving_counts[key] for key in differing} }); "
+            "a different sampling configuration is not an exact resume"
+        )
+
+    saved_stratification = record[SAMPLING_STRATIFICATION_KEY]
+    receiving_stratification = expected[SAMPLING_STRATIFICATION_KEY]
+    differing = [
+        key for key in SAMPLING_STRATIFICATION_KEYS
+        if not _same_number(saved_stratification[key], receiving_stratification[key])
+    ]
+    if differing:
+        raise TrainingError(
+            f"{where}.stratification: the layered sampling settings differ in "
+            f"{differing} (checkpoint "
+            f"{ {key: saved_stratification[key] for key in differing} }, receiving "
+            f"sampler { {key: receiving_stratification[key] for key in differing} })"
+        )
+
+    try:
+        sampler.validate_window_state(record[SAMPLING_WINDOW_KEY])
+    except Exception as exc:  # noqa: BLE001 - keep the sampler's actual reason
+        raise TrainingError(f"{where}.window: {exc}") from exc
+
+
+def _check_sampler_startup_binding(
+    sampler: Any,
+    identity: Mapping[str, Any],
+    scale_record: Any,
+    rebuilt_scales: PlanarStartupScales,
+    field: PlanarStartupField | None,
     *,
-    expected: float | None = None,
-    expected_cases: Mapping[str, tuple[float, float]] | None = None,
-    error: type[Exception] = TrainingError,
-) -> float:
-    """读出检查点里**冻结的**爆速并校验，返回它。
-
-    保存端写什么、读取端要求什么只有这一份定义。``Trainer.load`` 与
-    ``cli.predict.load_model_from_checkpoint`` 都调它——以前**只有预测端**调，
-    于是删掉这个字段或把它改成 ``-1`` 时"恢复训练放行、预测拒绝"（复核实测）。
-
-    校验分四层，任何一层不成立都**硬失败**：
-
-    1. **顶层字段**必须存在，且是合法的**有限正实数**（``True``、``"6930"``、
-       ``[6930]`` 都不算——不许用 ``float()`` 把错误类型转成合法输入）；
-    2. **逐算例关联**：``case_ids`` / ``scales`` / ``data_identity`` / ``provenance``
-       必须指同一批算例、同一个半径。这一层由
-       :func:`require_case_scales_association` 一处实现；
-    3. **时间定义**：每个算例的 ``scales[case_id][start_time]`` 必须等于
-       ``T_h = R_0/D + epsilon(R_0)``——用顶层那个 ``D`` 与**该算例自己的半径**
-       正向算一遍。用不了反解那一套来兜底：半径与起始时间**同时**翻倍时反解出的
-       ``D`` 一模一样，只有正向定义对得上才对得上；
-    4. ``expected`` / ``expected_cases``（恢复端传入接收实例**实际使用**的爆速，
-       以及每个算例的半径与起始时间）不为 ``None`` 时，还要与**接收实例**一致。
-       只查"文件内部自洽"是不够的：一份自洽的检查点照样能被另一个爆速、另一个
-       半径的实例恢复——实测同一份文件在恢复端给出 ``T_h = 8.21500721501 µs``、
-       在预测端给出 ``41.5186385737 µs``。
-
-    ``D`` 进 ``T_h = R_0/D + epsilon(R_0)``，所以任何一层都不允许回落到默认常量：
-    补一个默认值换来的不是错误，而是整条轨迹平移一个爆轰穿越时间。
-    """
-    if DETONATION_VELOCITY_FIELD not in payload:
-        raise error(
-            f"{path} carries no {DETONATION_VELOCITY_FIELD!r}, but checkpoint version "
-            f"{CHECKPOINT_VERSION} requires it. That field is the charge's detonation "
-            "velocity, a frozen physical parameter: the scheme-B time origin "
-            "T_h = R_0/D + epsilon(R_0) cannot be reconstructed without it, and "
-            "substituting a default would shift the whole trajectory by the detonation "
-            "transit time. A version-8 checkpoint without it is damaged, not an older "
-            "scheme's file"
-        )
-    raw = payload[DETONATION_VELOCITY_FIELD]
-    velocity = _real_number(raw)
-    if velocity is None:
-        raise error(
-            f"the checkpoint's {DETONATION_VELOCITY_FIELD} is {raw!r} "
-            f"({type(raw).__name__}), not a real number"
-        )
-    if not math.isfinite(velocity) or velocity <= 0.0:
-        raise error(
-            f"the checkpoint's {DETONATION_VELOCITY_FIELD} must be finite and positive, "
-            f"got {velocity!r}; it sets the time origin T_h = R_0/D + epsilon(R_0)"
-        )
-
-    # -- 第二层：逐算例关联（case_ids / scales / data_identity / provenance）--
-    #
-    # 这一层要回答的是"每条记录说的是不是**同一个算例、同一个半径**"。只比爆速
-    # 远远不够：把 ``scales[case_id].charge_radius`` 从 0.05 改成 0.10、同时把
-    # ``start_time`` 乘 2，反算出的爆速**仍然是** 6930，于是"冻结参数一致"这条
-    # 检查完全拦不住，而尺度记录已经不属于那个算例（复核实测：默认预测结束时间
-    # 从 300 µs 变成 154.108 µs、``s_max`` 从 5.59815 变成 2.79908）。
-    cases = require_case_scales_association(
-        payload, path, expected_cases=expected_cases, error=error
+    where: str,
+) -> None:
+    """接收采样器必须站在检查点的**同一个启动场与尺度**上。"""
+    sampler_field = getattr(sampler, "field", None)
+    try:
+        _require_field(sampler_field)
+    except TrainingError as exc:
+        raise TrainingError(f"{where}.field: {exc}") from exc
+    _check_startup_identity(
+        identity, sampler_field, rebuilt_scales, where=f"{where}.startup"
     )
+    sampler_scales = getattr(sampler, "scales", None)
+    if not isinstance(sampler_scales, PlanarStartupScales):
+        raise TrainingError(
+            f"{where}.scales: the sampler's scales are "
+            f"{type(sampler_scales).__name__}, not PlanarStartupScales"
+        )
+    _check_scales_match(scale_record, sampler_scales, where=f"{where}.scales")
+    if field is not None and sampler_field.cache_key() != field.cache_key():
+        raise TrainingError(
+            f"{where}.field: the sampler samples startup field "
+            f"{sampler_field.cache_key()!r}, but the handoff provided is "
+            f"{field.cache_key()!r}; resuming would continue on a different initial "
+            "condition"
+        )
 
-    # -- 第三层：起始时间必须**符合当前时间定义** ``T_h = R_0/D + epsilon`` --
-    #
-    # 用顶层那个 ``D`` 正向算一遍，与记录里的 ``start_time`` 比——这比"反解出 D
-    # 再比"更直接地表达了契约，而且同一份公式只有一份定义（``physics.similitude``）。
-    for case_id in cases:
-        radius = cases[case_id][SCALES_CHARGE_RADIUS_KEY]
-        recorded = cases[case_id][SCALES_START_TIME_KEY]
-        defined = handover_time(radius, detonation_velocity=velocity)
-        if abs(recorded - defined) > DETONATION_VELOCITY_RELATIVE_TOLERANCE * max(
-            abs(recorded), abs(defined)
-        ):
-            raise error(
-                f"the checkpoint's scales for case {case_id!r} record "
-                f"{SCALES_START_TIME_KEY} = {recorded!r} s, but the checkpoint's own "
-                f"{DETONATION_VELOCITY_FIELD} = {velocity!r} m/s at "
-                f"{SCALES_CHARGE_RADIUS_KEY} = {radius!r} m gives "
-                f"T_h = R_0/D + epsilon(R_0) = {defined!r} s. The case's time origin and "
-                "its frozen detonation velocity describe different time axes"
+
+def startup_identity(field: PlanarStartupField) -> dict[str, Any]:
+    return {
+        STARTUP_MODEL_ID_KEY: str(field.model_id),
+        STARTUP_METHOD_VERSION_KEY: str(field.method_version),
+        STARTUP_CACHE_KEY: str(field.cache_key()),
+        STARTUP_DELTA_KEY: float(field.delta),
+    }
+
+
+def _check_startup_identity(
+    identity: Any,
+    field: PlanarStartupField,
+    scales: PlanarStartupScales,
+    *,
+    where: str,
+) -> None:
+    if not isinstance(identity, Mapping):
+        raise TrainingError(f"{where}: the startup identity is not a mapping")
+    for key in (
+        STARTUP_MODEL_ID_KEY,
+        STARTUP_METHOD_VERSION_KEY,
+        STARTUP_CACHE_KEY,
+    ):
+        value = identity.get(key)
+        if not isinstance(value, str) or not value:
+            raise TrainingError(f"{where}: the startup identity has no usable {key!r}")
+    delta = _real_number(identity.get(STARTUP_DELTA_KEY))
+    checks = (
+        (identity[STARTUP_MODEL_ID_KEY], field.model_id, "model_id"),
+        (identity[STARTUP_METHOD_VERSION_KEY], field.method_version, "method_version"),
+        (identity[STARTUP_CACHE_KEY], field.cache_key(), "cache_key"),
+    )
+    for recorded, actual, label in checks:
+        if recorded != actual:
+            raise TrainingError(
+                f"{where}: the checkpoint was written for startup {label} "
+                f"{recorded!r}, but this field has {actual!r}; the initial condition is "
+                "not the one this checkpoint was trained on"
+            )
+    if delta is None or abs(delta - float(field.delta)) > SCALES_RELATIVE_TOLERANCE * max(
+        abs(float(field.delta)), 1.0e-30
+    ):
+        raise TrainingError(
+            f"{where}: the checkpoint's delta is {identity.get(STARTUP_DELTA_KEY)!r}, "
+            f"but this field has {field.delta!r}"
+        )
+    if not _same_number(field.epsilon, scales.startup_epsilon):
+        raise TrainingError(
+            f"{where}: the field epsilon is {field.epsilon!r} s but the recorded scales "
+            f"start at {scales.startup_epsilon!r} s"
+        )
+    if not _same_number(field.charge_radius, scales.charge_radius):
+        raise TrainingError(
+            f"{where}: the field charge radius is {field.charge_radius!r} m but the "
+            f"recorded scales belong to {scales.charge_radius!r} m"
+        )
+
+
+def _model_structure(model: Any) -> Any:
+    if not hasattr(model, "describe") or not hasattr(model, "state_dict"):
+        raise TrainingError(
+            f"the checkpoint needs a CoupledModel-like object, got {type(model).__name__}"
+        )
+    parameters = list(model.parameters())
+    if not parameters:
+        raise TrainingError("the model has no trainable parameters")
+    return _normalise({"describe": model.describe(), "dtype": str(parameters[0].dtype)})
+
+
+def _optimizer_reference(optimizer: Any) -> tuple[list[list[int]], dict[int, tuple[int, ...]]]:
+    state_dict = optimizer.state_dict()
+    groups = [list(group["params"]) for group in state_dict.get("param_groups", [])]
+    tensors = [parameter for group in optimizer.param_groups for parameter in group["params"]]
+    ids = [int(pid) for group in groups for pid in group]
+    if len(ids) != len(tensors):
+        raise TrainingError(
+            "the optimizer's parameter-group ids do not line up with its parameters"
+        )
+    shapes: dict[int, tuple[int, ...]] = {}
+    for pid, parameter in zip(ids, tensors):
+        shapes[pid] = tuple(parameter.shape)
+    return [[int(pid) for pid in group] for group in groups], shapes
+
+
+def collect_rng_state(*, sampler: Any = None) -> dict[str, Any]:
+    """全局 Python/NumPy/Torch 随机状态，加上可选的采样器状态。"""
+    import random
+
+    import torch
+
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "sampler": None if sampler is None else sampler.rng_state(),
+    }
+
+
+def _validate_rng_state(
+    state: Any, *, where: str, error: type[Exception] = TrainingError
+) -> None:
+    if not isinstance(state, Mapping):
+        raise error(f"{where}: the RNG state is {type(state).__name__}, not a mapping")
+    for key in ("python", "numpy", "torch"):
+        if key not in state:
+            raise error(f"{where}: the RNG state has no {key!r}")
+    if not isinstance(state["python"], tuple) or len(state["python"]) != 3:
+        raise error(f"{where}: the Python RNG state is not a 3-tuple")
+    numpy_state = state["numpy"]
+    if not isinstance(numpy_state, tuple) or len(numpy_state) != 5:
+        raise error(f"{where}: the NumPy RNG state is not a 5-tuple")
+    if not _is_tensor_like(state["torch"]):
+        raise error(f"{where}: the Torch RNG state is not a tensor")
+    sampler_state = state.get("sampler")
+    if sampler_state is not None and not isinstance(sampler_state, Mapping):
+        raise error(f"{where}: the sampler RNG state is not a mapping")
+
+
+def _apply_rng_state(state: Mapping[str, Any], sampler: Any) -> None:
+    import random
+
+    import torch
+
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.random.set_rng_state(state["torch"])
+    if state.get("sampler") is not None:
+        if sampler is None:
+            raise TrainingError(
+                "the checkpoint carries a sampler RNG state but no sampler was provided "
+                "to restore it into"
+            )
+        sampler.set_rng_state(state["sampler"])
+
+
+def _package_version() -> str:
+    try:
+        from .. import __version__
+
+        return str(__version__)
+    except Exception:  # pragma: no cover - defensive
+        return "unknown"
+
+
+def _require_new_checkpoint(payload: Any, path: Path) -> None:
+    if not isinstance(payload, Mapping):
+        raise TrainingError(f"{path}: the checkpoint is not a mapping")
+    stored_format = payload.get("format")
+    if stored_format != CHECKPOINT_FORMAT:
+        raise TrainingError(
+            f"{path}: unsupported checkpoint format {stored_format!r}. This build reads "
+            f"{CHECKPOINT_FORMAT!r} (version {CHECKPOINT_VERSION}). Old reference-field "
+            "checkpoints (format 'spherical_blast_pinn.checkpoint', version <= 8, with "
+            "detonation velocity and T_h = R_0/D + epsilon) are not migrated: their time "
+            "origin cannot be rebuilt without guessing. Regenerate the checkpoint with "
+            "the new startup chain."
+        )
+    stored_version = payload.get("version")
+    if not _is_int_like(stored_version) or int(stored_version) != CHECKPOINT_VERSION:
+        raise TrainingError(
+            f"{path}: checkpoint version {stored_version!r} is not supported; this "
+            f"build reads version {CHECKPOINT_VERSION}. There is no migration from the "
+            "old reference-field format — regenerate with the new startup chain."
+        )
+    if payload.get(PURPOSE_KEY) != CHECKPOINT_PURPOSE:
+        raise TrainingError(
+            f"{path}: checkpoint purpose {payload.get(PURPOSE_KEY)!r} is not "
+            f"{CHECKPOINT_PURPOSE!r}; it belongs to a different checkpoint contract"
+        )
+
+
+def save_startup_checkpoint(
+    path: Path | str,
+    *,
+    field: PlanarStartupField,
+    scales: PlanarStartupScales,
+    model: Any,
+    optimizer: Any = None,
+    step: int = 0,
+    sampler: Any = None,
+    extra: Mapping[str, Any] | None = None,
+) -> Path:
+    """写出新启动场检查点（模型 + 可选优化器/随机状态）。"""
+    import torch
+
+    from ..losses.objective import contact_pressure_scale
+
+    _require_field(field)
+    record = startup_scale_record(scales)
+    if not _same_number(record["startup_epsilon"], field.epsilon):
+        raise TrainingError(
+            f"the scales start at epsilon {record['startup_epsilon']!r} s but the field "
+            f"is at {field.epsilon!r} s"
+        )
+    if not _same_number(record["charge_radius"], field.charge_radius):
+        raise TrainingError(
+            f"the scales belong to R_0 = {record['charge_radius']!r} m but the field has "
+            f"{field.charge_radius!r} m"
+        )
+    step_value = require_step_value(step, field="step", where="save_startup_checkpoint")
+    model_state = {
+        name: value.detach().cpu().clone()
+        for name, value in model.state_dict().items()
+    }
+    validate_model_state(
+        model_state,
+        model.state_dict(),
+        where="save_startup_checkpoint: model_state",
+    )
+    optimizer_state = None
+    if optimizer is not None:
+        optimizer_state = copy.deepcopy(optimizer.state_dict())
+        reference_groups, parameter_shapes = _optimizer_reference(optimizer)
+        validate_optimizer_state(
+            optimizer_state,
+            reference_param_groups=reference_groups,
+            parameter_shapes=parameter_shapes,
+            where="save_startup_checkpoint: optimizer",
+        )
+    pressure = float(contact_pressure_scale(field))
+    if not math.isfinite(pressure) or pressure <= 0.0:
+        raise TrainingError(
+            f"the contact pressure scale is {pressure!r} Pa; it must be finite and positive"
+        )
+    rng_state = collect_rng_state(sampler=sampler)
+    sampling_state = None if sampler is None else sampling_record(sampler)
+    if sampler is not None:
+        # 写出的采样器必须站在**这次保存的**启动场与尺度上；否则文件一写出来就
+        # 自相矛盾，而读取端要到很久以后才会发现。
+        _check_sampler_startup_binding(
+            sampler,
+            startup_identity(field),
+            record,
+            scales,
+            field,
+            where="save_startup_checkpoint: sampler",
+        )
+    payload = {
+        "format": CHECKPOINT_FORMAT,
+        "version": CHECKPOINT_VERSION,
+        PURPOSE_KEY: CHECKPOINT_PURPOSE,
+        STARTUP_KEY: startup_identity(field),
+        SCALES_KEY: record,
+        MODEL_STRUCTURE_KEY: _model_structure(model),
+        MODEL_STATE_KEY: model_state,
+        OPTIMIZER_KEY: optimizer_state,
+        STEP_KEY: step_value,
+        RNG_KEY: rng_state,
+        SAMPLING_KEY: sampling_state,
+        CONTACT_PRESSURE_KEY: pressure,
+        FINGERPRINT_KEY: parameter_fingerprint_of(model_state),
+        CODE_VERSION_KEY: _package_version(),
+    }
+    for key, value in dict(extra or {}).items():
+        if key in payload:
+            raise TrainingError(
+                f"extra metadata {key!r} would overwrite a reserved checkpoint field"
+            )
+        payload[key] = value
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    torch.save(dict(payload), temporary)
+    temporary.replace(target)
+    return target
+
+
+def load_startup_checkpoint(
+    path: Path | str,
+    *,
+    handoff_json: Path | str | None = None,
+    model: Any = None,
+    scales: PlanarStartupScales | None = None,
+    optimizer: Any = None,
+    sampler: Any = None,
+    restore_rng: bool = True,
+) -> dict[str, Any]:
+    """读取并核对新启动场检查点；给出目标对象时执行恢复。
+
+    先完成**全部**检查，再修改任何对象。恢复过程中的异常会把模型、优化器与随机
+    状态回滚到调用前的值，避免留下"一半加载"的目标。
+    """
+    import torch
+
+    source = Path(path)
+    payload = torch.load(source, map_location="cpu", weights_only=False)
+    _require_new_checkpoint(payload, source)
+
+    record = payload.get(SCALES_KEY)
+    rebuilt = planar_scales_from_record(record, where=f"{source}: scales")
+    identity = payload.get(STARTUP_KEY)
+    if not isinstance(identity, Mapping):
+        raise TrainingError(f"{source}: the startup identity is not a mapping")
+    for key in (STARTUP_MODEL_ID_KEY, STARTUP_METHOD_VERSION_KEY, STARTUP_CACHE_KEY):
+        if not isinstance(identity.get(key), str) or not identity.get(key):
+            raise TrainingError(f"{source}: the startup identity has no usable {key!r}")
+    if _real_number(identity.get(STARTUP_DELTA_KEY)) is None:
+        raise TrainingError(f"{source}: the startup identity has no usable delta")
+
+    field = None
+    if handoff_json is not None:
+        field = _require_field(load_planar_startup_handoff(handoff_json))
+        _check_startup_identity(identity, field, rebuilt, where=f"{source}: startup")
+    if scales is not None:
+        _check_scales_match(record, scales, where=f"{source}: scales")
+
+    step_value = require_step_value(
+        payload.get(STEP_KEY), field="step", where=f"{source}: step"
+    )
+    pressure = _real_number(payload.get(CONTACT_PRESSURE_KEY))
+    if pressure is None or not math.isfinite(pressure) or pressure <= 0.0:
+        raise TrainingError(
+            f"{source}: the contact pressure scale {payload.get(CONTACT_PRESSURE_KEY)!r} "
+            "is not a finite positive number"
+        )
+
+    model_state = payload.get(MODEL_STATE_KEY)
+    if model is not None:
+        if not hasattr(model, "state_dict"):
+            raise TrainingError(f"{source}: the receiving model is not a torch module")
+        model_scales = getattr(model, "scales", None)
+        if not isinstance(model_scales, PlanarStartupScales):
+            raise TrainingError(
+                f"{source}: the receiving model's scales are "
+                f"{type(model_scales).__name__}, not PlanarStartupScales"
+            )
+        _check_scales_match(record, model_scales, where=f"{source}: model scales")
+        if _normalise(payload.get(MODEL_STRUCTURE_KEY)) != _model_structure(model):
+            raise TrainingError(
+                f"{source}: the checkpoint's network structure or EOS configuration does "
+                "not match this model; refusing to load parameters into a different model"
+            )
+        validate_model_state(
+            model_state,
+            model.state_dict(),
+            where=f"{source}: model_state",
+        )
+        stored_fingerprint = payload.get(FINGERPRINT_KEY)
+        if stored_fingerprint != parameter_fingerprint_of(model_state):
+            raise TrainingError(
+                f"{source}: the recorded parameter fingerprint does not match the stored "
+                "parameters; the checkpoint is damaged"
             )
 
-    # -- 第四层：与**接收实例实际使用的**爆速一致（恢复端传入 expected） ----
-    if expected is not None:
-        reference = _real_number(expected)
-        if reference is None or not math.isfinite(reference) or reference <= 0.0:
-            raise error(
-                f"cannot compare the checkpoint's {DETONATION_VELOCITY_FIELD} against "
-                f"{expected!r}, which is not a finite positive detonation velocity"
+    optimizer_state = payload.get(OPTIMIZER_KEY)
+    if optimizer is not None:
+        if model is None:
+            raise TrainingError(
+                f"{source}: restoring an optimizer needs the receiving model as well"
             )
-        if abs(velocity - reference) > DETONATION_VELOCITY_RELATIVE_TOLERANCE * max(
-            abs(velocity), abs(reference)
-        ):
-            raise error(
-                f"the checkpoint was trained with {DETONATION_VELOCITY_FIELD} = "
-                f"{velocity!r} m/s, but this trainer's scales use {reference!r} m/s. "
-                "Resuming would rebuild the time origin T_h = R_0/D + epsilon(R_0) from "
-                "a different D, silently shifting the trajectory by the difference in "
-                "detonation transit time. Refusing rather than adopting either value"
+        if optimizer_state is None:
+            raise TrainingError(
+                f"{source}: this checkpoint carries no optimizer state, but an optimizer "
+                "was supplied to restore; refusing to continue from a different update history"
             )
-    return velocity
+        reference_groups, parameter_shapes = _optimizer_reference(optimizer)
+        validate_optimizer_state(
+            optimizer_state,
+            reference_param_groups=reference_groups,
+            parameter_shapes=parameter_shapes,
+            where=f"{source}: optimizer",
+        )
 
+    if SAMPLING_KEY not in payload:
+        raise TrainingError(
+            f"{source}: the checkpoint has no {SAMPLING_KEY!r} field. It was written "
+            "by an earlier contract that did not record tau_end, point counts or the "
+            "time window, so an exact resume cannot be reconstructed. Regenerate it "
+            "with the current startup chain"
+        )
+    sampling_state = payload[SAMPLING_KEY]
+    if sampler is not None:
+        if sampling_state is None:
+            raise TrainingError(
+                f"{source}: this checkpoint carries no sampling configuration, but a "
+                "sampler was supplied. Without it the sampler's tau_end, point counts "
+                "and stratification cannot be shown to match, so the run cannot be "
+                "resumed exactly"
+            )
+        _check_sampling_record(sampling_state, sampler, where=f"{source}: sampling")
+        _check_sampler_startup_binding(
+            sampler, identity, record, rebuilt, field, where=f"{source}: sampler"
+        )
+    elif sampling_state is not None:
+        _validate_sampling_record(sampling_state, where=f"{source}: sampling")
 
-# --------------------------------------------------------------------------
-# 候选与"待发布"标志的一致性
-# --------------------------------------------------------------------------
+    rng_state = payload.get(RNG_KEY)
+    if restore_rng:
+        _validate_rng_state(rng_state, where=f"{source}: rng")
+        if sampler is not None:
+            if rng_state.get("sampler") is None:
+                raise TrainingError(
+                    f"{source}: the checkpoint has no sampler RNG state, but a sampler "
+                    "was supplied; a resume without it would sample a different trajectory"
+                )
+            sampler.validate_rng_state(rng_state["sampler"])
+
+    model_backup = (
+        {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
+        if model is not None
+        else None
+    )
+    optimizer_backup = (
+        copy.deepcopy(optimizer.state_dict()) if optimizer is not None else None
+    )
+    window_backup = (
+        sampler.window_state()
+        if sampler is not None and sampling_state is not None
+        else None
+    )
+    rng_backup = collect_rng_state(sampler=sampler) if restore_rng else None
+    try:
+        if model is not None:
+            model.load_state_dict(model_state, strict=True)
+        if optimizer is not None:
+            optimizer.load_state_dict(copy.deepcopy(optimizer_state))
+        if sampler is not None and sampling_state is not None:
+            sampler.set_window_state(sampling_state[SAMPLING_WINDOW_KEY])
+        if restore_rng:
+            _apply_rng_state(rng_state, sampler)
+    except Exception:
+        if model is not None and model_backup is not None:
+            model.load_state_dict(model_backup, strict=True)
+        if optimizer is not None and optimizer_backup is not None:
+            optimizer.load_state_dict(optimizer_backup)
+        if sampler is not None and window_backup is not None:
+            sampler.set_window_state(window_backup)
+        if restore_rng and rng_backup is not None:
+            _apply_rng_state(rng_backup, sampler)
+        raise
+
+    return {
+        "path": str(source),
+        "startup": dict(identity),
+        "scales": rebuilt,
+        "step": step_value,
+        "contact_pressure_pa": float(pressure),
+        "parameter_fingerprint": payload.get(FINGERPRINT_KEY),
+        "handoff_checked": field is not None,
+        "restored_model": model is not None,
+        "restored_optimizer": optimizer is not None,
+        "restored_sampling": bool(sampler is not None and sampling_state is not None),
+        "sampling": copy.deepcopy(sampling_state) if sampling_state is not None else None,
+        "restored_rng": bool(restore_rng),
+    }
 
 
 def same_selection_value(left: Any, right: Any) -> bool:
@@ -1546,36 +1887,40 @@ def require_best_candidate_consistency(
 
 __all__ = [
     "CHECKPOINT_FORMAT",
+    "CHECKPOINT_PURPOSE",
     "CHECKPOINT_VERSION",
-    "CASE_IDS_KEY",
-    "DATA_IDENTITY_CHARGE_RADIUS_KEY",
-    "DATA_IDENTITY_KEY",
-    "DETONATION_VELOCITY_FIELD",
-    "DETONATION_VELOCITY_RELATIVE_TOLERANCE",
-    "PROVENANCE_CASE_IDS_KEY",
-    "PROVENANCE_CHARGE_RADII_KEY",
-    "PROVENANCE_KEY",
-    "PROVENANCE_START_TIMES_KEY",
-    "PROVENANCE_VALID_TIME_KEY",
+    "CONTACT_PRESSURE_KEY",
+    "FINGERPRINT_KEY",
+    "MODEL_STATE_KEY",
+    "MODEL_STRUCTURE_KEY",
+    "OPTIMIZER_KEY",
     "PUBLISH_ARTIFACTS_KEY",
-    "SCALES_CHARGE_RADIUS_KEY",
-    "SCALES_KEY",
-    "SCALES_RELATIVE_TOLERANCE",
-    "SCALES_START_TIME_KEY",
-    "SCALES_TIME_SCALE_KEY",
     "PUBLISH_MARKER",
     "PUBLISH_OWNER_KEY",
+    "RNG_KEY",
+    "SAMPLING_KEY",
+    "SAMPLING_RECORD_KEYS",
+    "SCALES_KEY",
+    "SCALES_RECORD_KEYS",
+    "SCALES_RELATIVE_TOLERANCE",
+    "STARTUP_KEY",
+    "STEP_KEY",
     "TrainingError",
+    "collect_rng_state",
+    "load_startup_checkpoint",
     "parameter_fingerprint_of",
+    "planar_scales_from_record",
     "publish_marker_path",
     "read_publish_marker",
     "refuse_if_uncommitted",
     "require_best_candidate_consistency",
+    "require_publish_marker_contract",
+    "sampling_record",
+    "save_startup_checkpoint",
+    "startup_identity",
+    "startup_scale_record",
+    "uncommitted_artifacts",
     "validate_model_state",
     "validate_optimizer_state",
     "validate_state_snapshot",
-    "require_case_scales_association",
-    "require_detonation_velocity",
-    "require_publish_marker_contract",
-    "uncommitted_artifacts",
 ]

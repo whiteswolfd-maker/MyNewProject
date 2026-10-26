@@ -7,7 +7,7 @@ meta:
   study: "自由空气中球形 TNT 爆炸，1D 球对称双场 PINN"
   reference_radius_m: 0.05      # R_ref，提示词 §5
   reference_start_time_s: 1.0e-6  # epsilon_ref，提示词 §5
-  scheme: "B：中心起爆、有限爆速（卡片 D）传播形成非均匀爆后产物场；波前到达装药表面后接静止空气，短时双介质前置到交接时刻 T_h = T_b + epsilon"
+  scheme: "2026-10-25：t_phys=0 均匀静止产物球 + 静止空气，经 JWL 等熵释放与空气激波 RH 的局部平面黎曼匹配，在小正时间 epsilon 得到 PlanarStartupField"
 
 # ---------------------------------------------------------------------------
 # 材料参数（提示词 §4）。这是全仓库唯一的一份数值来源。
@@ -34,28 +34,6 @@ air:
   # **不是**标准大气压 101325 Pa。两者不能混用：DYNA 实际初始化出来的就是 101320，
   # 而 d3plot 里读得到。写 101325 会让 PINN 的环境态与训练数据差 5 Pa。
   pressure: 101320.0
-
-# ---------------------------------------------------------------------------
-# 参考前置求解（提示词 §5）。它给出参考初始场 q_ref(r, t)，是初值的唯一来源。
-# ---------------------------------------------------------------------------
-reference_field:
-  # 产物场（爆轰阶段）自己的网格数。它与下面的 cells_inside 是两套网格：
-  # 前者在 [0, R_0] 上均匀、用于构造波前到达时的产物场，后者是两介质前置的网格。
-  detonation_cells: 2000
-  charge_radius_m: 0.05
-  cells_inside: 2000       # 装药内均匀网格数
-  growth: 1.005            # 装药外网格几何放宽比
-  outer_radius_factor: 40.0
-  cfl: 0.2
-  q1: 1.5                  # von Neumann–Richtmyer，与算例卡片一致
-  q2: 0.06
-  # 采样窗口是**相对 T_b** 的 [0, handover_margin * epsilon]，不是绝对物理时间。
-  # 交接时刻 T_h 落在相对时间的 epsilon 处（50 mm：T_b = 7.215007 us，epsilon = 1 us，
-  # T_h = 8.215007 us），所以 margin = 1.2 表示窗口在交接时刻之后再留 20% 余量。
-  # 方案 A 时代这里乘的是 T_h 本身，语义已经变了——两个数都是秒，写错不会报错。
-  handover_margin: 1.2
-  sample_count: 41
-  check_outer_boundary: 0.5  # 激波越过外半径的这个比例即报错
 
 # ---------------------------------------------------------------------------
 # 数据。`directory` 指向已验证的 (t, r, rho, u, P) 时空剖面。
@@ -162,9 +140,6 @@ sampling:
   n_ic_air: 256
   n_contact: 128
   n_shock: 128
-  n_data_product: 256
-  n_data_air: 256
-  n_data_front: 64
   near_fraction: 0.15     # 内侧 10% 与外侧 10% 区间各占 15%
   near_span: 0.10
   xi_floor: 1.0e-3        # 轴心保护；与 r_min_fraction 相容

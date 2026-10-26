@@ -81,187 +81,25 @@ def _two_medium_case(**overrides) -> ExtractedCase:
     return _case(**base)
 
 
-class _StubReference:
-    """只提供采样器真正用到的那两个方法。
-
-    这里关心的是**数据监督**怎么取点，所以初值那一侧给一个解析的、处处有定义的
-    替身即可——用一个真的参考场会把这条测试变成"参考场求解"的测试。
-    """
-
-    def contact_and_shock_at(self, time):
-        return np.asarray([0.05]), np.asarray([0.10])
-
-    def sample(self, radius, time):
-        radius = np.asarray(radius, dtype=np.float64)
-        return (
-            np.where(radius < 0.05, 1600.0, 6.0 * mat.AIR_DENSITY),
-            np.zeros_like(radius),
-            np.where(radius < 0.05, 1.0e7, 2.0e5),
-        )
-
-
-def _sampler(case, count: int = 40):
-    from spherical_blast_pinn.physics.similitude import SimilitudeScales
-    from spherical_blast_pinn.sampling.sampler import RadiusSampler, SamplingConfig
-
-    scales = SimilitudeScales.for_radius(
-        0.05, time_scale=2.0, detonation_velocity=case.detonation_velocity
-    )
-    return RadiusSampler(
-        case=case, scales=scales, reference=_StubReference(),
-        config=SamplingConfig(
-            n_pde_product=2, n_pde_air=2, n_ic_product=2, n_ic_air=2,
-            n_contact=2, n_shock=2, n_data_product=count, n_data_air=count,
-            n_data_front=2,
-        ),
-        seed=0,
-    )
-
-
-def _finite_fraction(values) -> float:
-    array = np.asarray(values.reshape(-1))
-    return float(np.mean(np.isfinite(array)))
-
-
 # ==========================================================================
 # §11.1 逐字段有效性必须真的控制取数
 # ==========================================================================
 
 
-def _medium_masks(case) -> tuple[np.ndarray, np.ndarray]:
-    """产物的网格点与空气的网格点（按算例自己的材料数组）。"""
-    product = case.material[0] == 0
-    air = case.material[0] == 1
-    return product, air
 
 
-def test_a_field_valid_where_the_joint_mask_says_invalid_is_kept():
-    """联合掩码说不可用、该字段自己的掩码说可用 ⇒ **保留**。
-
-    掩码覆盖**整个产物区**，所以断言直接落在被改动的那些位置上——不是"别处还有
-    一些有限值"这种碰巧也能通过的检查。
-    """
-    case = _two_medium_case()
-    product, _ = _medium_masks(case)
-    validity = {name: np.ones((1, 40), dtype=bool) for name in
-                ("density", "velocity", "specific_energy", "pressure")}
-    # 产物区：联合掩码整片为假，密度自己的掩码为真，其余字段为假
-    case.valid = case.valid.copy()
-    case.valid[0, product] = False
-    validity["density"][0, product] = True
-    validity["velocity"][0, product] = False
-    validity["specific_energy"][0, product] = False
-    case.field_validity = validity
-
-    batch = _sampler(case, count=400).batch()
-    assert batch.rho_data_product.numel() > 0
-    assert _finite_fraction(batch.rho_data_product) == pytest.approx(1.0), (
-        "产物区里密度自己的掩码全是有效的，标签却仍然被联合掩码丢掉了"
-    )
-    assert _finite_fraction(batch.u_data_product) == pytest.approx(0.0), (
-        "速度自己的掩码在产物区是无效的，标签却留着"
-    )
-    assert _finite_fraction(batch.e_data_product) == pytest.approx(0.0)
 
 
-def test_a_field_invalid_where_the_joint_mask_says_valid_is_dropped():
-    """联合掩码说可用、该字段自己的掩码说不可用 ⇒ **丢掉**。
-
-    反方向。旧实现取联合掩码，所以这里的密度标签会被当成可用——它被明确标为
-    不可用，而数值恰好有限（有限不等于有效）。
-    """
-    case = _two_medium_case()
-    product, _ = _medium_masks(case)
-    validity = {name: np.ones((1, 40), dtype=bool) for name in
-                ("density", "velocity", "specific_energy", "pressure")}
-    validity["density"][0, product] = False
-    case.field_validity = validity
-
-    batch = _sampler(case, count=400).batch()
-    assert _finite_fraction(batch.rho_data_product) == pytest.approx(0.0), (
-        "密度被标为不可用的位置上，标签仍然全是有限值——逐字段掩码被忽略了"
-    )
-    # 其他字段不受影响（§11.1：一个字段缺失不丢掉其他字段）
-    assert _finite_fraction(batch.u_data_product) == pytest.approx(1.0)
-    assert _finite_fraction(batch.e_data_product) == pytest.approx(1.0)
 
 
-def test_an_exact_grid_query_is_not_poisoned_by_a_nan_neighbour():
-    """**恰好落在网格点上时必须返回该点的值。**
-
-    ``a * (1 - w) + b * w`` 在 ``w = 0`` 处不等于 ``a``：``nan * 0`` 仍然是
-    ``nan``。采样器查的正是单元中心，也就是网格点本身，所以只要相邻单元有一个
-    ``nan``，那个位置上的有效标签就会被这一项污染——掩码选对了位置，取值又把它
-    毁了。
-    """
-    case = _two_medium_case()
-    radius = case.radius
-    case.density = case.density.copy()
-    case.density[0, 12] = np.nan              # 一个无效单元
-
-    values = case.sample_at(0, radius[11:13])
-    assert np.isfinite(values["density"][0]), (
-        "查询点就是网格点 11、它的邻居 12 是 nan，结果却成了 nan"
-    )
-    assert values["density"][0] == pytest.approx(case.density[0, 11])
 
 
-def test_an_interior_query_still_reports_nan_when_a_side_is_missing():
-    """区间**内部**的查询仍然要求两侧都有效——不拿单侧去编一个值出来。"""
-    case = _two_medium_case()
-    radius = case.radius
-    case.density = case.density.copy()
-    case.density[0, 12] = np.nan
-
-    midpoint = np.asarray([0.5 * (radius[11] + radius[12])])
-    values = case.sample_at(0, midpoint)
-    assert not np.isfinite(values["density"][0]), (
-        "一侧缺失时仍然插出了一个值；那是一个无中生有的标签"
-    )
 
 
-def test_an_exact_grid_query_survives_a_nan_neighbour_end_to_end():
-    """上面那条走完整条采样链路：有效位置必须真的带出有限标签。"""
-    case = _two_medium_case()
-    # 产物区的偶数号单元置 NaN，奇数号保持有效
-    case.density = case.density.copy()
-    product, _ = _medium_masks(case)
-    indices = np.flatnonzero(product)
-    case.density[0, indices[::2]] = np.nan
-
-    batch = _sampler(case, count=400).batch()
-    assert _finite_fraction(batch.rho_data_product) > 0.0, (
-        "有效网格点的密度标签被相邻的 nan 污染光了"
-    )
 
 
-def test_the_sampler_records_which_validity_mask_it_used():
-    """用的是哪一档要能读出来——退化和等价在报表上不能长得一样。"""
-    without = _two_medium_case()
-    assert without.field_validity is None
-    batch = _sampler(without, count=20).batch()
-    assert "joint" in batch.diagnostics["data_validity_source"]
-
-    with_validity = _two_medium_case(
-        field_validity={name: np.ones((1, 40), dtype=bool) for name in
-                        ("density", "velocity", "specific_energy", "pressure")}
-    )
-    batch = _sampler(with_validity, count=20).batch()
-    assert "per-field" in batch.diagnostics["data_validity_source"]
 
 
-def test_a_partial_field_validity_mapping_is_refused_by_the_sampler():
-    """只给一半的逐字段记录时必须抛错，不能悄悄退回联合掩码。
-
-    退回会让"缺失的那一半"变成"都有效"，而那正是这份记录要防的事。
-    """
-    from spherical_blast_pinn.sampling.sampler import SamplingError
-
-    case = _two_medium_case(
-        field_validity={"density": np.ones((1, 40), dtype=bool)}
-    )
-    with pytest.raises(SamplingError, match="per-field validity"):
-        _sampler(case, count=20).batch()
 
 
 # ==========================================================================
@@ -269,24 +107,6 @@ def test_a_partial_field_validity_mapping_is_refused_by_the_sampler():
 # ==========================================================================
 
 
-def test_a_missing_shock_does_not_strike_out_a_usable_contact():
-    """激波缺失不得连累接触面。"""
-    case = _two_medium_case(
-        shock_radius=np.full(1, np.nan),
-        # 半径与有效性必须一致：真实读取器里 ``shock_valid`` 是由
-        # ``isfinite(shock_radius) & 资格`` 得来的。只把半径置 NaN 而不动有效性，
-        # 造出的是一个**真实读取器不可能产生**的对象，测的就不是读取器的行为了。
-        shock_valid=np.zeros(1, dtype=bool),
-    )
-    assert case.contact_valid.all()
-    sampler = _sampler(case, count=20)
-    contact_frames = sampler.case.contact_supervisable_frames()
-    assert contact_frames.any(), (
-        "激波没识别出来时接触面被一起撤标了；§11.1 要求两条前沿独立"
-    )
-    assert not sampler.case.air_supervisable_frames().any(), (
-        "激波缺失时空气组不该有资格——空气层要两条前沿都在"
-    )
 
 
 def test_the_eligibility_arrays_win_over_the_detection_code(tmp_path):

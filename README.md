@@ -10,19 +10,23 @@
 
 ## 一、物理方案
 
-**方案 B**（2026-09-22 由 A 改来）：中心起爆、**有限爆速**传播形成非均匀爆后产物场；
-爆轰波到达装药表面时接外部静止空气；短时球对称双介质前置求解；在共同**交接时刻**
-``T_h`` 输出两侧的 `rho, u, e, p` 与 `R_c, R_s` 作为 PINN 初值。**不求解化学反应**，
-两个网络同时启动、全程保留。
+**唯一初始化方案（2026-10-21 决策，2026-10-25 定稿）。**
 
-**方案 A 已经废弃。** 它假设原装药整球在物理时间零点同时转化为均匀、静止的产物，
-初值是 `u = 0`、`e = E0/rho0`、`p = 8.220 GPa`（均匀）。真实算例不是这样：卡片是
-`*INITIAL_DETONATION pid=0, x=y=z=0, lt=0` 配 `*MAT_HIGH_EXPLOSIVE_BURN`，也就是
-**中心起爆、有限爆速**；d3plot 里 t = 0 时刻装药单元的 `p` **恰好为零**，只有爆轰波
-扫过才升压——这是有限速度爆轰的第二个独立证据（第一个是反应前沿跟随 `r = D t`）。
+`t_phys = 0` 时是**均匀静止的 JWL 产物球 + 静止空气**：
 
-因此 A 的那套初值**不能**再当作初值。`E0 = 6.0e9 J/m³` 保留，但它现在的身份是
-**能量尺度** `e_* = E0/rho0 = 3.680981595e6 J/kg`，不是初值；B 场各位置的内能不同。
+* 产物用现行 JWL 与 `E0`，初始密度 `rho_p0`、比内能 `e_p0 = E0/rho_ref`；
+* 空气用现行理想气体 EOS，环境态 101320 Pa；
+* `R_0` 是**材料界面**，不是爆轰波前。
+
+它**不是** CJ 表面突破，也不引入 Taylor 内场；**不求解化学反应**，两个网络
+同时启动、全程保留。
+
+小正时间启动由**局部平面黎曼问题**给出：
+
+1. 产物侧用实际 JWL 等熵线积分（`de/dV = -p/rho0`、`du/dV = c/V`）；
+2. 空气侧用理想气体激波的三条 RH 关系；
+3. 压力/速度匹配得到 `p_*`、`u_*`，完整自相似稀疏波与星区都保留；
+4. 把该自相似扇嵌入球面，得到 `t_phys = epsilon` 的 `PlanarStartupField`。
 
 三个域：
 
@@ -36,44 +40,44 @@
 `p_p = p_a`、`u_p = u_a = dR_c/dt`，**不要求**密度或比内能相等。主激波由完整
 三条 Rankine–Hugoniot 条件约束，波前取解析环境态。
 
+2026-09-22 至 2026-10-21 使用过的“方案 B”（中心起爆 + 有限爆速 + 非均匀爆后
+产物场 + 拉格朗日双材料前置 + `T_h = R_0/D + epsilon`）已随旧代码整体删除；
+它只作为历史记录保留，不再是操作规范。
+
 ## 二、时间与尺度化
 
-时间零点由**理论爆轰渡越时间 + 交接延迟**给出，**不是**从数据里测出的燃烧时间：
+新链路只有一条时间轴：
 
 ```
-k            = R_0 / R_ref              R_ref = 0.05 m
-epsilon(R_0) = k * epsilon_ref          epsilon_ref = 1e-6 s
-T_b          = R_0 / D                  D 来自材料卡（6930 m/s）
-T_h          = T_b + epsilon(R_0)       PINN 的启动时刻
-tau          = T - T_h
+epsilon      = delta R_0 / (D_s - u_*)     来自实际启动场
+tau          = t_phys - epsilon
+hat_t        = U_* tau / R_0
+s            = hat_t / hat_T_*
+s = 0  <=>  tau = 0  <=>  t_phys = epsilon_field
 ```
 
-| R_0 | T_b (µs) | epsilon (µs) | **T_h (µs)** |
-|---|---:|---:|---:|
-| 50 mm | 7.215007 | 1.0 | **8.215007** |
-| 80 mm | 11.544012 | 1.6 | **13.144012** |
-| 100 mm | 14.430014 | 2.0 | **16.430014** |
-| 500 mm | 72.150072 | 10.0 | **82.150072** |
+由 `physics.similitude.PlanarStartupScales` 显式表达：`start_time()` 返回该场
+自己的 `epsilon`，`detonation_velocity=None`（新原点不经过 `R_0/D`）。它只能由
+`PlanarStartupScales.for_startup_field(field, time_scale=...)` 构造；把旧的
+`SimilitudeScales`（`start_time() = T_h = R_0/D + epsilon(R_0)`）传给初值批次
+会被明确拒绝——两条轴都只有秒的量纲，用错不会报错。
 
-方案 A 的原点只有 `epsilon`（50 mm 时 1 µs），那等于宣称整球在 1 µs 时已是均匀产物。
-方案 B 的原点晚了整整一个 `T_b`。两个数都只有秒的量纲，用错了不会报错，只会把整条
-轨迹平移一个 `T_b`——所以 `D` 是**必填参数**，读取端缺它就拒绝加载。
-
-`t_surface = T - T_b = tau + epsilon` 是"表面到达之后过了多久"，另有函数给出，
-**不要**再对 `tau` 平移一次。
+默认 `delta = 1/200`；50 mm、默认参数下 `epsilon = 3.096678562615235e-07 s`。
+不同 `delta` 对应不同物理时刻，不能相减后称为时间收敛。
 
 尺度：
 
 ```
 e_* = E_0/rho_0 = 3.680981595e6 J/kg      U_* = sqrt(e_*) = 1918.588 m/s
-hat_t = U_* t_PINN / R_0                   s = hat_t / hat_T_*
+hat_t = U_* tau / R_0                     s = hat_t / hat_T_*
 ```
 
 `rho_*,p = 1630`、`rho_*,a = 1.225`，速度尺度同为 `U_*`，比内能尺度同为
 `U_*^2`，压力尺度分别为 `rho_*,k U_*^2`。
 
-`hat_T_*` 由**训练半径**有效时间范围内最大的 `hat_t` 冻结得到，训练前确定，
-之后不再变。验证与盲测半径不参与它的估计。
+`hat_T_*` 仍由**训练半径**有效时间范围内最大的 `hat_t` 冻结得到；验证与盲测
+半径不参与它的估计。空间坐标、速度/密度/能量尺度与时间导数尺度系数都没有因为
+更换初值方案而改变。
 
 移动坐标与链式法则：
 
@@ -174,140 +178,139 @@ L   = (L_50 + L_80 + L_100) / 3
 而不是把同一帧的相邻网格点随机拆开——随机拆分会让两个集合互相看得见对方，
 "开发集误差"于是只是训练误差的一个更贵的写法。
 
-## 六、参考初始场
+## 六、启动初值：均匀产物球 + 局部平面黎曼
 
-**旧参考场**的初值来源是一个独立的拉格朗日球对称双材料前置求解器（新初值
-链路见本节末尾）：
-
-* 交错网格，节点带速度，单元带质量、比容、比内能；
-* 单元的材料身份固定，接触面永远是单元边界，两种材料不会被数值扩散混进同一
-  个单元；
-* 球对称拉格朗日动量方程 `du/dt = -r^2 dp/dm`，显式时间推进；
-* von Neumann–Richtmyer 人工粘性捕捉激波，`q1 = 1.5`、`q2 = 0.06`。
-
-`q_R0(r, t) = q_ref(r/k, t/k)`：只缩放长度与时间，状态量不乘 `k`，质量与能量
-随 `k^3`。
-
-### 新初值链路：均匀产物球 + 局部平面黎曼启动（2026-10-25）
-
-上面“独立拉格朗日前置求解器”只描述**旧参考场**。2026-10-21 用户确认的零时刻
-初值，以及 2026-10-25 改为的小正时间启动，是另一条链路：
+链路（全部在 `physics/` 与 `sampling/`）：
 
 * `physics/two_medium_initial.py`：`t_phys=0` 的均匀静止 JWL 产物球 + 静止空气，
-  `R0` 是单元界面；压力由 EOS 从 `(rho_p0, e_p0=E0/rho_ref)` 计算，不用整球
+  `R0` 是材料界面；压力由 EOS 从 `(rho_p0, e_p0=E0/rho_ref)` 计算，不用整球
   CJ 压力反推内能。质量/能量同时给出单位立体角与 `full_sphere_*` 两种口径。
 * `physics/two_medium_riemann.py`：局部平面 JWL—空气黎曼问题。产物侧用实际
   JWL 等熵线积分（`de/dV=-p/rho0`、`du/dV=c/V`），空气侧用理想气体激波三条 RH；
   求 `p_star,u_star`，不把常 gamma 产物公式替代 JWL。
 * `physics/two_medium_startup_planar.py`：把自相似扇嵌入球面，候选
-  `delta=(Rs-Rc)/R0=1/200`，`epsilon=delta R0/(D_s-u_star)`。没有网格时间推进，
-  不调用旧爆轰/前置/`TwoMediumStartup.run_to`。输出 `PlanarStartupField`，
-  `training_qualified=False`，不是旧 `ReferenceField`。
-* 入口：`python -m spherical_blast_pinn.cli.startup`。旧
-  `cli.reference_field` 与旧 Lagrangian `two_medium_startup.py` 保留给旧参考场/
-  旧测试，不属于新链路。
-* 保存—加载：`cli.startup` 写出带版本号的 `handoff.npz` + `handoff.json`；
-  `physics.two_medium_startup_handoff.load_planar_startup_handoff` 读取这一对文件，
-  校验格式版本、必需字段、JSON/NPZ 标量、重建的黎曼解与保存状态、以及保存数组与
-  公共解析采样的一致性；随后由实际数组、解析采样和初始参数独立重算质量/能量诊断，
-  并核对保存的 `checks`、`integrals` 及其报告顶层副本。它不是旧 `ReferenceField`
-  加载器，也不跨间断面做普通插值。
-* 初值批次适配：`sampling.planar_startup_initial.build_planar_startup_initial_batch`
-  把一个通过校验的 `PlanarStartupField` 转成现有 `SampleBatch` 的初值字段
-  （`xi/eta/rho/u/e` 两组、`contact_ic/shock_ic`），产物用 `sample_product`、
-  空气压缩层用 `sample_air`，自动加入球心、接触面两侧和激波波后锚点。它只做一次
-  `xi=r/Rc`、`eta=(r-Rc)/(Rs-Rc)` 的坐标无量纲化，`rho/u/e` 保持 SI，返回
-  `(N,1)` 张量。现有全局 `SimilitudeScales.start_time()`（`T_h=R0/D+epsilon`）
-  没有被改写；该适配层的初值批在 `s=0` 评价，并在 `diagnostics` 中记录启动场的
-  `t_phys=epsilon`、`tau=0`。完整训练接入仍未完成。
+  `delta=(Rs-Rc)/R0=1/200`，`epsilon=delta R0/(D_s-u_star)`。**没有网格时间推进**，
+  不做有限体积/差分/拉格朗日逐步推进。输出 `PlanarStartupField`，
+  `training_qualified=False`。
+* `physics/two_medium_startup_handoff.py`：`cli.startup` 写出带版本号的
+  `handoff.npz` + `handoff.json`；`load_planar_startup_handoff` 校验格式版本、
+  必需字段、JSON/NPZ 标量、重建的黎曼解与保存状态、保存数组与公共解析采样的
+  一致性，随后独立重算质量/能量诊断并核对保存的 `checks`、`integrals` 及顶层
+  副本。不跨间断面做普通插值。
+* `sampling/planar_startup_initial.py`：把一个通过校验的 `PlanarStartupField`
+  转成现有 `SampleBatch` 的初值字段（`xi/eta/rho/u/e` 两组、`contact_ic/shock_ic`），
+  产物用 `sample_product`、空气压缩层用 `sample_air`，自动加入球心、接触面两侧
+  和激波波后锚点。只做一次坐标无量纲化，`rho/u/e` 保持 SI，返回 `(N,1)` 张量。
+  批次必须携带 `PlanarStartupScales`（`s=0 ⇔ t_phys=epsilon_field`），并在
+  `diagnostics` 里记录由此换算出的物理时间、`tau` 与无量纲 `s`；旧尺度或与场
+  不一致的 `epsilon` 会被拒绝。
 
 局部平面场嵌入球面会产生几何近似误差；球对称质量/总能量残差由独立高分辨率
-积分报告，不用全局缩放或验收阈值掩盖。原有 `spherical_energy_residual` 的分母
-包含环境空气、会随远场外边界变化；另报 `ΔE`、`|ΔE|` 和
-`|ΔE|/初始产物内能`，后者只作补充诊断，不赋予训练资格。不同 `delta` 对应不同
-物理时刻，不是同一物理时刻的时间收敛。正式训练接入仍未完成。
+积分报告，不用全局缩放或验收阈值掩盖。不同 `delta` 对应不同物理时刻，不是同一
+物理时刻的时间收敛。
+
+**采样与损失已接入新启动场**：
+
+* `sampling.sampler.RadiusSampler(field, scales, tau_end)`：初值复用上面的适配器，
+  PDE/接触面/激波点按移动坐标契约生成；`tau_end` 是从网络启动时刻算起的时长，
+  不再由数据最后帧决定。无数据监督时数据与几何批次为空，不构造假算例；传入
+  真实算例会明确报未支持（数据时间轴尚未迁移）。
+* `losses.objective.contact_pressure_scale(field)`：取该启动场黎曼解的 `p_*`，
+  只作为接触压力残差的归一化尺度；接触条件与损失权重不变。
+* `evaluation.checks.build_check_set(field, scales, tau_end)`：用同一场、同一
+  `p_*` 建立固定检查集。
+
+`python -m spherical_blast_pinn.cli.check_startup_chain --handoff-json ...` 会从
+磁盘加载 handoff，装配完整批次、调用 `total_loss` 并执行**一次**反向传播，
+报告点数、分项损失与梯度。它不是训练：不建优化器、不更新参数、不写检查点，
+`training_qualified` 保持 false。
+
+**检查点（新契约）**：`training.checkpoint` 只读写
+`spherical_blast_pinn.startup_checkpoint` v1。它绑定启动场的 `model_id` /
+`method_version` / `cache_key`、完整的 `PlanarStartupScales` 参数（半径、
+`epsilon`、`time_scale`、各材料尺度、时间约定）、模型结构/EOS/dtype、模型参数、
+可选的优化器状态、步数、全局与采样器随机状态，以及**采样配置与动态时间窗口**
+（`tau_end`、各类点数、分层比例、`r_min_fraction`、当前窗口分数与历史）。
+保存/读取的公开接口是
+`save_startup_checkpoint(..., sampler=...)` 与
+`load_startup_checkpoint(..., handoff_json=..., sampler=...)`；加载时可用显式提供
+的 `handoff.json` 核对身份，检查点本身不复制初场数组。恢复前逐项核对：`tau_end`、
+点数或分层不同，或接收采样器不属于同一个启动场/尺度，都会在修改模型、优化器和
+采样器之前被拒绝；窗口按保存值恢复（允许相对接收端默认值收窄），因此续训的下
+一批采样与连续运行一致。旧格式（`spherical_blast_pinn.checkpoint`，version ≤ 8，
+带爆速与 `T_h`）会被明确拒绝并提示用新链路重新生成。
+
+**尚未接入**：`train`/`predict`/`compare` 会明确报错；`Trainer` 构造即抛
+`TrainingNotConnected`（见第七节）。
 
 ## 七、命令
 
+干净环境（独立 venv，不复用任何 editable 安装或 `PYTHONPATH`）：
+
 ```bash
-# 0. 从原始 d3plot 重新提取剖面，**并保留材料体积分数**
-#    已有的 raw_line.npz 只存了 t/x/rho/u/P，材料分区只能靠密度启发式猜。
-#
-#    径向网格 2500 层、近场加密、外半径 40 R_0；全部原生状态（--stride 1）。
-#    --config 是必填项（它只用来读日志/随机种子等通用设置，提取参数全在命令行上）。
-#    一次只跑一个算例：四个算例共用磁盘，并发跑只会让每个都很慢。
+python -m venv .venv
+.venv/Scripts/python -m pip install .        # 依赖在 pyproject.toml
+.venv/Scripts/python -c "import spherical_blast_pinn; print(spherical_blast_pinn.__file__)"
+```
+
+从原始 d3plot 重新提取剖面（保留材料体积分数）：
+
+```bash
 python -m spherical_blast_pinn.cli.extract_profiles --config configs/base.yaml \
   --case tnt_50mm --deck F:/tnt/tnt_files/dp0/SYS/MECH/input.k \
   --d3plot-dir F:/tnt/tnt_files/dp0/SYS/MECH --out F:/2/extracted_vf/50mm \
   --charge-radius 0.05 --shells 2500 --stride 1 --outer-radius-factor 40
+```
 
-#    80 / 100 / 500 mm 同理，换 --case / --deck / --d3plot-dir / --out / --charge-radius
-#    （半径就是算例名里的毫米数，与 configs/base.yaml 的 charge_radius_m 一致）：
-#      tnt_80mm   G:/500mmtnt/80mmtnt_files/dp0/SYS-3/MECH    0.080
-#      tnt_100mm  G:/500mmtnt/100mmtnt_files/dp0/SYS-3/MECH   0.100
-#      tnt_500mm  D:/500mmtnt/500mmtnt_files/dp0/SYS-3/MECH   0.500
+启动链路与数据审查：
 
+```bash
 # 1. DYNA 真实物理初始化审查（必须先做）
-python -m spherical_blast_pinn.cli.audit_dyna \
-  --config configs/base.yaml \
+python -m spherical_blast_pinn.cli.audit_dyna --config configs/base.yaml \
   --deck tnt_50mm=F:/tnt/tnt_files/dp0/SYS/MECH/input.k \
   --data tnt_50mm=F:/2/extracted
 
-# 2. 参考初始场与 §5 要求的全部检查（旧参考场链路）
-python -m spherical_blast_pinn.cli.reference_field --config configs/experiments/full.yaml
-
-# 2b. 新初值链路：均匀产物球 + 局部平面黎曼启动场（不训练、不写旧参考场缓存）
+# 2. 启动场：均匀产物球 + 局部平面黎曼，写出 handoff.npz/json
 python -m spherical_blast_pinn.cli.startup --charge-radius 0.05 --delta 0.005
 
-# 2c. delta 敏感性/自相似缩放诊断（不同 delta 是不同物理时刻，不是时间收敛）
+# 3. delta 敏感性/自相似缩放诊断（不同 delta 是不同物理时刻，不是时间收敛）
 python -m spherical_blast_pinn.cli.validate_startup_planar \
   --charge-radius 0.05 --deltas 0.005,0.0025,0.00125
 
-# 3. 数据质量审查
+# 3b. 装配检查：磁盘加载 handoff -> 完整物理批次 -> total_loss -> 一次 backward
+python -m spherical_blast_pinn.cli.check_startup_chain \
+  --handoff-json outputs/planar_startup/<model>/<key>/handoff.json \
+  --tau-end 1e-6 --output-json outputs/startup_chain_check.json
+
+# 4. 数据质量审查 / 状态方程一致性
 python -m spherical_blast_pinn.cli.audit_data --config configs/experiments/full.yaml
-
-# 4. 状态方程一致性
 python -m spherical_blast_pinn.cli.validate_eos --config configs/experiments/full.yaml
-
-# 5. 训练（不会自动发起；完整日程 20000 次更新）
-#    数据兼容性闸门会先跑一遍；不通过就直接停下，见第八节。
-python -m spherical_blast_pinn.cli.train --config configs/experiments/full.yaml
-
-# 6. 独立预测（看不到目标半径的真值）
-python -m spherical_blast_pinn.cli.predict --config configs/base.yaml \
-  --checkpoint outputs/full/best.pt --radius 0.08 --output outputs/predict/80mm.npz
-
-# 7. 与验证仿真对照
-python -m spherical_blast_pinn.cli.compare --config configs/base.yaml \
-  --prediction outputs/predict/80mm.npz --case tnt_80mm --output outputs/compare
 ```
 
-第 6 步的爆速读自**检查点**里冻结的那一份（``detonation_velocity``），不读配置、
-也不用默认常量：它进时间原点 ``T_h = R_0/D + epsilon(R_0)``，补一个默认值不会
-报错，只会把整条预测轨迹平移一个爆轰穿越时间。第 6 步与第 5 步的恢复共用**同一条**
-发布完整性规则——上一节说的那个未提交标记，两个入口都拒绝。
+**尚未接入**：`train`、`predict`、`compare` 目前只打印
+“新启动场的训练接口尚未接入”并以退出码 3 结束；它们不会回退到已删除的旧参考场。
 
 测试：
 
 ```bash
-pytest -q
+python -m pytest -q
 ```
 
 ## 八、数据状态与已知限制
 
-这一节必须如实读。当前仓库里的实现是完整的，但**数据侧有三个未解决的问题**，
-它们限制了这个模型能宣称什么。
+这一节必须如实读。**数据侧的结论仍然有效**，但它们限制了这个模型能宣称什么；
+训练入口尚未接入新启动场（见第六、七节）。
 
 ### 8.0 这些结论现在是训练入口的一道闸门，不是一段说明
 
 `audit_dyna` 除了写人读的审查表，还写一份机器可读的
-`data_compatibility.json`。训练入口读它，并且对每个训练算例要求状态为
-`compatible`：
+`data_compatibility.json`。训练入口（接线后）读它，并对每个训练算例要求
+状态为 `compatible`：
 
 | 状态 | 含义 | 训练是否放行 |
 |---|---|---|
 | `compatible` | 初始化、单位、EOS、时间定义、材料分区都审过且一致 | 放行 |
-| `incompatible` | 审过，**发现**与方案 B 冲突 | **拒绝** |
+| `incompatible` | 审过，**发现**与项目当前约定冲突 | **拒绝** |
 | `unknown` | 没有审查证据，或审查里是"缺证据" | **拒绝** |
 | `synthetic` | 明确标注的合成样例 | 只在合成路径放行 |
 
@@ -323,74 +326,24 @@ tnt_100mm: 报告里没有它的条目 —— unknown
 会被打上 `data_compatibility: unverified`。冒烟配置就是这么做的，因为它的用途是
 验证链路能跑通，不是物理训练。
 
-### 8.1 时间零点：方案 A 与数据冲突，**已决定改用方案 B**
+### 8.1 时间零点：数据是有限速度爆轰；旧方案 B 已退出
 
 `audit_dyna` 用数据本身判定时间零点：反应前沿在 `t <= R_0/D` 的帧上跟随
-`r = D t`，50 mm 算例上拟合斜率 7029 m/s 对卡片爆速 6930 m/s，偏差 1.4%。
-也就是说真实算例用的是**有限速度爆轰**，不是方案 A 的"零点整球同时转化"。
-第二条独立证据来自压力场本身：d3plot 里 t = 0 时刻装药单元的 `p` **恰好为零**，
-只有爆轰波扫过才升压。
+`r = D t`，50 mm 算例上拟合斜率 7029 m/s 对卡片爆速 6930 m/s，偏差 1.4%；
+d3plot 里 t = 0 时刻装药单元的 `p` 恰好为零，只有爆轰波扫过才升压。这说明真实
+算例用的是**有限速度爆轰**，不是“零点整球同时转化”。
 
-**用户已于 2026-09-22 决定改用方案 B**（中心起爆 + 有限爆速 + 非均匀爆后产物场
-+ 短时双介质前置 + 统一尺度映射），见第一节与第二节。
+2026-09-22 至 2026-10-21 使用的**方案 B** 曾据此构造中心起爆产物场，再做短时
+拉格朗日双材料前置，并把启动时刻定为 `T_h = T_b + epsilon`。该方案及其代码
+（`physics/detonation.py`、`physics/precursor.py`、
+`physics/two_medium_startup.py`、`cli/reference_field.py`、
+`cli/validate_startup.py`、`cli/diagnose_startup.py`）已于本轮删除，旧缓存也不再
+被任何代码读取。
 
-已经落地的部分：
-
-| 项 | 状态 |
-|---|---|
-| 时间原点 `T_h = T_b + D 侧` | **已实现**。`T_h` 由卡片爆速算出，与 §3 的表逐位一致；读取端缺 `D` 直接拒绝加载 |
-| A 式均匀初值 | **已删除**。`e_* = E0/rho0` 保留为**能量尺度**，不再是初值 |
-| 空气环境态 | **已修正**：由卡片 `E0 = 0.2533 MPa` 推出 101320 Pa，不再与标准大气压混用 |
-| 材料映射 / 读取 | **已改**：解析 `*ALE_MULTI-MATERIAL_GROUP` 的顺序 |
-| 球壳统计 | **已改**：单元与壳层的重叠体积分配，`u`、`e` 质量加权 |
-| 激波标签 | **已改**：压力梯度候选 + RH 核查，检测状态与监督资格分开 |
-
-**B 初场：已实现，未通过验收。** 新模块 `physics/detonation.py` 解中心起爆的有限
-爆速球对称爆轰（只解产物区；卡片没有未反应 EOS），波前按卡片 `D` 推进、紧邻波后
-取 Rayleigh–Hugoniot 的**亚声速支**（`D = 6930 > D_CJ = 6883`，所以是过驱动解），
-用拉格朗日有限体积 + 质量吸积前端单元。`physics/precursor.py` 的 A 式均匀初值
-**已删除且无回退分支**：它现在必须接收一个 `DetonationProfile`，否则直接报错。
-
-**已核实**：波前动量关系残差 `4.7e-16`；理想 CJ 相切解 `D_CJ = 6883.141717`、
-`p_CJ = 2.063886925e10`；质量积分不变量**精确**（`0.0`）；三个半径在同一个
-`xi = r/R_0` 上的密度剖面一致到 `~1e-9`。
-
-**~~未通过~~ 已修，并撤回一条推错的结论**（2026-10-11 更正）。
-
-* 历史记录（**据报告、待复验**）：某次旧版求解给出能量积分不变量偏差
-  `7.86e-2`。这个数字没有随版本一起留下可核验的产物，**不要把它当作当前值**。
-* **当前实测**（本机、本版本、`detonation_product_profile`，2026-10-11）：
-
-  ```
-  电荷半径 R_0        0.025 / 0.040 / 0.050 / 0.080 / 0.100 m
-  单元数 500    能量不变量相对偏差 4.06e-3   （五个半径完全相同）
-  单元数 1000                     3.35e-3   （五个半径完全相同）
-  单元数 2000                     2.94e-3   （五个半径完全相同）
-  容差                   1.0e-2            全部通过
-  ```
-
-* **撤回的推断**：旧文本由"三个半径上五位数字相同"推出"**与分辨率无关**，
-  不能靠加密网格消掉"。这是错的，而且是**方向**上的错：那三个数字是三个**装药
-  半径**，不是三档**网格**；同一半径下换分辨率，偏差从 4.06e-3 变到 2.94e-3，
-  **它确实随分辨率变化**。按装药半径不变只说明它与 `R_0` 无关。
-  真正的原因已定位并修好：前端单元的压力功按**本单元压力**扣，本单元一边被扫过
-  一边膨胀，压力低于波前压力，于是每步都欠扣、误差随步数累积（CFL 越小偏差越
-  大）。改成按**波前压力**扣之后落在 0.3%~0.5%。钉住这一条的测试是
-  `tests/test_scheme_b_migration.py::test_product_energy_invariant_is_met_at_the_default_resolution`。
-
-**与下面那两项不是一回事，不要串起来读**：
-
-* 本节说的是**产物区爆轰构造**的能量积分不变量；
-* `DISCRETE_BUDGET.md` 里的"残差 0.41 %"是**另一件事**——PINN 离散下内能与动能
-  之和与总能量的差，来源尚未定论（数值上碰巧接近 0.41 %，**没有任何关系**）；
-* `physics_basis_status` 是**第三件**独立的事。三者互补推出，各自单独记录。
-
-因此在**物理适用性**（§5 的网格加密、时间步与尺度映射证据）补齐之前：
-**不得生成正式初值，不得开始正式训练**。
-`reference_field.metadata` 里带着 `acceptance_status: NOT ACCEPTED` 与原因，而
-`cli._common.assert_reference_accepted` 是**真的会抛错**的闸门（不是注释）。
-配置里仍指向 A 时代的导出（`F:/2/extracted` 等），读取端会因此拒绝加载——
-这是设计要求，不是故障。
+**当前唯一初始化方案**是“`t=0` 均匀静止产物球 + 静止空气 + 局部平面黎曼启动”。
+它不把均匀球解释为 CJ 表面突破，也不引入 Taylor 内场。**数据时间轴还没有迁移**：
+真实数据仍按 LS-DYNA 原始时间记录；把新启动场与实验帧对齐属于下一轮训练接线的
+工作，本轮不做，也不能用简单平移宣称二者等价。
 
 ### 8.2 材料分区：旧的启发式判据已废弃，改用体积分数
 
@@ -539,10 +492,13 @@ src/spherical_blast_pinn/
   physics/
     material.py       材料参数与物理零点（唯一的一份数值来源）
     eos.py            一般 JWL 与理想气体，及其导数与声速
-    similitude.py     时间原点、参考尺度、hat T_*
+    similitude.py     时间尺度、hat T_*、PlanarStartupScales（epsilon 原点）
     moving_frame.py   xi/eta 与链式法则
     pde.py            强形式残差
-    precursor.py      拉格朗日双材料前置求解器（每帧带当前单元中心）
+    two_medium_initial.py    t=0 均匀静止产物球 + 静止空气
+    two_medium_riemann.py    JWL—空气局部平面黎曼解
+    two_medium_startup_planar.py  自相似扇嵌入球面（t_phys=epsilon）
+    two_medium_startup_handoff.py 版本化 handoff 保存/加载与重建核对
   models/
     product_net.py    (s, xi^2) -> (rho, u, e)
     air_net.py        (s, eta)  -> (rho, u, e)
@@ -553,20 +509,21 @@ src/spherical_blast_pinn/
     objective.py      总损失与权重
   sampling/
     batch.py          一个优化步的全部样本
-    sampler.py        §12 的采样规则
+    planar_startup_initial.py  启动场 -> SampleBatch 初值字段
+    sampler.py        §12 的采样规则（旧参考场参数已解除，接线待做）
   training/
     schedule.py       §13 的三阶段日程
     trainer.py        训练循环与检查点
   data/
     extracted_case.py 时空剖面读取、材料分区、质量报告、训练/开发帧划分
-    compatibility.py  数据与方案 B 的兼容性状态，以及训练入口的闸门
+    compatibility.py  数据与项目约定的兼容性状态，以及训练入口的闸门
     raw_reader.py     直接读 d3plot
     shell_average.py  按材料体积分数做球壳平均
     kfile_parser.py   .k 卡片解析（含 10 字符定宽格式）
   evaluation/
     waveform.py       超压、到达时间、正压时长、正相冲量
     checks.py         固定独立检查集、逐方程指标、守恒诊断、选模型偏序
-  cli/                七个命令
+  cli/                数据与启动场命令；train/predict/compare 尚未接入
 tests/                §15 要求的测试 + 审查清单的逐项回归
 _legacy_v1_backup/    第一版实现，仅供追溯
 ```

@@ -9,8 +9,9 @@ condition block has eight tensors, all shaped ``(N, 1)``:
 
 plus the scalar ``contact_ic``/``shock_ic`` positions.  The existing initial
 loss evaluates both groups at ``s = 0``, so both sides of this adapter are at
-the startup field's own ``tau = 0`` (``t_phys = epsilon``).  The saved physical
-time is recorded in ``diagnostics``.
+the startup field's own ``tau = 0`` (``t_phys = epsilon``).  ``diagnostics``
+records the physical time, ``tau`` and the dimensionless ``s`` obtained from the
+scales themselves, so the batch and its scales cannot disagree silently.
 
 Only the radial coordinates are non-dimensionalised, and only once:
 ``xi = r/R_c`` for ``0 <= r <= R_c`` and ``eta = (r-R_c)/(R_s-R_c)`` for
@@ -18,11 +19,14 @@ Only the radial coordinates are non-dimensionalised, and only once:
 second unit conversion is applied.  The inverse is therefore exactly
 ``r = xi R_c`` and ``r = R_c + eta (R_s-R_c)``.
 
-The existing global :class:`SimilitudeScales` time origin is *not* changed.
-Its ``s=0`` remains the old scheme-B ``T_h = R_0/D + epsilon``.  This adapter
-builds only the initial-condition block and records the startup's physical
-``epsilon`` separately; wiring the new startup into a full training run still
-requires a time-origin decision and is deliberately outside this module.
+The batch must carry the **planar-startup** time convention,
+:class:`PlanarStartupScales`, whose origin is the field's own ``epsilon``:
+``s = 0`` -> ``tau = 0`` -> ``t_phys = epsilon``.  A scheme-B
+:class:`SimilitudeScales` object (origin ``T_h = R_0/D + epsilon(R_0)``) is
+rejected explicitly instead of being silently reinterpreted: both origins have
+seconds as their unit, so a wrong one shifts the whole trajectory without
+raising anything.  The batch therefore also carries no detonation velocity
+(``None`` = not applicable); the new origin does not involve ``D``.
 
 The adapter samples the field with its one-sided methods:
 
@@ -45,7 +49,7 @@ try:  # pragma: no cover
 except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
-from ..physics.similitude import SimilitudeScales
+from ..physics.similitude import PlanarStartupScales, TIME_CONVENTION_PLANAR_STARTUP
 from ..physics.two_medium_initial import AIR, PRODUCT
 from ..physics.two_medium_startup_planar import PlanarStartupField
 from .batch import SampleBatch
@@ -90,10 +94,22 @@ def _validate_positive_int(name: str, value: Any) -> int:
     return integer
 
 
-def _validate_scales(field: PlanarStartupField, scales: SimilitudeScales) -> None:
-    if not isinstance(scales, SimilitudeScales):
+def _validate_scales(field: PlanarStartupField, scales: PlanarStartupScales) -> None:
+    """require the planar-startup convention, the same radius and the same epsilon."""
+    if not isinstance(scales, PlanarStartupScales):
         raise PlanarStartupBatchError(
-            "scales must be a SimilitudeScales instance from the existing sampler contract"
+            "the initial-condition batch needs the planar-startup time convention "
+            f"({TIME_CONVENTION_PLANAR_STARTUP!r}); got "
+            f"{type(scales).__name__} with convention "
+            f"{getattr(scales, 'time_convention', None)!r}. Its s=0 would be the "
+            "scheme-B T_h = R_0/D + epsilon(R_0), not the startup field's epsilon. "
+            "Build one with PlanarStartupScales.for_startup_field(field, "
+            "time_scale=...)."
+        )
+    epsilon = float(field.epsilon)
+    if not math.isfinite(epsilon) or epsilon <= 0.0:
+        raise PlanarStartupBatchError(
+            f"the startup field epsilon must be finite and positive, got {epsilon!r}"
         )
     if not math.isclose(
         float(scales.charge_radius),
@@ -106,11 +122,16 @@ def _validate_scales(field: PlanarStartupField, scales: SimilitudeScales) -> Non
             f"{scales.charge_radius!r} m, but the startup field has R_0 = "
             f"{field.charge_radius!r} m"
         )
-    velocity = float(scales.detonation_velocity)
-    if not math.isfinite(velocity) or velocity <= 0.0:
+    if not math.isclose(
+        float(scales.startup_epsilon),
+        epsilon,
+        rel_tol=1.0e-12,
+        abs_tol=0.0,
+    ):
         raise PlanarStartupBatchError(
-            "scales.detonation_velocity must be finite and positive; "
-            f"got {scales.detonation_velocity!r}"
+            "the supplied scales start at epsilon = "
+            f"{scales.startup_epsilon!r} s, but the startup field is at epsilon = "
+            f"{epsilon!r} s; the time origin must come from this field"
         )
 
 
@@ -169,7 +190,7 @@ def _column(values: np.ndarray, *, dtype: Any, device: Any) -> Any:
 def build_planar_startup_initial_batch(
     field: PlanarStartupField,
     *,
-    scales: SimilitudeScales,
+    scales: PlanarStartupScales,
     product_radii: Sequence[float] | np.ndarray | None = None,
     air_radii: Sequence[float] | np.ndarray | None = None,
     n_ic_product: int = 256,
@@ -185,10 +206,11 @@ def build_planar_startup_initial_batch(
     field:
         A validated :class:`PlanarStartupField`.
     scales:
-        Existing per-radius :class:`SimilitudeScales`.  It is required by the
-        ``SampleBatch`` contract and supplies material scales and the card
-        detonation velocity.  Its old global time origin is *not* used to place
-        these initial samples; the startup time is recorded separately.
+        A :class:`PlanarStartupScales` built from **this** field (typically via
+        :meth:`PlanarStartupScales.for_startup_field`).  It supplies the material
+        scales and the time origin ``t_phys(s=0) = field.epsilon``.  A scheme-B
+        :class:`SimilitudeScales`, a different charge radius or a different
+        startup epsilon is rejected.
     product_radii, air_radii:
         Optional explicit physical radii in metres.  A two-dimensional input is
         rejected rather than flattened.  When omitted, ``n_ic_product`` and
@@ -321,28 +343,38 @@ def build_planar_startup_initial_batch(
     xi_shape = _COLUMN_SHAPE_DESCRIPTION.replace("N", str(xi.size))
     eta_shape = _COLUMN_SHAPE_DESCRIPTION.replace("N", str(eta.size))
 
+    # Both groups sit at s=0.  Report the *actual* conversions of the scales the
+    # batch carries, not literals: if the origin were wrong this block would
+    # disagree with ``scales`` instead of hard-coding the expected answer.
+    initial_physical_time = float(scales.physical_time_from_network(0.0))
+    initial_tau = float(scales.pinn_time_from_physical(initial_physical_time))
+    initial_network_time = float(scales.network_time_from_physical(initial_physical_time))
     diagnostics = {
         "adapter": PLANAR_STARTUP_IC_ADAPTER_VERSION,
         "planar_startup_model_id": field.model_id,
         "planar_startup_cache_key": field.cache_key(),
         "planar_startup_epsilon_s": float(field.epsilon),
-        "initial_physical_time_s": float(field.epsilon),
-        "initial_physical_time_product_s": float(field.epsilon),
-        "initial_physical_time_air_s": float(field.epsilon),
-        "initial_tau_s": 0.0,
-        "initial_tau_product_s": 0.0,
-        "initial_tau_air_s": 0.0,
-        "initial_network_time_s": 0.0,
-        "initial_network_time_product_s": 0.0,
-        "initial_network_time_air_s": 0.0,
-        "initial_time_convention": (
-            "both IC groups are evaluated at s=0, representing the startup "
-            "field's t_phys=epsilon and tau=t_phys-epsilon=0"
-        ),
+        "time_convention": scales.time_convention,
         "similitude_start_time_s": float(scales.start_time()),
+        "similitude_startup_epsilon_s": float(scales.startup_epsilon),
+        "initial_physical_time_s": initial_physical_time,
+        "initial_physical_time_product_s": initial_physical_time,
+        "initial_physical_time_air_s": initial_physical_time,
+        "initial_tau_s": initial_tau,
+        "initial_tau_product_s": initial_tau,
+        "initial_tau_air_s": initial_tau,
+        # s 是无量纲的网络时间，不能带秒的后缀。
+        "initial_network_time": initial_network_time,
+        "initial_network_time_product": initial_network_time,
+        "initial_network_time_air": initial_network_time,
+        "initial_network_time_is_dimensionless": True,
+        "initial_time_convention": (
+            "s=0 -> tau=0 -> t_phys=epsilon_field for both IC groups; the batch "
+            "scales carry the planar-startup origin, not T_h=R_0/D+epsilon"
+        ),
         "similitude_time_origin_note": (
-            "the existing global SimilitudeScales start_time remains "
-            "T_h=R_0/D+epsilon(R_0); this IC-only adapter does not redefine it"
+            "PlanarStartupScales.start_time() is the field's own epsilon; the "
+            "scheme-B T_h=R_0/D+epsilon(R_0) is a different object and is rejected"
         ),
         "n_ic_product": int(xi.size),
         "n_ic_air": int(eta.size),
@@ -361,7 +393,8 @@ def build_planar_startup_initial_batch(
     return SampleBatch(
         case_id=str(case_id),
         charge_radius=charge,
-        detonation_velocity=float(scales.detonation_velocity),
+        # 新原点不含 R_0/D：这里显式记“不适用”，不填任何伪造爆速。
+        detonation_velocity=None,
         scales=scales,
         pinn_time_min=0.0,
         pinn_time_max=0.0,

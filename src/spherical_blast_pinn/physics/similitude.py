@@ -55,6 +55,15 @@ REFERENCE_RADIUS = 0.05
 #: 参考启动时间，s。
 REFERENCE_START_TIME = 1.0e-6
 
+#: 时间原点约定标识。它是**显式**字段，不由某个数值是否为零来推断。
+#:
+#: * :data:`TIME_CONVENTION_SCHEME_B` —— ``t_phys = T_h + tau``，
+#:   ``T_h = R_0/D + epsilon(R_0)``；
+#: * :data:`TIME_CONVENTION_PLANAR_STARTUP` —— ``t_phys = epsilon_field + tau``，
+#:   原点就是启动场自己的 ``epsilon``，与 ``R_0/D`` 无关。
+TIME_CONVENTION_SCHEME_B = "scheme_b_handover"
+TIME_CONVENTION_PLANAR_STARTUP = "planar_startup_epsilon"
+
 
 class SimilitudeError(ValueError):
     """尺度化输入不合法。"""
@@ -260,6 +269,23 @@ class SimilitudeScales:
             self.charge_radius, detonation_velocity=self.detonation_velocity
         )
 
+    @property
+    def time_convention(self) -> str:
+        """本对象采用的时间原点约定。**显式**，不从任何数值推断。"""
+        return TIME_CONVENTION_SCHEME_B
+
+    def pinn_time_from_physical(self, physical_time):
+        """``tau = T - start_time``，s。正向平移只在这里出现一次。"""
+        return physical_time - self.start_time()
+
+    def network_time_from_physical(self, physical_time):
+        """``s = hat t(tau) / hat T_*``，``tau = T - start_time``。
+
+        与 :meth:`physical_time_from_network` 配对：两向都只经 ``start_time()``
+        平移一次，不会因为约定不同而各推一套公式。
+        """
+        return self.network_time(self.pinn_time_from_physical(physical_time))
+
     def hat_time(self, pinn_time):
         """``hat t = U_* t_PINN / R_0``。"""
         return self.reference_velocity * pinn_time / self.charge_radius
@@ -281,7 +307,11 @@ class SimilitudeScales:
         return self.pinn_time_from_hat(self.hat_time_from_network(s))
 
     def physical_time_from_network(self, s):
-        """``t_phys = t_PINN + epsilon(R_0)``。"""
+        """``t_phys = t_PINN + start_time()``；原点由具体约定决定。
+
+        方案 B 下 ``start_time()`` 是 ``T_h = R_0/D + epsilon(R_0)``；平面启动
+        约定下是场自己的 ``epsilon``。平移只在这一处相加。
+        """
         return self.pinn_time_from_network(s) + self.start_time()
 
     # -- 相似坐标 ---------------------------------------------------------
@@ -320,6 +350,123 @@ class SimilitudeScales:
 
     def with_time_scale(self, time_scale: float) -> "SimilitudeScales":
         return replace(self, time_scale=float(time_scale))
+
+
+@dataclass(frozen=True)
+class PlanarStartupScales(SimilitudeScales):
+    """以启动场**自己的** ``epsilon`` 为时间原点的尺度集合。
+
+    .. math:: t_{\\rm phys} = \\epsilon_{\\rm field} + \\tau, \\qquad s = 0
+              \\iff \\tau = 0 \\iff t_{\\rm phys} = \\epsilon_{\\rm field}
+
+    与方案 B 的区别只在时间原点，空间、速度、比内能与 ``hat T_*`` 的定义完全
+    沿用 :class:`SimilitudeScales`（因此时间导数尺度系数也不变）。方案 B 的
+    ``T_h = R_0/D + \\epsilon(R_0)`` **不参与**这里的换算，所以本类不携带爆速：
+    ``detonation_velocity`` 必须是 ``None``（明确的"不适用"），既不用 1、也不
+    用卡片上的 ``6930`` 之类数值去满足旧接口。
+
+    约定由**类型**区分，而不是由某个参数恰好为零来猜。旧对象仍是
+    :class:`SimilitudeScales`，其 ``start_time()`` 与换算行为逐位不变。
+    """
+
+    #: 启动场的 ``epsilon``，s。必须有限且为正。
+    startup_epsilon: float = math.nan
+    #: 新原点不依赖爆速：这里只允许 ``None``。
+    detonation_velocity: float | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.detonation_velocity is not None:
+            raise SimilitudeError(
+                "PlanarStartupScales must not carry a detonation velocity: the "
+                "planar-startup time origin is epsilon_field, not R_0/D + epsilon"
+            )
+        epsilon = float(self.startup_epsilon)
+        if not math.isfinite(epsilon) or epsilon <= 0.0:
+            raise SimilitudeError(
+                "startup_epsilon must be finite and positive, got "
+                f"{self.startup_epsilon!r}"
+            )
+
+    @classmethod
+    def for_radius(cls, *args, **kwargs):  # type: ignore[override]
+        """拒绝无 ``epsilon`` 的构造：本类只能从实际启动场建立。"""
+        raise SimilitudeError(
+            "PlanarStartupScales cannot be built from a bare radius; use "
+            "PlanarStartupScales.for_startup_field(field, time_scale=...) so the "
+            "time origin is the field's own epsilon"
+        )
+
+    @classmethod
+    def for_startup_field(cls, field: Any, *, time_scale: float) -> "PlanarStartupScales":
+        """从实际 :class:`PlanarStartupField` 构造。
+
+        只读取 ``field.charge_radius`` 与 ``field.epsilon``；其余尺度沿用
+        :meth:`SimilitudeScales.for_radius` 的同一套材料常数，调用者不必自己
+        重算 ``epsilon``。字段缺失或非有限/非正时明确拒绝。
+        """
+        radius = getattr(field, "charge_radius", None)
+        epsilon = getattr(field, "epsilon", None)
+        if radius is None or epsilon is None:
+            raise SimilitudeError(
+                "for_startup_field needs an object carrying charge_radius and "
+                f"epsilon; got {type(field).__name__}"
+            )
+        radius = float(radius)
+        epsilon = float(epsilon)
+        if not math.isfinite(radius) or radius <= 0.0:
+            raise SimilitudeError(
+                f"the startup field charge radius must be finite and positive, got {radius!r}"
+            )
+        if not math.isfinite(epsilon) or epsilon <= 0.0:
+            raise SimilitudeError(
+                f"the startup field epsilon must be finite and positive, got {epsilon!r}"
+            )
+        return cls(
+            charge_radius=radius,
+            reference_velocity=mat.REFERENCE_VELOCITY,
+            reference_specific_energy=mat.PRODUCT_SPECIFIC_ENERGY,
+            product_density=mat.PRODUCT_REFERENCE_DENSITY,
+            air_density=mat.AIR_DENSITY,
+            time_scale=float(time_scale),
+            detonation_velocity=None,
+            startup_epsilon=epsilon,
+        )
+
+    # -- 时间原点 ---------------------------------------------------------
+    @property
+    def time_convention(self) -> str:
+        return TIME_CONVENTION_PLANAR_STARTUP
+
+    def start_time(self) -> float:
+        """``t_phys`` at ``s = 0``：就是启动场的 ``epsilon``，s。"""
+        return float(self.startup_epsilon)
+
+    def start_delay(self) -> float:
+        """不适用：方案 B 的 ``epsilon(R_0)=k epsilon_ref`` 不是这里的原点。"""
+        raise SimilitudeError(
+            "start_delay() is the scheme-B radius-scaled delay k*epsilon_ref; the "
+            "planar-startup convention uses the field's own epsilon "
+            f"({self.startup_epsilon!r} s)"
+        )
+
+    def transit_time(self) -> float:
+        """不适用：新原点不减去 ``R_0/D``。"""
+        raise SimilitudeError(
+            "transit_time() needs the card detonation velocity; the planar-startup "
+            "time origin is epsilon_field and carries no R_0/D term"
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        payload = super().as_dict()
+        payload.update(
+            {
+                "time_convention": self.time_convention,
+                "startup_epsilon_s": float(self.startup_epsilon),
+                "detonation_velocity": None,
+            }
+        )
+        return payload
 
 
 # --------------------------------------------------------------------------
@@ -465,6 +612,9 @@ def scales_for_cases(
 __all__ = [
     "REFERENCE_RADIUS",
     "REFERENCE_START_TIME",
+    "TIME_CONVENTION_PLANAR_STARTUP",
+    "TIME_CONVENTION_SCHEME_B",
+    "PlanarStartupScales",
     "SimilitudeError",
     "SimilitudeScales",
     "freeze_time_scale",

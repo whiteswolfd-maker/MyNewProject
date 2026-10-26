@@ -4,8 +4,32 @@
 `src/spherical_blast_pinn/physics/two_medium_initial.py`。
 
 **2026-10-25 更新**：小正时间启动已从旧 Lagrangian `TwoMediumStartup.run_to`
-改为**局部平面 JWL—空气黎曼近似**（见下文“2026-10-25”一节）。旧 Lagrangian
-实现只作为历史/旧测试依赖保留，不再属于新链路。
+改为**局部平面 JWL—空气黎曼近似**（见下文“2026-10-25”一节）。
+
+**2026-10-26 更新（当前）**：采样器与接触压力尺度已经直接接到新启动场：
+
+* `RadiusSampler(field, scales, tau_end)` 由 `PlanarStartupField` 生成
+  IC / PDE / 接触面 / 激波点；`tau_end` 显式给出，不再由数据最后帧决定；
+  真实数据监督尚未迁移，传入算例会明确报未支持。
+* `contact_pressure_scale(field)` 取场自己的 `p_*`，只作为损失归一化尺度。
+* `cli.check_startup_chain` 完成“磁盘 handoff → 完整批次 → total_loss →
+  一次 backward”的装配检查；不训练、不写检查点、不改变 `training_qualified`。
+* `Trainer` 构造即抛 `TrainingNotConnected`，正式训练/预测仍未接入。
+* 检查点迁移到 `spherical_blast_pinn.startup_checkpoint` v1：只绑定启动场身份与
+  `PlanarStartupScales`，保存模型/优化器/步数/随机状态；旧格式（带 `D` 与 `T_h`）
+  明确拒绝。独立接口 `save_startup_checkpoint` / `load_startup_checkpoint` 已通过
+  落盘往返与短程恢复一致性测试。
+* 检查点同时保存**采样配置与动态窗口**（`tau_end`、点数、分层比例、
+  `r_min_fraction`、当前窗口分数与历史）。恢复前先核对静态配置与接收采样器的
+  启动场/尺度；不同 `tau_end` 或采样设置、或换了启动场，都在修改模型、优化器
+  与采样器之前拒绝。窗口按保存值无条件恢复（允许相对接收端默认值收窄），
+  因此非默认阶段窗口续训后的下一批采样与连续运行逐位一致。
+
+旧的方案 B 初始化/前置求解链路已整体删除：
+`physics/detonation.py`、`physics/precursor.py`（含 `ReferenceField` 与验收缓存）、
+`physics/two_medium_startup.py`（旧 Lagrangian 推进）、`cli/reference_field.py`、
+`cli/validate_startup.py`、`cli/diagnose_startup.py` 及其专属测试与配置节都已
+移除。下面“与现有文档的关系”“仍未接入正式训练”两处旧表述以本节为准。
 
 ## 决策
 
@@ -32,10 +56,10 @@
 
 ## 与现有文档的关系
 
-`AGENTS.md` 中"B 初场由 `physics/detonation.py` 构造"的要求继续约束**旧参考场
-构造**；它不再定义新的初值模块。`physics/two_medium_initial.py` 不导入、不调用
+旧的“B 初场由 `physics/detonation.py` 构造”的要求已随旧方案一起退出，不再是
+任何代码的规范。`physics/two_medium_initial.py` 不导入、不调用
 `ProductsDetonation`、`SphericalPrecursor` 或 `detonation_product_profile`，也不
-写任何参考场文件。旧求解器与旧参考场代码保留，不删除、不修改。
+写任何参考场文件。旧求解器与旧参考场代码**已删除**，不是“保留不修改”。
 
 ## 参数与单位
 
@@ -74,7 +98,7 @@
 - 入口：`python -m spherical_blast_pinn.cli.startup`；`delta` 敏感性诊断：
   `python -m spherical_blast_pinn.cli.validate_startup_planar`；测试：
   `tests/test_two_medium_riemann.py`、`tests/test_two_medium_startup_planar.py`。
-- **仍未接入正式训练**；旧 `ReferenceField`/`detonation` 链路保留，原因同上。
+- **仍未接入正式训练**；旧 `ReferenceField`/`detonation` 链路已在本轮删除，新 handoff 尚未接到采样器、损失尺度、训练器与检查点。
 
 ## 2026-10-21 第二轮（历史）：旧 Lagrangian 短时推进
 
@@ -88,15 +112,19 @@
 - 时间口径：`t_phys = 0` 是初值；交接为 `t_h > 0`；网络时间 `tau = t_phys - t_h`。
   不再使用 `R_0/D + epsilon`，也不写死 1 μs。
 
+### 2026-10-21 旧 Lagrangian 推进：已被取代
+
+上述 `two_medium_startup.py` 的实现已在 2026-10-25 被局部平面黎曼启动取代，
+并在 2026-10-26 随旧方案一起删除。它的相容能量更新、时间中心速度与边界功实现
+不再存在于本仓库；需要时可从版本历史追溯。
+
 ### 尚未完成（阻塞项）
 
-- **正式训练接入**：`cli._common.build_context` 仍用旧 `ReferenceField` 与
-  `T_h = R_0/D + epsilon` 构造模型和尺度。把 `TwoMediumHandoff` 接进去之前，
-  旧链路必须保留。
-- 因此本轮**没有删除** `physics/detonation.py`、`cli/reference_field.py` 与旧参考场
-  验收：它们仍被 `build_context`、`evaluation/checks.py` 和 4 个测试模块导入，
-  直接删除会产生悬空导入。旧诊断脚本 `scripts/diagnose_front_momentum.py` 已删除。
-- 新链路的物理适用性（交接时刻、激波展宽、RH 一致性）只做了小规模数值检查，
-  不构成验收结论。
+- **正式训练接入**：`PlanarStartupField` / `handoff` 还没有接到采样器、损失尺度、
+  训练器与检查点。`cli._common.build_context` 现在**明确失败**并报告
+  “新启动场的训练接口尚未接入”，不会回退旧方案。
+- 数据时间轴还没有迁移到 `tau = t_phys - epsilon`；这属于同一轮接线工作。
+- 新链路的物理适用性（`delta` 选择、平面近似误差、RH 一致性）只做了小规模数值
+  检查，不构成验收结论。
 
-**分段常数初值、短时两介质推进、交接对象已实现；正式训练接入尚未完成。**
+**零时刻初值、局部平面黎曼启动、handoff 与初值批次已实现；正式训练接入尚未完成。**
