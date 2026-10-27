@@ -5,6 +5,6 @@ predict / compare 的流程，由 ``cli`` 下的两个命令驱动。
 """
 from __future__ import annotations
 
-from . import metrics, plots
+from . import checks, field_compare
 
-__all__ = ["metrics", "plots"]
+__all__ = ["checks", "field_compare"]

@@ -157,6 +157,80 @@ def case_loss(
     return total, pde, initial, contact, shock, data, geometry, admissibility
 
 
+def total_loss_for_cases(
+    batches: Sequence[SampleBatch],
+    model,
+    *,
+    contact_pressures: Sequence[float],
+    pde_weight: float = 1.0,
+    weights: Mapping[str, float] | None = None,
+) -> LossBreakdown:
+    """多半径共用**一套可训练参数**的等权总损失。
+
+    ``batches`` 每个半径一个，``batch.scales`` 携带该半径自己的时间/几何尺度；
+    ``contact_pressures`` 与 ``batches`` 逐项对应。所有 batch 用**同一个**
+    ``model`` 评价，每个半径的输出换算走自己的尺度。半径之间只共享约化规则：
+    先组内均值，再对半径等权平均。
+
+    这不是"多个模型各算一遍再平均"：参数只有一份，反向传播一次。
+    """
+    if torch is None:  # pragma: no cover
+        raise RuntimeError("PyTorch is required")
+    if not batches:
+        raise ValueError("total_loss_for_cases needs at least one case")
+    if len(contact_pressures) != len(batches):
+        raise ValueError(
+            "contact_pressures must have one entry per batch; got "
+            f"{len(contact_pressures)} for {len(batches)} batches"
+        )
+
+    effective = dict(BASE_WEIGHTS)
+    if weights:
+        effective.update({k: float(v) for k, v in weights.items()})
+    effective["pde"] = float(pde_weight)
+
+    totals: list[Any] = []
+    per_case: dict[str, float] = {}
+    terms: dict[str, float] = {}
+    monitors: dict[str, Any] = {}
+    group_values: dict[str, list[Any]] = {}
+
+    for batch, contact_pressure in zip(batches, contact_pressures):
+        value, pde, initial, contact, shock, data, geometry, admissibility = case_loss(
+            batch, model, weights=effective, contact_pressure=float(contact_pressure)
+        )
+        totals.append(value)
+        per_case[batch.case_id] = float(value.detach())
+        for name, breakdown in (
+            ("pde", pde),
+            ("initial", initial),
+            ("contact", contact),
+            ("shock", shock),
+            ("data", data),
+            ("geometry", geometry),
+            ("admissibility", admissibility),
+        ):
+            terms[f"{batch.case_id}.{name}"] = float(breakdown.total.detach())
+            group_values.setdefault(name, []).append(breakdown.total)
+            for key, monitor in breakdown.monitors.items():
+                monitors[f"{batch.case_id}.{key}"] = (
+                    float(monitor) if isinstance(monitor, (int, float)) else monitor
+                )
+
+    total = sum(totals) / len(totals)
+    group_tensors = {
+        name: sum(values) / len(values) for name, values in group_values.items()
+    }
+    return LossBreakdown(
+        total=total,
+        per_case=per_case,
+        weights=effective,
+        terms=terms,
+        monitors=monitors,
+        group_tensors=group_tensors,
+    )
+
+
 def total_loss(
     batches: Sequence[SampleBatch],
     model,
@@ -231,4 +305,5 @@ __all__ = [
     "case_loss",
     "contact_pressure_scale",
     "total_loss",
+    "total_loss_for_cases",
 ]

@@ -161,11 +161,11 @@ def test_no_data_supervision_is_an_empty_batch_not_a_fake_case(field, scales):
         assert getattr(batch, name) is None, name
     assert math.isnan(batch.geometry_delta_contact)
     assert math.isnan(batch.geometry_delta_shock)
-    assert "disabled" in batch.diagnostics["data_supervision"]
+    assert batch.diagnostics["data_supervision"] == "none"
 
 
 def test_real_data_supervision_is_explicitly_unsupported(field, scales):
-    with pytest.raises(SamplingError, match="real-data supervision is not supported"):
+    with pytest.raises(SamplingError, match="SupervisionDataset"):
         RadiusSampler(
             field=field, scales=scales, tau_end=TAU_END, case=object()
         )

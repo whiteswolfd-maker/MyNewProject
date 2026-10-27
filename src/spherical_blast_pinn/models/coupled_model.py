@@ -98,34 +98,51 @@ class CoupledModel(nn.Module if nn is not None else object):  # type: ignore[mis
         )
 
     # -- 场 ---------------------------------------------------------------
-    def product_fields(self, s, xi) -> ProductFields:
-        return self.product_net(s, xi)
+    def product_fields(self, s, xi, scales=None) -> ProductFields:
+        return self.product_net(s, xi, scales=scales)
 
-    def air_fields(self, s, eta) -> AirFields:
-        return self.air_net(s, eta)
+    def air_fields(self, s, eta, scales=None) -> AirFields:
+        return self.air_net(s, eta, scales=scales)
 
     # -- 前沿 -------------------------------------------------------------
     def front_state(
-        self, s, *, charge_radius: float | None = None, create_graph: bool = True
+        self,
+        s,
+        *,
+        charge_radius: float | None = None,
+        create_graph: bool = True,
+        scales=None,
     ) -> FrontState:
         """前沿位置与速度。``s`` 必须可微。
 
-        ``charge_radius`` 由**该样本所属的算例**给出：三个训练半径共用这一套
-        网络，物理半径只在还原时才乘上去。不传则退回模块默认尺度里的半径。
+        ``charge_radius`` 与 ``scales`` 由**该样本所属的算例**给出：所有半径
+        共用这一套网络，物理半径与时间/速度尺度只在还原时才乘上去。
         """
         return self.front_net.state(
-            s, charge_radius=charge_radius, create_graph=create_graph
+            s,
+            charge_radius=charge_radius,
+            create_graph=create_graph,
+            scales=scales,
         )
 
     def front_positions(self, s):
+        """无量纲前沿位置（与半径、尺度无关）。"""
         return self.front_net.positions(s)
 
     def front_data(
-        self, s, *, charge_radius: float | None = None, create_graph: bool = True
+        self,
+        s,
+        *,
+        charge_radius: float | None = None,
+        create_graph: bool = True,
+        scales=None,
     ) -> FrontData:
         """前沿的**物理**位置与速度，供链式法则使用。"""
         state = self.front_state(
-            s, charge_radius=charge_radius, create_graph=create_graph
+            s,
+            charge_radius=charge_radius,
+            create_graph=create_graph,
+            scales=scales,
         )
         return FrontData(
             contact_radius=state.contact_radius,
@@ -162,7 +179,9 @@ class CoupledModel(nn.Module if nn is not None else object):  # type: ignore[mis
         air = (~product) & (radius < shock_radius)
         return product, air, ~(product | air)
 
-    def piecewise_profile(self, radius, s, *, charge_radius: float | None = None):
+    def piecewise_profile(
+        self, radius, s, *, charge_radius: float | None = None, scales=None
+    ):
         """整条径向剖面；每个场量只在自己的域上评价，域外为 ``nan``。
 
         ``charge_radius`` 与 :meth:`front_state` 同理：三个训练半径共用一套网络，
@@ -178,7 +197,10 @@ class CoupledModel(nn.Module if nn is not None else object):  # type: ignore[mis
             # 若是 ``(n_r,)`` 就会与它广播成 ``(n_r, n_r)``——一个不报错、只是把
             # 每个查询点都变成对所有半径取值的失误。
             radius = radius.reshape(1, -1)
-        r0 = float(charge_radius if charge_radius is not None else self.scales.charge_radius)
+        active = self.scales if scales is None else scales
+        r0 = float(
+            charge_radius if charge_radius is not None else active.charge_radius
+        )
         contact_column = radius.new_tensor(r0) * positions.contact_hat  # (n_t, 1)
         shock_column = radius.new_tensor(r0) * positions.shock_hat
         if contact_column.shape[0] == 1:
@@ -200,7 +222,7 @@ class CoupledModel(nn.Module if nn is not None else object):  # type: ignore[mis
         if bool(product_mask.any()):
             sub_r = radius[product_mask].reshape(-1, 1)
             xi = sub_r / contact[product_mask].reshape(-1, 1)
-            out = self.product_fields(_broadcast_s(s, sub_r), xi)
+            out = self.product_fields(_broadcast_s(s, sub_r), xi, scales=scales)
             for name, value in (
                 ("density", out.density),
                 ("velocity", out.velocity),
@@ -213,7 +235,7 @@ class CoupledModel(nn.Module if nn is not None else object):  # type: ignore[mis
             c = contact[air_mask].reshape(-1, 1)
             h = shock[air_mask].reshape(-1, 1) - c
             eta = (sub_r - c) / h
-            out = self.air_fields(_broadcast_s(s, sub_r), eta)
+            out = self.air_fields(_broadcast_s(s, sub_r), eta, scales=scales)
             for name, value in (
                 ("density", out.density),
                 ("velocity", out.velocity),
@@ -295,20 +317,41 @@ def build_model(
     config,
     *,
     scales: SimilitudeScales,
+    conditions: Mapping[str, Any],
     initial_contact_hat: float = 1.0,
     initial_gap_hat: float = 0.1,
     seed: int | None = None,
     device=None,
 ) -> CoupledModel:
-    """由配置构造整套模型。"""
+    """由配置构造整套模型。
+
+    ``conditions`` 是**启动场保存的**材料/环境条件（见
+    :func:`~...physics.material_state.field_material_conditions`）。模型不允许
+    再从 ``config`` 另取一份 JWL 或环境态：那样自定义材料 handoff 会被默认
+    TNT 静默替换。配置与 handoff 的一致性在装配阶段由
+    :func:`~...physics.material_state.config_condition_mismatches` 检查。
+    """
+    from ..physics.eos import EOSError, JWLParameters
+
     chosen_seed = int(seed if seed is not None else _first_seed(config))
     dtype = resolve_dtype(str(config.get("networks.dtype", "float64")))
     product_section = config.section("networks.product")
     air_section = config.section("networks.air")
     front_section = config.section("networks.front")
+    try:
+        jwl = JWLParameters.from_mapping(conditions["jwl"])
+        air_gamma = float(conditions["air_gamma"])
+        ambient_density = float(conditions["initial_state"]["air_density"])
+        ambient_pressure = float(conditions["initial_state"]["air_pressure"])
+    except (KeyError, TypeError, ValueError, EOSError) as exc:
+        raise ModelError(
+            "build_model needs the startup field's complete material conditions "
+            f"(jwl, air_gamma, ambient density/pressure): {exc}"
+        ) from exc
 
     product = ProductNet(
         scales=scales,
+        jwl=jwl,
         width=int(product_section.get("width", 128)),
         depth=int(product_section.get("depth", 4)),
         activation=str(product_section.get("activation", "tanh")),
@@ -317,7 +360,7 @@ def build_model(
     )
     air = AirNet(
         scales=scales,
-        gamma_air=float(config.get("air.gamma", mat.AIR_GAMMA)),
+        gamma_air=air_gamma,
         width=int(air_section.get("width", 128)),
         depth=int(air_section.get("depth", 4)),
         activation=str(air_section.get("activation", "tanh")),
@@ -342,9 +385,9 @@ def build_model(
         air=air,
         front=front,
         scales=scales,
-        gamma_air=float(config.get("air.gamma", mat.AIR_GAMMA)),
-        ambient_density=float(config.get("air.rho", mat.AIR_DENSITY)),
-        ambient_pressure=float(config.get("air.pressure", mat.AIR_PRESSURE)),
+        gamma_air=air_gamma,
+        ambient_density=ambient_density,
+        ambient_pressure=ambient_pressure,
     )
     target = device if device is not None else resolve_device(str(config.get("training.device", "auto")))
     return model.to(target)
@@ -355,6 +398,73 @@ def _first_seed(config) -> int:
     return int(seeds[0]) if seeds else 0
 
 
+def build_model_from_description(
+    description: Mapping[str, Any],
+    *,
+    scales: SimilitudeScales,
+    device=None,
+) -> CoupledModel:
+    """按检查点里的 ``model_structure`` 重建同结构模型。
+
+    预测端不依赖训练配置：宽度、深度、激活、JWL、空气 EOS、环境态与前沿初始
+    偏置都在 ``model.describe()`` 里。参数随后由 ``load_state_dict`` 装入。
+    """
+    from ..physics.eos import JWLParameters
+    from .mlp import resolve_dtype
+
+    describe = description["describe"]
+    dtype_name = str(description["dtype"]).replace("torch.", "")
+    dtype = resolve_dtype(dtype_name)
+    product_section = describe["product"]
+    air_section = describe["air"]
+    front_section = describe["front"]
+    ambient = describe["undisturbed"]
+    product = ProductNet(
+        scales=scales,
+        jwl=JWLParameters.from_mapping(product_section["jwl"]),
+        width=int(product_section["width"]),
+        depth=int(product_section["depth"]),
+        activation=str(product_section["activation"]),
+        seed=0,
+        dtype=dtype,
+    )
+    air = AirNet(
+        scales=scales,
+        gamma_air=float(air_section["gamma_air"]),
+        width=int(air_section["width"]),
+        depth=int(air_section["depth"]),
+        activation=str(air_section["activation"]),
+        seed=0,
+        dtype=dtype,
+    )
+    front = FrontNet(
+        scales=scales,
+        width=int(front_section["width"]),
+        depth=int(front_section["depth"]),
+        activation=str(front_section["activation"]),
+        initial_contact_hat=float(front_section["initial_contact_hat"]),
+        initial_gap_hat=float(front_section["initial_gap_hat"]),
+        anchor_contact_at_charge_surface=bool(
+            front_section.get("anchored_contact", False)
+        ),
+        anchor_until_s=front_section.get("anchor_until_s"),
+        seed=0,
+        dtype=dtype,
+    )
+    model = CoupledModel(
+        product=product,
+        air=air,
+        front=front,
+        scales=scales,
+        gamma_air=float(air_section["gamma_air"]),
+        ambient_density=float(ambient["rho_ambient"]),
+        ambient_pressure=float(ambient["p_ambient"]),
+    )
+    if device is not None:
+        model = model.to(device)
+    return model
+
+
 __all__ = [
     "GROUP_AIR",
     "GROUP_FRONT",
@@ -363,5 +473,6 @@ __all__ = [
     "CoupledModel",
     "UndisturbedState",
     "build_model",
+    "build_model_from_description",
     "resolve_front_anchor",
 ]

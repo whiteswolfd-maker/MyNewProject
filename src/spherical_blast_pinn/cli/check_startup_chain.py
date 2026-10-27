@@ -22,6 +22,12 @@ from ..models.air_net import AirNet
 from ..models.coupled_model import CoupledModel
 from ..models.front_net import FrontNet
 from ..models.product_net import ProductNet
+from ..physics.eos import JWLParameters
+from ..physics.material_state import (
+    condition_mismatches,
+    field_material_conditions,
+    model_material_conditions,
+)
 from ..physics.similitude import PlanarStartupScales
 from ..physics.two_medium_startup_handoff import load_planar_startup_handoff
 from ..sampling.sampler import RadiusSampler, SamplingConfig
@@ -117,9 +123,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
     )
     batch = sampler.batch()
+    conditions = field_material_conditions(field)
     model = CoupledModel(
-        product=ProductNet(scales=scales, width=args.width, depth=args.depth, seed=args.seed),
-        air=AirNet(scales=scales, width=args.width, depth=args.depth, seed=args.seed + 1),
+        product=ProductNet(
+            scales=scales,
+            jwl=JWLParameters.from_mapping(conditions["jwl"]),
+            width=args.width,
+            depth=args.depth,
+            seed=args.seed,
+        ),
+        air=AirNet(
+            scales=scales,
+            gamma_air=float(conditions["air_gamma"]),
+            width=args.width,
+            depth=args.depth,
+            seed=args.seed + 1,
+        ),
         front=FrontNet(
             scales=scales,
             width=args.width,
@@ -131,7 +150,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             seed=args.seed + 2,
         ),
         scales=scales,
+        gamma_air=float(conditions["air_gamma"]),
+        ambient_density=float(conditions["initial_state"]["air_density"]),
+        ambient_pressure=float(conditions["initial_state"]["air_pressure"]),
     )
+    problems = condition_mismatches(
+        conditions,
+        model_material_conditions(model),
+        reference_label="startup field",
+        actual_label="assembly-check model",
+    )
+    if problems:
+        raise SystemExit(
+            "the assembly-check model does not use the startup field's material/"
+            "environment: " + "; ".join(problems)
+        )
     pressure = contact_pressure_scale(field)
     loss = total_loss([batch], model, contact_pressure=pressure)
     loss.total.backward()

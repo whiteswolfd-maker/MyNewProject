@@ -1,21 +1,27 @@
-"""独立预测（提示词 §14）。
+"""独立预测（新启动场时间轴）。
 
 .. code-block:: bash
 
-    python -m spherical_blast_pinn.cli.predict --config configs/base.yaml \
-        --checkpoint outputs/full/last.pt --radius 0.08 --output outputs/predict/80mm.npz
+    python -m spherical_blast_pinn.cli.predict \
+        --checkpoint outputs/run/last.pt \
+        --handoff-json outputs/planar_startup/<model>/<key>/handoff.json \
+        --tau 0,1e-7,2e-7 --output outputs/predict/run.npz
 
-**这条命令看不到任何目标半径的真值。** 它加载检查点里的物理参数与尺度，不读
-目标半径的真实场量、初态或 ``R_c``/``R_s`` 轨迹，也不重跑目标半径的完整 CFD。
-允许使用验证文件的时间戳与位置**作为查询坐标**，但真值不参与预测。
+时间参数**必须显式**：``--t-phys``（物理时间，秒）与 ``--tau``（从启动场时刻
+算起的时长，秒）二选一，不接受"默认到训练末端"这种含糊参数。
+``tau = t_phys - epsilon_field``，``s = U_* tau / (R_0 hat T_*)``。
 
-输出按**预测的** ``R_c``/``R_s`` 分区：``r < R_c`` 返回产物，``R_c < r < R_s``
-返回空气，``r > R_s`` 返回环境态。界面处不给平均值，而是明确标出左右极限。
+输出按**预测的**前沿分区：产物侧 ``0 <= r < Rc``、空气侧 ``Rc < r < Rs``、
+环境侧 ``r >= Rs``。两侧界面各取自己的单侧极限，不跨界面插值，也不在界面处
+做平均。
 """
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -26,38 +32,278 @@ try:  # pragma: no cover
 except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
-from ..models.coupled_model import CoupledModel
-from ..models.product_net import ProductNet
-from ..models.air_net import AirNet
-from ..models.front_net import FrontNet
-from ..models.mlp import resolve_device, resolve_dtype
-from ..physics.similitude import (
-    SimilitudeScales,
-    physical_time_from_scaled,
-    scaled_time_coverage,
+from ..models.coupled_model import CoupledModel, build_model_from_description
+from ..physics.similitude import PlanarStartupScales
+from ..training.checkpoint import (
+    SCALES_KEY,
+    TrainingError,
+    inspect_startup_checkpoint,
+    load_frozen_model,
+    load_startup_checkpoint,
+    planar_scales_from_record,
 )
-from ._common import (
-    SetupError,
-    TRAINING_NOT_CONNECTED_MESSAGE,
-    TrainingNotConnected,
-    add_common_arguments,
-    configure_stdout,
-    load_config_from_args,
-    write_json,
-)
+from ..physics.two_medium_startup_handoff import load_planar_startup_handoff
+from ._common import SetupError, configure_stdout
+
+#: 界面单侧极限的偏移（在相似坐标上）。它只表示"取左/右极限"，不改变物理。
+SIDE_EPS = 1.0e-9
 
 
-def load_model_from_checkpoint(path: Path, *, charge_radius: float, device=None) -> tuple[CoupledModel, dict[str, Any]]:
-    """预测入口尚未接入新启动场检查点。
+def _parse_time_list(text: str, label: str) -> np.ndarray:
+    values = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = float(part)
+        except ValueError as exc:
+            raise SetupError(f"{label}: {part!r} is not a number") from exc
+        if not math.isfinite(value):
+            raise SetupError(f"{label}: {part!r} is not finite")
+        values.append(value)
+    if not values:
+        raise SetupError(f"{label} contains no times")
+    return np.asarray(values, dtype=np.float64)
 
-    旧的参考场检查点（带爆速与 ``T_h``）已经退出；新格式按 ``startup`` /
-    ``scales`` 绑定启动场，而把预测网格、覆盖判据与前沿重建迁到
-    ``PlanarStartupScales`` 属于后续工作。这里明确拒绝，不猜测旧数据的时间原点。
-    """
-    raise SetupError(
-        "predict 尚未接入新启动场检查点：旧的参考场检查点不再读取，"
-        "新的 startup/scales 契约还没有接到预测网格与前沿重建。"
+
+@dataclass
+class _SelectedCase:
+    record: dict[str, Any]
+    case_id: str
+    field: Any
+    scales: PlanarStartupScales
+    model: CoupledModel
+    mode: str
+    trained_case_ids: list[str]
+    tau_end: float
+    window_fraction: float
+
+
+def _matching_record(
+    cases: Sequence[dict[str, Any]], *, radius: float
+) -> dict[str, Any] | None:
+    matching = [
+        record for record in cases
+        if abs(
+            float(record[SCALES_KEY]["charge_radius"]) - float(radius)
+        ) <= 1.0e-12 * max(abs(float(radius)), 1.0)
+    ]
+    if len(matching) > 1:
+        raise SetupError(
+            f"more than one checkpoint case has R_0 = {radius!r} m; pass --case-id"
+        )
+    return None if not matching else matching[0]
+
+
+def _build_case(
+    checkpoint: Path, *, handoff_json: Path, case_id: str | None, radius: float | None
+) -> _SelectedCase:
+    inspected = inspect_startup_checkpoint(checkpoint)
+    cases = inspected["cases"]
+    trained_ids = [str(record["case_id"]) for record in cases]
+    field = load_planar_startup_handoff(handoff_json)
+    record = None
+    if case_id is not None:
+        matched = [r for r in cases if str(r["case_id"]) == case_id]
+        if not matched:
+            raise SetupError(
+                f"no trained case {case_id!r}; the checkpoint binds {trained_ids}. "
+                "For an untrained compatible radius use --radius without --case-id."
+            )
+        record = matched[0]
+        if radius is not None and abs(
+            float(record[SCALES_KEY]["charge_radius"]) - float(radius)
+        ) > 1.0e-12 * max(abs(float(radius)), 1.0):
+            raise SetupError(
+                f"--case-id {case_id!r} has R_0="
+                f"{float(record[SCALES_KEY]['charge_radius'])!r} m, not {radius!r} m"
+            )
+    elif radius is not None:
+        record = _matching_record(cases, radius=float(radius))
+    elif len(cases) == 1:
+        record = cases[0]
+    else:
+        raise SetupError(
+            "this checkpoint binds several cases; pass --case-id (trained) or "
+            "--radius (trained or compatible untrained)"
+        )
+
+    reference = record if record is not None else cases[0]
+    time_scale = float(reference[SCALES_KEY]["time_scale"])
+    if record is None:
+        # 未训练半径：用冻结的共享参数；只要求材料/环境/delta/方法/时间尺度
+        # 与检查点兼容，cache_key 可以与训练算例不同。
+        scales = PlanarStartupScales.for_startup_field(field, time_scale=time_scale)
+        model = build_model_from_description(
+            inspected["model"]["model_structure"], scales=scales, device="cpu"
+        )
+        load_frozen_model(
+            checkpoint,
+            handoff_json=handoff_json,
+            scales=scales,
+            model=model,
+        )
+        mode = "frozen_shared_parameters"
+        selected_id = f"untrained:{field.charge_radius:g}"
+    else:
+        scales = planar_scales_from_record(
+            record[SCALES_KEY], where="checkpoint.scales"
+        )
+        model = build_model_from_description(
+            inspected["model"]["model_structure"], scales=scales, device="cpu"
+        )
+        load_startup_checkpoint(
+            checkpoint,
+            handoff_json=handoff_json,
+            model=model,
+            scales=scales,
+            restore_rng=False,
+            weights_only=True,
+            select_case_id=str(record["case_id"]),
+        )
+        mode = "trained_case_reproduction"
+        selected_id = str(record["case_id"])
+
+    tau_end = float(reference["sampling"]["tau_end_s"])
+    window_fraction = float(reference["sampling"]["window"]["fraction"])
+    return _SelectedCase(
+        record=reference,
+        case_id=selected_id,
+        field=field,
+        scales=scales,
+        model=model,
+        mode=mode,
+        trained_case_ids=trained_ids,
+        tau_end=tau_end,
+        window_fraction=window_fraction,
     )
+
+
+def _profile_blocks(
+    case: _SelectedCase,
+    *,
+    tau: float,
+    n_product: int,
+    n_air: int,
+    radius_max_factor: float,
+) -> dict[str, Any]:
+    if torch is None:  # pragma: no cover
+        raise RuntimeError("PyTorch is required")
+    scales = case.scales
+    model = case.model
+    dtype = model.product_net.dtype_
+    s_value = float(scales.network_time(torch.as_tensor(tau, dtype=dtype)))
+    s = torch.tensor([[s_value]], dtype=dtype, requires_grad=True)
+    state = model.front_net.state(
+        s,
+        charge_radius=scales.charge_radius,
+        create_graph=False,
+        scales=scales,
+    )
+    contact = float(state.contact_radius.detach())
+    shock = float(state.shock_radius.detach())
+    contact_speed = float(state.contact_speed.detach())
+    shock_speed = float(state.shock_speed.detach())
+    if not (math.isfinite(contact) and math.isfinite(shock) and 0.0 < contact < shock):
+        raise SetupError(
+            f"the model predicts Rc={contact!r}, Rs={shock!r} at tau={tau!r}; "
+            "a valid profile needs 0 < Rc < Rs"
+        )
+    n_product = max(2, int(n_product))
+    n_air = max(2, int(n_air))
+    xi = np.linspace(0.0, 1.0 - SIDE_EPS, n_product)
+    eta = np.linspace(SIDE_EPS, 1.0 - SIDE_EPS, n_air)
+    product_radius = contact * xi
+    air_radius = contact + eta * (shock - contact)
+    ambient_radius = np.asarray(
+        [shock, shock * (1.0 + 1.0e-6), max(shock * 1.05, scales.charge_radius * float(radius_max_factor))]
+    )
+    with torch.no_grad():
+        product = model.product_fields(
+            torch.full((n_product, 1), s_value, dtype=dtype),
+            torch.as_tensor(xi.reshape(-1, 1), dtype=dtype),
+            scales=scales,
+        )
+        air = model.air_fields(
+            torch.full((n_air, 1), s_value, dtype=dtype),
+            torch.as_tensor(eta.reshape(-1, 1), dtype=dtype),
+            scales=scales,
+        )
+        ambient = model.undisturbed
+        product_values = {
+            "density": product.density.detach().numpy().reshape(-1),
+            "velocity": product.velocity.detach().numpy().reshape(-1),
+            "specific_energy": product.specific_energy.detach().numpy().reshape(-1),
+            "pressure": product.pressure.detach().numpy().reshape(-1),
+        }
+        air_values = {
+            "density": air.density.detach().numpy().reshape(-1),
+            "velocity": air.velocity.detach().numpy().reshape(-1),
+            "specific_energy": air.specific_energy.detach().numpy().reshape(-1),
+            "pressure": air.pressure.detach().numpy().reshape(-1),
+        }
+    ambient_values = {
+        "density": np.full(ambient_radius.size, ambient.density),
+        "velocity": np.full(ambient_radius.size, ambient.velocity),
+        "specific_energy": np.full(ambient_radius.size, ambient.specific_energy),
+        "pressure": np.full(ambient_radius.size, ambient.pressure),
+    }
+    regions = (
+        np.zeros(product_radius.size, dtype=np.int8),
+        np.ones(air_radius.size, dtype=np.int8),
+        np.full(ambient_radius.size, 2, dtype=np.int8),
+    )
+    radius = np.concatenate([product_radius, air_radius, ambient_radius])
+    values = {
+        name: np.concatenate([product_values[name], air_values[name], ambient_values[name]])
+        for name in ("density", "velocity", "specific_energy", "pressure")
+    }
+    return {
+        "tau": float(tau),
+        "physical_time": float(scales.physical_time_from_network(s_value)),
+        "network_time": s_value,
+        "radius": radius,
+        "region": np.concatenate(regions),
+        **values,
+        "overpressure": values["pressure"] - float(ambient.pressure),
+        "contact_radius": contact,
+        "shock_radius": shock,
+        "contact_speed": contact_speed,
+        "shock_speed": shock_speed,
+        "product_points": int(product_radius.size),
+        "air_points": int(air_radius.size),
+        "ambient_points": int(ambient_radius.size),
+        "contact_left": {
+            "radius": contact * (1.0 - SIDE_EPS),
+            "density": float(product_values["density"][-1]),
+            "velocity": float(product_values["velocity"][-1]),
+            "specific_energy": float(product_values["specific_energy"][-1]),
+            "pressure": float(product_values["pressure"][-1]),
+        },
+        "contact_right": {
+            "radius": contact + (shock - contact) * SIDE_EPS,
+            "density": float(air_values["density"][0]),
+            "velocity": float(air_values["velocity"][0]),
+            "specific_energy": float(air_values["specific_energy"][0]),
+            "pressure": float(air_values["pressure"][0]),
+        },
+        "shock_post": {
+            "radius": shock - (shock - contact) * SIDE_EPS,
+            "density": float(air_values["density"][-1]),
+            "velocity": float(air_values["velocity"][-1]),
+            "specific_energy": float(air_values["specific_energy"][-1]),
+            "pressure": float(air_values["pressure"][-1]),
+        },
+        "ambient": {
+            "radius": float(ambient_radius[0]),
+            "density": float(ambient.density),
+            "velocity": float(ambient.velocity),
+            "specific_energy": float(ambient.specific_energy),
+            "pressure": float(ambient.pressure),
+        },
+    }
+
 
 def predict_grid(
     model: CoupledModel,
@@ -66,115 +312,76 @@ def predict_grid(
     radii: np.ndarray,
     scaled_time_coverage: float | None = None,
 ) -> dict[str, Any]:
-    """在**物理时间**网格 ``(t_phys, r)`` 上给出预测。
+    """在固定 ``(t_phys, r)`` 网格上给出分区预测（不跨界面插值）。
 
-    输入的 ``physical_times`` 是秒，物理时间。``t_phys -> t_PINN -> s`` 的换算
-    **只在这里做一次**：物理时间减一次 ``T_h = R_0/D + epsilon(R_0)``，得到 ``t_PINN``
-    除以 ``R_0/U_*`` 再除以 ``hat T_*`` 得到 ``s``。输出里同时给出
-    ``physical_time`` 与 ``pinn_time``，两者始终满足
-    ``physical_time = pinn_time + T_h``，所以下游不需要再猜哪一个已经
-    含过零点。这正是"在一处加、在另一处又加一次"最容易发生的地方：两个数组都
-    只有秒的量纲，多平移一次不会报错，只会把轨迹整体错开。
-
-    按预测前沿分区；域外为 ``nan``，不填任何替代值。超出训练**尺度化**时间
-    覆盖（``s_max``）的查询标记为外推——判断在 ``s`` 上做，因此与目标半径无关。
+    保留这个接口给独立调用；CLI 的重建流程用 :func:`_profile_blocks`，因为它
+    输出的是按材料侧分段的点，界面两侧各取单侧极限。
     """
     if torch is None:  # pragma: no cover
         raise RuntimeError("PyTorch is required")
     scales = model.scales
     dtype = model.product_net.dtype_
     physical_times = np.asarray(physical_times, dtype=np.float64).reshape(-1)
-    start = float(scales.start_time())
-    pinn_times = physical_times - start
-    if np.any(pinn_times < -1.0e-15):
-        earliest = float(physical_times[np.argmin(pinn_times)])
+    epsilon = float(scales.start_time())
+    tau = physical_times - epsilon
+    if np.any(tau < -1.0e-15):
+        earliest = float(physical_times[np.argmin(tau)])
         raise SetupError(
-            f"a query at t_phys = {earliest:.6g} s precedes the PINN time origin "
-            f"T_h = R_0/D + epsilon(R_0) = {start:.6g} s; the trained domain starts there"
+            f"a query at t_phys = {earliest:.6g} s precedes the startup origin "
+            f"epsilon = {epsilon:.6g} s"
         )
-    pinn_times = np.maximum(pinn_times, 0.0)
-
-    n_t = pinn_times.size
-    n_r = radii.size
-
-    s_values = scales.network_time(torch.as_tensor(pinn_times, dtype=dtype))
-    s_values = s_values.reshape(-1, 1)
-    radius = torch.as_tensor(radii, dtype=dtype).reshape(1, -1).expand(n_t, n_r)
-
+    tau = np.maximum(tau, 0.0)
+    s_values = scales.network_time(torch.as_tensor(tau, dtype=dtype)).reshape(-1, 1)
+    radius = torch.as_tensor(radii, dtype=dtype).reshape(1, -1).expand(
+        tau.size, np.asarray(radii).size
+    )
     with torch.no_grad():
         positions = model.front_positions(s_values)
-        contact_column = scales.charge_radius * positions.contact_hat
-        shock_column = scales.charge_radius * positions.shock_hat
-        # 前沿只随时间变，半径网格是另一维；掩码是 (n_t, n_r)，所以前沿必须先
-        # 广播到同一形状再参与比较。
-        contact = contact_column.expand(n_t, n_r)
-        shock = shock_column.expand(n_t, n_r)
-
+        contact = scales.charge_radius * positions.contact_hat
+        shock = scales.charge_radius * positions.shock_hat
+        contact = contact.expand_as(radius)
+        shock = shock.expand_as(radius)
         product_mask = radius < contact
         air_mask = (radius >= contact) & (radius < shock)
         undisturbed = ~(product_mask | air_mask)
-
         out = {
-            "density": torch.full((n_t, n_r), float("nan"), dtype=dtype),
-            "velocity": torch.full((n_t, n_r), float("nan"), dtype=dtype),
-            "specific_energy": torch.full((n_t, n_r), float("nan"), dtype=dtype),
-            "pressure": torch.full((n_t, n_r), float("nan"), dtype=dtype),
+            name: torch.full(radius.shape, float("nan"), dtype=dtype)
+            for name in ("density", "velocity", "specific_energy", "pressure")
         }
-        for mask, fields in (
-            (
-                product_mask,
-                model.product_fields(
-                    s_values.expand(n_t, n_r)[product_mask].reshape(-1, 1),
-                    (radius[product_mask] / contact[product_mask]).reshape(-1, 1),
-                ),
-            ),
-            (
-                air_mask,
-                model.air_fields(
-                    s_values.expand(n_t, n_r)[air_mask].reshape(-1, 1),
-                    (
-                        (radius[air_mask] - contact[air_mask])
-                        / (shock[air_mask] - contact[air_mask])
-                    ).reshape(-1, 1),
-                ),
-            ),
-        ):
-            if not bool(mask.any()):
-                continue
-            for name, value in (
-                ("density", fields.density),
-                ("velocity", fields.velocity),
-                ("specific_energy", fields.specific_energy),
-                ("pressure", fields.pressure),
-            ):
-                out[name][mask] = value.reshape(-1)
-        for name, value in (
-            ("density", model.undisturbed.density),
-            ("velocity", model.undisturbed.velocity),
-            ("specific_energy", model.undisturbed.specific_energy),
-            ("pressure", model.undisturbed.pressure),
-        ):
-            out[name][undisturbed] = value
-
-    # 前沿速度要 autograd 对 ``s`` 求导，所以**不能**包在 ``torch.no_grad()``
-    # 里——那里面建不出计算图，``autograd.grad`` 会直接报"不 requires_grad"。
-    # 场量是纯前向的，继续留在 no_grad 里省内存。
-    s_grad = s_values.detach().clone().requires_grad_(True)
-    state = model.front_net.state(s_grad, create_graph=False)
-    contact_speed = state.contact_speed.detach().reshape(-1).numpy()
-    shock_speed = state.shock_speed.detach().reshape(-1).numpy()
-
-    # 外推判断在 ``s`` 上做，不在秒数上做：同样的 s 在大半径上对应更长的物理
-    # 时间，拿秒数比大小会把覆盖内的点判成外推（或反过来）。
+        if bool(product_mask.any()):
+            fields = model.product_fields(
+                s_values.expand_as(radius)[product_mask].reshape(-1, 1),
+                (radius[product_mask] / contact[product_mask]).reshape(-1, 1),
+                scales=model.scales,
+            )
+            for name in out:
+                out[name][product_mask] = getattr(fields, name).reshape(-1)
+        if bool(air_mask.any()):
+            fields = model.air_fields(
+                s_values.expand_as(radius)[air_mask].reshape(-1, 1),
+                (
+                    (radius[air_mask] - contact[air_mask])
+                    / (shock[air_mask] - contact[air_mask])
+                ).reshape(-1, 1),
+                scales=model.scales,
+            )
+            for name in out:
+                out[name][air_mask] = getattr(fields, name).reshape(-1)
+        for name in out:
+            out[name][undisturbed] = getattr(model.undisturbed, name if name != "specific_energy" else "specific_energy")
     s_flat = s_values.detach().reshape(-1).numpy()
-    if scaled_time_coverage is None:
-        extrapolated = np.zeros(n_t, dtype=bool)
-    else:
-        extrapolated = s_flat > float(scaled_time_coverage) + 1.0e-12
-
+    extrapolated = (
+        np.zeros(tau.size, dtype=bool)
+        if scaled_time_coverage is None
+        else s_flat > float(scaled_time_coverage) + 1.0e-12
+    )
     return {
         "physical_time": physical_times,
-        "pinn_time": pinn_times,
+        # ``pinn_time`` 是旧名字，等价于 ``tau = t_phys - epsilon``；两者同时给出
+        # 且只平移一次，便于旧对照代码读取而不需要再猜时间零点。
+        "pinn_time": tau,
+        "tau": tau,
+        "start_time": epsilon,
         "network_time": s_flat,
         "radius": np.asarray(radii),
         "density": out["density"].numpy(),
@@ -182,62 +389,189 @@ def predict_grid(
         "specific_energy": out["specific_energy"].numpy(),
         "pressure": out["pressure"].numpy(),
         "overpressure": out["pressure"].numpy() - model.undisturbed.pressure,
-        "contact_radius": contact_column.detach().reshape(-1).numpy(),
-        "shock_radius": shock_column.detach().reshape(-1).numpy(),
-        "contact_speed": contact_speed,
-        "shock_speed": shock_speed,
-        "region": np.where(
-            product_mask.numpy(), 0, np.where(air_mask.numpy(), 1, 2)
-        ).astype(np.int64),
+        "contact_radius": contact.detach().reshape(-1).numpy(),
+        "shock_radius": shock.detach().reshape(-1).numpy(),
+        "region": np.where(product_mask.numpy(), 0, np.where(air_mask.numpy(), 1, 2)),
         "extrapolated": extrapolated,
-        "charge_radius": float(scales.charge_radius),
-        "start_time": start,
-        "time_origin": "physical_time = pinn_time + start_time, applied exactly once here",
-        "scaled_time_coverage": (
-            float("nan") if scaled_time_coverage is None else float(scaled_time_coverage)
-        ),
-        # 固定的物理尺度，供对照使用。**不能**由参考数据现算：那样分母会随被
-        # 比较的那份数据变，误差就不再是同一个量。
-        "scale_product_density": float(model.scales.product_density),
-        "scale_air_density": float(model.scales.air_density),
-        "scale_velocity": float(model.scales.reference_velocity),
-        "scale_specific_energy": float(model.scales.reference_specific_energy),
-        "ambient_pressure": float(model.undisturbed.pressure),
-        "note": (
-            "region: 0=product, 1=air, 2=ambient. NaN means outside every region. "
-            "No value is ever filled in by clamping. physical_time = pinn_time + start_time."
-        ),
+        "epsilon_s": epsilon,
+        "time_convention": scales.time_convention,
     }
 
 
+def _write_npz(path: Path, payload: dict[str, Any], metadata: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arrays = {
+        key: value for key, value in payload.items()
+        if isinstance(value, np.ndarray)
+    }
+    arrays["metadata"] = np.asarray(json.dumps(metadata, sort_keys=True, default=str))
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with open(temporary, "wb") as handle:
+        np.savez_compressed(handle, **arrays)
+    temporary.replace(path)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """正式入口：新启动场的训练接口尚未接入，明确失败而不是回退旧方案。"""
     try:
         return _run(argv)
-    except TrainingNotConnected as exc:
+    except (SetupError, TrainingError) as exc:
         print(f"\n** {exc} **\n", file=sys.stderr)
-        return 3
+        return 6
 
 
 def _run(argv: Sequence[str] | None = None) -> int:
-
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    add_common_arguments(parser)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--radius", type=float, required=True, help="目标装药半径，m")
-    parser.add_argument("--output", default=None, help="预测结果 npz 路径")
     parser.add_argument(
-        "--time-end",
-        type=float,
-        default=None,
-        help="查询终止的**物理**时间，s（省略时取训练尺度化覆盖的末端）",
+        "--handoff-json", required=True,
+        help="该检查点绑定的 handoff.json（显式给出，不依赖检查点里的路径）",
     )
-    parser.add_argument("--n-times", type=int, default=200)
-    parser.add_argument("--radius-max-factor", type=float, default=12.0)
-    parser.add_argument("--n-radii", type=int, default=600)
+    parser.add_argument("--case-id", default=None)
+    parser.add_argument("--radius", type=float, default=None, help="按 R_0 选算例，m")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--t-phys", default=None, help="物理时间，秒（逗号分隔，可多个）")
+    group.add_argument("--tau", default=None, help="从 epsilon 起算的时长，秒")
+    parser.add_argument("--output", default=None, help="输出 .npz（缺省写到检查点旁）")
+    parser.add_argument("--output-json", default=None)
+    parser.add_argument("--n-product", type=int, default=128)
+    parser.add_argument("--n-air", type=int, default=256)
+    parser.add_argument("--radius-max-factor", type=float, default=8.0)
     args = parser.parse_args(argv)
     configure_stdout()
-    raise TrainingNotConnected(TRAINING_NOT_CONNECTED_MESSAGE)
+
+    checkpoint = Path(args.checkpoint)
+    handoff = Path(args.handoff_json)
+    case = _build_case(
+        checkpoint, handoff_json=handoff, case_id=args.case_id, radius=args.radius
+    )
+    epsilon = float(case.field.epsilon)
+    tau_end = float(case.tau_end)
+    window_fraction = float(case.window_fraction)
+    trained_tau_max = tau_end * window_fraction
+
+    if args.tau is not None:
+        tau = _parse_time_list(args.tau, "--tau")
+        if np.any(tau < 0.0):
+            raise SetupError("--tau must be non-negative (it starts at epsilon)")
+        physical = epsilon + tau
+    else:
+        physical = _parse_time_list(args.t_phys, "--t-phys")
+        tau = physical - epsilon
+        if np.any(tau < -1.0e-15):
+            earliest = float(physical[np.argmin(tau)])
+            raise SetupError(
+                f"--t-phys {earliest:.6g} s precedes epsilon = {epsilon:.6g} s; "
+                "the trained domain starts at the startup field's own time"
+            )
+        tau = np.maximum(tau, 0.0)
+
+    profiles = [
+        _profile_blocks(
+            case,
+            tau=float(value),
+            n_product=args.n_product,
+            n_air=args.n_air,
+            radius_max_factor=args.radius_max_factor,
+        )
+        for value in tau
+    ]
+    time_index = np.concatenate([
+        np.full(profile["radius"].size, index, dtype=np.int64)
+        for index, profile in enumerate(profiles)
+    ])
+    stacked = {
+        "radius": np.concatenate([p["radius"] for p in profiles]),
+        "time_index": time_index,
+        "region": np.concatenate([p["region"] for p in profiles]),
+        "density": np.concatenate([p["density"] for p in profiles]),
+        "velocity": np.concatenate([p["velocity"] for p in profiles]),
+        "specific_energy": np.concatenate([p["specific_energy"] for p in profiles]),
+        "pressure": np.concatenate([p["pressure"] for p in profiles]),
+        "overpressure": np.concatenate([p["overpressure"] for p in profiles]),
+        "times_phys": physical,
+        "tau": tau,
+        "network_time": np.asarray([p["network_time"] for p in profiles]),
+        "contact_radius": np.asarray([p["contact_radius"] for p in profiles]),
+        "shock_radius": np.asarray([p["shock_radius"] for p in profiles]),
+        "contact_speed": np.asarray([p["contact_speed"] for p in profiles]),
+        "shock_speed": np.asarray([p["shock_speed"] for p in profiles]),
+        "extrapolated": np.asarray([float(t) > trained_tau_max for t in tau]),
+    }
+    metadata = {
+        "format": "spherical_blast_pinn.startup_prediction",
+        "version": 1,
+        "checkpoint": str(checkpoint),
+        "case_id": case.case_id,
+        "mode": case.mode,
+        "trained_case_ids": list(case.trained_case_ids),
+        "frozen_parameters": True,
+        "charge_radius_m": float(case.scales.charge_radius),
+        "epsilon_s": epsilon,
+        "time_convention": case.scales.time_convention,
+        "time_mapping": "tau = t_phys - epsilon; s = network_time(tau)",
+        "tau_end_s": tau_end,
+        "trained_window_fraction": window_fraction,
+        "trained_tau_max_s": trained_tau_max,
+        "ambient_pressure": float(case.model.undisturbed.pressure),
+        "product_density_scale": float(case.scales.product_density),
+        "air_density_scale": float(case.scales.air_density),
+        "velocity_scale": float(case.scales.reference_velocity),
+        "energy_scale": float(case.scales.reference_specific_energy),
+        "extrapolated": [bool(t > trained_tau_max) for t in tau],
+        "profiles": [
+            {
+                key: profile[key]
+                for key in (
+                    "tau", "physical_time", "network_time", "contact_radius",
+                    "shock_radius", "contact_speed", "shock_speed",
+                    "product_points", "air_points", "ambient_points",
+                    "contact_left", "contact_right", "shock_post", "ambient",
+                )
+            }
+            for profile in profiles
+        ],
+        "region_codes": {"0": "product", "1": "air", "2": "ambient"},
+        "rules": (
+            "product: 0 <= r < Rc with xi in [0, 1-eps]; air: Rc < r < Rs with "
+            "eta in [eps, 1-eps]; ambient: r >= Rs. No cross-interface interpolation."
+        ),
+    }
+    output = Path(args.output) if args.output else checkpoint.with_name(
+        f"{checkpoint.stem}.predict.npz"
+    )
+    _write_npz(output, stacked, metadata)
+    json_path = (
+        Path(args.output_json)
+        if args.output_json
+        else output.with_suffix(".json")
+    )
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+
+    print(
+        f"case        : {case.case_id}  R0={case.scales.charge_radius:g} m  "
+        f"mode={case.mode}"
+    )
+    if case.mode == "frozen_shared_parameters":
+        print(
+            f"frozen      : shared parameters trained on {case.trained_case_ids}; "
+            "no parameter update, no supervision read"
+        )
+    print(f"time origin : epsilon={epsilon:.6e} s; {case.scales.time_convention}")
+    for profile in profiles:
+        flag = (
+            "  [extrapolated]"
+            if profile["tau"] > trained_tau_max + 1.0e-15
+            else ""
+        )
+        print(
+            f"  tau={profile['tau']:.6e} s  t_phys={profile['physical_time']:.6e} s  "
+            f"s={profile['network_time']:.6e}  Rc={profile['contact_radius']:.6e} m  "
+            f"Rs={profile['shock_radius']:.6e} m{flag}"
+        )
+    print(f"written     : {output}")
+    print(f"              {json_path}")
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

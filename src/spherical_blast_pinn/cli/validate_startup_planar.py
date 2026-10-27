@@ -183,7 +183,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "spherical_energy_residual keeps the original global denominator (includes ambient air; depends on outer boundary)",
             "spherical_energy_change_abs_over_initial_product_internal is the supplemental product-energy normalization",
             "planar mass/energy residuals check the Riemann fan itself",
-            "no training is started and training_qualified remains false",
+            "no training is started; training_qualified is provenance, not a run gate",
         ],
     }
     out_dir = Path(args.output_dir)

@@ -25,6 +25,41 @@
   与采样器之前拒绝。窗口按保存值无条件恢复（允许相对接收端默认值收窄），
   因此非默认阶段窗口续训后的下一批采样与连续运行逐位一致。
 
+**2026-10-28 更新（当前）**：多半径改为**共享一套可训练参数**（一个
+ProductNet、一个 AirNet、一套前沿参数、一个优化器）；此前"每半径一个模型"
+的 v2 检查点明确拒绝。旧的独立模型保存/预测选取路径与 `compare_legacy` 已删除。
+
+* `Trainer` 消费多个 `StartupCase`（每个半径自己的 field/scales/采样器/监督
+  数据）与**一个共享模型**：一个 ProductNet、一个 AirNet、一套前沿参数、一个
+  优化器。网络无量纲，物理输出换算逐次使用 `batch.scales`；多半径按半径等权
+  汇总（`total_loss_for_cases`），一次反向、一次更新。支持范围是同材料、
+  同环境、同 `delta`、同启动方法与时间尺度，只有 `R_0`/`epsilon` 不同。
+* 检查点升级到 **v5**：`model` + `cases` + `training`。共享参数/优化器只有
+  一份；各 case 保存尺度、场身份、无量纲前沿初值、完整材料/环境/初始热力学
+  状态、采样配置/窗口、RNG、连续帧组开发划分、RAR 配置/点池/触发进度与数据
+  身份；训练块保存步号、阶段、日程、平衡器、历史、选模（含共享权重）、运行
+  来源与诊断身份。v2/v3/v4 明确拒绝；旧格式没有 RAR 或开发划分状态，不能精确
+  续训。
+* 材料/环境以 handoff 保存的完整 JWL、空气 `gamma`、环境密度/压力与初始产物/
+  空气状态为准；YAML 显式物理值必须一致，冲突在优化前报错。自动构造初场时
+  `jwl`、`E0` 与 `air` 参数真正进入初值；`check_shared_compatibility` 直接比较
+  完整 EOS、环境与初始状态，并核对第一份 case 与共享模型。`rho_*/U_*/e_*` 仍是
+  数值归一化尺度，不强制等于实际初态。
+* `train --diagnostic` 只限制运行身份与步数并记录诊断身份；**不再**要求
+  `training_qualified=True`。该字段只保留为来源记录，程序正确性检查不变。
+* 连续帧组开发划分与 RAR 已接入：训练监督只用训练帧；固定检查集另建开发帧
+  批次；RAR 每 case/材料独立评分与点池，不调用优化器、不写梯度，关闭时采样
+  路径不变。
+* `predict` 支持两种模式：`--case-id` 严格复现训练算例；`--radius` 在未训练
+  半径上使用**冻结共享参数**，只核对材料/环境/delta/方法/时间尺度与无量纲
+  前沿初值，使用新半径自己的 handoff 与 `epsilon`，不更新参数。`--t-phys`/
+  `--tau` 二选一，按材料侧输出单侧剖面与前沿；`compare` 要求参照数据有已确认
+  时间原点，缺失量输出 `null`。
+* 数据监督契约：`data/startup_supervision.py` 显式 `T_origin`、SI 单位、逐字段
+  有效性、前沿有效性与不确定性、synthetic/real 标记。真实 DYNA 提取尚未接入。
+* 旧独立模型检查点与旧 `compare_legacy` 已删除；通用材料侧对照规则迁到
+  `evaluation/field_compare.py`。
+
 旧的方案 B 初始化/前置求解链路已整体删除：
 `physics/detonation.py`、`physics/precursor.py`（含 `ReferenceField` 与验收缓存）、
 `physics/two_medium_startup.py`（旧 Lagrangian 推进）、`cli/reference_field.py`、

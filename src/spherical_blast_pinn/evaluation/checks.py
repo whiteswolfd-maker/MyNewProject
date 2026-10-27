@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -28,6 +28,7 @@ try:  # pragma: no cover
 except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
+from ..data.startup_supervision import SupervisionDataset, sample_supervision
 from ..physics import material as mat
 from ..physics.moving_frame import AIR, PRODUCT
 from ..physics.similitude import PlanarStartupScales
@@ -56,9 +57,11 @@ class CheckSet:
     label: str
     batches: list[SampleBatch]
     definition: dict[str, Any]
-    #: 与训练损失同源的 ``Pc_*``（启动场的 ``p_*``）。两个不同的分母会让检查
+    #: 与训练损失同源的 ``Pc_*``（启动场的 ``p_*``），两个不同的分母会让检查
     #: 指标与训练损失不可比，所以在建立检查集时就从场里取定、随检查集一起走。
     contact_pressure: float = float("nan")
+    #: 开发帧的固定数据批次；只在 ``data_loss`` 中使用，不参与物理 PDE 评价。
+    data_batches: list[SampleBatch] = field(default_factory=list)
 
     @property
     def case_ids(self) -> list[str]:
@@ -94,6 +97,10 @@ class CheckSet:
             restrict_to_time_window(batch, bounds[batch.case_id])
             for batch in self.batches
         ]
+        data_batches = [
+            restrict_to_time_window(batch, bounds[batch.case_id])
+            for batch in self.data_batches
+        ]
         definition = dict(self.definition)
         definition["window"] = {
             "fraction": value,
@@ -105,6 +112,7 @@ class CheckSet:
             batches=batches,
             definition=definition,
             contact_pressure=self.contact_pressure,
+            data_batches=data_batches,
         )
 
 
@@ -120,21 +128,30 @@ def build_check_set(
     r_min_fraction: float = 1.0e-2,
     case_id: str | None = None,
     label: str = "independent-check",
+    development_case: SupervisionDataset | None = None,
+    development_config: SamplingConfig | None = None,
 ) -> CheckSet:
     """建立一个固定检查集：一次采样，之后一直用这一套。
 
-    采样器**不参与梯度**，用独立种子；它从新启动场采样，没有数据监督。
-    检查点的 ``Pc_*`` 在建立时从同一个启动场取定，因此训练与检查共用一条
-    归一化尺度。
+    物理批次用独立种子、无数据监督。``development_case`` 带连续帧组划分时，
+    另建一个**只含开发帧标签**的固定数据批次；它只用于 ``data_loss`` 和既有的
+    选模偏序，不进入 PDE 物理批次，也不随训练/RAR 重采。
     """
     if torch is None:  # pragma: no cover
         raise RuntimeError("PyTorch is required")
+    physics_config = replace(
+        config or SamplingConfig(),
+        n_data_product=0,
+        n_data_air=0,
+        n_data_contact=0,
+        n_data_shock=0,
+    )
     sampler = RadiusSampler(
         field=field,
         scales=scales,
         tau_end=tau_end,
         case_id=case_id,
-        config=config,
+        config=physics_config,
         seed=int(seed),
         dtype=dtype,
         device=device,
@@ -142,6 +159,51 @@ def build_check_set(
     )
     batch = sampler.batch()
     contact_pressure = contact_pressure_scale(field)
+    data_batches: list[SampleBatch] = []
+    development_definition = None
+    if development_case is not None and development_case.frame_split is not None:
+        counts = development_config or SamplingConfig()
+        sampled = sample_supervision(
+            development_case,
+            scales=scales,
+            field_epsilon=float(field.epsilon),
+            window_tau_max=float(tau_end),
+            rng=np.random.default_rng(int(seed) + 90000),
+            n_product=int(counts.n_data_product),
+            n_air=int(counts.n_data_air),
+            n_contact=int(counts.n_data_contact),
+            n_shock=int(counts.n_data_shock),
+            dtype=dtype,
+            device=device,
+            frame_mask=development_case.development_frame_mask(),
+        )
+        fields = dict(sampled.fields)
+        delta_contact = fields.pop(
+            "geometry_delta_contact", development_case.contact_delta_m
+        )
+        delta_shock = fields.pop(
+            "geometry_delta_shock", development_case.shock_delta_m
+        )
+        data_batch = SampleBatch(
+            case_id=batch.case_id,
+            charge_radius=float(batch.charge_radius),
+            detonation_velocity=None,
+            scales=scales,
+            pinn_time_min=0.0,
+            pinn_time_max=float(tau_end),
+            geometry_delta_contact=float(delta_contact),
+            geometry_delta_shock=float(delta_shock),
+            **fields,
+        )
+        data_batches.append(data_batch)
+        development_definition = {
+            "case_id": batch.case_id,
+            "split": development_case.frame_split.as_dict(),
+            "data_identity": development_case.identity(),
+            "counts": dict(sampled.counts),
+            "seed": int(seed) + 90000,
+            "purpose": "fixed development labels; never in a training gradient or RAR",
+        }
     definition = {
         "seed": int(seed),
         "purpose": "fixed physics verification and model selection; never in a gradient",
@@ -150,6 +212,7 @@ def build_check_set(
             "tau_end_s": float(tau_end),
             "points": batch.as_dict(),
         },
+        "development_data": development_definition,
         "contact_pressure_pa": float(contact_pressure),
         "selection_criteria": SELECTION_CRITERIA,
     }
@@ -158,6 +221,7 @@ def build_check_set(
         batches=[batch],
         definition=definition,
         contact_pressure=contact_pressure,
+        data_batches=data_batches,
     )
 
 
@@ -237,7 +301,10 @@ def _validity_rates(batch: SampleBatch, model) -> dict[str, float]:
         raise RuntimeError("PyTorch is required")
     out: dict[str, float] = {}
     if batch.s_product is not None and batch.s_product.numel():
-        fields = model.product_fields(batch.s_product.detach(), batch.xi_product.detach())
+        fields = model.product_fields(
+            batch.s_product.detach(), batch.xi_product.detach(),
+            scales=batch.scales,
+        )
         out["product_nonfinite_rate"] = float(
             (~torch.isfinite(fields.pressure)).to(torch.float64).mean()
         )
@@ -249,7 +316,9 @@ def _validity_rates(batch: SampleBatch, model) -> dict[str, float]:
             (c2 < 0.0).to(torch.float64).mean()
         )
     if batch.s_air is not None and batch.s_air.numel():
-        fields = model.air_fields(batch.s_air.detach(), batch.eta_air.detach())
+        fields = model.air_fields(
+            batch.s_air.detach(), batch.eta_air.detach(), scales=batch.scales
+        )
         out["air_nonfinite_rate"] = float(
             (~torch.isfinite(fields.pressure)).to(torch.float64).mean()
         )
@@ -258,7 +327,8 @@ def _validity_rates(batch: SampleBatch, model) -> dict[str, float]:
         )
     if batch.xi_ic_product is not None and batch.xi_ic_product.numel():
         fields = model.product_fields(
-            torch.zeros_like(batch.xi_ic_product), batch.xi_ic_product
+            torch.zeros_like(batch.xi_ic_product), batch.xi_ic_product,
+            scales=batch.scales,
         )
         out["ic_product_negative_pressure_rate"] = float(
             (fields.pressure < 0.0).to(torch.float64).mean()
@@ -397,6 +467,31 @@ def run_checks(
         per_radius[batch.case_id] = entry
         metrics.update({f"{batch.case_id}.{key}": value for key, value in entry.items()})
 
+    # 开发帧是**固定**的单独批次：只喂给 data_loss，不进入 PDE/界面/初值。
+    for data_batch in check_set.data_batches:
+        data = data_loss(data_batch, model)
+        entry = per_radius.setdefault(data_batch.case_id, {})
+        entry.update({f"data_{k}": float(v) for k, v in data.parts.items()})
+        entry.update(
+            {
+                f"data_{k}": float(v)
+                for k, v in data.monitors.items()
+                if isinstance(v, (int, float))
+            }
+        )
+        n_groups = int(data.monitors.get("data_n_groups", 0))
+        development_error = (
+            _guarded_mean([math.sqrt(float(v)) for v in data.parts.values()])
+            if n_groups > 0
+            else float("nan")
+        )
+        entry["data_development_rms"] = development_error
+        if math.isfinite(development_error):
+            physics_excess += _hinge_excess(development_error, field_l2_limit)
+        metrics.update(
+            {f"{data_batch.case_id}.{key}": value for key, value in entry.items()}
+        )
+
     per_radius_values = list(per_radius.values())
     metrics["pde_rms_max"] = max(
         (value for entry in per_radius_values for key, value in entry.items()
@@ -446,6 +541,15 @@ def run_checks(
 # --------------------------------------------------------------------------
 
 
+def _trapezoid(values: np.ndarray, times: np.ndarray) -> float:
+    """非均匀时间网格上的梯形积分（只用于守恒诊断）。"""
+    values = np.asarray(values, dtype=np.float64)
+    times = np.asarray(times, dtype=np.float64)
+    if values.size < 2:
+        return 0.0
+    return float(np.sum(0.5 * (values[1:] + values[:-1]) * np.diff(times)))
+
+
 def conservation_diagnostics(
     model,
     check_set: CheckSet,
@@ -470,7 +574,6 @@ def conservation_diagnostics(
     """
     if torch is None:  # pragma: no cover
         raise RuntimeError("PyTorch is required")
-    from ..evaluation.metrics import trapezoid
 
     rows: list[dict[str, float]] = []
     mass_drift = 0.0
@@ -494,7 +597,9 @@ def conservation_diagnostics(
             s = torch.as_tensor([[float(s_value)]], dtype=radii.dtype, device=radii.device)
             # ``piecewise_profile`` 返回 ``(1, n_r)``；压成一维，否则 ``[-1]`` 取到
             # 的是整行而不是最外侧那一点。
-            profile = model.piecewise_profile(radii, s, charge_radius=radius_0)
+            profile = model.piecewise_profile(
+                radii, s, charge_radius=radius_0, scales=batch.scales
+            )
             density = profile["density"].reshape(-1)
             velocity = profile["velocity"].reshape(-1)
             energy = profile["specific_energy"].reshape(-1)
@@ -541,7 +646,7 @@ def conservation_diagnostics(
         drift = float(np.max(np.abs(mass_array / max(mass_array[0], 1.0e-300) - 1.0)))
         flux_integral = np.concatenate([[0.0], np.cumsum(
             [
-                trapezoid(flux_array[i:i + 2], physical[i:i + 2])
+                _trapezoid(flux_array[i:i + 2], physical[i:i + 2])
                 for i in range(physical.size - 1)
             ]
         )])

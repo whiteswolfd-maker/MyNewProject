@@ -120,16 +120,18 @@ class AirNet(nn.Module if nn is not None else object):  # type: ignore[misc]
         return self.scales.reference_specific_energy
 
     # -- 前向 -------------------------------------------------------------
-    def forward(self, s, eta) -> AirFields:
+    def forward(self, s, eta, scales=None) -> AirFields:
+        """``scales`` 是这条样本所属算例的尺度；网络本身无量纲。"""
         if nn is None:  # pragma: no cover
             raise ModelError("PyTorch is required")
+        active = self.scales if scales is None else scales
         s = as_column(s, dtype=self.dtype_)
         eta = as_column(eta, dtype=self.dtype_)
         raw = self.mlp(torch.cat([s, eta], dim=-1))
 
-        density = self.density_scale * F.softplus(raw[:, 0:1])
-        velocity = self.velocity_scale * raw[:, 1:2]
-        energy = self.energy_scale * F.softplus(raw[:, 2:3])
+        density = float(active.air_density) * F.softplus(raw[:, 0:1])
+        velocity = float(active.reference_velocity) * raw[:, 1:2]
+        energy = float(active.reference_specific_energy) * F.softplus(raw[:, 2:3])
         pressure = ideal_gas_pressure(density, energy, self.gamma_air)
         return AirFields(
             density=density,

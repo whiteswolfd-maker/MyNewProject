@@ -292,8 +292,8 @@ class PlanarStartupField:
             )
         if self.training_qualified:
             raise PlanarStartupError(
-                "the local planar startup field cannot be training-qualified; "
-                "external validation and the training handoff are not implemented"
+                "the local planar startup field cannot claim training_qualified=True: "
+                "that flag is provenance only, not a scientific acceptance certificate"
             )
         if not isinstance(self.product_eos, JWLParameters):
             raise PlanarStartupError("product_eos must be a JWLParameters instance")

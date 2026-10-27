@@ -303,11 +303,11 @@ def test_both_groups_use_the_same_epsilon_and_zero_network_time(field):
     product_fields = model.product_fields
     air_fields = model.air_fields
 
-    def spy_product(s, xi):
+    def spy_product(s, xi, scales=None):
         seen["product_s"] = s.detach().clone()
         return product_fields(s, xi)
 
-    def spy_air(s, eta):
+    def spy_air(s, eta, scales=None):
         seen["air_s"] = s.detach().clone()
         return air_fields(s, eta)
 

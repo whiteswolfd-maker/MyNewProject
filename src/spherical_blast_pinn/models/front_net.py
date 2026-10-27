@@ -155,7 +155,7 @@ class FrontNet(nn.Module if nn is not None else object):  # type: ignore[misc]
 
         它们只设置输出层偏置，使未训练网络的初始前沿落在启动场附近。新链路
         的初值由 :mod:`spherical_blast_pinn.physics.two_medium_startup_planar`
-        在 ``t_phys = epsilon`` 给出；把 handoff 接到网络的适配器尚未实现。
+        在 ``t_phys = epsilon`` 给出；装配层把该场的无量纲前沿初值传到这里。
         """
         if nn is None:  # pragma: no cover
             raise ModelError("PyTorch is required")
@@ -260,6 +260,7 @@ class FrontNet(nn.Module if nn is not None else object):  # type: ignore[misc]
         *,
         charge_radius: float | None = None,
         create_graph: bool = True,
+        scales=None,
     ) -> FrontState:
         """物理单位的位置与速度；要求 ``s`` 可微。
 
@@ -311,8 +312,11 @@ class FrontNet(nn.Module if nn is not None else object):  # type: ignore[misc]
         d_contact = d_contact if d_contact is not None else zero
         d_shock = d_shock if d_shock is not None else zero
 
-        factor = self.scales.reference_velocity / self.scales.time_scale
-        radius = float(charge_radius if charge_radius is not None else self.scales.charge_radius)
+        active = self.scales if scales is None else scales
+        factor = float(active.reference_velocity) / float(active.time_scale)
+        radius = float(
+            charge_radius if charge_radius is not None else active.charge_radius
+        )
         return FrontState(
             contact_radius=radius * positions.contact_hat,
             shock_radius=radius * positions.shock_hat,

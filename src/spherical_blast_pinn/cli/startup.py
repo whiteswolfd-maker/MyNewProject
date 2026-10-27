@@ -145,7 +145,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(f"cells              : {field.n_cells} ({field.n_inside} product)")
     print(f"checks             : {'PASS' if checks['passed'] else 'FAIL'}")
-    print(f"training qualified : {field.training_qualified} (not wired)")
+    print(f"training_qualified: {field.training_qualified} (provenance only; not a run gate)")
     print(f"cache_key          : {field.cache_key()}")
     print(f"written            : {npz_path}")
     print(f"                     {json_path}")

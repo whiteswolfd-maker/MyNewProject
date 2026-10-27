@@ -1,0 +1,65 @@
+# 新启动场链路的**程序诊断**配置：小网络、小批次、10 步上限。
+#
+# 这不是物理训练，也不构成任何科研验收。诊断模式只限制运行身份和步数；
+# training_qualified 不再是运行门槛。该配置用于验证 train/resume/predict/compare
+# 的代码路径。
+inherits: ../base.yaml
+
+data:
+  # 新监督链没有实现按连续帧组划开发集；显式写 0，不让旧配置的 0.1 被静默
+  # 继承成"看起来做了开发集划分"。
+  development_holdout_fraction: 0.0
+
+training:
+  output_dir: outputs/startup_diagnostic
+  log_every: 1
+  checkpoint_every: 5
+  check_every: 0            # 诊断不跑固定检查集；阶段判据不会被触发
+  max_updates: 10
+  diagnostic_max_updates: 20
+  r_min_fraction: 1.0e-2
+
+networks:
+  dtype: float64
+  product:
+    width: 8
+    depth: 1
+  air:
+    width: 8
+    depth: 1
+  front:
+    width: 8
+    depth: 1
+
+sampling:
+  n_pde_product: 8
+  n_pde_air: 8
+  n_ic_product: 4
+  n_ic_air: 4
+  n_contact: 4
+  n_shock: 4
+  n_data_product: 0
+  n_data_air: 0
+  n_data_contact: 0
+  n_data_shock: 0
+
+startup:
+  time_scale: 2.0
+  tau_end_s: 1.0e-6
+  handoff_dir: outputs/planar_startup_diagnostic
+  build:
+    delta: 0.005
+    outer_radius_factor: 4.0
+    inner_cells: 16
+    fan_cells: 24
+    plateau_cells: 4
+    air_cells: 6
+    ambient_cells: 8
+    dense_samples: 1024
+  cases:
+    - case_id: diag_r050
+      charge_radius_m: 0.050
+      split: train
+    - case_id: diag_r080
+      charge_radius_m: 0.080
+      split: train

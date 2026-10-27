@@ -286,7 +286,7 @@ def test_missing_recovery_state_is_refused(tmp_path):
         load_startup_checkpoint(path, model=target, optimizer=optimizer)
 
     # 没有采样配置的检查点不能恢复到一个采样器上：点数与 tau_end 都无从核对。
-    with pytest.raises(TrainingError, match="no sampling configuration"):
+    with pytest.raises(TrainingError, match="no sampler state"):
         load_startup_checkpoint(
             path, model=target, sampler=_sampler(field, scales)
         )
@@ -301,23 +301,23 @@ def test_missing_recovery_state_is_refused(tmp_path):
     )
 
     payload = torch.load(with_sampler, map_location="cpu", weights_only=False)
-    del payload["rng"]
+    del payload["training"]["rng"]
     stripped = tmp_path / "no_rng.pt"
     torch.save(payload, stripped)
-    with pytest.raises(TrainingError, match="RNG state"):
+    with pytest.raises(TrainingError, match="rng"):
         load_startup_checkpoint(stripped, model=target)
 
     payload = torch.load(with_sampler, map_location="cpu", weights_only=False)
-    payload["rng"]["sampler"] = None
+    payload["cases"][0]["sampler_rng"] = None
     no_sampler = tmp_path / "no_sampler.pt"
     torch.save(payload, no_sampler)
-    with pytest.raises(TrainingError, match="no sampler RNG state"):
+    with pytest.raises(TrainingError, match="sampler RNG state"):
         load_startup_checkpoint(
             no_sampler, model=target, sampler=_sampler(field, scales)
         )
 
     payload = torch.load(with_sampler, map_location="cpu", weights_only=False)
-    del payload["sampling"]
+    del payload["cases"][0]["sampling"]
     old_contract = tmp_path / "no_sampling_field.pt"
     torch.save(payload, old_contract)
     with pytest.raises(TrainingError, match="sampling"):

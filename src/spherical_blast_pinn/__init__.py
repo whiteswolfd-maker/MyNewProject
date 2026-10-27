@@ -18,11 +18,13 @@ RH 的局部平面黎曼匹配，在小的正时间 ``epsilon`` 得到
 .. code-block:: bash
 
     python -m spherical_blast_pinn.cli.startup                 # 写出 handoff.npz/json
-    python -m spherical_blast_pinn.cli.validate_startup_planar # delta 敏感性诊断
-    python -m spherical_blast_pinn.cli.audit_dyna --config configs/experiments/smoke.yaml
+    python -m spherical_blast_pinn.cli.train --config configs/experiments/startup_diagnostic.yaml \
+        --diagnostic --max-steps 10                            # 程序诊断训练
+    python -m spherical_blast_pinn.cli.predict --checkpoint ... --handoff-json ... --tau 1e-7
+    python -m spherical_blast_pinn.cli.compare --prediction ... --reference ...
 
-正式训练/预测/检查点的接线尚未实现；``train``/``predict``/``compare`` 会明确报
-“新启动场的训练接口尚未接入”，不会回退旧方案。
+启动场不再以 ``training_qualified`` 作为运行门槛；该字段只作为来源记录保留。
+程序正确性检查（数值、EOS、格式、解析/恢复绑定、隔离）仍然硬失败。
 """
 
 from __future__ import annotations

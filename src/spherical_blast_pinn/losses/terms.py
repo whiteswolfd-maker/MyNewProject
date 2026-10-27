@@ -81,7 +81,8 @@ def initial_condition_loss(batch: SampleBatch, model, *, contact_pressure=None) 
     product_parts = []
     if batch.xi_ic_product is not None and batch.xi_ic_product.numel():
         fields = model.product_fields(
-            torch.zeros_like(batch.xi_ic_product), batch.xi_ic_product
+            torch.zeros_like(batch.xi_ic_product), batch.xi_ic_product,
+            scales=batch.scales,
         )
         product_parts = [
             (((fields.density - batch.rho_ic_product) / scales.product_density) ** 2).mean(),
@@ -90,7 +91,10 @@ def initial_condition_loss(batch: SampleBatch, model, *, contact_pressure=None) 
         ]
     air_parts = []
     if batch.eta_ic_air is not None and batch.eta_ic_air.numel():
-        fields = model.air_fields(torch.zeros_like(batch.eta_ic_air), batch.eta_ic_air)
+        fields = model.air_fields(
+            torch.zeros_like(batch.eta_ic_air), batch.eta_ic_air,
+            scales=batch.scales,
+        )
         air_parts = [
             (((fields.density - batch.rho_ic_air) / scales.air_density) ** 2).mean(),
             (((fields.velocity - batch.u_ic_air) / scales.reference_velocity) ** 2).mean(),
@@ -177,12 +181,12 @@ def contact_loss(batch: SampleBatch, model, *, contact_pressure: float) -> TermB
         return TermBreakdown(total=zero, monitors={"contact_n_points": 0})
 
     s = s.detach().requires_grad_(True)
-    fronts = model.front_data(s, charge_radius=batch.charge_radius)
+    fronts = model.front_data(s, charge_radius=batch.charge_radius, scales=batch.scales)
     check_moving_frame(fronts, scales, name="contact")
 
     ones = torch.ones_like(s)
-    product = model.product_fields(s, ones)
-    air = model.air_fields(s, torch.zeros_like(s))
+    product = model.product_fields(s, ones, scales=batch.scales)
+    air = model.air_fields(s, torch.zeros_like(s), scales=batch.scales)
 
     pressure = (product.pressure - air.pressure) / float(contact_pressure)
     speed_product = (product.velocity - fronts.contact_speed) / scales.reference_velocity
@@ -231,10 +235,10 @@ def shock_loss(batch: SampleBatch, model) -> TermBreakdown:
         return TermBreakdown(total=_or_zero(batch.s_shock), monitors={"shock_n_points": 0})
 
     s = s.detach().requires_grad_(True)
-    fronts = model.front_data(s, charge_radius=batch.charge_radius)
+    fronts = model.front_data(s, charge_radius=batch.charge_radius, scales=batch.scales)
     check_moving_frame(fronts, scales, name="shock")
 
-    post = model.air_fields(s, torch.ones_like(s))
+    post = model.air_fields(s, torch.ones_like(s), scales=batch.scales)
     ambient = model.undisturbed
 
     rho0 = ambient.density
@@ -333,8 +337,8 @@ def admissibility_loss(batch: SampleBatch, model, *, product_fields, air_fields)
     s = batch.s_shock
     if s is not None and s.numel():
         s = s.detach().requires_grad_(True)
-        fronts = model.front_data(s, charge_radius=batch.charge_radius)
-        post = model.air_fields(s, torch.ones_like(s))
+        fronts = model.front_data(s, charge_radius=batch.charge_radius, scales=batch.scales)
+        post = model.air_fields(s, torch.ones_like(s), scales=batch.scales)
         ambient = model.undisturbed
 
         rho0 = ambient.density
@@ -428,15 +432,16 @@ def shell_average_of_model(model, medium: str, batch: SampleBatch, s, lo, hi):
     radii = centres.reshape(-1, 1)
     s_repeated = s.repeat_interleave(N_QUADRATURE, dim=0)
     fronts = model.front_data(
-        s_repeated, charge_radius=batch.charge_radius, create_graph=False
+        s_repeated, charge_radius=batch.charge_radius, create_graph=False,
+        scales=batch.scales,
     )
     if medium == PRODUCT:
         coordinate = radii / fronts.contact_radius
-        fields = model.product_fields(s_repeated, coordinate)
+        fields = model.product_fields(s_repeated, coordinate, scales=batch.scales)
     else:
         gap = fronts.shock_radius - fronts.contact_radius
         coordinate = (radii - fronts.contact_radius) / gap
-        fields = model.air_fields(s_repeated, coordinate)
+        fields = model.air_fields(s_repeated, coordinate, scales=batch.scales)
     # 逐点场量折回 (n, N_QUADRATURE) 再按几何体积加权。求积点的展开是
     # 行主序的（第 i 个观测的 NQ 个点连续排列），与 ``repeat_interleave`` 一致。
     density_points = fields.density.reshape(n, N_QUADRATURE)
@@ -489,7 +494,10 @@ def data_loss(batch: SampleBatch, model) -> TermBreakdown:
         if s is None or not s.numel():
             return None
         s_leaf = s.detach().requires_grad_(True)
-        fronts = model.front_data(s_leaf, charge_radius=batch.charge_radius, create_graph=False)
+        fronts = model.front_data(
+            s_leaf, charge_radius=batch.charge_radius, create_graph=False,
+            scales=batch.scales,
+        )
         # 支持区是否落在预测域内。落在外面时**照常评价**并记录，不把坐标钳到边界
         # 伪装成一致（§11）——位置冲突由 L_geometry 专门负责。
         if medium == PRODUCT:
@@ -636,16 +644,16 @@ def medium_pde_residual(batch: SampleBatch, model, medium: str):
     s = s_raw.detach().requires_grad_(True)
     coordinate = coordinate_raw.detach().requires_grad_(True)
 
-    fronts = model.front_data(s, charge_radius=batch.charge_radius)
+    fronts = model.front_data(s, charge_radius=batch.charge_radius, scales=batch.scales)
     check_moving_frame(fronts, scales, name=f"{medium} pde")
 
     if medium == PRODUCT:
         radius = fronts.contact_radius * coordinate
-        fields = model.product_fields(s, coordinate)
+        fields = model.product_fields(s, coordinate, scales=batch.scales)
         pressure_derivatives = model.product_net.pressure_derivatives
     else:
         radius = fronts.contact_radius + (fronts.shock_radius - fronts.contact_radius) * coordinate
-        fields = model.air_fields(s, coordinate)
+        fields = model.air_fields(s, coordinate, scales=batch.scales)
         pressure_derivatives = model.air_net.pressure_derivatives
 
     # 唯一属于"移动域非法"的判据是半径到达轴心：``xi = r/R_c`` 在 ``R_c <= 0``
@@ -685,7 +693,7 @@ def front_floor_monitor(batch: SampleBatch, model) -> dict[str, float]:
     if reference is None or not reference.numel():
         return {}
     s = reference.detach().requires_grad_(True)
-    fronts = model.front_data(s, charge_radius=batch.charge_radius, create_graph=False)
+    fronts = model.front_data(s, charge_radius=batch.charge_radius, create_graph=False, scales=batch.scales)
     ratio = (fronts.contact_radius.detach() / float(batch.charge_radius)).reshape(-1)
     below = ratio < 1.0
     return {
@@ -702,10 +710,13 @@ def pde_states(batch: SampleBatch, model) -> tuple[Any, Any]:
     air = None
     if batch.s_product is not None and batch.s_product.numel():
         product = model.product_fields(
-            batch.s_product.detach(), batch.xi_product.detach()
+            batch.s_product.detach(), batch.xi_product.detach(),
+            scales=batch.scales,
         )
     if batch.s_air is not None and batch.s_air.numel():
-        air = model.air_fields(batch.s_air.detach(), batch.eta_air.detach())
+        air = model.air_fields(
+            batch.s_air.detach(), batch.eta_air.detach(), scales=batch.scales
+        )
     return product, air
 
 
@@ -767,7 +778,8 @@ def geometry_loss(batch: SampleBatch, model) -> TermBreakdown:
             return None
         s_leaf = s.detach().requires_grad_(True)
         fronts = model.front_data(
-            s_leaf, charge_radius=batch.charge_radius, create_graph=False
+            s_leaf, charge_radius=batch.charge_radius, create_graph=False,
+            scales=batch.scales,
         )
         if medium == PRODUCT:
             violation = (r - fronts.contact_radius - delta_contact) / radius

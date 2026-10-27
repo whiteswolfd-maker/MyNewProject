@@ -154,10 +154,10 @@ class _StubModel:
         self.undisturbed = undisturbed
         self.gamma_air = GAMMA
 
-    def front_data(self, s, *, charge_radius=None, create_graph=True):
+    def front_data(self, s, *, charge_radius=None, create_graph=True, scales=None):
         return self._front.data(s, charge_radius=charge_radius)
 
-    def air_fields(self, s, eta):
+    def air_fields(self, s, eta, scales=None):
         return self._air.fields(s, eta)
 
 
@@ -240,7 +240,7 @@ class _ContactModel:
         self._product_pressure = float(product_pressure)
         self._air_pressure = float(air_pressure)
 
-    def front_data(self, s, *, charge_radius=None, create_graph=True):
+    def front_data(self, s, *, charge_radius=None, create_graph=True, scales=None):
         shape = s.shape
         return FrontData(
             contact_radius=torch.full(shape, R0, dtype=s.dtype),
@@ -249,7 +249,7 @@ class _ContactModel:
             shock_speed=torch.full(shape, 2.0 * self._front, dtype=s.dtype),
         )
 
-    def product_fields(self, s, xi):
+    def product_fields(self, s, xi, scales=None):
         shape = s.shape
         density = torch.full(shape, 1630.0, dtype=s.dtype)
         energy = torch.full(shape, 3.0e6, dtype=s.dtype)
@@ -260,7 +260,7 @@ class _ContactModel:
             pressure=torch.full(shape, self._product_pressure, dtype=s.dtype),
         )
 
-    def air_fields(self, s, eta):
+    def air_fields(self, s, eta, scales=None):
         shape = s.shape
         density = torch.full(shape, 12.0, dtype=s.dtype)
         energy = torch.full(shape, 2.0e6, dtype=s.dtype)

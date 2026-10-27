@@ -61,7 +61,9 @@ data:
   synthetic_smoke: false
 
   # 训练/开发划分（§11）：按**连续帧组**留出，不是把同一帧的相邻网格点随机拆开。
+  # group_frames 是每组的连续原始帧数；整组进入训练或整组进入开发。
   development_holdout_fraction: 0.1
+  development_group_frames: 10
   split_seed: 20260920
 
   # **下面这些目录还没有迁移到当前提取器。** F:/2/extracted 与两个 GitHub
@@ -160,6 +162,17 @@ training:
   max_updates: null
   r_min_fraction: 1.0e-2
   lbfgs_iterations: 500
+  # PDE 残差驱动的内部配点细化。关闭时采样行为与原来完全一致。
+  rar:
+    enabled: false
+    interval: 500
+    n_candidates_product: 512
+    n_candidates_air: 512
+    n_select_product: 128
+    n_select_air: 128
+    pool_capacity_product: 512
+    pool_capacity_air: 512
+    pool_fraction: 0.25
 
 # ---------------------------------------------------------------------------
 # 验收目标（提示词 §16）。这些是**内部验收目标**，不是调参旋钮。

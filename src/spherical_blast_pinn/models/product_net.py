@@ -127,17 +127,23 @@ class ProductNet(nn.Module if nn is not None else object):  # type: ignore[misc]
         return self.scales.reference_specific_energy
 
     # -- 前向 -------------------------------------------------------------
-    def forward(self, s, xi) -> ProductFields:
-        """``s`` 与 ``xi`` 为形状 ``(N, 1)`` 的张量。"""
+    def forward(self, s, xi, scales=None) -> ProductFields:
+        """``s`` 与 ``xi`` 为形状 ``(N, 1)`` 的张量。
+
+        ``scales`` 是**这条样本所属算例**的尺度。网络本身无量纲；输出换算用
+        该算例的 ``rho_*, U_*, e_*``。同一组权重可以服务多个半径，但材料常数
+        必须相同（由调用方在装配/加载时核对），本方法不偷偷混用。
+        """
         if nn is None:  # pragma: no cover
             raise ModelError("PyTorch is required")
+        active = self.scales if scales is None else scales
         s = as_column(s, dtype=self.dtype_)
         xi = as_column(xi, dtype=self.dtype_)
         raw = self.mlp(torch.cat([s, xi * xi], dim=-1))
 
-        density = self.density_scale * F.softplus(raw[:, 0:1])
-        velocity = self.velocity_scale * xi * raw[:, 1:2]
-        energy = self.energy_scale * F.softplus(raw[:, 2:3])
+        density = float(active.product_density) * F.softplus(raw[:, 0:1])
+        velocity = float(active.reference_velocity) * xi * raw[:, 1:2]
+        energy = float(active.reference_specific_energy) * F.softplus(raw[:, 2:3])
         pressure = jwl_pressure(density, energy, self.jwl)
         return ProductFields(
             density=density,

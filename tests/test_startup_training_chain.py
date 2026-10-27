@@ -16,7 +16,6 @@ from spherical_blast_pinn.cli.check_startup_chain import (
     _failure_reasons,
     _grad_summary,
 )
-from spherical_blast_pinn.cli._common import TrainingNotConnected
 from spherical_blast_pinn.evaluation.checks import build_check_set, run_checks
 from spherical_blast_pinn.losses.objective import contact_pressure_scale, total_loss
 from spherical_blast_pinn.models.air_net import AirNet
@@ -281,19 +280,6 @@ def test_the_check_set_uses_the_same_startup_field_and_pressure(loaded_field):
     report = run_checks(model, check_set, steps=0)
     assert math.isfinite(report.metrics["physics_violation_score"])
     assert report.admissible is True
-
-
-def test_the_formal_trainer_refuses_to_construct():
-    from spherical_blast_pinn.training.trainer import Trainer
-
-    with pytest.raises(TrainingNotConnected, match="尚未迁移到新启动场"):
-        Trainer(
-            config=None,
-            cases=[],
-            model=None,
-            scales_by_radius={},
-            time_scale=TIME_SCALE,
-        )
 
 
 def test_the_entry_point_returns_nonzero_and_writes_the_failed_groups(
