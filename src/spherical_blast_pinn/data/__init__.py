@@ -4,7 +4,9 @@
 
 * :mod:`extracted_case` —— 已提取的 ``(t, r, rho, u, P)`` 时空剖面；
 * :mod:`raw_reader` / :mod:`shell_average` —— 直接从 d3plot 读取、按材料
-  体积分数做球壳平均的完整流程（提示词 §11 要求的能力）。
+  体积分数做球壳平均的完整流程（提示词 §11 要求的能力）；
+* :mod:`dyna_supervision` —— 把已提取剖面和显式 ``T_origin`` 转成新
+  :class:`startup_supervision.SupervisionDataset` 的适配层（不做训练）。
 
 ``specific_internal_energy`` 在两条路径上都不是输出字段，而是由 ``(rho, p)``
 按材料各自的状态方程反解出来的；反解式在 :mod:`extracted_case` 与
@@ -14,6 +16,7 @@ from __future__ import annotations
 
 from . import (
     contract,
+    dyna_supervision,
     extracted_case,
     interface_reconstruction,
     isolation,
@@ -21,11 +24,13 @@ from . import (
     raw_reader,
     schema,
     shell_average,
+    startup_supervision,
     units,
 )
 
 __all__ = [
     "contract",
+    "dyna_supervision",
     "extracted_case",
     "interface_reconstruction",
     "isolation",
@@ -33,5 +38,6 @@ __all__ = [
     "raw_reader",
     "schema",
     "shell_average",
+    "startup_supervision",
     "units",
 ]

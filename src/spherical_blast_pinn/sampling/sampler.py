@@ -21,9 +21,11 @@
 和单侧边界规则。产物/空气的初值半径由本采样器的分层规则给出，锚点（球心、
 接触面两侧、波后）由适配器补齐。
 
-**数据监督**：尚未迁移到 ``tau = t_phys - epsilon``。传入 ``case`` 会在构造时
-明确报未支持，而不是继续沿用 ``case.pinn_times``（旧 ``T_h`` 时间轴）。不构造
-假算例、不伪造观测：无数据时数据与几何监督批次为空，其它物理点照常生成。
+**数据监督**：可选的 :class:`~...data.startup_supervision.SupervisionDataset`
+带**显式**的 DYNA→模型时间原点与逐字段有效性。时间映射是
+``t_phys = T_DYNA - T_origin``、``tau = t_phys - epsilon_field``；原点未知的
+数据会被拒绝监督。无数据时数据与几何监督批次为空，其它物理点照常生成；旧的
+``ExtractedCase``（``T_h`` 时间轴）仍明确报未支持。
 """
 from __future__ import annotations
 
@@ -39,6 +41,7 @@ except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
 from ..data.extracted_case import ExtractedCase
+from ..data.startup_supervision import SupervisionDataset, sample_supervision
 from ..physics.similitude import PlanarStartupScales
 from ..physics.two_medium_startup_planar import PlanarStartupField
 from .batch import SampleBatch
@@ -62,6 +65,12 @@ class SamplingConfig:
     n_ic_air: int = 256
     n_contact: int = 128
     n_shock: int = 128
+    #: 数据监督点数。**没有数据时它们不产生任何组**；有数据但全为 0 会在
+    #: 构造采样器时明确报错，而不是悄悄"有数据却不监督"。
+    n_data_product: int = 0
+    n_data_air: int = 0
+    n_data_contact: int = 0
+    n_data_shock: int = 0
 
     #: 空间分层的比例：内侧 10% 区间、外侧 10% 区间各占多少。
     near_fraction: float = 0.15
@@ -74,6 +83,7 @@ class SamplingConfig:
         for name in (
             "n_pde_product", "n_pde_air", "n_ic_product", "n_ic_air",
             "n_contact", "n_shock",
+            "n_data_product", "n_data_air", "n_data_contact", "n_data_shock",
         ):
             if int(getattr(self, name)) < 0:
                 raise SamplingError(f"{name} must be non-negative")
@@ -220,8 +230,9 @@ class RadiusSampler:
         从网络启动时刻（``s = 0``，``t_phys = epsilon_field``）算起的持续时间，
         秒。必须是有限正数；**不**从任何数据帧隐式推导。
     case:
-        只有 ``None`` 受支持。真实数据的时间轴还没有迁移到
-        ``tau = t_phys - epsilon``，传入算例会明确报未支持。
+        可选的 :class:`SupervisionDataset`。它必须带**已确认**的 DYNA→模型时间
+        原点与逐字段有效性；原点未知的数据可以加载审查，但这里会明确拒绝监督。
+        旧的 :class:`ExtractedCase`（旧 ``T_h`` 时间轴）仍明确报未支持。
     """
 
     def __init__(
@@ -230,13 +241,14 @@ class RadiusSampler:
         field: PlanarStartupField,
         scales: PlanarStartupScales,
         tau_end: float,
-        case: ExtractedCase | None = None,
+        case: SupervisionDataset | None = None,
         case_id: str | None = None,
         config: SamplingConfig | None = None,
         seed: int = 0,
         dtype=None,
         device=None,
         r_min_fraction: float = 1.0e-2,
+        rar_config=None,
     ) -> None:
         if torch is None:  # pragma: no cover
             raise RuntimeError("PyTorch is required")
@@ -253,18 +265,53 @@ class RadiusSampler:
             raise SamplingError(
                 "the startup field has no passed consistency report; refusing to sample it"
             )
-        if case is not None:
+        if isinstance(case, ExtractedCase):
             raise SamplingError(
-                "real-data supervision is not supported yet: the data time axis is still "
-                "t_phys, not tau = t_phys - epsilon, so case.pinn_times cannot be reused. "
-                "Pass case=None for the physics-only batch; re-extraction onto the new "
-                "origin is a later task."
+                "the old ExtractedCase time axis (T_h-based) is not supported: pass a "
+                "SupervisionDataset with an explicit DYNA-to-model time origin instead"
             )
+        if case is not None and not isinstance(case, SupervisionDataset):
+            raise SamplingError(
+                f"case must be a SupervisionDataset or None, got {type(case).__name__}"
+            )
+        if case is not None:
+            case.require_supervision_ready()
+            if abs(float(case.charge_radius_m) - float(scales.charge_radius)) > (
+                1.0e-12 * max(abs(float(scales.charge_radius)), 1.0)
+            ):
+                raise SamplingError(
+                    f"supervision case {case.case_id!r} belongs to R_0 = "
+                    f"{case.charge_radius_m!r} m, not {scales.charge_radius!r} m"
+                )
+            if case_id is not None and case.case_id != case_id:
+                raise SamplingError(
+                    f"case_id {case_id!r} does not match the supervision dataset's "
+                    f"{case.case_id!r}"
+                )
 
         self.field = field
         self.scales = scales
+        self.case = case
+        # 有开发集划分时，训练监督只读取训练帧；PDE、初值、接触/激波采样不受
+        # 影响。没有划分时保持原来的“全部可用帧”行为。
+        self.data_frame_mask = (
+            None if case is None else case.training_frame_mask()
+        )
         self.config = config or SamplingConfig()
         self.config.validate()
+        data_counts = sum(
+            int(getattr(self.config, f"n_data_{name}"))
+            for name in ("product", "air", "contact", "shock")
+        )
+        if case is not None and data_counts <= 0:
+            raise SamplingError(
+                "a supervision dataset is attached but every n_data_* count is zero; "
+                "refusing a run that silently ignores its data"
+            )
+        if case is None and data_counts > 0:
+            raise SamplingError(
+                "n_data_* points were requested but no supervision dataset was given"
+            )
         if self.config.n_ic_product < 1 or self.config.n_ic_air < 1:
             raise SamplingError(
                 "n_ic_product and n_ic_air must both be >= 1: the initial condition is "
@@ -283,6 +330,26 @@ class RadiusSampler:
             )
         self.r_min_fraction = fraction
         self.r_min = fraction * float(scales.charge_radius)
+
+        from .rar import RARConfig, RARPointPool
+
+        if rar_config is None:
+            rar_config = RARConfig()
+        if not isinstance(rar_config, RARConfig):
+            raise SamplingError(
+                f"rar_config must be a RARConfig, got {type(rar_config).__name__}"
+            )
+        rar_config.validate()
+        self.rar_config = rar_config
+        self.rar_pools = {
+            medium: RARPointPool(
+                medium=medium,
+                capacity=int(getattr(rar_config, f"pool_capacity_{medium}")),
+            )
+            for medium in (PRODUCT, AIR)
+        }
+        self._rar_last_update_step: int | None = None
+        self._rar_last_summary: dict[str, Any] | None = None
 
         if abs(float(scales.charge_radius) - float(field.charge_radius)) > 1.0e-12 * max(
             abs(float(field.charge_radius)), 1.0
@@ -317,6 +384,8 @@ class RadiusSampler:
 
     def _case_label(self, case_id: str | None) -> str:
         if case_id is None:
+            if self.case is not None:
+                return self.case.case_id
             return f"planar_startup:{self.field.cache_key()[:16]}"
         if not isinstance(case_id, str) or not case_id:
             raise SamplingError("case_id must be a non-empty string")
@@ -473,12 +542,17 @@ class RadiusSampler:
                 "n_ic_air": int(config.n_ic_air),
                 "n_contact": int(config.n_contact),
                 "n_shock": int(config.n_shock),
+                "n_data_product": int(config.n_data_product),
+                "n_data_air": int(config.n_data_air),
+                "n_data_contact": int(config.n_data_contact),
+                "n_data_shock": int(config.n_data_shock),
             },
             "stratification": {
                 "near_fraction": float(config.near_fraction),
                 "near_span": float(config.near_span),
                 "xi_floor": float(config.xi_floor),
             },
+            "rar": self.rar_config.as_dict(),
             "window": self.window_state(),
         }
 
@@ -500,6 +574,80 @@ class RadiusSampler:
         hat = np.concatenate([uniform, log_part])
         self.rng.shuffle(hat)
         return hat / self.scales.time_scale
+
+    # -- RAR --------------------------------------------------------------
+    def _rar_coordinates(self, medium: str, count: int) -> np.ndarray:
+        """Uniform interior candidates for RAR (not the base stratified draw)."""
+        count = int(count)
+        if count <= 0:
+            return np.zeros(0, dtype=np.float64)
+        lo = 1.0e-9
+        if medium == PRODUCT:
+            lo = max(lo, float(self.config.xi_floor))
+        return lo + (1.0 - 2.0 * lo) * self.rng.random(count)
+
+    def _pde_points(self, medium: str, count: int):
+        """Base stratified points with an optional bounded RAR-pool fraction.
+
+        A nonempty PDE group always keeps at least one base point.  If the pool
+        has fewer usable points than requested, base sampling fills the rest so
+        the total stays exactly ``count``.
+        """
+        count = int(count)
+        if count <= 0:
+            return np.zeros(0), np.zeros(0)
+        if not self.rar_config.enabled:
+            return self.sample_network_time(count), self._stratified_coordinate(count)
+        pool = self.rar_pools[medium]
+        n_pool = min(
+            len(pool),
+            count - 1,
+            int(round(count * float(self.rar_config.pool_fraction))),
+        )
+        if n_pool <= 0:
+            return self.sample_network_time(count), self._stratified_coordinate(count)
+        pool_s, pool_coordinate = pool.sample(
+            n_pool, self.rng, window_s_max=float(self.scales.network_time(self.window_pinn_time_max))
+        )
+        if pool_s.size == 0:
+            return self.sample_network_time(count), self._stratified_coordinate(count)
+        n_base = count - int(pool_s.size)
+        base_s = self.sample_network_time(n_base)
+        base_coordinate = self._stratified_coordinate(n_base)
+        s = np.concatenate([base_s, pool_s])
+        coordinate = np.concatenate([base_coordinate, pool_coordinate])
+        order = self.rng.permutation(s.size)
+        return s[order], coordinate[order]
+
+    def maybe_update_rar(self, model, step: int) -> dict[str, Any] | None:
+        from .rar import maybe_update_rar
+
+        return maybe_update_rar(self, model, int(step))
+
+    def rar_state(self) -> dict[str, Any]:
+        from .rar import _rar_state
+
+        return _rar_state(
+            config=self.rar_config,
+            last_update_step=self._rar_last_update_step,
+            pools=self.rar_pools,
+        )
+
+    def validate_rar_state(self, state: Any) -> None:
+        from .rar import validate_rar_state
+
+        validate_rar_state(state, config=self.rar_config, where=f"case {self.case_id!r}")
+
+    def set_rar_state(self, state: Any) -> None:
+        from .rar import validate_rar_state
+
+        validated = validate_rar_state(
+            state, config=self.rar_config, where=f"case {self.case_id!r}"
+        )
+        self.rar_pools = dict(validated["pools"])
+        self._rar_last_update_step = validated["last_update_step"]
+        # A restored state is not a freshly performed update.
+        self._rar_last_summary = None
 
     # -- 空间 -------------------------------------------------------------
     def _stratified_coordinate(self, count: int) -> np.ndarray:
@@ -567,8 +715,10 @@ class RadiusSampler:
     # -- 组装 -------------------------------------------------------------
     def batch(self) -> SampleBatch:
         config = self.config
-        s_pde_product = self.sample_network_time(config.n_pde_product)
-        s_pde_air = self.sample_network_time(config.n_pde_air)
+        s_pde_product, xi_pde_product = self._pde_points(
+            PRODUCT, config.n_pde_product
+        )
+        s_pde_air, eta_pde_air = self._pde_points(AIR, config.n_pde_air)
         s_contact = self.sample_network_time(config.n_contact)
         s_shock = self.sample_network_time(config.n_shock)
 
@@ -582,13 +732,37 @@ class RadiusSampler:
             # 本阶段窗口的上端（tau，秒），不是完整时段。
             "pinn_time_max": self.window_pinn_time_max,
             "s_product": self._column(s_pde_product),
-            "xi_product": self._column(self._stratified_coordinate(config.n_pde_product)),
+            "xi_product": self._column(xi_pde_product),
             "s_air": self._column(s_pde_air),
-            "eta_air": self._column(self._stratified_coordinate(config.n_pde_air)),
+            "eta_air": self._column(eta_pde_air),
             "s_contact": self._column(s_contact),
             "s_shock": self._column(s_shock),
         }
         payload.update(self._initial_condition())
+
+        data_counts = {
+            "product": 0, "air": 0, "contact": 0, "shock": 0,
+        }
+        data_tau_range = None
+        if self.case is not None:
+            supervision = sample_supervision(
+                self.case,
+                scales=self.scales,
+                field_epsilon=float(self.field.epsilon),
+                window_tau_max=float(self.window_pinn_time_max),
+                rng=self.rng,
+                n_product=int(config.n_data_product),
+                n_air=int(config.n_data_air),
+                n_contact=int(config.n_data_contact),
+                n_shock=int(config.n_data_shock),
+                dtype=self.dtype,
+                device=self.device,
+                frame_mask=self.data_frame_mask,
+            )
+            payload.update(supervision.fields)
+            data_counts = supervision.counts
+            data_tau_range = supervision.tau_range_s
+
         payload["diagnostics"] = {
             "time_convention": self.scales.time_convention,
             "startup_epsilon_s": float(self.field.epsilon),
@@ -605,7 +779,20 @@ class RadiusSampler:
             "n_contact": int(config.n_contact),
             "n_shock": int(config.n_shock),
             "planar_startup_cache_key": self.field.cache_key(),
-            "data_supervision": "disabled: real-data time axis is not migrated",
+            "data_supervision": (
+                "none" if self.case is None else "supervision dataset"
+            ),
+            "data_case_id": None if self.case is None else self.case.case_id,
+            "data_synthetic": (
+                None if self.case is None else bool(self.case.synthetic)
+            ),
+            "data_time_origin_status": (
+                None if self.case is None else self.case.time_origin.status
+            ),
+            "data_counts": dict(data_counts),
+            "data_tau_range_s": (
+                None if data_tau_range is None else list(data_tau_range)
+            ),
         }
         return SampleBatch(**payload)
 

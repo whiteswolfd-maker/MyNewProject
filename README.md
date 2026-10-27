@@ -174,9 +174,11 @@ L   = (L_50 + L_80 + L_100) / 3
 超出 §16 容差多少，最后才比较开发集误差。不按加权训练总损失选模型。`best.pt`
 是这条偏序下的最优检查点。
 
-数据在三个训练半径内按**连续帧组**留出约 10% 作开发检查（`data.development_holdout_fraction`），
-而不是把同一帧的相邻网格点随机拆开——随机拆分会让两个集合互相看得见对方，
-"开发集误差"于是只是训练误差的一个更贵的写法。
+监督数据在每个训练半径内按**连续帧组**留出配置比例作开发检查
+（`data.development_holdout_fraction`、`data.development_group_frames`、
+`data.split_seed`），而不是把同一帧的相邻网格点随机拆开——随机拆分会让两个集合
+互相看得见对方，"开发集误差"于是只是训练误差的一个更贵的写法。训练采样只用
+训练帧；固定检查集另建开发帧批次，只进入 `data_loss` 与既定选模偏序。
 
 ## 六、启动初值：均匀产物球 + 局部平面黎曼
 
@@ -209,39 +211,62 @@ L   = (L_50 + L_80 + L_100) / 3
 积分报告，不用全局缩放或验收阈值掩盖。不同 `delta` 对应不同物理时刻，不是同一
 物理时刻的时间收敛。
 
-**采样与损失已接入新启动场**：
+**训练、预测与对照已接入新启动场**：
 
-* `sampling.sampler.RadiusSampler(field, scales, tau_end)`：初值复用上面的适配器，
-  PDE/接触面/激波点按移动坐标契约生成；`tau_end` 是从网络启动时刻算起的时长，
-  不再由数据最后帧决定。无数据监督时数据与几何批次为空，不构造假算例；传入
-  真实算例会明确报未支持（数据时间轴尚未迁移）。
-* `losses.objective.contact_pressure_scale(field)`：取该启动场黎曼解的 `p_*`，
-  只作为接触压力残差的归一化尺度；接触条件与损失权重不变。
-* `evaluation.checks.build_check_set(field, scales, tau_end)`：用同一场、同一
-  `p_*` 建立固定检查集。
+* `RadiusSampler(field, scales, tau_end, case=...)`：初值复用启动场适配器；
+  可选的 `SupervisionDataset` 带**显式** DYNA→模型时间原点与逐字段有效性，
+  时间映射为 `t_phys = T_DYNA - T_origin`、`tau = t_phys - epsilon`。原点未知时
+  数据可以加载审查，但监督与同时间对比都被拒绝。
+* **多个半径共用一套可训练参数**：一个 ProductNet、一个 AirNet、一套前沿参数
+  与一个优化器。每个半径保留自己的 field、scales、`epsilon`、`R_c/R_s` 初值、
+  `p_*`、`tau_end`、采样器、RNG、监督数据和时间映射。网络本身无量纲，物理量
+  换算逐次使用该 batch 的 `scales`；支持范围是同材料、同环境、同 `delta`、同
+  启动方法与时间尺度，超出范围在装配时拒绝。材料/环境以 handoff 保存的完整
+  JWL、空气 `gamma`、环境密度/压力与初始产物/空气状态为准；YAML 显式值必须
+  与之一致，冲突在优化之前报错并列出双方数值。自动构造初场时 `jwl`、`E0` 与
+  `air` 参数真正进入初值；不支持的非默认值（如 `jwl.V0 != 1`）在装配阶段拒绝。
+  `check_shared_compatibility` 直接比较完整 EOS、环境与初始热力学状态，并核对
+  第一份 case 与共享模型；无量纲前沿相同不能代替材料一致性。`rho_* / U_* / e_*`
+  仍是数值归一化尺度，不强制等于实际初态。
+* `Trainer` 实现采样→各 case 损失→半径等权联合损失→一次 backward→**一次**
+  共享参数更新；分项日志、固定检查集、阶段/窗口、自适应平衡、保存/恢复，以及
+  固定采样点的**联合** L-BFGS 精修（不逐 case 覆盖）。
+* **连续帧组开发集**：监督数据按原始时间顺序组成连续帧组，整组划分为训练/开发；
+  训练采样只用训练帧，固定检查集另建开发帧批次，只进入 `data_loss` 和既有选模
+  偏序。没有开发划分时该项是 `NaN`，不是 0。
+* **RAR**：`training.rar` 控制开关、触发间隔、候选/选点数、点池容量与替换比例。
+  每个 case/材料域独立评分、点池（有上限/去重/触发间隔）。候选点和评分只用当前
+  时间窗口、合法材料域与生产 PDE 残差尺度；不调用优化器、不写梯度、不切换模型
+  模式。RAR 关闭时采样路径保持不变。
+* **诊断模式** `--diagnostic` 只限制运行身份和步数（默认上限 100），记录诊断
+  身份；它不再替代已取消的科研资格门槛。正式装配不会因
+  `training_qualified=False` 被拒绝。
 
-`python -m spherical_blast_pinn.cli.check_startup_chain --handoff-json ...` 会从
-磁盘加载 handoff，装配完整批次、调用 `total_loss` 并执行**一次**反向传播，
-报告点数、分项损失与梯度。它不是训练：不建优化器、不更新参数、不写检查点，
-`training_qualified` 保持 false。
+`python -m spherical_blast_pinn.cli.check_startup_chain --handoff-json ...` 仍是
+只做一次装配/反向的检查，不是训练。
 
-**检查点（新契约）**：`training.checkpoint` 只读写
-`spherical_blast_pinn.startup_checkpoint` v1。它绑定启动场的 `model_id` /
-`method_version` / `cache_key`、完整的 `PlanarStartupScales` 参数（半径、
-`epsilon`、`time_scale`、各材料尺度、时间约定）、模型结构/EOS/dtype、模型参数、
-可选的优化器状态、步数、全局与采样器随机状态，以及**采样配置与动态时间窗口**
-（`tau_end`、各类点数、分层比例、`r_min_fraction`、当前窗口分数与历史）。
-保存/读取的公开接口是
-`save_startup_checkpoint(..., sampler=...)` 与
-`load_startup_checkpoint(..., handoff_json=..., sampler=...)`；加载时可用显式提供
-的 `handoff.json` 核对身份，检查点本身不复制初场数组。恢复前逐项核对：`tau_end`、
-点数或分层不同，或接收采样器不属于同一个启动场/尺度，都会在修改模型、优化器和
-采样器之前被拒绝；窗口按保存值恢复（允许相对接收端默认值收窄），因此续训的下
-一批采样与连续运行一致。旧格式（`spherical_blast_pinn.checkpoint`，version ≤ 8，
-带爆速与 `T_h`）会被明确拒绝并提示用新链路重新生成。
+**检查点（v5）**：`training.checkpoint` 只读写
+`spherical_blast_pinn.startup_checkpoint` v5，顶层是 `model`、`cases` 与
+`training`。`model` 只有**一份**共享参数、优化器与指纹；每个 case 绑定启动场
+身份、完整 `PlanarStartupScales`、无量纲前沿初值、完整材料/环境/初始状态记录、
+采样配置与窗口、采样器 RNG、连续帧组开发划分、RAR 配置/点池/触发进度、接触
+压力尺度与可选监督数据内容身份；`training` 绑定步号、阶段与窗口、日程、平衡器、
+全局 RNG、历史、选模记录（含共享权重）、运行来源与诊断身份。多半径恢复必须
+给出**同一组 case_id**，缺失/重复/多余都拒绝。恢复先核对再修改，失败回滚；
+`--init-from` 只加载参数，`--resume` 才恢复完整训练状态。保存、恢复与冻结预测
+使用 `physics/material_state.py` 的同一份材料判据；模型结构与案例材料记录也
+互相核对。v2/v3/v4 与旧 reference-field 格式都会被明确拒绝——旧格式没有 RAR/
+开发划分状态，无法精确续训。
 
-**尚未接入**：`train`/`predict`/`compare` 会明确报错；`Trainer` 构造即抛
-`TrainingNotConnected`（见第七节）。
+**预测未训练半径**：`predict --radius <新半径>` 在半径不属于训练集合时使用
+`load_frozen_model`：核对完整材料/环境/初始热力学状态、delta/方法/时间尺度与
+无量纲前沿初值，使用
+新半径自己的 handoff 与 `epsilon`，**不创建随机网络、不读优化器、不更新参数**。
+`--case-id` 是训练算例的严格复现。
+
+旧提取格式的通用场量对照规则（逐字段有效性、材料侧插值、缺失不为零）已迁到
+`evaluation/field_compare.py`，由新 `compare` 使用；旧 `compare_legacy` 与
+其专用测试已删除。
 
 ## 七、命令
 
@@ -277,6 +302,14 @@ python -m spherical_blast_pinn.cli.startup --charge-radius 0.05 --delta 0.005
 python -m spherical_blast_pinn.cli.validate_startup_planar \
   --charge-radius 0.05 --deltas 0.005,0.0025,0.00125
 
+# 3a. 把当前提取器写出的 DYNA 剖面转成 SupervisionDataset
+#     T_origin = LT + R0/D 从提取元数据读取并记录
+python -m spherical_blast_pinn.cli.build_supervision \
+  --profile-dir F:/2/extracted_geom/50mm_d \
+  --handoff-json outputs/planar_startup_diagnostic/<...>/handoff.json \
+  --output outputs/supervision/tnt_50mm.npz \
+  --gauge-radius-m 0.88
+
 # 3b. 装配检查：磁盘加载 handoff -> 完整物理批次 -> total_loss -> 一次 backward
 python -m spherical_blast_pinn.cli.check_startup_chain \
   --handoff-json outputs/planar_startup/<model>/<key>/handoff.json \
@@ -287,8 +320,34 @@ python -m spherical_blast_pinn.cli.audit_data --config configs/experiments/full.
 python -m spherical_blast_pinn.cli.validate_eos --config configs/experiments/full.yaml
 ```
 
-**尚未接入**：`train`、`predict`、`compare` 目前只打印
-“新启动场的训练接口尚未接入”并以退出码 3 结束；它们不会回退到已删除的旧参考场。
+新链路训练 / 恢复 / 预测 / 对照：
+
+```bash
+# 4. 程序诊断训练（10 步上限；没有科研验收，不是正式训练）
+python -m spherical_blast_pinn.cli.train \
+  --config configs/experiments/startup_diagnostic.yaml \
+  --diagnostic --max-steps 10 --output-dir outputs/startup_diagnostic
+
+# 5. 续训：恢复模型/优化器/采样窗口/RNG/阶段（--init-from 只加载参数）
+python -m spherical_blast_pinn.cli.train \
+  --config configs/experiments/startup_diagnostic.yaml \
+  --diagnostic --max-steps 15 --resume outputs/startup_diagnostic/last.pt
+
+# 6. 预测：时间必须显式（--t-phys 与 --tau 互斥）
+python -m spherical_blast_pinn.cli.predict \
+  --checkpoint outputs/startup_diagnostic/last.pt \
+  --handoff-json outputs/planar_startup_diagnostic/<model>/<key>/handoff.json \
+  --case-id diag_r050 --tau 0,1e-7 --output outputs/startup_diagnostic/predict.npz
+
+# 7. 对照：参照数据必须带已确认的时间原点；缺失量输出 null
+python -m spherical_blast_pinn.cli.compare \
+  --prediction outputs/startup_diagnostic/predict.npz \
+  --reference synthetic_reference.npz --output outputs/startup_diagnostic/compare.json \
+  --gauge-radius-m 0.88
+```
+
+正式装配不再要求 `training_qualified=True`；该字段只作为来源记录保留，程序
+正确性检查仍然硬失败。`--diagnostic` 只是有限步诊断运行身份，不是科研资格门槛。
 
 测试：
 
@@ -298,8 +357,9 @@ python -m pytest -q
 
 ## 八、数据状态与已知限制
 
-这一节必须如实读。**数据侧的结论仍然有效**，但它们限制了这个模型能宣称什么；
-训练入口尚未接入新启动场（见第六、七节）。
+这一节必须如实读。**数据侧的结论仍然有效**，但它们限制了这个模型能宣称什么。
+新链路的数据监督走 `data/startup_supervision.py` 的显式契约；下面这些旧提取
+结论仍然适用于旧 `ExtractedCase` 与 `audit_*` 命令。
 
 ### 8.0 这些结论现在是训练入口的一道闸门，不是一段说明
 
@@ -341,9 +401,25 @@ d3plot 里 t = 0 时刻装药单元的 `p` 恰好为零，只有爆轰波扫过�
 被任何代码读取。
 
 **当前唯一初始化方案**是“`t=0` 均匀静止产物球 + 静止空气 + 局部平面黎曼启动”。
-它不把均匀球解释为 CJ 表面突破，也不引入 Taylor 内场。**数据时间轴还没有迁移**：
-真实数据仍按 LS-DYNA 原始时间记录；把新启动场与实验帧对齐属于下一轮训练接线的
-工作，本轮不做，也不能用简单平移宣称二者等价。
+它不把均匀球解释为 CJ 表面突破，也不引入 Taylor 内场。数据侧现在通过
+`SupervisionDataset` 接受**显式**时间原点：`t_phys = T_DYNA - T_origin`、
+`tau = t_phys - epsilon`。对已确认的中心起爆算例，当前约定为
+
+```text
+T_origin = LT + R0 / D
+```
+
+`LT` 是 `*INITIAL_DETONATION` 的 lighting time，`R0` 是初始装药半径，`D` 是
+该 deck 的爆速。`cli.build_supervision` 从提取元数据生成该原点并保存
+`T_origin`、`R0`、`D`、`LT` 与依据；非中心起爆点、缺参数或未知来源的 deck
+会被拒绝，不自动套用公式。原点未知的数据仍可加载/审查，但不能进入监督或
+同时间对比。合成样例必须标 `synthetic`，只用于接口验证。
+
+当前新版提取样例：`F:/2/extracted_geom/50mm_d`（6 状态）与
+`100mm_d`（3 状态），含逐字段有效性、独立前沿资格和位置不确定性。
+`F:/2/extracted_vf/50mm` 及 GitHub 下的 80/100 mm 旧导出是 16 列 ALE 的同批
+结果，但没有逐字段有效性；`cli.build_supervision` 会明确拒绝，需要按当前
+提取器重提。500 mm 提取未进入训练/开发/选模。
 
 ### 8.2 材料分区：旧的启发式判据已废弃，改用体积分数
 
@@ -360,6 +436,17 @@ d3plot 里 t = 0 时刻装药单元的 `p` 恰好为零，只有爆轰波扫过�
 | 材料分区来源 | 密度最陡下降 | d3plot 体积分数 |
 | `R_c < R_0` 的帧 | 92 | **0** |
 | 空气壳层有有限场量 | — | **全部** |
+
+纯介质密度不再使用混合物密度列，而由每材料质量列与占据体积计算：
+`rho_m = m_m / (alpha_m V_cell)`；壳层值按 `sum(m_m)/sum(alpha_m V)` 汇总。
+混合物密度只保留在 `RawFrame.density` 作为原始读数，不替代材料密度。未反应、
+质量为零或体积为零的单元不产生材料密度，也不进入纯介质监督。
+
+16 列不是所有算例的通用布局。50 mm 的 7 个 ALE 组对应
+`[密度, 7 个体积分数, 材料号, 7 个分材料质量]`；100 mm 只有 2 个 ALE 组，
+history 是 6 列 `[密度, 2 个体积分数, 材料号, 2 个分材料质量]`。
+`resolve_d3plot_layout` 按实际列宽和该 deck 的 ALE 组数解析列位置；列宽不足
+时硬失败，不把 16 列映射套到别的算例上。
 
 `material_partition` 是兼容性闸门里独立的一项，而且判定的是**提取结果**本身——
 体积分数范围、标签与阈值自洽、每个被标为有效的壳层都带有限的 `rho/u/e/p`、以及
@@ -523,7 +610,7 @@ src/spherical_blast_pinn/
   evaluation/
     waveform.py       超压、到达时间、正压时长、正相冲量
     checks.py         固定独立检查集、逐方程指标、守恒诊断、选模型偏序
-  cli/                数据与启动场命令；train/predict/compare 尚未接入
+  cli/                startup/train/predict/compare 与数据审查命令
 tests/                §15 要求的测试 + 审查清单的逐项回归
 _legacy_v1_backup/    第一版实现，仅供追溯
 ```

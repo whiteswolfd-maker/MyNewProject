@@ -5,6 +5,7 @@ COMMANDS = (
     "audit_dyna",
     "audit_data",
     "startup",
+    "build_supervision",
     "validate_startup_planar",
     "check_startup_chain",
     "train",

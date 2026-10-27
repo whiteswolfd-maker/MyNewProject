@@ -1203,17 +1203,24 @@ def extract_case(
         "field_provenance": {
             "t": "d3plot global timesteps, converted by the deck's time unit",
             "x": "cell centroid radius; ALE mesh, computed once and state-independent",
-            "rho": "d3plot history variable column 0 (mixture density)",
+            "rho": (
+                "per-material ALE group mass / (alpha_m * cell_volume), using the "
+                "d3plot per-material mass columns; pure-medium shell density is "
+                "sum(m_m) / sum(alpha_m V). The mixture-density history column is "
+                "retained in RawFrame.density but is not substituted for a material "
+                "density"
+            ),
             "u": "node velocity averaged per cell, projected on the radial direction",
             "P": "negative trace of the solid element stress (strengthless: sigma = -p I)",
             "e": (
                 "RECONSTRUCTED, not an LS-DYNA output: this d3plot carries no "
-                "solid-element internal energy, so e = (p - p_cold(V))/(omega rho) "
-                "for products and e = p/((gamma-1) rho) for air, inverted per CELL "
-                "and then volume-weighted onto the shells. The inverse always exists; "
-                "cells where it comes out non-positive are not in a valid state of "
-                "that EOS (p below the JWL cold curve, i.e. the explosive has not "
-                "released its chemical energy yet) and get no energy label"
+                "solid-element internal energy, so e = (p - p_cold(V))/(omega rho_m) "
+                "for products and e = p/((gamma-1) rho_m) for air, where rho_m is the "
+                "per-material mass/(alpha V) density, inverted per CELL and then "
+                "volume-weighted onto the shells. The inverse always exists; cells "
+                "where it comes out non-positive are not in a valid state of that EOS "
+                "(p below the JWL cold curve, i.e. the explosive has not released its "
+                "chemical energy yet) and get no energy label"
             ),
         },
         # **场量布局声明**（提示词 §4）。写出来之后，"这份文件是什么布局"是一个
@@ -1252,6 +1259,12 @@ def extract_case(
             "fraction is recorded in material.npz as contaminated_shell_fraction. "
             "Shell averaging skips nan silently, so contamination is measured "
             "separately instead of being averaged away"
+        ),
+        "pressure_kind": "absolute",
+        "pressure_source": (
+            "negative trace of the solid-element stress, p = -(sxx+syy+szz)/3; "
+            "absolute (the undeformed ambient air reads 101320 Pa at t=0); no "
+            "artificial-viscosity correction is claimed"
         ),
         "lasso_version": lasso_version(),
         "validated_lasso_version": VALIDATED_LASSO_VERSION,

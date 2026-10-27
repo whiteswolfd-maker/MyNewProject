@@ -35,7 +35,8 @@ Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现
   ``epsilon = delta R_0/(D_s-u_*)``。不同 ``epsilon`` 对应不同物理时刻，
   不能相减后称为时间收敛。
 * 新启动场固定 ``reference_field=False``、``training_qualified=False``，
-  不是旧 ``ReferenceField`` 的替代品。
+  不是旧 ``ReferenceField`` 的替代品。``training_qualified`` 只是来源记录，
+  **不再是运行门槛**；程序正确性检查仍硬失败。
 
 ## 时间
 
@@ -55,8 +56,12 @@ Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现
   冻结。外推判据在无量纲 ``s`` 上做，不在秒数上做。
 * 物理时间与网络时间的换算只经由 ``physics.similitude``，而且只平移一次
   （``physical_time_from_network`` / ``network_time_from_physical`` 配对）。
-* LS-DYNA 的原始时间轴 ``T`` 属于数据侧；它还没有迁移到新链路的时间原点
-  （见"尚未接入"）。
+* LS-DYNA 的原始时间轴 ``T`` 属于数据侧。新链路要求显式给出
+  ``T_origin``（DYNA 的哪个时刻对应模型 ``t_phys=0``），再按
+  ``t_phys = T - T_origin``、``tau = t_phys - epsilon`` 换算。没有默认原点；
+  原点未知时监督与同时间对比都拒绝。对已确认的中心起爆、``LT + R0/D``
+  约定，``cli.build_supervision`` 从卡片元数据生成并记录 ``LT``、``R0``、``D``；
+  非中心起爆或参数缺失时硬失败，不套用公式。
 
 ## 坐标与 PDE
 
@@ -76,47 +81,70 @@ Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现
 * ``R_s <= R_c``、前沿或前沿速度非有限、配置点半径到达轴心（``R_c <= 0``）；
 * 零个产物配置点，或大部分请求的产物点被丢弃；
 * 产物 PDE 残差在**零个点**上求值（``mean`` 会把 ``nan`` 吞掉）；
-* 检查点里的 ``hat_T_*`` 与当前运行不同；
-* 检查点里没有采样器的 RNG 状态；
-* 训练半径缺数据；
-* 训练算例的数据兼容性不是 ``compatible``。
+* 检查点的 case 集合、调度、尺度、采样配置或窗口与当前运行不同；
+* 检查点里没有采样器或全局 RNG 状态（续训时）；
+* 监督数据的 DYNA→模型时间原点未知，或与字段/半径不匹配；
+* 总损失或梯度非有限（更新之前拦下，参数不变）。
 
 **``R_c < R_0`` 不在这一列**：它是监控量，不是非法移动域。
 
 ## 正式命令的当前状态
 
-* 可运行：``python -m spherical_blast_pinn.cli.startup``（写出 handoff）、
-  ``python -m spherical_blast_pinn.cli.validate_startup_planar``（delta 敏感性）、
-  ``python -m spherical_blast_pinn.cli.check_startup_chain``（装配 + 一次反向传播），
-  以及数据侧的 ``audit_dyna`` / ``audit_data`` / ``extract_profiles`` /
-  ``validate_eos``。
-* **已接入新启动场**：``sampling.sampler.RadiusSampler(field, scales, tau_end)``
-  直接生成 IC / PDE / 接触面 / 激波点；IC 复用
-  ``build_planar_startup_initial_batch``。``losses.objective.contact_pressure_scale(field)``
-  取场自己的 ``p_*``。``evaluation.checks.build_check_set(field, scales, tau_end)``
-  用同一启动场与同一压力尺度建立固定检查集。无数据监督时数据与几何批次为空，
-  **不构造假算例**；把真实算例传给采样器会明确报未支持（数据时间轴尚未迁移）。
-* **尚未接入**：``train`` / ``predict`` / ``compare``。它们会明确报
-  “新启动场的训练接口尚未接入”并以退出码 3 结束，**不会**回退旧参考场。
-  ``Trainer`` 构造时直接抛 ``TrainingNotConnected``：训练执行层仍按旧的多半径
-  / 检查点语义，迁移它属于下一轮。不得用伪造的 ``ReferenceField``、伪造爆速或
-  ``training_qualified=True`` 绕过。
-* **检查点（新契约）**：``training.checkpoint`` 只读写
-  ``spherical_blast_pinn.startup_checkpoint`` v1，绑定启动场的
-  ``model_id`` / ``method_version`` / ``cache_key``、完整的
-  ``PlanarStartupScales`` 参数、模型结构/EOS/dtype、模型参数、可选的优化器
-  状态、步数、全局+采样器随机状态，以及**采样配置与动态时间窗口**
-  （``tau_end``、各类点数、分层比例、``r_min_fraction``、当前窗口分数与
-  历史）。恢复端必须逐项相同：``tau_end``/点数/分层不同，或接收采样器站在
-  另一个启动场/尺度上，都会在修改模型、优化器和采样器**之前**明确拒绝——
-  换一套采样设置继续跑不能称为精确续训。保存用
-  ``save_startup_checkpoint(path, field=..., scales=..., model=..., optimizer=..., sampler=...)``，
-  读取用 ``load_startup_checkpoint(path, handoff_json=..., model=..., sampler=...)``。
-  旧检查点（format ``spherical_blast_pinn.checkpoint``、version ≤ 8、带爆速与
-  ``T_h``）按格式/版本**明确拒绝**，不迁移、不猜测旧时间原点。
-* 保留但未接线的通用组件：``models/``、``physics/pde.py``、
-  ``physics/moving_frame.py``、``losses/terms.py``、``sampling/batch.py``、
-  ``training/schedule.py``、``training/balancing.py``、``training/trainer.py``。
+* 可运行：``startup``（写 handoff）、``validate_startup_planar``、
+  ``check_startup_chain``（装配 + 一次反向）、``train``（单/多半径，Adam +
+  可选 L-BFGS）、``predict``、``compare``，以及数据侧
+  ``audit_dyna`` / ``audit_data`` / ``extract_profiles`` / ``validate_eos``。
+* **训练装配**：``cli._common.build_context`` 读 ``startup.cases``，为每个半径
+  加载或构造 handoff、``PlanarStartupScales`` 与 ``RadiusSampler``，然后建立
+  **一个共享的** ``CoupledModel``（ProductNet + AirNet + 前沿参数）与**一个**
+  Adam。网络无量纲，物理输出换算逐次使用 ``batch.scales``；支持范围是同材料、
+  同环境、同 ``delta``、同启动方法与时间尺度，只有 ``R_0``/``epsilon`` 不同。
+  材料/环境以 handoff 保存的完整 JWL、空气 ``gamma``、环境密度/压力与初始
+  产物/空气热力学状态为准；YAML 中显式写出的对应物理值必须一致，冲突在优化
+  之前报错并列出双方数值。自动构造初场时，``jwl``、``E0`` 与 ``air`` 参数
+  实际进入初值；不支持的非默认值（如 ``jwl.V0 != 1``）在装配阶段拒绝。
+  ``check_shared_compatibility`` 直接比较完整 EOS、环境态与初始热力学状态，
+  第一份 case 也与共享模型核对；无量纲前沿恰好相同不能代替材料一致性。
+  参考尺度 ``rho_*/U_*/e_*`` 是数值归一化量，不强制等于实际初态。
+* **诊断模式**（``--diagnostic``）：只限制运行身份与步数（默认上限 100），
+  检查点与清单记录 ``diagnostic``；它不再承担"科研资格"门槛。正式装配不会因
+  ``training_qualified=False`` 被拒绝。
+* **数据监督**：``data.startup_supervision.SupervisionDataset`` 带显式
+  ``T_origin``、SI 单位、逐字段有效性、两条前沿各自的有效性与位置不确定性、
+  synthetic/real 标记。``t_phys = T_DYNA - T_origin``、``tau = t_phys - epsilon``。
+  原点未知的数据可以加载审查，但监督/同时间对比被拒绝；**没有默认
+  ``T_origin=0``**。当前已确认的 50/80/100/500 mm 中心起爆卡片用
+  ``T_origin = LT + R0/D``，由 ``data/dyna_supervision.py`` 从提取元数据生成；
+  非零起爆点或缺参数不能套用。当前可用的新版提取是
+  ``F:/2/extracted_geom/50mm_d``（6 状态）、``100mm_d``（3 状态）；
+  ``extracted_vf``/GitHub 旧导出缺逐字段有效性，转换会拒绝。
+* **检查点（v5）**：顶层 ``model`` + ``cases`` + ``training``。``model`` 只有
+  一份共享参数、优化器与指纹；每个 case 绑定启动场身份、完整 scales、无量纲
+  前沿初值、完整材料/环境/初始状态记录、采样配置/窗口、采样器 RNG、连续帧组
+  开发划分（经数据身份）、RAR 配置/点池/触发进度与数据内容身份；``training``
+  绑定全局步号、阶段与窗口、日程、平衡器、全局 RNG、历史、选模记录（含共享
+  权重）、运行来源与诊断身份。多半径恢复要求**完全相同的 case_id 集合**。
+  ``--resume`` 恢复完整训练状态；``--init-from`` 只加载参数（不恢复 RAR/窗口/
+  RNG）。恢复先核对再修改，失败回滚。保存、恢复与冻结预测共用
+  ``physics/material_state.py`` 的同一份材料判据；模型结构与材料记录也互相
+  核对。v2/v3/v4 与旧 reference-field 格式按版本明确拒绝。
+* **未训练半径预测**：``predict --radius`` 在半径不在训练集合时走
+  ``load_frozen_model``：核对完整材料/环境/初始热力学状态、delta/方法/时间尺度与
+  无量纲前沿初值，
+  使用新半径自己的 handoff 与 ``epsilon``，不读优化器、不恢复 RNG、不更新参数；
+  ``cache_key`` 允许与训练算例不同。``--case-id`` 则是训练算例的严格复现。
+* **RAR**：配置在 ``training.rar``（``enabled``、``interval``、每介质候选/选点
+  数、点池容量、替换比例）。每个 case、每个材料域有独立的候选评分、点池和
+  随机状态。候选点只在当前时间窗口与合法材料域内生成；评分复用生产 PDE 残差
+  的无量纲尺度，**不调用优化器、不写 ``.grad``、不切换模型模式**。点池有容量、
+  去重和触发间隔；只用配置比例的 PDE 点由池替换，基础分层采样保留。RAR 关闭
+  时采样路径与原来一致。非有限残差明确失败。
+* **开发集**：真实/合成监督都按原始时间顺序形成连续帧组，整组划分训练/开发，
+  记录实际组号、帧号和比例。训练采样只用训练帧；固定检查集另建开发帧批次，
+  只进入 ``data_loss`` 与既有选模偏序，不进梯度、RAR 或训练配点。
+* **阶段机/平衡器**仍保留；L-BFGS 对联合目标做一次更新，不逐 case 覆盖。
+* 旧提取格式的场量对照工具已删除；通用规则（逐字段有效性、材料侧插值、
+  缺失不为零）迁到 ``evaluation/field_compare.py``，新 ``compare`` 使用它。
 
 ## 已退出的旧方案（只作历史）
 
@@ -198,6 +226,11 @@ Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现
   四个算例上两者恰好相等（psid = 1..7 且列也按 1..7 排），但那是卡片刚好这么写的：
   500 mm 的 part 名全是 `Solid Body N`，靠名字猜不可能。字段名因此是
   `product_ale_indices` / `air_ale_indices`，不是 `*_material_ids`。
+* **history 列宽由 ALE 组数解析，不是固定 16 列。** 紧凑布局是
+  `[密度, n 个体积分数, 材料号, n 个分材料质量]`。50 mm 的 n=7（16 列），
+  100 mm 的 n=2（6 列）。`resolve_d3plot_layout` 用实际列宽 + deck 的组数；
+  列宽不够时硬失败。纯介质密度由 `m_m/(alpha_m V)` 计算，混合物密度列只作
+  原始读数保留。
 * **球壳统计用单元与壳层的重叠体积**（`data/shell_average.py`，§8），不是"质心落在
   壳层里就整格算进去"。后者在壳层比单元细时是阶梯，而且**壳层之间的体积与质量不守恒**。
   重叠按**圆台重构**（`dV/dr ~ r^2`，对固定立体角精确；实测完全在内侧的单元重叠分数
@@ -231,8 +264,10 @@ Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现
 * 选模型的偏序在 `evaluation/checks.py:SELECTION_CRITERIA` 里逐字写死：先非物理
   状态计数，再物理/界面残差超出 §16 容差多少，最后才比开发集误差。**不按加权
   训练总损失选模型。**
-* 数据在训练半径内按**连续帧组**留出约 10% 作开发检查（`ExtractedCase.frame_split`）。
-  同一帧的相邻网格点高度相关，随机拆开会让"开发集误差"只是训练误差的另一种写法。
+* 数据在训练半径内按**连续帧组**留出约配置比例作开发检查
+  （`SupervisionDataset.assign_frame_split`）。同一帧的相邻网格点高度相关，
+  随机拆开会让"开发集误差"只是训练误差的另一种写法。开发帧只进入固定
+  `data_loss` 与既有选模偏序，不进入训练梯度或 RAR。
 * 守恒诊断（产物质量漂移、固定控制体能量平衡）只报告，不进梯度。
 
 ## 契约

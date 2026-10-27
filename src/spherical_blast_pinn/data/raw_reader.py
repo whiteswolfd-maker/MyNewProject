@@ -63,6 +63,12 @@ class RawFrame:
     tnt_volume_fraction: np.ndarray
     radial_velocity: np.ndarray | None = None
     specific_internal_energy: np.ndarray | None = None
+    #: Per-material densities from the ALE group masses and occupied volume:
+    #: ``rho_m = m_m / (alpha_m * V_cell)``.  The mixture column remains in
+    #: ``density``; these arrays are what the pure-medium shell average uses.
+    #: ``None`` means this reader did not provide per-material masses.
+    density_product: np.ndarray | None = None
+    density_air: np.ndarray | None = None
     material_id: np.ndarray | None = None
     burn_fraction: np.ndarray | None = None
     cell_centroid: np.ndarray | None = None
@@ -95,6 +101,12 @@ class RawFrame:
             if value.size != n:
                 raise RawReadError(
                     f"field {name!r} has {value.size} entries but radius has {n}"
+                )
+        for name in ("density_product", "density_air"):
+            value = getattr(self, name)
+            if value is not None and np.asarray(value).size != n:
+                raise RawReadError(
+                    f"field {name!r} has {np.asarray(value).size} entries but radius has {n}"
                 )
 
     @property
@@ -279,6 +291,60 @@ class D3plotLayout:
             material_index_column=int(section.get("material_index", default.material_index_column)),
             per_material_mass_columns=tuple(range(int(mass_start), int(mass_stop) + 1)),
         )
+
+    @classmethod
+    def for_ale_group_count(cls, n_groups: int) -> "D3plotLayout":
+        """Compact history layout for a deck with ``n_groups`` ALE materials.
+
+        The observed 16-column layout is the ``n_groups=7`` member of
+
+        ``[mixture density, n alpha columns, material index, n mass columns]``
+        (width ``2*n+2``), not a universal DYNA layout.  The 100 mm case has
+        two ALE groups and six history columns; applying the 16-column mapping
+        there would read past the array.
+        """
+        groups = int(n_groups)
+        if groups < 1:
+            raise RawReadError(f"ALE group count must be >= 1, got {n_groups!r}")
+        return cls(
+            mixture_density_column=0,
+            volume_fraction_columns=tuple(range(1, groups + 1)),
+            material_index_column=groups + 1,
+            per_material_mass_columns=tuple(range(groups + 2, 2 * groups + 2)),
+        )
+
+
+def resolve_d3plot_layout(
+    layout: D3plotLayout, *, history_width: int, n_ale_groups: int
+) -> D3plotLayout:
+    """Resolve the history layout from the actual array width and ALE groups.
+
+    The default 16-column object is only the seven-group member of the compact
+    family.  If the state array has the compact width for the deck's own group
+    count, that layout is used.  An explicitly supplied layout is retained when
+    all its indices fit; a layout whose indices exceed the array is a hard
+    error, not a silently truncated read.
+    """
+    width = int(history_width)
+    groups = int(n_ale_groups)
+    if width <= 0 or groups < 1:
+        raise RawReadError(
+            f"invalid d3plot history geometry: width={history_width!r}, groups={n_ale_groups!r}"
+        )
+    compact = D3plotLayout.for_ale_group_count(groups)
+    if width == 2 * groups + 2 and layout == D3plotLayout():
+        return compact
+    required = max(
+        [layout.mixture_density_column, layout.material_index_column,
+         *layout.volume_fraction_columns, *layout.per_material_mass_columns]
+    )
+    if required >= width:
+        raise RawReadError(
+            f"the configured history layout needs column {required} but the state "
+            f"array has width {width} for {groups} ALE groups; refusing to read a "
+            "truncated or guessed material mapping"
+        )
+    return layout
 
 
 def _import_lasso():
@@ -739,11 +805,26 @@ def read_d3plot_states(
     stress = np.asarray(handle.arrays[ArrayType.element_solid_stress], dtype=np.float64)
     history = np.asarray(handle.arrays[ArrayType.element_solid_history_variables], dtype=np.float64)
 
-    layout = case.layout
+    # The default 16-column mapping is only the seven-group member of the
+    # compact family.  Resolve against this state array's actual width and the
+    # deck's declared ALE group count before any column is indexed.
+    declared_ale = np.asarray(getattr(case, "ale_material_ids", []), dtype=np.int64).reshape(-1)
+    n_ale_groups = (
+        int(declared_ale.size)
+        if declared_ale.size
+        else max(
+            max(case.product_ale_indices, default=1),
+            max(case.air_ale_indices, default=1),
+        )
+    )
+    layout = resolve_d3plot_layout(
+        case.layout,
+        history_width=int(history.shape[-1]),
+        n_ale_groups=n_ale_groups,
+    )
     # 传入的是 **ALE 材料号**（1 基，来自 `*ALE_MULTI-MATERIAL_GROUP` 的出现顺序），
     # 不是 part id。把"第 k 个体积分数列"对上"第 k 个 ALE 材料"需要 d3plot 声明的
     # ALE 材料号就是 1..N —— 本机四个算例都是，但这是个**必须核实的前提**，不是约定。
-    declared_ale = np.asarray(getattr(case, "ale_material_ids", []), dtype=np.int64).reshape(-1)
     if declared_ale.size and not np.array_equal(
         declared_ale, np.arange(1, declared_ale.size + 1, dtype=np.int64)
     ):
@@ -764,6 +845,15 @@ def read_d3plot_states(
         layout.volume_fraction_columns[ale_index - 1]
         for ale_index in case.product_ale_indices
     ]
+    if len(layout.per_material_mass_columns) < max(
+        max(case.product_ale_indices, default=0),
+        max(case.air_ale_indices, default=0),
+    ):
+        raise RawReadError(
+            "the configured per-material mass columns do not cover the declared "
+            "ALE material indices; material density cannot be formed from "
+            "m/(alpha V)"
+        )
 
     for local_index, global_state in enumerate(state_indices):
         node_velocity = _state_slice(velocity, local_index)
@@ -829,6 +919,36 @@ def read_d3plot_states(
         is_product = alpha >= 0.95
         is_air = alpha <= 0.05
 
+        # Per-material densities from the ALE group masses and occupied volume.
+        # This is the defining relation rho_m = m_m / (alpha_m V_cell); the
+        # mixture density column is not substituted for a material density.
+        mass_factor = units.density * units.length**3
+        product_mass_columns = [
+            layout.per_material_mass_columns[ale_index - 1]
+            for ale_index in case.product_ale_indices
+        ]
+        air_mass_columns = [
+            layout.per_material_mass_columns[ale_index - 1]
+            for ale_index in case.air_ale_indices
+        ]
+        product_mass = (
+            element_history[:, product_mass_columns].sum(axis=1) * mass_factor
+        )
+        air_mass = element_history[:, air_mass_columns].sum(axis=1) * mass_factor
+        alpha_air = np.clip(1.0 - alpha, 0.0, 1.0)
+        safe_volume = np.where(volume_si > 0.0, volume_si, np.nan)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            density_product = np.where(
+                (alpha > 0.0) & (product_mass > 0.0) & (safe_volume > 0.0),
+                product_mass / (alpha * safe_volume),
+                np.nan,
+            )
+            density_air = np.where(
+                (alpha_air > 0.0) & (air_mass > 0.0) & (safe_volume > 0.0),
+                air_mass / (alpha_air * safe_volume),
+                np.nan,
+            )
+
         energy = np.full(n_elements, np.nan, dtype=np.float64)
         state_valid = np.zeros(n_elements, dtype=bool)
         # 反解本身**永远**有定义（``omega > 0``、``rho > 0`` 时
@@ -840,7 +960,7 @@ def read_d3plot_states(
         # ``alpha >= 0.95`` 的单元全部属于这一类（整球尚未起爆，``p`` 恰为 0）。
         if np.any(is_product):
             e_product = reconstruct_product_energy(
-                density_si[is_product], pressure_si[is_product], jwl
+                density_product[is_product], pressure_si[is_product], jwl
             )
             good = np.isfinite(e_product) & (e_product > 0.0)
             product_index = np.flatnonzero(is_product)
@@ -848,7 +968,7 @@ def read_d3plot_states(
             state_valid[product_index[good]] = True
         if np.any(is_air):
             e_air = reconstruct_air_energy(
-                density_si[is_air], pressure_si[is_air], gamma_air
+                density_air[is_air], pressure_si[is_air], gamma_air
             )
             good = np.isfinite(e_air) & (e_air > 0.0)
             air_index = np.flatnonzero(is_air)
@@ -870,6 +990,8 @@ def read_d3plot_states(
             tnt_volume_fraction=alpha,
             radial_velocity=radial,
             specific_internal_energy=energy,
+            density_product=density_product,
+            density_air=density_air,
             state_valid=state_valid,
             # 径向覆盖区间，单位换算与 radius 一致。球壳统计用它做重叠体积分配。
             cell_radius_inner=(
@@ -884,7 +1006,11 @@ def read_d3plot_states(
                 "state_index": int(global_state),
                 "energy_source": "reconstructed_from_eos",
                 "pressure_source": "stress_trace",
-                "density_source": "history_variable_column_0",
+                "density_source": (
+                    "per-material mass columns / (alpha_m * cell_volume) for the "
+                    "medium densities; history_variable_column_0 is retained as the "
+                    "mixture density"
+                ),
                 "volume_fraction_source": "history_variable_columns_1_7",
                 "position_convention": case.position_convention,
                 # 被标成产物或空气、但 (rho, p) 不是该 EOS 的合法状态、因而没有比内能

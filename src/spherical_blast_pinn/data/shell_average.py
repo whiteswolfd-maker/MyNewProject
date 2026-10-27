@@ -645,10 +645,23 @@ def shell_average(
     # 聚合就是矩阵乘：A @ (cell_weight * value)。体积加权用 cell_weight = 介质份额，
     # 质量加权再乘一个 rho。这样每个场量只做一次稀疏乘，而不是两千万配对的 bincount。
     volume_weight_cell = medium_fraction
-    rho_cell = np.asarray(frame.density, dtype=np.float64)
+    # Prefer the per-material density m_m/(alpha_m V) when the reader supplied
+    # it.  The mixture density is only a fallback for readers that do not carry
+    # the ALE group masses; for a pure cell the two coincide, but for a cell at
+    # the 0.95 purity threshold they do not.
+    density_values = getattr(frame, f"density_{medium}", None)
+    if density_values is not None:
+        density_values = np.asarray(density_values, dtype=np.float64)
+        if density_values.size != n_cells:
+            raise ShellAverageError(
+                f"density_{medium} has {density_values.size} entries, expected {n_cells}"
+            )
+    else:
+        density_values = np.asarray(frame.density, dtype=np.float64)
+    rho_cell = density_values
     mass_weight_cell = volume_weight_cell * rho_cell
 
-    density, _ = assignment.mean(n_cells, n_shells, volume_weight_cell, rho_cell)
+    density, _ = assignment.mean(n_cells, n_shells, volume_weight_cell, density_values)
     pressure, total_weight = assignment.mean(
         n_cells, n_shells, volume_weight_cell, np.asarray(frame.pressure, dtype=np.float64)
     )
@@ -690,7 +703,7 @@ def shell_average(
 
     index = grid.indices(np.asarray(frame.radius, dtype=np.float64))
     dispersion = {
-        "density": _shell_dispersion(index[select], frame.density[select], n_shells),
+        "density": _shell_dispersion(index[select], density_values[select], n_shells),
         "pressure": _shell_dispersion(index[select], frame.pressure[select], n_shells),
         "radial_velocity": _shell_dispersion(
             index[select], np.asarray(frame.radial_velocity)[select], n_shells
