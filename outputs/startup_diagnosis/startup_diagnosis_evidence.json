@@ -1,0 +1,190 @@
+{
+  "usage": "diagnostic only; not an acceptance gate",
+  "method_version": "compatible_lagrangian_spherical_v2",
+  "charge_radius": 0.05,
+  "handoff_time_s": 1e-06,
+  "handoff_run": "n800_cfl0.2",
+  "runs": [
+    "n800_cfl0.2",
+    "n1600_cfl0.2",
+    "n1600_cfl0.1"
+  ],
+  "fronts": {
+    "n800_cfl0.2": {
+      "contact_radius_m": 0.05392363856387146,
+      "shock_radius_m": 0.05463533836795658,
+      "air_layer_m": 0.0007116998040851211,
+      "contact_speed_m_s": 4109.852954056211,
+      "shock_speed_m_s": 4905.603839989994
+    },
+    "n1600_cfl0.2": {
+      "contact_radius_m": 0.05399412001098547,
+      "shock_radius_m": 0.054777259281712946,
+      "air_layer_m": 0.0007831392707274773,
+      "contact_speed_m_s": 3970.8113603174634,
+      "shock_speed_m_s": 4814.541225748538
+    },
+    "n1600_cfl0.1": {
+      "contact_radius_m": 0.05401406123605904,
+      "shock_radius_m": 0.05479881253516659,
+      "air_layer_m": 0.0007847512991075445,
+      "contact_speed_m_s": 3995.494655403276,
+      "shock_speed_m_s": 4864.0180565198
+    }
+  },
+  "grid_sensitivity": {
+    "contact": 0.0013053541218871572,
+    "shock": 0.0025908728479182123,
+    "air_layer": 0.09122191839006408,
+    "contact_speed": 0.03501591516743108,
+    "shock_speed": 0.018914079238629592,
+    "front_relative_combined": 0.0025908728479182123
+  },
+  "timestep_sensitivity": {
+    "contact": 0.0003691858123095711,
+    "shock": 0.00039331606756640906,
+    "air_layer": 0.0020541901388382035,
+    "contact_speed": 0.0061777820306760265,
+    "shock_speed": 0.010172008038691916,
+    "front_relative_combined": 0.00039331606756640906
+  },
+  "contact_by_run": {
+    "n800_cfl0.2": {
+      "pressure_relative": 0.18222477352805896,
+      "velocity_relative": 0.0,
+      "contact_pressure_product": 19664851.245560735,
+      "contact_pressure_air": 24046768.120378446,
+      "product_cell_radius_m": 0.053438585281415665,
+      "air_cell_radius_m": 0.05392670309375366,
+      "face_linear_diagnostic": {
+        "product_pressure": 4148973.37951144,
+        "air_pressure": 23853496.917959105,
+        "pressure_relative": 0.826064354682197,
+        "reliable": false,
+        "reason": "linear extrapolation across the last cell is unreliable when the product rarefaction is steep; diagnostic only"
+      },
+      "metric": "pressure difference between the two cells adjacent to the contact, normalized by their maximum; it is a discrete upper bound on the face jump and includes the half-cell gradient"
+    },
+    "n1600_cfl0.2": {
+      "pressure_relative": 0.3823761288283157,
+      "velocity_relative": 0.0,
+      "contact_pressure_product": 13483908.140519952,
+      "contact_pressure_air": 21831908.98198259,
+      "product_cell_radius_m": 0.05367151086634299,
+      "air_cell_radius_m": 0.05399575620556277,
+      "face_linear_diagnostic": {
+        "product_pressure": 6291623.758194471,
+        "air_pressure": 21652483.280325,
+        "pressure_relative": 0.7094271508380985,
+        "reliable": false,
+        "reason": "linear extrapolation across the last cell is unreliable when the product rarefaction is steep; diagnostic only"
+      },
+      "metric": "pressure difference between the two cells adjacent to the contact, normalized by their maximum; it is a discrete upper bound on the face jump and includes the half-cell gradient"
+    },
+    "n1600_cfl0.1": {
+      "pressure_relative": 0.3893892478263745,
+      "velocity_relative": 0.0,
+      "contact_pressure_product": 13487983.132220572,
+      "contact_pressure_air": 22089331.188824695,
+      "product_cell_radius_m": 0.05367888389483425,
+      "air_cell_radius_m": 0.05401569112770005,
+      "face_linear_diagnostic": {
+        "product_pressure": 5864968.880365711,
+        "air_pressure": 22003257.155698713,
+        "pressure_relative": 0.7334499688448753,
+        "reliable": false,
+        "reason": "linear extrapolation across the last cell is unreliable when the product rarefaction is steep; diagnostic only"
+      },
+      "metric": "pressure difference between the two cells adjacent to the contact, normalized by their maximum; it is a discrete upper bound on the face jump and includes the half-cell gradient"
+    }
+  },
+  "face_pressure_estimates": {
+    "n800_cfl0.2": {
+      "linear": {
+        "product_pressure": 4148973.379511388,
+        "air_pressure": 23853496.917964946,
+        "pressure_relative": 0.8260643546822418,
+        "product_density": 25.05698197877973,
+        "air_density": 11.37818747262827
+      },
+      "quadratic": {
+        "product_pressure": 7547366.232362938,
+        "air_pressure": 23795633.612327963,
+        "pressure_relative": 0.6828255824021083,
+        "product_density": 48.289195384888444,
+        "air_density": 11.602035779505968
+      }
+    },
+    "n1600_cfl0.2": {
+      "linear": {
+        "product_pressure": 6291623.758194528,
+        "air_pressure": 21652483.28032406,
+        "pressure_relative": 0.7094271508380832,
+        "product_density": 38.196916644313205,
+        "air_density": 10.62094813641852
+      },
+      "quadratic": {
+        "product_pressure": 9914327.142826227,
+        "air_pressure": 21599236.197427474,
+        "pressure_relative": 0.5409871417579548,
+        "product_density": 60.5241295711603,
+        "air_density": 10.82953180372715
+      }
+    }
+  },
+  "field_errors_physical_coordinates": {
+    "per_variable": {
+      "product_density": 0.0027928397963706817,
+      "product_velocity": 0.012020773007596377,
+      "product_specific_energy": 0.003069849587444273,
+      "air_density": 0.08357323091974232,
+      "air_velocity": 0.029417484377060644,
+      "air_specific_energy": 0.04849637827007046
+    },
+    "max": 0.08357323091974232,
+    "definition": "volume-weighted (r^2 dr) relative L2 on the common physical domain: product [0, min Rc], air [max Rc, min Rs]"
+  },
+  "field_errors_front_aligned": {
+    "per_variable": {
+      "product_density": 0.006893763350901738,
+      "product_velocity": 0.018380581824686403,
+      "product_specific_energy": 0.00546839818147422,
+      "air_density": 0.0866823157373371,
+      "air_velocity": 0.025576726912357666,
+      "air_specific_energy": 0.02006573378919229
+    },
+    "max": 0.0866823157373371,
+    "definition": "same relative L2 after mapping product xi=r/Rc and air eta=(r-Rc)/(Rs-Rc) to [0,1]; weights are the spherical volume weights in each coordinate (the layer-width factor cancels)"
+  },
+  "timestep_field_errors_physical": {
+    "per_variable": {
+      "product_density": 0.00032464788925173985,
+      "product_velocity": 0.0017438626067787903,
+      "product_specific_energy": 0.0015607900639176967,
+      "air_density": 0.05015563553687455,
+      "air_velocity": 0.011300934892683637,
+      "air_specific_energy": 0.03541651739471422
+    },
+    "max": 0.05015563553687455
+  },
+  "excluded_regions": {
+    "delta_contact_m": 7.048144711400972e-05,
+    "delta_shock_m": 0.00014192091375636595,
+    "fine_air_layer_m": 0.0007831392707274773,
+    "delta_contact_over_fine_layer": 0.08999861167546581,
+    "delta_shock_over_fine_layer": 0.18122053006552988,
+    "physical_product_excluded_band_m": 7.048144711400972e-05,
+    "physical_air_excluded_bands_m": [
+      7.048144711400972e-05,
+      0.00014192091375636595
+    ]
+  },
+  "aligned_over_physical_ratio": {
+    "product_density": 2.4683704950997334,
+    "product_velocity": 1.5290682066012746,
+    "product_specific_energy": 1.7813244674397222,
+    "air_density": 1.0372019219955793,
+    "air_velocity": 0.8694396361200093,
+    "air_specific_energy": 0.4137573671470609
+  }
+}

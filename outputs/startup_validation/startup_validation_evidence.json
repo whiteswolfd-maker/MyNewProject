@@ -1,0 +1,189 @@
+{
+  "source": "python -m spherical_blast_pinn.cli.validate_startup --charge-radius 0.05 --handoff-time 1e-06 --coarse-cells 800 --fine-cells 1600 --cfl 0.2 --fine-cfl 0.1 (generated 2026-10-21T10:54:22+00:00)",
+  "method_version": "compatible_lagrangian_spherical_v2",
+  "charge_radius": 0.05,
+  "handoff_time_s": 1e-06,
+  "initial_state": {
+    "product_density": 1630.0,
+    "product_specific_energy": 3680981.5950920247,
+    "air_density": 1.225,
+    "air_specific_energy": 206775.51020408163,
+    "air_gamma": 1.4,
+    "charge_radius": 0.05
+  },
+  "eos": {
+    "A": 371200000000.0,
+    "B": 3747100000.0,
+    "R1": 4.15,
+    "R2": 0.95,
+    "omega": 0.3,
+    "rho0": 1630.0,
+    "energy_shift": 0.0
+  },
+  "artificial_viscosity": {
+    "q1": 1.5,
+    "q2": 0.06
+  },
+  "runs": [
+    {
+      "id": "n800_cfl0.2",
+      "cells_inside": 800,
+      "outside_growth": 1.01,
+      "outer_radius_factor": 3.0,
+      "cfl": 0.2,
+      "charge_radius": 0.05,
+      "handoff_time_s": 1e-06
+    },
+    {
+      "id": "n1600_cfl0.2",
+      "cells_inside": 1600,
+      "outside_growth": 1.01,
+      "outer_radius_factor": 3.0,
+      "cfl": 0.2,
+      "charge_radius": 0.05,
+      "handoff_time_s": 1e-06
+    },
+    {
+      "id": "n1600_cfl0.1",
+      "cells_inside": 1600,
+      "outside_growth": 1.01,
+      "outer_radius_factor": 3.0,
+      "cfl": 0.1,
+      "charge_radius": 0.05,
+      "handoff_time_s": 1e-06
+    }
+  ],
+  "handoff_run": "n800_cfl0.2",
+  "grid_convergence": {
+    "coarse_run": "n800_cfl0.2",
+    "fine_run": "n1600_cfl0.2",
+    "front_relative": 0.0025908728479182123,
+    "field_relative": 0.08357323091974232,
+    "per_variable": {
+      "product_density": 0.0027928397963706817,
+      "product_velocity": 0.012020773007596377,
+      "product_specific_energy": 0.003069849587444273,
+      "air_density": 0.08357323091974232,
+      "air_velocity": 0.029417484377060644,
+      "air_specific_energy": 0.04849637827007046
+    }
+  },
+  "timestep_sensitivity": {
+    "coarse_run": "n1600_cfl0.2",
+    "fine_run": "n1600_cfl0.1",
+    "front_relative": 0.00039331606756640906,
+    "field_relative": 0.05015563553687455,
+    "per_variable": {
+      "product_density": 0.00032464788925173985,
+      "product_velocity": 0.0017438626067787903,
+      "product_specific_energy": 0.0015607900639176967,
+      "air_density": 0.05015563553687455,
+      "air_velocity": 0.011300934892683637,
+      "air_specific_energy": 0.03541651739471422
+    }
+  },
+  "contact_consistency": {
+    "pressure_relative": 0.18222477352805896,
+    "velocity_relative": 0.0,
+    "contact_pressure_product": 19664851.245560735,
+    "contact_pressure_air": 24046768.120378446,
+    "product_cell_radius_m": 0.053438585281415665,
+    "air_cell_radius_m": 0.05392670309375366,
+    "face_linear_diagnostic": {
+      "product_pressure": 4148973.37951144,
+      "air_pressure": 23853496.917959105,
+      "pressure_relative": 0.826064354682197,
+      "reliable": false,
+      "reason": "linear extrapolation across the last cell is unreliable when the product rarefaction is steep; diagnostic only"
+    },
+    "metric": "pressure difference between the two cells adjacent to the contact, normalized by their maximum; it is a discrete upper bound on the face jump and includes the half-cell gradient"
+  },
+  "contact_consistency_comparison_run": {
+    "pressure_relative": 0.3823761288283157,
+    "velocity_relative": 0.0,
+    "contact_pressure_product": 13483908.140519952,
+    "contact_pressure_air": 21831908.98198259,
+    "product_cell_radius_m": 0.05367151086634299,
+    "air_cell_radius_m": 0.05399575620556277,
+    "face_linear_diagnostic": {
+      "product_pressure": 6291623.758194471,
+      "air_pressure": 21652483.280325,
+      "pressure_relative": 0.7094271508380985,
+      "reliable": false,
+      "reason": "linear extrapolation across the last cell is unreliable when the product rarefaction is steep; diagnostic only"
+    },
+    "metric": "pressure difference between the two cells adjacent to the contact, normalized by their maximum; it is a discrete upper bound on the face jump and includes the half-cell gradient"
+  },
+  "metric_definition": "volume-weighted (r^2 dr) relative L2 on the common material-side domain: product [0, min Rc], air [max Rc, min Rs]; max over rho, u, e; two grids only, so this is a sensitivity result, not an observed order",
+  "run_diagnostics": {
+    "n800_cfl0.2": {
+      "contact_radius_m": 0.05392363856387146,
+      "shock_radius_m": 0.05463533836795658,
+      "contact_speed_m_s": 4109.852954056211,
+      "shock_speed_m_s": 4905.603839989994,
+      "shock_speed_trajectory_m_s": 4859.53669645936,
+      "shock_speed_deviation": 0.009390718254723143,
+      "shock_rh_mass_rel": 0.04524623705699216,
+      "shock_rh_momentum_rel": 0.014603970650675709,
+      "shock_rh_energy_rel": 0.005231779010629233,
+      "shock_diagnostics_valid": true,
+      "energy": {
+        "internal": 231378.28042116688,
+        "kinetic": 18897.36876225532,
+        "boundary_work": -2.5931196898468372e-17,
+        "drift": 0.0
+      },
+      "volume_work": {
+        "last_relative_mismatch": 1.2547981426875278e-05,
+        "max_relative_mismatch": 0.00018720228234345396,
+        "definition": "|dV_work - dV_geometric| / |dV_geometric|, dV_geometric = V(r^{n+1}) - V(r^n), dV_work = dt * (A_{i+1} ubar_{i+1} - A_i ubar_i), A = (r^n)^2"
+      }
+    },
+    "n1600_cfl0.2": {
+      "contact_radius_m": 0.05399412001098547,
+      "shock_radius_m": 0.054777259281712946,
+      "contact_speed_m_s": 3970.8113603174634,
+      "shock_speed_m_s": 4814.541225748538,
+      "shock_speed_trajectory_m_s": 4855.953030089928,
+      "shock_speed_deviation": 0.008528048785641394,
+      "shock_rh_mass_rel": 0.0403886536934668,
+      "shock_rh_momentum_rel": 0.004127347633612362,
+      "shock_rh_energy_rel": 0.001166666588035415,
+      "shock_diagnostics_valid": true,
+      "energy": {
+        "internal": 231397.68117056516,
+        "kinetic": 18880.104590356113,
+        "boundary_work": -2.6753873469659356e-17,
+        "drift": 0.0
+      },
+      "volume_work": {
+        "last_relative_mismatch": 6.691209226621457e-06,
+        "max_relative_mismatch": 9.363754881115341e-05,
+        "definition": "|dV_work - dV_geometric| / |dV_geometric|, dV_geometric = V(r^{n+1}) - V(r^n), dV_work = dt * (A_{i+1} ubar_{i+1} - A_i ubar_i), A = (r^n)^2"
+      }
+    },
+    "n1600_cfl0.1": {
+      "contact_radius_m": 0.05401406123605904,
+      "shock_radius_m": 0.05479881253516659,
+      "contact_speed_m_s": 3995.494655403276,
+      "shock_speed_m_s": 4864.0180565198,
+      "shock_speed_trajectory_m_s": 4798.185265918904,
+      "shock_speed_deviation": 0.013534651770597794,
+      "shock_rh_mass_rel": 0.06519493106512933,
+      "shock_rh_momentum_rel": 0.0052855835636058945,
+      "shock_rh_energy_rel": 0.015667071785654612,
+      "shock_diagnostics_valid": false,
+      "energy": {
+        "internal": 231404.90505050812,
+        "kinetic": 18872.880710413287,
+        "boundary_work": -2.675387346965963e-17,
+        "drift": 5.814305566163039e-16
+      },
+      "volume_work": {
+        "last_relative_mismatch": 3.896003781185549e-06,
+        "max_relative_mismatch": 4.499654188000557e-05,
+        "definition": "|dV_work - dV_geometric| / |dV_geometric|, dV_geometric = V(r^{n+1}) - V(r^n), dV_work = dt * (A_{i+1} ubar_{i+1} - A_i ubar_i), A = (r^n)^2"
+      }
+    }
+  }
+}

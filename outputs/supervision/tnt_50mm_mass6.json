@@ -1,0 +1,366 @@
+{
+  "format": "spherical_blast_pinn.supervision",
+  "version": 1,
+  "case_id": "tnt_50mm",
+  "synthetic": false,
+  "source_kind": "real",
+  "profile_dir": "F:\\2\\extracted_geom\\50mm_mass6",
+  "handoff_json": "outputs\\planar_startup_diagnostic\\uniform_product_sphere_air_planar_riemann_v1\\8257f2b650cd2b1b\\handoff.json",
+  "charge_radius_m": 0.05,
+  "epsilon_case_s": 3.096678562615235e-07,
+  "time_origin": {
+    "status": "confirmed",
+    "origin_time_s": 7.215007215007215e-06,
+    "method": "LT + R0 / D",
+    "evidence": "LT=0.0 s, R0=0.05 m, D=6930.0 m/s; epsilon_case=3.096678562615235e-07 s",
+    "source": "dyna_extraction",
+    "mapping": "t_phys = T_DYNA - T_origin; tau = t_phys - epsilon_field"
+  },
+  "origin_parameters": {
+    "formula": "T_origin = LT + R0 / D",
+    "charge_radius_m": 0.05,
+    "detonation_velocity_m_s": 6930.0,
+    "lighting_time_s": 0.0,
+    "origin_time_s": 7.215007215007215e-06,
+    "epsilon_case_s": 3.096678562615235e-07,
+    "mapping": "t_phys = T_DYNA - T_origin; tau = t_phys - epsilon_case",
+    "basis": "centre detonation; T_origin is the estimated arrival time of the detonation wave at the initial charge surface, not a measured burn-fraction completion time"
+  },
+  "n_frames": 6,
+  "n_radial_points": 2500,
+  "times_dyna_s": [
+    0.0,
+    1.9987059204140678e-05,
+    9.999422036344185e-05,
+    0.0002999033313244581,
+    0.0005029165768064559,
+    0.0010001290356740355
+  ],
+  "tau_s": [
+    -7.524675071268738e-06,
+    1.246238413287194e-05,
+    9.246954529217312e-05,
+    0.00029237865625318936,
+    0.0004953919017351871,
+    0.0009926043606027666
+  ],
+  "medium_counts": {
+    "unclassified": 7946,
+    "product": 7019,
+    "air": 35
+  },
+  "valid_field_counts": {
+    "density": 7054,
+    "velocity": 7054,
+    "specific_energy": 7054,
+    "pressure": 7054
+  },
+  "front_valid_counts": {
+    "contact": 5,
+    "shock": 2
+  },
+  "front_delta_m": {
+    "contact": 0.05552618046437169,
+    "shock": 0.055990389144535364
+  },
+  "supervision_ready": true,
+  "supervision_blockers": [],
+  "gauges": [
+    {
+      "radius_m": 0.88,
+      "tracking": "fixed_spatial_eulerian_shell",
+      "origin_status": "confirmed",
+      "times_dyna_s": [
+        0.0,
+        1.9987059204140678e-05,
+        9.999422036344185e-05,
+        0.0002999033313244581,
+        0.0005029165768064559,
+        0.0010001290356740355
+      ],
+      "times_phys_s": [
+        -7.215007215007215e-06,
+        1.2772051989133463e-05,
+        9.277921314843464e-05,
+        0.0002926883241094509,
+        0.0004957015695914486,
+        0.0009929140284590282
+      ],
+      "tau_s": [
+        -7.524675071268738e-06,
+        1.246238413287194e-05,
+        9.246954529217312e-05,
+        0.00029237865625318936,
+        0.0004953919017351871,
+        0.0009926043606027666
+      ],
+      "pressure_pa": [
+        null,
+        null,
+        null,
+        null,
+        107744.71781884674,
+        null
+      ],
+      "overpressure_pa": [
+        null,
+        null,
+        null,
+        null,
+        6424.7178188467515,
+        null
+      ],
+      "valid": [
+        false,
+        false,
+        false,
+        false,
+        true,
+        false
+      ],
+      "reason": [
+        "bracket_not_all_air",
+        "bracket_not_all_air",
+        "bracket_not_all_air",
+        "bracket_not_all_air",
+        "linear_within_air_bracket",
+        "bracket_not_all_air"
+      ],
+      "n_valid": 1,
+      "n_frames": 6,
+      "interpolation": "linear inside one air-only radial bracket; no extrapolation; no material-interface crossing",
+      "incident_or_reflected": "undetermined (no gauge orientation in the d3plot profile)",
+      "missing_policy": "unavailable points are null/False, never zero"
+    },
+    {
+      "radius_m": 1.19,
+      "tracking": "fixed_spatial_eulerian_shell",
+      "origin_status": "confirmed",
+      "times_dyna_s": [
+        0.0,
+        1.9987059204140678e-05,
+        9.999422036344185e-05,
+        0.0002999033313244581,
+        0.0005029165768064559,
+        0.0010001290356740355
+      ],
+      "times_phys_s": [
+        -7.215007215007215e-06,
+        1.2772051989133463e-05,
+        9.277921314843464e-05,
+        0.0002926883241094509,
+        0.0004957015695914486,
+        0.0009929140284590282
+      ],
+      "tau_s": [
+        -7.524675071268738e-06,
+        1.246238413287194e-05,
+        9.246954529217312e-05,
+        0.00029237865625318936,
+        0.0004953919017351871,
+        0.0009926043606027666
+      ],
+      "pressure_pa": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        110707.83455029588
+      ],
+      "overpressure_pa": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        9387.834550295898
+      ],
+      "valid": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        true
+      ],
+      "reason": [
+        "bracket_not_all_air",
+        "bracket_not_all_air",
+        "bracket_not_all_air",
+        "bracket_not_all_air",
+        "bracket_not_all_air",
+        "linear_within_air_bracket"
+      ],
+      "n_valid": 1,
+      "n_frames": 6,
+      "interpolation": "linear inside one air-only radial bracket; no extrapolation; no material-interface crossing",
+      "incident_or_reflected": "undetermined (no gauge orientation in the d3plot profile)",
+      "missing_policy": "unavailable points are null/False, never zero"
+    }
+  ],
+  "field_provenance": {
+    "t": "d3plot global timesteps, converted by the deck's time unit",
+    "x": "cell centroid radius; ALE mesh, computed once and state-independent",
+    "rho": "per-material ALE group mass / (alpha_m * cell_volume), using the d3plot per-material mass columns; pure-medium shell density is sum(m_m) / sum(alpha_m V). The mixture-density history column is retained in RawFrame.density but is not substituted for a material density",
+    "u": "node velocity averaged per cell, projected on the radial direction",
+    "P": "negative trace of the solid element stress (strengthless: sigma = -p I)",
+    "e": "RECONSTRUCTED, not an LS-DYNA output: this d3plot carries no solid-element internal energy, so e = (p - p_cold(V))/(omega rho_m) for products and e = p/((gamma-1) rho_m) for air, where rho_m is the per-material mass/(alpha V) density, inverted per CELL and then volume-weighted onto the shells. The inverse always exists; cells where it comes out non-positive are not in a valid state of that EOS (p below the JWL cold curve, i.e. the explosive has not released its chemical energy yet) and get no energy label"
+  },
+  "source": {
+    "profile_directory": "F:\\2\\extracted_geom\\50mm_mass6",
+    "conversion": "extracted DYNA shell profile -> supervision contract",
+    "field_validity_source": "extracted per-field masks",
+    "front_position_source": {
+      "contact": "material.npz contact_has_supervision / contact_radius; ExtractedCase.contact_valid is intersected when available",
+      "shock": "material.npz shock_has_supervision / shock_radius; ExtractedCase.shock_valid is intersected when available",
+      "contact_delta": "material.npz contact_position_uncertainty_m (median)",
+      "shock_delta": "material.npz shock_cell_thickness_m (median)"
+    },
+    "time_origin_parameters": {
+      "epsilon_case_s": 3.096678562615235e-07,
+      "time_origin": {
+        "status": "confirmed",
+        "origin_time_s": 7.215007215007215e-06,
+        "method": "LT + R0 / D",
+        "evidence": "LT=0.0 s, R0=0.05 m, D=6930.0 m/s; epsilon_case=3.096678562615235e-07 s",
+        "source": "dyna_extraction",
+        "mapping": "t_phys = T_DYNA - T_origin; tau = t_phys - epsilon_field"
+      }
+    },
+    "units": "SI as written by cli.extract_profiles; no second conversion",
+    "density_definition": "per-material ALE mass / (alpha_m * cell_volume), aggregated on pure-medium shells as sum(m_m)/sum(alpha_m V); the mixture density column is not substituted and mixed cells are unlabelled, never copied to both sides",
+    "velocity_definition": "radial projection of the eight-node mean cell velocity, u_r = u . (x-x0)/|x-x0|; sign is preserved and r=0 is zero",
+    "pressure_definition": "negative trace of the solid-element stress, p = -(sxx+syy+szz)/3; no unconfirmed artificial-viscosity correction was applied",
+    "energy_definition": "EOS-derived from (rho,p): e=(p-p_cold)/(omega rho) for products and e=p/((gamma-1)rho) for air; non-positive EOS states are unlabelled",
+    "extraction": {
+      "case_id": "tnt_50mm",
+      "R_0": 0.05,
+      "t_0": 0.0,
+      "t_end": 0.0010001290356740355,
+      "n_x": 2500,
+      "n_t": 6,
+      "deck": {
+        "deck": "F:\\tnt\\tnt_files\\dp0\\SYS\\MECH\\input.k",
+        "unit_system": "mm_s_t",
+        "product_part_ids": [
+          2,
+          3,
+          4,
+          7
+        ],
+        "air_part_ids": [
+          1,
+          5,
+          6
+        ],
+        "ale_material_mapping": {
+          "source": "*ALE_MULTI-MATERIAL_GROUP, in card order",
+          "n_groups": 7,
+          "resolved_as": [
+            "part id",
+            "part id",
+            "part id",
+            "part id",
+            "part id",
+            "part id",
+            "part id"
+          ],
+          "product_ale_indices": [
+            2,
+            3,
+            4,
+            7
+          ],
+          "air_ale_indices": [
+            1,
+            5,
+            6
+          ],
+          "other_ale_indices": [],
+          "kind_by_ale_index": {
+            "1": "air",
+            "2": "product",
+            "3": "product",
+            "4": "product",
+            "5": "air",
+            "6": "air",
+            "7": "product"
+          },
+          "note": "the ALE material index is the card order, NOT part_id - 1; the volume-fraction column for ALE material k is column k"
+        },
+        "initial_detonation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "initial_detonation_time": 0.0,
+        "termination_time": 0.001,
+        "d3plot_interval": 1e-06,
+        "control_ale": {
+          "field_0": -1.0,
+          "field_1": 1.0,
+          "field_2": 1.0,
+          "field_3": -1.0,
+          "field_4": 0.0,
+          "field_5": 0.0,
+          "field_6": 0.0,
+          "field_7": 0.0
+        }
+      },
+      "d3plot_directory": "F:\\tnt\\tnt_files\\dp0\\SYS\\MECH",
+      "field_provenance": {
+        "t": "d3plot global timesteps, converted by the deck's time unit",
+        "x": "cell centroid radius; ALE mesh, computed once and state-independent",
+        "rho": "per-material ALE group mass / (alpha_m * cell_volume), using the d3plot per-material mass columns; pure-medium shell density is sum(m_m) / sum(alpha_m V). The mixture-density history column is retained in RawFrame.density but is not substituted for a material density",
+        "u": "node velocity averaged per cell, projected on the radial direction",
+        "P": "negative trace of the solid element stress (strengthless: sigma = -p I)",
+        "e": "RECONSTRUCTED, not an LS-DYNA output: this d3plot carries no solid-element internal energy, so e = (p - p_cold(V))/(omega rho_m) for products and e = p/((gamma-1) rho_m) for air, where rho_m is the per-material mass/(alpha V) density, inverted per CELL and then volume-weighted onto the shells. The inverse always exists; cells where it comes out non-positive are not in a valid state of that EOS (p below the JWL cold curve, i.e. the explosive has not released its chemical energy yet) and get no energy label"
+      },
+      "material_partition_source": {
+        "method": "ale_volume_fraction",
+        "producer": "cli.extract_profiles",
+        "producer_version": 1,
+        "fields": [
+          "tnt_volume_fraction"
+        ],
+        "input_identifier": "sha256:9e81913756de2b8f8778ad3f5ad5024b7ee8d7ab7b2997c2f7a01394480b104a",
+        "detail": {
+          "volume_fraction_columns": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7
+          ],
+          "pure_product_threshold": 0.95,
+          "pure_air_threshold": 0.05,
+          "mixed_band_excluded": true,
+          "symmetry_factor": 8.0
+        }
+      },
+      "material_partition_is_volume_fraction_based": true,
+      "profile_layout": {
+        "version": 1,
+        "layout": "frames_by_radius"
+      },
+      "units": {
+        "source": "mm_s_t",
+        "density_to_si": 999999999999.9999
+      },
+      "symmetry_factor": 8.0,
+      "pressure_kind": "absolute",
+      "pressure_source": "negative trace of the solid-element stress, p = -(sxx+syy+szz)/3; absolute (the undeformed ambient air reads 101320 Pa at t=0); no artificial-viscosity correction is claimed"
+    },
+    "unlabelled_no_state_points": 1288
+  },
+  "notes": [
+    "converted by cli.build_supervision; no optimizer or trainer was invoked",
+    "handoff cache_key=8257f2b650cd2b1b8c380661ae8b60cbcb79e566b7cf729e93dc4878692f09d3",
+    "density/velocity/pressure/specific_energy are copied from the extracted profile in SI; invalid points remain invalid and are never zero-filled",
+    "1288 labelled point(s) had no valid field at all and were demoted to unclassified; no value was invented or copied to either side"
+  ],
+  "output": "outputs\\supervision\\tnt_50mm_mass6.npz"
+}

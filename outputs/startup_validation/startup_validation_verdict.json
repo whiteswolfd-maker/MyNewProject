@@ -1,0 +1,17 @@
+{
+  "accepted": false,
+  "reasons": [
+    "grid_convergence.field_relative 8.357e-02 > 2.0e-02",
+    "timestep_sensitivity.field_relative 5.016e-02 > 2.0e-02",
+    "contact_consistency.pressure_relative 1.822e-01 > 1.0e-02"
+  ],
+  "thresholds": {
+    "grid_front_relative": 0.01,
+    "grid_field_relative": 0.02,
+    "timestep_front_relative": 0.01,
+    "timestep_field_relative": 0.02,
+    "contact_pressure_relative": 0.01,
+    "contact_velocity_relative": 0.01
+  },
+  "training_qualified": false
+}
