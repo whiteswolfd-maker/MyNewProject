@@ -222,6 +222,9 @@
 ## 7. 可运行的命令
 
 ```bash
+# 注意（2026-10-28）：以下 command 保留为历史记录。不要再读取或写入
+# F:/2/extracted_geom 作为数据源；实际源是 F:/tnt/...（50 mm）、
+# G:/500mmtnt/...（80/100 mm）和 D:/500mmtnt/...（500 mm）。
 # 重新提取（规则已冻结；--states 为早期/中期/末期的代表状态）
 PYTHONPATH=src python -m spherical_blast_pinn.cli.extract_profiles \
   --config configs/base.yaml --case tnt_50mm \
@@ -229,6 +232,11 @@ PYTHONPATH=src python -m spherical_blast_pinn.cli.extract_profiles \
   --d3plot-dir F:/tnt/tnt_files/dp0/SYS/MECH \
   --out F:/2/extracted_geom/50mm_full --charge-radius 0.05 --stride 10
 
+# 注意（2026-10-28）：下面这条 100 mm 命令使用的是错误的
+#   F:/2/decks/tnt_spherical_100mm.k + F:/2/runs/100mm_full，
+# 不是实际 100 mmtnt。该运行与对应 100 mm 提取已删除。
+# 实际原始数据：G:/500mmtnt/100mmtnt_files/dp0/SYS-3/MECH。
+# 重新提取前必须先校验该 deck 的单位与历史变量布局。
 PYTHONPATH=src python -m spherical_blast_pinn.cli.extract_profiles \
   --config configs/base.yaml --case tnt_100mm \
   --deck F:/2/decks/tnt_spherical_100mm.k \

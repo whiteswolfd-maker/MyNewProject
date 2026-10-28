@@ -415,8 +415,14 @@ T_origin = LT + R0 / D
 会被拒绝，不自动套用公式。原点未知的数据仍可加载/审查，但不能进入监督或
 同时间对比。合成样例必须标 `synthetic`，只用于接口验证。
 
-当前新版提取样例：`F:/2/extracted_geom/50mm_d`（6 状态）与
-`100mm_d`（3 状态），含逐字段有效性、独立前沿资格和位置不确定性。
+数据源一律用原始 d3plot：50 mm `F:/tnt/tnt_files/dp0/SYS/MECH`，
+80 mm `G:/500mmtnt/80mmtnt_files/dp0/SYS-3/MECH`，
+100 mm `G:/500mmtnt/100mmtnt_files/dp0/SYS-3/MECH`，
+500 mm `D:/500mmtnt/500mmtnt_files/dp0/SYS-3/MECH`。
+`F:/2/extracted_geom` 下的派生提取不再作为输入或提取输出。
+旧的 `100mm_d`/`100mm_mass3` 提取及其派生监督文件来自错误的
+`F:/2/runs/100mm_full`，已删除。按实际 100 mm deck 完成单位与历史变量布局
+校验并重新提取之前，没有可用的 100 mm 提取。
 `F:/2/extracted_vf/50mm` 及 GitHub 下的 80/100 mm 旧导出是 16 列 ALE 的同批
 结果，但没有逐字段有效性；`cli.build_supervision` 会明确拒绝，需要按当前
 提取器重提。500 mm 提取未进入训练/开发/选模。

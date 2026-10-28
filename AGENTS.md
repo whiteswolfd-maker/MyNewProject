@@ -115,8 +115,14 @@ Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现
   原点未知的数据可以加载审查，但监督/同时间对比被拒绝；**没有默认
   ``T_origin=0``**。当前已确认的 50/80/100/500 mm 中心起爆卡片用
   ``T_origin = LT + R0/D``，由 ``data/dyna_supervision.py`` 从提取元数据生成；
-  非零起爆点或缺参数不能套用。当前可用的新版提取是
-  ``F:/2/extracted_geom/50mm_d``（6 状态）、``100mm_d``（3 状态）；
+  非零起爆点或缺参数不能套用。数据源一律用原始 d3plot：
+  50 mm ``F:/tnt/tnt_files/dp0/SYS/MECH``，80 mm
+  ``G:/500mmtnt/80mmtnt_files/dp0/SYS-3/MECH``，100 mm
+  ``G:/500mmtnt/100mmtnt_files/dp0/SYS-3/MECH``，500 mm
+  ``D:/500mmtnt/500mmtnt_files/dp0/SYS-3/MECH``。不要再读取或写入
+  ``F:/2/extracted_geom`` 下的派生提取。旧的 ``100mm_d`` 来自错误的
+  ``F:/2/runs/100mm_full``，该运行与对应提取已删除；在按实际 100 mm deck 完成
+  单位/历史变量布局校验并重新提取之前，没有可用的 100 mm 提取。
   ``extracted_vf``/GitHub 旧导出缺逐字段有效性，转换会拒绝。
 * **检查点（v5）**：顶层 ``model`` + ``cases`` + ``training``。``model`` 只有
   一份共享参数、优化器与指纹；每个 case 绑定启动场身份、完整 scales、无量纲
