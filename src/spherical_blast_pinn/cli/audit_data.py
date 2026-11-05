@@ -9,16 +9,18 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Any, Sequence
 
 from ._common import (
+    SetupError,
     add_common_arguments,
     configure_stdout,
-    load_cases,
     load_config_from_args,
     write_json,
 )
+from ._extracted_audit import load_extracted_cases
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -30,7 +32,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_stdout()
     config = load_config_from_args(args)
 
-    cases = load_cases(config, split=args.split)
+    try:
+        cases = load_extracted_cases(config, split=args.split)
+    except SetupError as exc:
+        print(f"\n** {exc} **\n", file=sys.stderr)
+        return 6
     reports: list[dict[str, Any]] = []
     for case in cases:
         report = case.quality_report()
@@ -49,16 +55,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     (out_dir / "data_audit.md").write_text(text, encoding="utf-8")
     print(text)
     print(f"\nwritten: {out_dir / 'data_audit.json'}")
-    return 0 if all(r["n_frames_supervisable"] > 0 for r in reports) else 1
+    return 0 if all(r["n_frames_front_usable"] > 0 for r in reports) else 1
 
 
 def render(reports: Sequence[dict[str, Any]]) -> str:
     lines = [
-        "# 数据质量审查",
+        "# 数据质量审查（旧提取剖面）",
         "",
-        "本表由 `python -m spherical_blast_pinn.cli.audit_data` 生成。",
+        "本表由 `python -m spherical_blast_pinn.cli.audit_data` 生成，只审计"
+        "`raw_line.npz` 这类**已经提取**的剖面。它不是训练入口；训练使用"
+        "`startup.cases` 与 `SupervisionDataset`。",
         "",
-        "| 算例 | R_0 (m) | 帧数 | 可监督帧 | t_PINN 终止 (s) | 接触面有效率 | 主激波有效率 | 最薄空气层单元数 |",
+        "| 算例 | R_0 (m) | 帧数 | 前沿可用帧 | 最后可用 DYNA 时刻 (s) | 接触面有效率 | 主激波有效率 | 最薄空气层单元数 |",
         "|---|---|---|---|---|---|---|---|",
     ]
     for r in reports:
@@ -67,10 +75,10 @@ def render(reports: Sequence[dict[str, Any]]) -> str:
                 case_id=r["case_id"],
                 r0=r["charge_radius_m"],
                 n=r["n_frames"],
-                ok=r["n_frames_supervisable"],
+                ok=r["n_frames_front_usable"],
                 tmax=(
-                    f"{r['t_pinn_last_valid_s']:.4e}"
-                    if r.get("t_pinn_last_valid_s") is not None
+                    f"{r['t_dyna_last_front_usable_s']:.4e}"
+                    if r.get("t_dyna_last_front_usable_s") is not None
                     else "—"
                 ),
                 cv=r["contact_valid_fraction"],
@@ -90,8 +98,8 @@ def render(reports: Sequence[dict[str, Any]]) -> str:
         lines.append(f"- 材料分区来源：{r['material_masks_from']}")
         lines.append(f"- 识别参数：`{r['detector']}`")
         lines.append(
-            f"- 有效时间范围：物理 {r['t_phys_first_s']:.4e} – {r['t_phys_last_s']:.4e} s；"
-            f"启动时刻 {r['time_start_s']:.4e} s"
+            f"- 原始 DYNA 时间范围：{r['t_dyna_first_s']:.4e} – "
+            f"{r['t_dyna_last_s']:.4e} s；模型时间原点不在此表内"
         )
         lines.append("")
     return "\n".join(lines)

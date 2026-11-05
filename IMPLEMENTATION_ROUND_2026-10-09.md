@@ -3,6 +3,12 @@
 日期 2026-10-09。本轮把"能解决的"逐项做完，**没有**动研究性的那个阻塞。
 本机测试：`PYTHONPATH=src pytest -q` → **254 passed**（本轮开始时 186 passed）。
 
+> **2026-11-05 清理说明。** 本文件是历史记录，不是当前操作规范。
+> `configs/experiments/geom_smoke.yaml`、`data/contract.py` 与
+> `tests/test_data_contract_fields.py` 已删除；第 7 节里引用它们的命令和
+> 测试表不再可运行。当前训练入口只读 `startup.cases`，旧提取剖面审计需要
+> 自备含 `data.cases` 的配置。
+
 全文的结论按三档分开写，因为它们混在一起时最容易读成一句含糊的"差不多了"：
 
 * **已解决**：有代码、有回归测试、有在真实数据上跑出来的数；

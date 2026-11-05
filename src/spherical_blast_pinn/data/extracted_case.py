@@ -46,7 +46,6 @@ import numpy as np
 
 from ..physics import material as mat
 from ..physics.eos import jwl_pressure_numpy
-from ..physics.similitude import handover_time
 
 #: 逻辑字段 -> ``raw_line.npz`` 的键。
 DEFAULT_FIELD_MAP: dict[str, str] = {
@@ -189,41 +188,14 @@ class ExtractedCase:
     #: 同样是 ``None`` 表示未记录，而不是"都够格"。
     front_supervision_eligibility: dict[str, Any] | None = None
 
-    # -- 时间（方案 B）----------------------------------------------------
-    @property
-    def detonation_velocity(self) -> float:
-        """卡片上的爆速 ``D``，m/s，来自提取元数据。
-
-        **没有它就不能算时间原点。** 方案 B 的原点是 ``T_h = R_0/D + epsilon``，
-        缺少 ``D`` 时唯一"能用"的做法是退回只有 ``epsilon`` 的方案 A 时间轴——而两条
-        时间轴都只有秒的量纲，退回去不会报错，只会把整条轨迹平移一个 ``T_b``。
-        所以这里直接失败，而不是给一个默认值。
-        """
-        velocity = float(self.source.get("detonation_velocity_m_s") or 0.0)
-        if not (velocity > 0.0):
-            raise DataError(
-                f"{self.case_id}: the extraction metadata carries no usable detonation "
-                "velocity, so the scheme-B time origin T_h = R_0/D + epsilon cannot be "
-                "formed. A cache written before the scheme-B migration must be "
-                "re-extracted, not silently read with the scheme-A clock."
-            )
-        return velocity
-
-    @property
-    def pinn_times(self) -> np.ndarray:
-        """``tau = T - T_h``，``T_h = R_0/D + epsilon``。"""
-        return self.times - self.start_time
-
-    @property
-    def start_time(self) -> float:
-        """``T_h``，s：PINN 的启动时刻（方案 B）。"""
-        return handover_time(
-            self.charge_radius, detonation_velocity=self.detonation_velocity
-        )
-
-    def _after_start(self) -> np.ndarray:
-        """时间落在 PINN 启动时刻之后的帧。"""
-        return self.pinn_times >= 0.0
+    # -- 时间 ------------------------------------------------------------
+    #
+    # ``ExtractedCase`` keeps the **raw DYNA time axis** only.  The DYNA-to-model
+    # mapping ``T_origin = LT + R0/D`` and ``tau = T_DYNA - T_origin - epsilon``
+    # belongs to :mod:`spherical_blast_pinn.data.dyna_supervision`; it needs the
+    # handoff's ``epsilon`` and the deck metadata, neither of which this legacy
+    # container owns.  The old scheme-B origin ``T_h = R0/D + epsilon`` is not
+    # exposed here, so no audit report can silently present it as the model clock.
 
     # -- 位置不确定性（§11.2）--------------------------------------------
     @property
@@ -265,99 +237,21 @@ class ExtractedCase:
             )
         return gap
 
-    def supervisable_frames(self, *, minimum_air_cells: int = 1) -> np.ndarray:
-        """可以用于监督的帧：时间在启动之后、且**至少一个前沿**识别可靠。
+    def front_usable_frames(self, *, minimum_air_cells: int = 1) -> np.ndarray:
+        """Frames where at least one front is usable.
 
-        提示词 §11.1 要求两套前沿**独立**。这里以前写的是
-        ``contact_valid & shock_valid``：只要激波那一天没识别出来，整帧就从训练
-        窗口里消失——**接触面明明可靠，也被一起丢掉**，而且丢得完全无声（表现为
-        有效时间范围莫名其妙地短）。
-
-        现在改成"至少一侧可靠"。空气间隙要求只在**两侧都可用**时才施加：只有
-        单侧前沿时算不出间隙，用"算不出"去否决整帧就是拿缺失当不合格。
-
-        提示词要求**每个训练半径取自己的最后有效仿真帧作为终止时间**，不要求
-        三个半径的终止时间同比例缩放。这里给出的就是这个集合，终止时间由
-        :meth:`last_valid_pinn_time` 给出。
+        This is an **audit** selector on the raw DYNA time axis.  It deliberately
+        applies no model-clock filter: ``T_origin`` and ``epsilon`` belong to the
+        handoff and are enforced by
+        :class:`~spherical_blast_pinn.data.startup_supervision.SupervisionDataset`.
+        The air-gap requirement is applied only when both fronts exist; a missing
+        front is not treated as a failed gap.
         """
         front_ok = self.contact_valid | self.shock_valid
         gap_ok = (self._air_gap_cells() >= int(minimum_air_cells)) | ~(
             self.contact_valid & self.shock_valid
         )
-        return self._after_start() & front_ok & gap_ok
-
-    def contact_supervisable_frames(self) -> np.ndarray:
-        """接触面**单独**可监督的帧（§11.1）。不要求激波有效。"""
-        return self._after_start() & self.contact_valid
-
-    def shock_supervisable_frames(self, *, minimum_air_cells: int = 1) -> np.ndarray:
-        """激波**单独**可监督的帧（§11.1）。不要求接触面有效。"""
-        return self._after_start() & self.shock_valid
-
-    def air_supervisable_frames(self, *, minimum_air_cells: int = 1) -> np.ndarray:
-        """空气区（``Rc`` 与 ``Rs`` 之间）可监督的帧。
-
-        这一项**必须**两侧前沿都可靠——空气间隙是两套前沿共同定义的。它单独成
-        一个方法，而不是混进 :meth:`supervisable_frames` 去否决整帧。
-        """
-        return (
-            self._after_start()
-            & self.contact_valid
-            & self.shock_valid
-            & (self._air_gap_cells() >= int(minimum_air_cells))
-        )
-
-    def frame_split(
-        self,
-        *,
-        holdout_fraction: float = 0.1,
-        seed: int = 0,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """把可监督帧按**连续帧组**划分成 ``(train, development)``。
-
-        提示词 §11 要求"优先按完整时间段/帧组留出，而非将同一帧相邻网格点随机
-        拆分后宣称独立验证"。同一帧相邻网格点高度相关，随机拆分会让两个集合
-        互相看得见对方，于是开发集误差只是训练误差的一个更贵的写法。
-
-        这里按位置把可用帧切成 ``round(1/holdout_fraction)`` 个连续块，整块留一
-        块作开发检查；留哪一块由 ``seed`` 决定，因此同一份数据在同一个种子上
-        永远给出同一个划分（划分本身要可复现，才谈得上"在看最终结果之前固定"）。
-
-        返回值是**真实帧号**，不是位置——见 :meth:`ExtractedCase.sample_at`
-        的调用约定。
-        """
-        if not (0.0 < float(holdout_fraction) < 0.5):
-            raise DataError(
-                f"holdout_fraction must lie in (0, 0.5), got {holdout_fraction}"
-            )
-        usable = np.flatnonzero(self.supervisable_frames())
-        if usable.size < 2:
-            return usable, np.zeros(0, dtype=np.int64)
-
-        blocks = max(2, int(round(1.0 / float(holdout_fraction))))
-        blocks = min(blocks, usable.size)
-        edges = np.linspace(0, usable.size, blocks + 1).astype(int)
-        held = int(seed) % blocks
-        # 避开第一块：它承载启动时刻附近最陡的一段，也是 IC 之外唯一能看到早期
-        # 演化的监督；把它整个留出去会让开发集与训练集的时间分布差得太远。
-        if blocks > 1 and held == 0:
-            held = 1
-        positions = np.arange(usable.size)
-        development = usable[(positions >= edges[held]) & (positions < edges[held + 1])]
-        train = usable[(positions < edges[held]) | (positions >= edges[held + 1])]
-        return train, development
-
-    def last_valid_pinn_time(self) -> float:
-        usable = self.supervisable_frames()
-        if not np.any(usable):
-            raise DataError(
-                f"case {self.case_id!r} has no supervisable frame: the front detectors "
-                "never produced a reliable contact/shock pair after the start time"
-            )
-        return float(self.pinn_times[usable].max())
-
-    def last_valid_physical_time(self) -> float:
-        return self.last_valid_pinn_time() + self.start_time
+        return front_ok & gap_ok
 
     # -- 查询 -------------------------------------------------------------
     def frame_index(self, physical_time: float) -> int:
@@ -413,7 +307,10 @@ class ExtractedCase:
 
     # -- 质量报告 ---------------------------------------------------------
     def quality_report(self) -> dict[str, Any]:
-        usable = self.supervisable_frames()
+        usable = self.front_usable_frames()
+        volume_based = bool(
+            self.source.get("material_partition_is_volume_fraction_based")
+        )
         air_cells = np.zeros(self.times.size, dtype=np.int64)
         for index in range(self.times.size):
             if self.contact_valid[index] and self.shock_valid[index]:
@@ -432,13 +329,17 @@ class ExtractedCase:
             "case_id": self.case_id,
             "charge_radius_m": self.charge_radius,
             "n_frames": int(self.times.size),
-            "n_frames_supervisable": int(np.count_nonzero(usable)),
-            "time_start_s": self.start_time,
-            "t_phys_first_s": float(self.times[0]),
-            "t_phys_last_s": float(self.times[-1]),
-            "t_pinn_last_valid_s": (
-                float(self.pinn_times[usable].max()) if np.any(usable) else None
+            # Frames with at least one usable front, on the **raw DYNA axis**.
+            # This is not a supervision verdict: the startup handoff adds
+            # ``T_origin = LT + R0/D`` and ``epsilon`` before frames can enter
+            # training.
+            "n_frames_front_usable": int(np.count_nonzero(usable)),
+            "t_dyna_first_s": float(self.times[0]),
+            "t_dyna_last_s": float(self.times[-1]),
+            "t_dyna_last_front_usable_s": (
+                float(self.times[usable].max()) if np.any(usable) else None
             ),
+            "time_axis": "raw DYNA time; model time is applied by dyna_supervision",
             "contact_valid_fraction": float(np.mean(self.contact_valid)),
             "shock_valid_fraction": float(np.mean(self.shock_valid)),
             "min_air_cells": int(air_cells[usable].min()) if np.any(usable) else 0,
@@ -455,10 +356,15 @@ class ExtractedCase:
                 self.source.get("frames_rejected_contact_below_charge_radius", 0)
             ),
             "detector_reliability": (
-                "该判据是启发式的，不是从材料体积分数读出来的。本数据集上它给出的"
-                "接触面位置存在量化跳变，且大量帧落在装药半径以内（物理上不可能）；"
-                "这些帧已按物理约束剔除，但**探测器本身仍不可靠**——用它做的前沿监督"
-                "只能作为弱标签，权威的材料分区需要从 d3plot 的材料体积分数重新提取。"
+                "材料分区来自 d3plot 的 ALE 材料体积分数；这里的 DetectorSettings "
+                "只用于旧剖面的回退读取，不参与本次分区。"
+                if volume_based
+                else (
+                    "该判据是启发式的，不是从材料体积分数读出来的。本数据集上它给出的"
+                    "接触面位置存在量化跳变，且大量帧落在装药半径以内（物理上不可能）；"
+                    "这些帧已按物理约束剔除，但**探测器本身仍不可靠**——用它做的前沿监督"
+                    "只能作为弱标签，权威的材料分区需要从 d3plot 的材料体积分数重新提取。"
+                )
             ),
             **{k: v for k, v in self.source.items() if k != "raw"},
         }
@@ -1631,7 +1537,8 @@ def _load_with_volume_fraction_partition(
             "energy_source": energy_source,
             "front_resolution": front_resolution,
             "front_eligibility_source": front_eligibility,
-            # 方案 B 的时间原点 T_h = R_0/D + epsilon 需要卡片爆速。
+            # The new supervision mapping uses this to form
+            # T_origin = LT + R0/D; the legacy container keeps it as metadata.
             "detonation_velocity_m_s": metadata.get("detonation_velocity_m_s"),
             "frames_rejected_contact_below_charge_radius": int(
                 np.count_nonzero(np.isfinite(contact_radius) & (contact_radius < charge_radius))
@@ -1715,20 +1622,6 @@ def _field_validity_from_companion(
     return out
 
 
-def load_cases(specifications: Sequence[Mapping[str, Any]], **kwargs) -> list[ExtractedCase]:
-    """按 ``[{case_id, directory, split}, ...]`` 批量读取。"""
-    cases: list[ExtractedCase] = []
-    for specification in specifications:
-        case = load_extracted_case(
-            specification["directory"],
-            case_id=specification.get("case_id"),
-            **kwargs,
-        )
-        case.source["split"] = specification.get("split")
-        cases.append(case)
-    return cases
-
-
 __all__ = [
     "DEFAULT_FIELD_MAP",
     "DataError",
@@ -1738,7 +1631,6 @@ __all__ = [
     "REQUIRED_FIELDS",
     "detect_contact_radius",
     "detect_shock_radius",
-    "load_cases",
     "load_extracted_case",
     "partition_materials",
     "specific_energy_from_pressure",

@@ -6,8 +6,9 @@
 inherits: ../base.yaml
 
 data:
-  # 新监督链没有实现按连续帧组划开发集；显式写 0，不让旧配置的 0.1 被静默
-  # 继承成"看起来做了开发集划分"。
+  # 本配置不挂监督数据；显式写 0，不让一个为数据准备的默认值看起来像
+  # "已经做了开发集划分"。（挂接数据后由 `SupervisionDataset.assign_frame_split`
+  # 按连续帧组划分。）
   development_holdout_fraction: 0.0
 
 training:

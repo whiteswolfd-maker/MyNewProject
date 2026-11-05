@@ -164,6 +164,17 @@ L   = (L_50 + L_80 + L_100) / 3
 每次 Adam 更新，三个半径都参与并等权：一次采样、一个联合损失、一次优化器
 更新。
 
+> **2026-11-05 未解决的方案冲突（未擅自改写）。** 本轮清理提示词要求
+> “两个网络分别保留最终确定的训练目标和更新流程”，并明确不要把训练改成
+> “单一总损失、一次反向传播”。当前仓库的实现仍是后者：
+> `training/trainer.py:355-415` 对 `total_loss_for_cases` 做一次
+> `backward()`、一次 `Adam.step()`；`losses/objective.py` 没有按
+> ProductNet/AirNet 拆分目标。仓库内没有给出每个网络各自应承担哪些损失项、
+> 如何交替/冻结的完整定义，所以这里只记录冲突，没有自行发明第三套训练方案。
+> 在同一处还有两项未落地：`AirNet` 输出 `rho/u/e`（压力由 EOS 得出，不是直接
+> 输出 `p`）；模型只有 `R_c`/`R_s`，没有环境侧右边界 `R_b`（`evaluation/checks.py`
+> 里的 `R_box` 只是诊断控制体）。这三项需要在拿到明确最终方案后单独实现。
+
 **独立检查与选模型。** 每 500 步（`training.check_every`）在一套**固定**的检查
 点上跑一次完整物理验收：一次采样、全程复用、独立的随机种子、取**开发帧**、
 不进梯度。报告逐半径、逐介质、逐方程给出归一化残差的 RMS / P95 / 最大值与位置，
@@ -283,17 +294,17 @@ python -m venv .venv
 ```bash
 python -m spherical_blast_pinn.cli.extract_profiles --config configs/base.yaml \
   --case tnt_50mm --deck F:/tnt/tnt_files/dp0/SYS/MECH/input.k \
-  --d3plot-dir F:/tnt/tnt_files/dp0/SYS/MECH --out F:/2/extracted_vf/50mm \
+  --d3plot-dir F:/tnt/tnt_files/dp0/SYS/MECH \
+  --out F:/2/extracted_all_20261028/50mm \
   --charge-radius 0.05 --shells 2500 --stride 1 --outer-radius-factor 40
 ```
 
 启动链路与数据审查：
 
 ```bash
-# 1. DYNA 真实物理初始化审查（必须先做）
+# 1. DYNA 真实物理初始化审查（必须显式给出 deck；--data 只用于旧提取剖面审计）
 python -m spherical_blast_pinn.cli.audit_dyna --config configs/base.yaml \
-  --deck tnt_50mm=F:/tnt/tnt_files/dp0/SYS/MECH/input.k \
-  --data tnt_50mm=F:/2/extracted
+  --deck tnt_50mm=F:/tnt/tnt_files/dp0/SYS/MECH/input.k
 
 # 2. 启动场：均匀产物球 + 局部平面黎曼，写出 handoff.npz/json
 python -m spherical_blast_pinn.cli.startup --charge-radius 0.05 --delta 0.005
@@ -305,8 +316,8 @@ python -m spherical_blast_pinn.cli.validate_startup_planar \
 # 3a. 把当前提取器写出的 DYNA 剖面转成 SupervisionDataset
 #     T_origin = LT + R0/D 从提取元数据读取并记录
 python -m spherical_blast_pinn.cli.build_supervision \
-  --profile-dir F:/2/extracted_geom/50mm_d \
-  --handoff-json outputs/planar_startup_diagnostic/<...>/handoff.json \
+  --profile-dir F:/2/extracted_all_20261028/50mm \
+  --handoff-json outputs/planar_startup/<model>/<key>/handoff.json \
   --output outputs/supervision/tnt_50mm.npz \
   --gauge-radius-m 0.88
 
@@ -315,9 +326,11 @@ python -m spherical_blast_pinn.cli.check_startup_chain \
   --handoff-json outputs/planar_startup/<model>/<key>/handoff.json \
   --tau-end 1e-6 --output-json outputs/startup_chain_check.json
 
-# 4. 数据质量审查 / 状态方程一致性
-python -m spherical_blast_pinn.cli.audit_data --config configs/experiments/full.yaml
-python -m spherical_blast_pinn.cli.validate_eos --config configs/experiments/full.yaml
+# 4. 状态方程一致性（数据闭合可选）
+python -m spherical_blast_pinn.cli.validate_eos --config configs/base.yaml
+
+# 4a. 旧提取剖面审计（必须自备含 data.cases 的审计配置；训练不读 data.cases）
+python -m spherical_blast_pinn.cli.audit_data --config <legacy-audit-config.yaml>
 ```
 
 新链路训练 / 恢复 / 预测 / 对照：
@@ -361,30 +374,27 @@ python -m pytest -q
 新链路的数据监督走 `data/startup_supervision.py` 的显式契约；下面这些旧提取
 结论仍然适用于旧 `ExtractedCase` 与 `audit_*` 命令。
 
-### 8.0 这些结论现在是训练入口的一道闸门，不是一段说明
+### 8.0 旧 `data_compatibility.json` 是审计记录，不是新训练入口的闸门
 
-`audit_dyna` 除了写人读的审查表，还写一份机器可读的
-`data_compatibility.json`。训练入口（接线后）读它，并对每个训练算例要求
-状态为 `compatible`：
+`audit_dyna` 仍会写一份机器可读的 `data_compatibility.json`，用于审计**旧
+`ExtractedCase` 提取剖面**。新训练入口**不读**这份文件：它只从
+`startup.cases` 装配启动场，并要求每个手工挂接的 `SupervisionDataset` 通过
+`require_supervision_ready()`（显式 `T_origin`、逐字段有效性、前沿资格）。把旧
+报告的 `compatible` 当成新链路的放行条件，或者反过来把 `incompatible` 当成新
+链路的拒绝条件，都会把两套不同的数据路径混在一起。
 
-| 状态 | 含义 | 训练是否放行 |
-|---|---|---|
-| `compatible` | 初始化、单位、EOS、时间定义、材料分区都审过且一致 | 放行 |
-| `incompatible` | 审过，**发现**与项目当前约定冲突 | **拒绝** |
-| `unknown` | 没有审查证据，或审查里是"缺证据" | **拒绝** |
-| `synthetic` | 明确标注的合成样例 | 只在合成路径放行 |
+旧审计状态的含义仍然保留：
 
-本机三份数据实测的状态（`outputs/dyna_audit/data_compatibility.json`）：
+| 状态 | 含义 |
+|---|---|
+| `compatible` | 旧提取剖面的初始化、单位、EOS、时间定义、材料分区审过且一致 |
+| `incompatible` | 审过，**发现**与旧审计约定冲突 |
+| `unknown` | 没有审查证据，或审查里是"缺证据" |
+| `synthetic` | 明确标注的合成样例 |
 
-```
-tnt_50mm : incompatible（detonation_model 不一致；time_origin 不一致；material_partition 不可靠）
-tnt_80mm : incompatible（detonation_model 不一致；time_origin 缺证据；material_partition 不可靠）
-tnt_100mm: 报告里没有它的条目 —— unknown
-```
-
-要越过闸门必须显式写 `data.allow_unverified_cases: true`，并且运行清单与检查点
-会被打上 `data_compatibility: unverified`。冒烟配置就是这么做的，因为它的用途是
-验证链路能跑通，不是物理训练。
+本机历史报告（`outputs/dyna_audit/data_compatibility.json`）中的 50/80/100 mm
+条目是旧审计结果，**不再控制训练**。`data.allow_unverified_cases` 已从配置中
+移除；它曾经只是一个设置项，代码从未把它接到新链路上。
 
 ### 8.1 时间零点：数据是有限速度爆轰；旧方案 B 已退出
 
@@ -426,6 +436,19 @@ T_origin = LT + R0 / D
 `F:/2/extracted_vf/50mm` 及 GitHub 下的 80/100 mm 旧导出是 16 列 ALE 的同批
 结果，但没有逐字段有效性；`cli.build_supervision` 会明确拒绝，需要按当前
 提取器重提。500 mm 提取未进入训练/开发/选模。
+
+**当前全量提取没有完成。** 四套算例的原始 d3plot 只完成了来源、状态数、材料
+映射、history 布局与少量代表状态的核对；`F:/2/extracted_all_20261028` 下没有
+可用的 `raw_line.npz`/`metadata.json`。因此 `configs/base.yaml` 不写
+`data.cases`，`startup.cases` 也没有 `data:` 条目；训练入口当前跑的是纯物理
+损失链路，不包含数据监督。挂接数据前不能把 `full.yaml` 的结果当作完整训练。
+
+100 mm 原始数据还有一个**未定论**的字段现象：同一元素在状态 0 与 78 之间，
+`alpha_product=1`、单元体积不变，但原始 history 的 mixture density 与
+per-material mass 同时下降约 1000 倍（1630 → 1.63 kg/m³）。该下降已经在原始
+history 里，不是 `rho_m = m/(alpha V)` 或 SI 换算引入的。没有乘 1000 修补；
+80/100/500 mm 的晚期产物密度/质量因此只能保留原始剖面，不能当作已验证的正式
+监督数据。
 
 ### 8.2 材料分区：旧的启发式判据已废弃，改用体积分数
 
@@ -608,15 +631,20 @@ src/spherical_blast_pinn/
     schedule.py       §13 的三阶段日程
     trainer.py        训练循环与检查点
   data/
-    extracted_case.py 时空剖面读取、材料分区、质量报告、训练/开发帧划分
-    compatibility.py  数据与项目约定的兼容性状态，以及训练入口的闸门
+    extracted_case.py 旧提取剖面读取、材料分区、原始 DYNA 时间轴与质量报告
+    dyna_supervision.py  旧提取剖面 + 显式 T_origin -> SupervisionDataset
+    startup_supervision.py  新监督契约（SI、逐字段有效性、前沿资格、帧组划分）
+    compatibility.py  旧提取剖面的兼容性审计状态（不是训练闸门）
     raw_reader.py     直接读 d3plot
     shell_average.py  按材料体积分数做球壳平均
     kfile_parser.py   .k 卡片解析（含 10 字符定宽格式）
   evaluation/
     waveform.py       超压、到达时间、正压时长、正相冲量
     checks.py         固定独立检查集、逐方程指标、守恒诊断、选模型偏序
-  cli/                startup/train/predict/compare 与数据审查命令
+  cli/
+    train/predict/compare/startup/check_startup_chain  新链路入口
+    extract_profiles/build_supervision                数据链路
+    audit_data/validate_eos                          旧提取剖面审计（需显式 data.cases）
 tests/                §15 要求的测试 + 审查清单的逐项回归
 _legacy_v1_backup/    第一版实现，仅供追溯
 ```

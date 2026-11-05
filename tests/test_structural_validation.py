@@ -205,30 +205,6 @@ def test_both_reading_paths_apply_the_same_rule(tmp_path):
             load_extracted_case(directory, case_id=directory.name)
 
 
-def test_a_legacy_three_state_export_is_diagnosable_but_not_ready(tmp_path):
-    """只有旧三态码、没有资格数组的导出：**可以读来诊断，不能判就绪**。
-
-    三态码是真证据，但它不是当前契约要求的那一档。把这一档判成 ready，等于把
-    "数据还没迁移"读成"数据已经就绪"。
-    """
-    from spherical_blast_pinn.data.contract import evaluate_case_contract
-
-    directory = _export(tmp_path / "legacy", times=[1.0e-5, 2.0e-5], rho=np.ones((2, 3)))
-    payload = dict(np.load(directory / "material.npz", allow_pickle=True))
-    payload.pop("contact_has_supervision")
-    payload.pop("shock_has_supervision")
-    np.savez(directory / "material.npz", **payload)
-
-    case = load_extracted_case(directory, case_id="legacy")
-    # 读得出来，而且确实用了三态码这一档
-    assert case.contact_valid.any()
-    assert case.front_supervision_eligibility["level"] == "legacy_state_code"
-
-    verdict = evaluate_case_contract(case)
-    assert not verdict.ready
-    assert any("三态码" in reason for reason in verdict.reasons), verdict.reasons
-
-
 # --------------------------------------------------------------------------
 # §4 原始结构必须在任何规范化之前检查
 # --------------------------------------------------------------------------
@@ -278,29 +254,67 @@ def test_an_all_nan_joint_valid_mask_is_refused(tmp_path):
         load_extracted_case(directory, case_id="nanvalid")
 
 
-def test_the_contract_does_not_trust_that_the_case_was_read(tmp_path):
-    """契约对**已经构造好的对象**执行同一套结构检查。
+def test_legacy_front_state_codes_are_not_supervision_eligibility(tmp_path):
+    """只有三态码、没有资格数组的旧导出不能进入新监督链。
 
-    读取时的校验只保护"从文件读进来的那一份"。复核做的就是：读完之后把 velocity
-    改成错误形状，再直接调契约——仍然 ``ready=True``。
+    三态码说明"定位器找到了一个位置"，不说明"这个位置够格当标签"。新提取器
+    显式写 ``contact_has_supervision`` / ``shock_has_supervision``；旧导出必须
+    重提，不能在转换时把三态码直接升级成资格。
     """
-    from spherical_blast_pinn.data.contract import evaluate_case_contract
+    from spherical_blast_pinn.data.dyna_supervision import (
+        DynaSupervisionError,
+        supervision_from_extracted_case,
+    )
+    from spherical_blast_pinn.data.startup_supervision import TimeOrigin
+
+    directory = _export(
+        tmp_path / "legacy", times=[1.0e-5, 2.0e-5], rho=np.ones((2, 3))
+    )
+    payload = dict(np.load(directory / "material.npz", allow_pickle=True))
+    payload.pop("contact_has_supervision")
+    payload.pop("shock_has_supervision")
+    np.savez(directory / "material.npz", **payload)
+
+    case = load_extracted_case(directory, case_id="legacy")
+    assert case.front_supervision_eligibility["level"] == "legacy_state_code"
+    origin = TimeOrigin(
+        status="confirmed", origin_time_s=0.0,
+        method="test", evidence="legacy eligibility check",
+    )
+    with pytest.raises(DynaSupervisionError, match="legacy front state codes"):
+        supervision_from_extracted_case(
+            case, time_origin=origin, epsilon_s=1.0e-7, synthetic=False
+        )
+
+
+def test_the_supervision_conversion_does_not_trust_that_the_case_was_read(tmp_path):
+    """监督转换对**已经构造好的对象**重新核形状，不信任"据说读取过"。
+
+    读取时的校验只保护"从文件读进来的那一份"；把 velocity 改成错误形状后再转换，
+    必须失败，而不是产出一个按帧号错位的 ``SupervisionDataset``。
+    """
+    from spherical_blast_pinn.data.dyna_supervision import (
+        DynaSupervisionError,
+        supervision_from_extracted_case,
+    )
+    from spherical_blast_pinn.data.startup_supervision import TimeOrigin
 
     directory = _export(tmp_path / "mutated", times=[1.0e-5, 2.0e-5], rho=np.ones((2, 3)))
     case = load_extracted_case(directory, case_id="mutated")
-    # **基线必须在结构上是干净的。** 不能用 ``assert ... or True`` 那种永真断言：
-    # 它在基线本来就坏着的时候也通过，下面的结论就没有意义。这里断言的是
-    # **结构检查**这一项——算例可能因为别的理由不就绪（例如这份三格网格上
-    # 前沿检测没产生可靠帧），那与本条要测的事情无关。
-    baseline = evaluate_case_contract(case)
-    assert baseline.detail["structural_problems"] == [], baseline.detail["structural_problems"]
+    origin = TimeOrigin(
+        status="confirmed", origin_time_s=0.0,
+        method="test", evidence="synthetic structural check",
+    )
+    baseline = supervision_from_extracted_case(
+        case, time_origin=origin, epsilon_s=1.0e-7, synthetic=True
+    )
+    assert baseline.n_frames == 2
 
     case.velocity = np.ones((1, 3))          # 帧数与时间轴对不上
-    verdict = evaluate_case_contract(case)
-    assert not verdict.ready
-    assert verdict.detail["structural_problems"], (
-        "契约信任了『据说读取过』；变过形状的对象没有被重新检查"
-    )
+    with pytest.raises(DynaSupervisionError, match="velocity has shape"):
+        supervision_from_extracted_case(
+            case, time_origin=origin, epsilon_s=1.0e-7, synthetic=True
+        )
 
 
 def test_a_two_dimensional_state_code_is_refused_end_to_end(tmp_path):

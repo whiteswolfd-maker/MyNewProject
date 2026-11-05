@@ -69,6 +69,16 @@ def final_validation_radii_m(config) -> tuple[float, ...]:
 
 
 def _case_specs(config) -> list[Mapping[str, Any]]:
+    """Case inventory used only for the blind-counterpart checks.
+
+    The canonical list is ``splits.final_validation_cases``: training cases live
+    in ``startup.cases``, and a final-validation case must not be one of them.
+    ``data.cases`` is kept as a fallback for old audit configurations that still
+    carry a mixed extracted-profile inventory.
+    """
+    declared = config.get("splits.final_validation_cases", None)
+    if declared:
+        return list(declared)
     return list(config.get("data.cases", []) or [])
 
 

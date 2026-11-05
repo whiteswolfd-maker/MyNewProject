@@ -1,24 +1,19 @@
-"""数据与**方案 B** 的兼容性状态，以及训练入口的强制检查（提示词 §3、§11）。
+"""旧提取剖面的兼容性审计状态（提示词 §3、§11）。
 
-为什么需要这个模块
-------------------
+**这不是新训练入口的闸门。** 新链路只接受启动场 handoff 与显式的
+:class:`~spherical_blast_pinn.data.startup_supervision.SupervisionDataset`；
+``audit_dyna`` 写出的 ``data_compatibility.json`` 只描述旧 ``ExtractedCase``
+剖面，训练入口不读它，也不读 ``data.cases``。
 
-审查报告里写着"这份数据与方案 B 不一致"，而训练入口只看
-"文件存在、半径对得上、有可监督帧"。于是"审查发现不兼容"与"训练照常开始"
-可以同时成立——审查报告变成了一个漂亮的附件，而不是一道闸门。
+这里把旧审计结论写成机器可读的**状态**：
 
-这里把审查结论写成机器可读的**状态**，并让训练入口对状态负责：
-
-* ``compatible`` —— 初始化、单位、EOS、时间定义、材料分区都审过，与方案 B 一致；
-* ``incompatible`` —— 审过，并且**发现**与方案 B 冲突；
+* ``compatible`` —— 初始化、单位、EOS、时间定义、材料分区都审过，与旧审计约定一致；
+* ``incompatible`` —— 审过，并且**发现**冲突；
 * ``unknown`` —— 没有审查证据，或者审查报告里该项是"缺证据"；
 * ``synthetic`` —— 明确标注的合成数据，只能用于接口与数学关系检查。
 
-正式训练只接受 ``compatible``。``unknown`` 与 ``incompatible`` 都会让运行停下
-来；要越过它，必须在配置里显式写 ``data.allow_unverified_cases: true``，并且
-结果与检查点会被打上 ``data_compatibility: unverified`` 的标记。
-
-这不比"训练入口只看文件存不存在"更严格——它只是让审查结论能被代码读到。
+保留这个模块是为了让 ``audit_dyna`` 的报告可机读、可追溯；不要让任何新入口
+把它当成训练放行条件。
 """
 
 from __future__ import annotations
@@ -501,105 +496,11 @@ def synthetic_case(case_id: str, *, source: str, reason: str = "") -> CaseCompat
     )
 
 
-# --------------------------------------------------------------------------
-# 训练入口的闸门
-# --------------------------------------------------------------------------
-
-
-@dataclass
-class GateDecision:
-    """闸门的结论。``allowed`` 为假时 ``message`` 说明为什么。"""
-
-    allowed: bool
-    mode: str
-    unverified: bool
-    statuses: dict[str, str]
-    message: str = ""
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "allowed": self.allowed,
-            "mode": self.mode,
-            "data_compatibility": "unverified" if self.unverified else "verified",
-            "statuses": self.statuses,
-            "message": self.message,
-        }
-
-
-def enforce_training_gate(
-    case_ids: Sequence[str],
-    statuses: Mapping[str, CaseCompatibility],
-    *,
-    allow_unverified: bool = False,
-    require_compatible: bool = True,
-) -> GateDecision:
-    """训练入口的强制检查。
-
-    ``require_compatible=False`` 只用于明确标注的合成冒烟路径：那时数据本来就
-    不是 DYNA 参考解，要求它"与方案 B 一致"没有意义，但**必须**标注成合成。
-
-    返回 :class:`GateDecision`；不通过时抛 :class:`CompatibilityError`。返回一个
-    对象而不是只抛异常，是为了让调用方能把 ``data_compatibility`` 写进检查点与
-    运行清单——一次在未核实数据上跑出来的结果，必须在它自己的元数据里说得清楚。
-    """
-    resolved = {
-        case_id: statuses.get(case_id, CaseCompatibility(case_id=case_id)) for case_id in case_ids
-    }
-    status_map = {case_id: entry.status for case_id, entry in resolved.items()}
-
-    if not require_compatible:
-        offenders = [entry for entry in resolved.values() if entry.status != SYNTHETIC]
-        if offenders:
-            raise CompatibilityError(
-                "this run is configured as a synthetic smoke check, but these cases are "
-                "not flagged synthetic: "
-                + "; ".join(entry.summary_line() for entry in offenders)
-                + ". Synthetic runs must use explicitly synthetic data; they may not "
-                "quietly consume real cases."
-            )
-        return GateDecision(
-            allowed=True,
-            mode="synthetic_smoke",
-            unverified=True,
-            statuses=status_map,
-            message="synthetic smoke check: results carry no physical claim",
-        )
-
-    blocking = [entry for entry in resolved.values() if entry.status != COMPATIBLE]
-    if not blocking:
-        return GateDecision(allowed=True, mode="production", unverified=False, statuses=status_map)
-
-    detail = "\n  ".join(entry.summary_line() for entry in blocking)
-    if allow_unverified:
-        return GateDecision(
-            allowed=True,
-            mode="production_unverified",
-            unverified=True,
-            statuses=status_map,
-            message=(
-                "data compatibility is NOT verified for:\n  "
-                + detail
-                + "\nRunning anyway because data.allow_unverified_cases = true. The "
-                "checkpoint and run manifest are stamped data_compatibility = unverified, "
-                "and no result from this run may be reported as a physical validation."
-            ),
-        )
-    raise CompatibilityError(
-        "training refused: these cases are not cleared for scheme A supervision:\n  "
-        + detail
-        + "\nRun `python -m spherical_blast_pinn.cli.audit_dyna` to produce a "
-        "compatibility report, then set data.compatibility_report to it. To train "
-        "anyway on unaudited data, set data.allow_unverified_cases: true explicitly — "
-        "the result will be stamped unverified."
-    )
-
-
 __all__ = [
     "ALL_STATUSES",
     "COMPATIBLE",
     "CompatibilityError",
     "CaseCompatibility",
-    "GateDecision",
     "INCOMPATIBLE",
     "REPORT_FILENAME",
     "REPORT_FORMAT",
@@ -610,7 +511,6 @@ __all__ = [
     "VERDICT_TO_STATUS",
     "build_report",
     "compatibility_from_findings",
-    "enforce_training_gate",
     "load_report",
     "material_partition_verdict",
     "synthetic_case",

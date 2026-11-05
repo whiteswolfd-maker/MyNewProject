@@ -133,12 +133,6 @@ def _run(argv: Sequence[str] | None = None) -> int:
         device=config.get("training.device", "cpu"),
     )
 
-    if context.data_contract is not None and not context.data_contract.ready:
-        print("\n** 训练未开始：数据契约没有放行 **\n", file=sys.stderr)
-        for reason in context.data_contract.reasons:
-            print(f"  - {reason}", file=sys.stderr)
-        return 4
-
     isolation = getattr(context, "validation_isolation", None)
     if isolation is not None and not isolation.ok:
         print("\n** 训练未开始：验证隔离被破坏 **\n", file=sys.stderr)

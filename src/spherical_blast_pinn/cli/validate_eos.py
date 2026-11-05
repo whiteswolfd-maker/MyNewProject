@@ -28,12 +28,13 @@ from ..physics.eos import (
     jwl_pressure_numpy,
 )
 from ._common import (
+    SetupError,
     add_common_arguments,
     configure_stdout,
-    load_cases,
     load_config_from_args,
     write_json,
 )
+from ._extracted_audit import load_extracted_cases
 
 
 def material_table(config) -> dict[str, Any]:
@@ -95,6 +96,8 @@ def closure_check(cases, *, tolerance: float) -> dict[str, Any]:
         "tolerance": float(tolerance),
         "max_relative_closure_error": worst,
         "passed": bool(worst <= tolerance),
+        "performed": bool(detail),
+        "n_cases": len(detail),
         "cases": detail,
     }
 
@@ -113,8 +116,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     table = material_table(config)
 
     # 1) 参考状态 (rho_ref, e_*) 处的 EOS 压力。
-    #    **方案 B 里这不是初值压力**：初值场非均匀，压力逐点不同。这里比的是
-    #    JWL 实现本身没有漂移，所以用固定的参考状态，而不是"整球初压"。
+    #    这里比的是 JWL 实现本身没有漂移，所以用固定的参考状态；它不是
+    #    "均匀产物球初压"的断言（初压由 E0/rho_ref 与 JWL 在当前实现中给出）。
     expected = 8.220261897e9
     p_reference = table["p_reference_state_pa"]
     p_init_ok = abs(p_reference - expected) / expected < 1.0e-8
@@ -132,16 +135,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         air_card_ok = False
         air_card_note = str(exc)
 
-    # 3) 数据闭合
-    cases = load_cases(config, split=args.split)
-    closure = closure_check(cases, tolerance=args.tolerance)
+    # 3) 数据闭合（可选：只有显式配置 data.cases 时才执行）
+    try:
+        cases = load_extracted_cases(config, split=args.split)
+    except SetupError as exc:
+        cases = []
+        closure = closure_check(cases, tolerance=args.tolerance)
+        closure["note"] = (
+            "no legacy extracted-profile data.cases block was configured; the "
+            "data-closure check was not performed.  This command audits legacy "
+            f"extracted profiles only.  ({exc})"
+        )
+    else:
+        closure = closure_check(cases, tolerance=args.tolerance)
 
     report = {
         "material_table": table,
-        "initial_pressure": {
+        "reference_pressure": {
             "expected_pa": expected,
-            "computed_pa": p_init,
-            "relative_deviation": abs(p_init - expected) / expected,
+            "computed_pa": p_reference,
+            "relative_deviation": abs(p_reference - expected) / expected,
             "passed": p_init_ok,
         },
         "air_card": {
@@ -162,14 +175,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     write_json(out_dir / "eos_validation.json", report)
 
     lines = ["# 状态方程一致性检查", ""]
-    lines.append(f"- p_init = {p_init:.6e} Pa（规范 {expected:.6e}）："
+    lines.append(f"- p_ref = {p_reference:.6e} Pa（规范 {expected:.6e}）："
                  f"{'通过' if p_init_ok else '**未通过**'}")
     lines.append(f"- e_* = {table['e_star_j_kg']:.6e} J/kg，U_* = {table['u_star_m_s']:.4f} m/s")
     lines.append(f"- 空气卡等价于理想气体：{'通过' if air_card_ok else '**未通过**'}"
                  + (f"（{air_card_note}）" if air_card_note else ""))
-    lines.append(f"- 数据闭合最大相对误差：{closure['max_relative_closure_error']:.3e}"
-                 f"（容差 {closure['tolerance']:.1e}）："
-                 f"{'通过' if closure['passed'] else '**未通过**'}")
+    if closure.get("performed"):
+        lines.append(
+            f"- 数据闭合最大相对误差：{closure['max_relative_closure_error']:.3e}"
+            f"（容差 {closure['tolerance']:.1e}）："
+            f"{'通过' if closure['passed'] else '**未通过**'}"
+        )
+    else:
+        lines.append("- 数据闭合：未执行（没有配置旧提取剖面的 data.cases）")
     lines.append("")
     lines.append("| 算例 | 产物点 | 空气点 | 最大闭合相对误差 |")
     lines.append("|---|---|---|---|")
@@ -183,7 +201,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     (out_dir / "eos_validation.md").write_text(text, encoding="utf-8")
     print(text)
     print(f"\nwritten: {out_dir / 'eos_validation.json'}")
-    return 0 if (p_init_ok and air_card_ok and closure["passed"]) else 1
+    closure_ok = (not closure.get("performed")) or closure["passed"]
+    return 0 if (p_init_ok and air_card_ok and closure_ok) else 1
 
 
 if __name__ == "__main__":  # pragma: no cover

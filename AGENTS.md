@@ -93,7 +93,10 @@ Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现
 * 可运行：``startup``（写 handoff）、``validate_startup_planar``、
   ``check_startup_chain``（装配 + 一次反向）、``train``（单/多半径，Adam +
   可选 L-BFGS）、``predict``、``compare``，以及数据侧
-  ``audit_dyna`` / ``audit_data`` / ``extract_profiles`` / ``validate_eos``。
+  ``audit_dyna`` / ``extract_profiles`` / ``validate_eos``。
+  ``audit_data`` 与 ``validate_eos`` 的**数据闭合**部分只审计旧
+  ``ExtractedCase`` 剖面，需要配置里显式写 ``data.cases``；训练入口不读
+  ``data.cases``，只读 ``startup.cases``。
 * **训练装配**：``cli._common.build_context`` 读 ``startup.cases``，为每个半径
   加载或构造 handoff、``PlanarStartupScales`` 与 ``RadiusSampler``，然后建立
   **一个共享的** ``CoupledModel``（ProductNet + AirNet + 前沿参数）与**一个**
@@ -106,6 +109,10 @@ Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现
   ``check_shared_compatibility`` 直接比较完整 EOS、环境态与初始热力学状态，
   第一份 case 也与共享模型核对；无量纲前沿恰好相同不能代替材料一致性。
   参考尺度 ``rho_*/U_*/e_*`` 是数值归一化量，不强制等于实际初态。
+  **已知冲突（未改写）**：当前实现是“一个联合损失、一次 ``backward``、一次
+  Adam 更新”；2026-11-05 清理提示词要求“两个网络分别保留训练目标与更新流程”。
+  仓库内没有按网络拆分损失、交替/冻结的完整定义，所以没有自行发明新训练方案；
+  详细位置与影响见 ``README.md`` 第五节末尾的冲突说明。
 * **诊断模式**（``--diagnostic``）：只限制运行身份与步数（默认上限 100），
   检查点与清单记录 ``diagnostic``；它不再承担"科研资格"门槛。正式装配不会因
   ``training_qualified=False`` 被拒绝。
@@ -123,7 +130,15 @@ Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现
   ``F:/2/extracted_geom`` 下的派生提取。旧的 ``100mm_d`` 来自错误的
   ``F:/2/runs/100mm_full``，该运行与对应提取已删除；在按实际 100 mm deck 完成
   单位/历史变量布局校验并重新提取之前，没有可用的 100 mm 提取。
-  ``extracted_vf``/GitHub 旧导出缺逐字段有效性，转换会拒绝。
+  ``extracted_vf``/GitHub 旧导出缺逐字段有效性，转换会拒绝。旧导出只有
+  ``contact_state``/``shock_state`` 三态码而没有
+  ``contact_has_supervision``/``shock_has_supervision`` 时，``dyna_supervision``
+  也拒绝转换——"定位到了"不等于"够格当标签"。
+  **当前全量提取未完成**：``F:/2/extracted_all_20261028`` 下没有可用的
+  ``raw_line.npz``/``metadata.json``，所以 ``base.yaml`` 没有挂接监督数据，
+  正式训练入口当前只能跑纯物理损失。100 mm 原始 history 的 product
+  density/mass 在 alpha=1、体积不变的单元上下降约 1000 倍，来源未定论；不得
+  乘 1000 修补，也不得把 80/100/500 mm 的晚期产物密度当作已验证监督。
 * **检查点（v5）**：顶层 ``model`` + ``cases`` + ``training``。``model`` 只有
   一份共享参数、优化器与指纹；每个 case 绑定启动场身份、完整 scales、无量纲
   前沿初值、完整材料/环境/初始状态记录、采样配置/窗口、采样器 RNG、连续帧组
@@ -161,6 +176,11 @@ Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现
 ``physics/two_medium_startup.py``、``cli/reference_field.py``、
 ``cli/validate_startup.py``、``cli/diagnose_startup.py`` 及其专属测试已删除。
 旧缓存文件（``reference_field.npz``）不再被任何代码读取，也不得当成新启动场。
+
+旧数据契约 ``data/contract.py`` 与其专属测试也已删除：训练入口只通过
+``SupervisionDataset.require_supervision_ready()`` 判定监督资格。旧
+``ExtractedCase`` 不再暴露方案 B 的 ``T_h``/``pinn_times``/``frame_split``；
+它只保留原始 DYNA 时间轴，模型时间原点由 ``data/dyna_supervision.py`` 生成。
 
 ## 剖面提取
 
@@ -256,11 +276,16 @@ Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现
 
 ## 数据闸门
 
-* `audit_dyna` 写 `data_compatibility.json`，训练入口读它。状态 `incompatible`
-  或 `unknown` 一律拒绝；越过它必须显式写 `data.allow_unverified_cases: true`，
-  并且检查点与运行清单会被打上 `data_compatibility: unverified`。
+* `audit_dyna` 写的 `data_compatibility.json` 是**旧提取剖面**的审计记录；
+  新训练入口不读它，也不读 `data.cases`。新链路的闸门是启动场 handoff 校验
+  与 `SupervisionDataset.require_supervision_ready()`；旧报告里的
+  `compatible/incompatible` 不能替代这两项。
+* `data.allow_unverified_cases` 已从配置中移除——它从未接到新链路上，保留它
+  只会让"我越过了闸门"和"根本没有这道闸门"同时成立。
 * 没有审查证据**不等于**通过。报告里没有的算例是 `unknown`。
 * 没有从材料体积分数来的分区，就是没有；那一项独立判定，别的项审得再好也不放行。
+* 旧提取剖面只有三态码、没有 `contact_has_supervision` /
+  `shock_has_supervision` 时，`dyna_supervision` 拒绝转换。
 
 ## 检查与选模型
 

@@ -19,11 +19,7 @@ from spherical_blast_pinn.data import compatibility as compat
 from spherical_blast_pinn.data.compatibility import (
     COMPATIBLE,
     INCOMPATIBLE,
-    SYNTHETIC,
-    UNKNOWN,
     CaseCompatibility,
-    CompatibilityError,
-    enforce_training_gate,
 )
 from spherical_blast_pinn.data.extracted_case import ExtractedCase, load_extracted_case
 from spherical_blast_pinn.physics import material as mat
@@ -442,43 +438,6 @@ def test_scaled_time_coverage_is_the_same_for_every_radius():
 # ==========================================================================
 
 
-def test_gate_allows_compatible_cases():
-    statuses = {"a": CaseCompatibility("a", status=COMPATIBLE)}
-    decision = enforce_training_gate(["a"], statuses)
-    assert decision.allowed and not decision.unverified
-
-
-@pytest.mark.parametrize("status", [INCOMPATIBLE, UNKNOWN])
-def test_gate_refuses_incompatible_or_unknown_cases(status):
-    statuses = {"a": CaseCompatibility("a", status=status, reasons=[f"审查结论：{status}"])}
-    with pytest.raises(CompatibilityError):
-        enforce_training_gate(["a"], statuses)
-
-
-def test_gate_treats_a_missing_entry_as_unknown():
-    """报告里没有的算例不是"默认通过"。"""
-    with pytest.raises(CompatibilityError):
-        enforce_training_gate(["never-audited"], {})
-
-
-def test_gate_records_an_explicit_override():
-    statuses = {"a": CaseCompatibility("a", status=INCOMPATIBLE)}
-    decision = enforce_training_gate(["a"], statuses, allow_unverified=True)
-    assert decision.allowed
-    assert decision.unverified
-    assert decision.as_dict()["data_compatibility"] == "unverified"
-
-
-def test_synthetic_mode_refuses_real_cases():
-    """合成冒烟路径只能吃标注为合成的数据，不能顺手把真实算例跑掉。"""
-    statuses = {"a": CaseCompatibility("a", status=COMPATIBLE)}
-    with pytest.raises(CompatibilityError):
-        enforce_training_gate(["a"], statuses, require_compatible=False)
-    synthetic = {"a": CaseCompatibility("a", status=SYNTHETIC)}
-    decision = enforce_training_gate(["a"], synthetic, require_compatible=False)
-    assert decision.allowed and decision.mode == "synthetic_smoke"
-
-
 def test_report_round_trips_through_disk(tmp_path):
     payload = compat.build_report(
         {"a": CaseCompatibility("a", status=INCOMPATIBLE, checks={"time_origin": INCOMPATIBLE})},
@@ -728,19 +687,6 @@ def test_fixed_mesh_geometry_hoists_only_when_the_mesh_really_is_fixed():
 # ==========================================================================
 
 
-
-
-def test_frame_split_holds_out_whole_frame_groups(tmp_path):
-    case = _write_case(tmp_path)
-    train, dev = case.frame_split(holdout_fraction=0.1, seed=0)
-    assert dev.size > 0
-    assert set(train.tolist()) & set(dev.tolist()) == set()
-    assert set(train.tolist()) | set(dev.tolist()) == set(
-        np.flatnonzero(case.supervisable_frames()).tolist()
-    )
-    # 留出的必须是**连续**的一段，而不是零散的点。
-    ordered = np.sort(dev)
-    assert np.all(np.diff(ordered) == 1)
 
 
 # ==========================================================================

@@ -154,14 +154,16 @@ def test_the_repository_base_config_declares_the_isolation_it_claims():
     """仓库里那份真实配置必须真的自洽，不能只是写着一句话。"""
     base = Path(__file__).resolve().parent.parent / "configs" / "base.yaml"
     config = load_config(base)
-    specs = config.get("data.cases", [])
-    assert specs, "base.yaml 里没有算例，这条测试失去意义"
+    startup_specs = config.get("startup.cases", [])
+    assert startup_specs, "base.yaml 里没有 startup.cases，这条测试失去意义"
+    assert all(str(spec.get("split")) == "train" for spec in startup_specs), (
+        "startup.cases 只能包含训练算例"
+    )
 
     training = [
         _stub_case(spec["case_id"], float(spec["charge_radius_m"]))
-        for spec in specs if str(spec.get("split")) == "train"
+        for spec in startup_specs
     ]
-    # 旧参考场已经删除，参考半径不再是隔离判据的一部分；数据侧的规则不变。
     verdict = evaluate_validation_isolation(
         config, training, reference_radius_m=None
     )
@@ -171,18 +173,20 @@ def test_the_repository_base_config_declares_the_isolation_it_claims():
     )
     assert 500.0 in verdict.detail["final_validation_radii_mm"]
     assert verdict.detail["strict_blind_test"] is True
+    assert config.get("splits.final_validation_cases"), (
+        "声明了严格盲测却没有最终验证算例清单"
+    )
 
 
 def _write_config(directory: Path, cases: list[tuple[str, float, str]]) -> Path:
-    """写一份继承 ``configs/base.yaml`` 的最小配置，只覆盖算例清单。"""
+    """写一份继承 ``configs/base.yaml`` 的配置，覆盖最终验证算例清单。"""
     base = Path(__file__).resolve().parent.parent / "configs" / "base.yaml"
     directory.mkdir(parents=True, exist_ok=True)
-    lines = [f"inherits: {base.as_posix()}", "", "data:", "  cases:"]
+    lines = [f"inherits: {base.as_posix()}", "", "splits:", "  final_validation_cases:"]
     for case_id, radius_m, split in cases:
         lines += [
             f"    - case_id: {case_id}",
             f"      charge_radius_m: {radius_m}",
-            f"      directory: /nonexistent/{case_id}",
             f"      split: {split}",
         ]
     path = directory / "config.yaml"

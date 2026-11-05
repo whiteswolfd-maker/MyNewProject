@@ -321,6 +321,21 @@ def supervision_from_extracted_case(
         masks[name] = masks[name] & (medium != NO_MEDIUM)
 
     companion = _companion_arrays(case)
+    # The current extractor writes explicit front-supervision eligibility.  A
+    # legacy export only has a three-state code, which is evidence that a front
+    # was located but not that it is eligible as a label.  Do not silently
+    # promote it on the new path; re-extract instead.
+    for key, explicit in (
+        ("contact_has_supervision", contact_valid),
+        ("shock_has_supervision", shock_valid),
+    ):
+        if not synthetic and explicit is None and key not in companion:
+            raise DynaSupervisionError(
+                f"this extraction has no {key!r}: legacy front state codes are not "
+                "front-supervision eligibility. Re-extract with the current "
+                "extractor; otherwise a located-but-ineligible front would become a "
+                "training label"
+            )
     if contact_valid is None:
         contact_valid = np.asarray(case.contact_valid, dtype=bool)
     else:

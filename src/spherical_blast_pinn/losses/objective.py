@@ -239,62 +239,22 @@ def total_loss(
     pde_weight: float = 1.0,
     weights: Mapping[str, float] | None = None,
 ) -> LossBreakdown:
-    """三个半径等权平均后的总损失。
+    """单半径或“同一接触压力尺度”的批量总损失。
 
-    ``pde_weight`` 就是 ``lambda_PDE``：它在建立初值阶段是 0.1，在增强阶段平滑
-    升到 1，在完整联合训练阶段固定在 1。其余权重不随阶段变。
+    这是 :func:`total_loss_for_cases` 的薄包装：所有 batch 共用同一个
+    ``contact_pressure``。保留它是因为 ``check_startup_chain`` 与单半径测试只
+    有一个启动场，不需要逐个半径传压力表。
     """
     if torch is None:  # pragma: no cover
         raise RuntimeError("PyTorch is required")
     if not batches:
         raise ValueError("total_loss needs at least one radius batch")
-
-    effective = dict(BASE_WEIGHTS)
-    if weights:
-        effective.update({k: float(v) for k, v in weights.items()})
-    effective["pde"] = float(pde_weight)
-
-    totals: list[Any] = []
-    per_case: dict[str, float] = {}
-    terms: dict[str, float] = {}
-    monitors: dict[str, Any] = {}
-    group_values: dict[str, list[Any]] = {}
-
-    for batch in batches:
-        value, pde, initial, contact, shock, data, geometry, admissibility = case_loss(
-            batch, model, weights=effective, contact_pressure=contact_pressure
-        )
-        totals.append(value)
-        per_case[batch.case_id] = float(value.detach())
-        for name, breakdown in (
-            ("pde", pde),
-            ("initial", initial),
-            ("contact", contact),
-            ("shock", shock),
-            ("data", data),
-            ("geometry", geometry),
-            ("admissibility", admissibility),
-        ):
-            terms[f"{batch.case_id}.{name}"] = float(breakdown.total.detach())
-            group_values.setdefault(name, []).append(breakdown.total)
-            for key, monitor in breakdown.monitors.items():
-                monitors[f"{batch.case_id}.{key}"] = (
-                    float(monitor) if isinstance(monitor, (int, float)) else monitor
-                )
-
-    total = sum(totals) / len(totals)
-    # 半径等权（与 ``total`` 同一条约化规则），但**不加权**：平衡器要量的正是
-    # "这一组自己有多大"。
-    group_tensors = {
-        name: sum(values) / len(values) for name, values in group_values.items()
-    }
-    return LossBreakdown(
-        total=total,
-        per_case=per_case,
-        weights=effective,
-        terms=terms,
-        monitors=monitors,
-        group_tensors=group_tensors,
+    return total_loss_for_cases(
+        batches,
+        model,
+        contact_pressures=[float(contact_pressure)] * len(batches),
+        pde_weight=pde_weight,
+        weights=weights,
     )
 
 
