@@ -17,8 +17,10 @@
 
 ## 新方案 ContactNet/AirNet（2026-11-04）
 
-* 物理时钟：``t`` 是与 d3plot 同一零点的物理秒；前置给 ``t_sep``、``t0=t_sep+epsilon``；
-  不做时间归一化，不乘 ``R0/100mm``。
+* 物理时钟：``t`` 是物理秒，不做时间归一化，不乘 ``R0/100mm``。前置给
+  ``t_sep``、``t0=t_sep+epsilon``，但 ``t_cj=R_cj/D`` 是均匀 CJ 近似，模型时钟与
+  d3plot 时间轴是否同原点**尚未核实**；不按 ``t_sep`` 平移数据，也不伪造事件对齐。
+  这些状态记录在 ``PrecursorResult.clock`` 和 ``precheck`` 输出里。
 * 前置：CJ 密度/压力/质点速度、JWL 等熵释律、强冲击或精确空气 Hugoniot；
   ``R_sep=R0 V_sep^(1/3)``；``t_sep`` 从 CJ 半径的均匀球膨胀积分得到，
   ``R0/D`` 只作为表面到达参考时间单独报告。
@@ -28,8 +30,19 @@
 * 一个 loop：先 AirNet 更新（``L_a``，ContactNet 几何 detached），再 ContactNet
   更新（``L_c``，AirNet 场/导数 detached，几何保留梯度）。每次 backward 后检查
   非目标网络没有梯度、参数未移动。
-* 500 mm 只能是 ``role: test``；训练入口拒绝。``predict-500`` 只读 ``R_b``/物理
-  参数/已训练网络；先保存预测，再由 ``evaluate-500`` 读参考内部场和区间。
+* 500 mm 只能是 ``role: test``；训练入口拒绝。``predict-500`` 走
+  ``load_prediction_case``，只读 ``metadata``/``rb_times``/``rb_radius``/``rb_valid``；
+  它的时间范围来自包含 ``t0`` 的连续 ``R_b`` 段，不依赖内部监督。先保存预测，
+  再由 ``evaluate-500`` 读参考内部场和区间。
+* 接触面数据损失必须在 ``batch.t_contact`` 上重新计算 ``R_b``/``dR_b/dt``/
+  ``ContactNet``；不能复用 PDE 时刻的预测。预测/标签/掩码先展平、按掩码选点，
+  再做减法，禁止 ``[N,1]`` 与 ``[N]`` 广播成 ``[N,N]``。
+* ``R_b`` 的 NaN/无效帧必须保留为断段标志；时间严格递增；平台保段，回退拒段；
+  求解区间必须落在包含 ``t0`` 的一个连续段内。
+* 能量残差用单位体积总能量 ``E=p/(gamma-1)+rho u^2/2`` 的尺度 ``s_E/T_star``，
+  不是比内能 ``e/T_star``。空气 EOS 的 ``e`` 定义不变。
+* 分离状态分开记录接触区间、受冲击空气层、环境侧右边界三项证据；
+  “能定位混合段”不等于“已分离”。
 * 当前没有真实 d3plot 缓存；``base.yaml`` 的 ``synthetic: false`` 会拒绝无缓存训练；``smoke.yaml`` 的 ``synthetic: true`` 只是工程夹具。
   真实工况必须先 ``extract_profiles`` 再 ``build-cache``，不能把合成结果写成
   TNT 精度验证。

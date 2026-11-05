@@ -2,13 +2,20 @@
 #
 # This file is the default entry for the new scheme.  It does not inherit the
 # legacy product/air/front configuration.  The JWL/detonation/air values here
-# are the material-card inputs for the precursor; they are not results from the
-# Yue thesis table.  Real d3plot caches are not committed; `cache: null` with
-# `synthetic: true` is an engineering fixture only.
+# are CONFIGURATION PLACEHOLDERS for the precursor, not verified material-card
+# values and not results from the Yue thesis table.  Check them against the
+# actual deck/card and then set material_source/material_source_verified.
+# Real d3plot caches are not committed; `cache: null` with `synthetic: false`
+# refuses training until build-cache has produced a cache.
 contact_air:
   version: 1
 
   precursor:
+    # These are configuration inputs, not a verified material card.  Set
+    # material_source to the actual deck/card and material_source_verified: true
+    # only after checking the values against it.
+    material_source: unverified_config_defaults
+    material_source_verified: false
     epsilon_s: 1.0e-6
     shock_model: strong          # "strong" or "exact"; exact is a documented cross-check
     v_max: 100.0
@@ -38,6 +45,7 @@ contact_air:
     density_kg_m3: 1.0e-9
     velocity_m_s: 1.0e-6
     min_ambient_cells: 2
+    min_shocked_air_cells: 2     # fewer -> shocked-air layer is unresolvable
 
   cases:
     # Real runs: set cache to a .npz produced by build-cache.  No synthetic

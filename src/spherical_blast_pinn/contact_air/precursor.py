@@ -98,6 +98,10 @@ class PrecursorConfig:
     v_max: float = 100.0
     integration_limit: int = 200
     root_tolerance: float = 1.0e-12
+    #: Where the JWL/detonation/air numbers came from.  The default is a
+    #: configuration placeholder, not a verified material card.
+    material_source: str = "unverified_config_defaults"
+    material_source_verified: bool = False
 
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.charge_radius_m)) or self.charge_radius_m <= 0.0:
@@ -108,6 +112,16 @@ class PrecursorConfig:
             raise PrecursorError("shock_model must be 'strong' or 'exact'")
         if self.v_max <= 1.0:
             raise PrecursorError("v_max must exceed 1")
+        if not str(self.material_source).strip():
+            raise PrecursorError("material_source must not be empty")
+        if self.material_source_verified and (
+            str(self.material_source).strip().lower()
+            in ("", "unverified_config_defaults", "default", "defaults")
+        ):
+            raise PrecursorError(
+                "material_source_verified=True needs a real material-card source, "
+                "not the unverified default placeholder"
+            )
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "PrecursorConfig":
@@ -129,6 +143,12 @@ class PrecursorConfig:
             v_max=float(payload.get("v_max", 100.0)),
             integration_limit=int(payload.get("integration_limit", 200)),
             root_tolerance=float(payload.get("root_tolerance", 1.0e-12)),
+            material_source=str(
+                payload.get("material_source", "unverified_config_defaults")
+            ),
+            material_source_verified=bool(
+                payload.get("material_source_verified", False)
+            ),
         )
 
 
@@ -143,6 +163,8 @@ class PrecursorResult:
     c_cj: float
     p_cj: float
     p_sep: float
+    p_c_t0: float
+    initial_pressure_compatibility: dict[str, Any]
     u_c_sep: float
     u_a_sep: float
     rho_a_sep: float
@@ -160,6 +182,7 @@ class PrecursorResult:
     checks: dict[str, Any] = field(default_factory=dict)
     provenance: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    clock: dict[str, Any] = field(default_factory=dict)
 
     @property
     def charge_radius(self) -> float:
@@ -227,6 +250,10 @@ class PrecursorResult:
             "p_cj": self.p_cj,
             "p_sep": self.p_sep,
             "p_a_sep": self.p_sep,
+            "p_c_t0": self.p_c_t0,
+            "initial_pressure_compatibility": dict(
+                self.initial_pressure_compatibility
+            ),
             "u_c_sep": self.u_c_sep,
             "u_a_sep": self.u_a_sep,
             "rho_a_sep": self.rho_a_sep,
@@ -243,6 +270,7 @@ class PrecursorResult:
             "checks": dict(self.checks),
             "provenance": dict(self.provenance),
             "notes": list(self.notes),
+            "clock": dict(self.clock),
         }
 
 
@@ -421,6 +449,54 @@ def compute_precursor(config: PrecursorConfig) -> PrecursorResult:
     t0 = t_sep + config.epsilon_s
     Rc0 = R_sep + u_c_sep * config.epsilon_s
     Rs0 = R_sep + D_s * config.epsilon_s
+    V_c0 = V_sep * (Rc0 / R_sep) ** 3
+    p_c_t0 = _p(V_c0, jwl, C)
+    initial_pressure_compatibility = {
+        "p_c_t0_pa": float(p_c_t0),
+        "p_a_sep_pa": float(p_sep),
+        "absolute_difference_pa": float(p_c_t0 - p_sep),
+        "relative_difference": float(abs(p_c_t0 - p_sep) / p_sep),
+        "assessment": (
+            "non-negligible (>=1% of p_a_sep); reported, not forced to zero"
+            if abs(p_c_t0 - p_sep) / p_sep >= 1.0e-2
+            else "small (<1% of p_a_sep) but still reported"
+        ),
+        "forced_equal": False,
+        "note": (
+            "p_c(t0) is JWL at R_c(t0)=R_sep+u_c,sep*epsilon; p_a,sep is the "
+            "matched air pressure. They are different states at slightly "
+            "different positions/times."
+        ),
+    }
+    clock = {
+        "reference_state": "CJ detonation state at V_cj = rho_TNT/rho_CJ",
+        "reference_position_m": float(R_cj),
+        "reference_time_s": float(t_cj),
+        "time_formula": "t_cj = R_cj / D",
+        "time_formula_basis": (
+            "uniform CJ detonation from the charge centre at constant D; the "
+            "CJ radius R_cj=R0 V_cj^(1/3) is reached at that time. This is an "
+            "approximation whose physical basis still needs confirmation against "
+            "the deck/initiation model"
+        ),
+        "time_formula_verified": False,
+        "surface_arrival_reference_s": float(t_surface_ref),
+        "surface_arrival_role": (
+            "R0/D is recorded as a separate surface-arrival reference only; it is "
+            "not used as t_cj and not used as the model origin"
+        ),
+        "t_sep_definition_s": float(t_sep),
+        "t0_definition": "t0 = t_sep + epsilon_s",
+        "d3plot_clock_relation": (
+            "frame times are used as recorded by the extraction (physical seconds); "
+            "no t_sep or R0/D shift is applied and no event is aligned to a "
+            "theoretical time. R_b(t0) must exist on that same axis; the shared "
+            "origin of the model clock and the d3plot clock is not verified here"
+        ),
+        "d3plot_clock_verified": False,
+        "material_source": config.material_source,
+        "material_source_verified": bool(config.material_source_verified),
+    }
 
     checks = {
         "W_cj_in_unit_interval": bool(0.0 < V_cj < 1.0),
@@ -442,21 +518,29 @@ def compute_precursor(config: PrecursorConfig) -> PrecursorResult:
 
     provenance = {
         "jwl": {
-            "A": "material card", "B": "material card",
-            "R1": "material card", "R2": "material card",
-            "omega": "material card", "rho_tnt": "material card",
+            "A": "config input (material-card provenance unverified)",
+            "B": "config input (material-card provenance unverified)",
+            "R1": "config input (material-card provenance unverified)",
+            "R2": "config input (material-card provenance unverified)",
+            "omega": "config input (material-card provenance unverified)",
+            "rho_tnt": "config input (material-card provenance unverified)",
             "C": c_source,
         },
         "detonation": {
-            "velocity": "material/deck card",
-            "cj_pressure": "material/deck card",
-            "cj_density": "material/deck card",
+            "velocity": "config input (deck provenance unverified)",
+            "cj_pressure": "config input (deck provenance unverified)",
+            "cj_density": "config input (deck provenance unverified)",
         },
         "air": {
-            "density": "material card / ambient state",
-            "pressure": "material card / ambient state",
-            "gamma": "material card",
+            "density": "config input (ambient-state provenance unverified)",
+            "pressure": "config input (ambient-state provenance unverified)",
+            "gamma": "config input (material-card provenance unverified)",
         },
+        "material_source": {
+            "value": config.material_source,
+            "verified": bool(config.material_source_verified),
+        },
+        "clock": dict(clock),
         "shock_model": (
             "strong-shock approximation (documented; exact Hugoniot is a "
             "separate cross-check)"
@@ -480,9 +564,14 @@ def compute_precursor(config: PrecursorConfig) -> PrecursorResult:
         "reported separately as a reference, not used as t_ref",
         f"air Hugoniot model: {config.shock_model}; the other model is available "
         "for a documented mass/velocity cross-check",
-        "the same initial state is used over the shocked layer; the O(epsilon) "
-        "difference between p_c(t0) and the thin-layer p_a,sep is reported, not "
-        "forced to zero",
+        "the same initial state is used over the shocked layer; the difference "
+        "between p_c(t0) and the thin-layer p_a,sep is reported with its actual "
+        "relative size by CaseData.initial_compatibility(), not dismissed as "
+        "O(epsilon) and not forced to zero",
+        "t_cj=R_cj/D is a uniform-CJ approximation and is marked unverified; the "
+        "shared origin of this model clock and the d3plot time axis is not assumed",
+        f"material source = {config.material_source!r}; verified = "
+        f"{bool(config.material_source_verified)}",
     ]
     return PrecursorResult(
         config=config,
@@ -494,6 +583,8 @@ def compute_precursor(config: PrecursorConfig) -> PrecursorResult:
         c_cj=c_cj,
         p_cj=p_cj,
         p_sep=p_sep,
+        p_c_t0=p_c_t0,
+        initial_pressure_compatibility=initial_pressure_compatibility,
         u_c_sep=u_c_sep,
         u_a_sep=u_a_sep,
         rho_a_sep=rho_a_sep,
@@ -511,6 +602,7 @@ def compute_precursor(config: PrecursorConfig) -> PrecursorResult:
         checks=checks,
         provenance=provenance,
         notes=notes,
+        clock=clock,
     )
 
 
@@ -526,6 +618,8 @@ def compare_shock_models(config: PrecursorConfig) -> dict[str, Any]:
         v_max=config.v_max,
         integration_limit=config.integration_limit,
         root_tolerance=config.root_tolerance,
+        material_source=config.material_source,
+        material_source_verified=config.material_source_verified,
     )
     exact_config = PrecursorConfig(
         charge_radius_m=config.charge_radius_m,
@@ -537,6 +631,8 @@ def compare_shock_models(config: PrecursorConfig) -> dict[str, Any]:
         v_max=config.v_max,
         integration_limit=config.integration_limit,
         root_tolerance=config.root_tolerance,
+        material_source=config.material_source,
+        material_source_verified=config.material_source_verified,
     )
     strong = compute_precursor(strong_config)
     exact = compute_precursor(exact_config)

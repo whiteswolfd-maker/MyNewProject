@@ -68,6 +68,10 @@ def sample_case_batch(
             f"case {case.case_id!r} is a test case and must not be sampled for training"
         )
     t0, t_end = float(case.t0), float(case.t_end)
+    # Hard gate: the solve window is one connected R_b segment.  A CaseData
+    # object already enforces this, but sampling is also used directly in
+    # tests and diagnostics, so it does not rely on that alone.
+    case.boundary.require_interval(t0, t_end)
 
     def uniform_t(count: int) -> Any:
         if count <= 0:
@@ -95,8 +99,18 @@ def sample_case_batch(
     )
     t_right = uniform_t(int(n_right))
 
-    data = case.observations.sample(int(n_data), generator)
+    data = case.observations.sample(
+        int(n_data), generator, t_min=t0, t_max=t_end
+    )
     contact_indices = case.contact.indices()
+    if contact_indices.size:
+        contact_times = case.contact.times[contact_indices]
+        in_window = (
+            (contact_times >= t0)
+            & (contact_times <= t_end)
+            & np.asarray([case.boundary.has_slope(float(t)) for t in contact_times])
+        )
+        contact_indices = contact_indices[in_window]
     if contact_indices.size and int(n_contact) > 0:
         if contact_indices.size <= int(n_contact):
             chosen = contact_indices

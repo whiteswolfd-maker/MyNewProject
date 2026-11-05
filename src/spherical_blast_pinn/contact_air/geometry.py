@@ -34,6 +34,15 @@ class RightBoundaryTrajectory:
     segments: list[tuple[float, float, PchipInterpolator]] = field(default_factory=list)
     isolated: list[tuple[float, float]] = field(default_factory=list)
     rejected: list[str] = field(default_factory=list)
+    #: Frames that were supplied with ``valid=True`` but whose radius is not a
+    #: usable positive finite number.  They remain in the time axis as break
+    #: markers; nothing is deleted and the two sides are never joined.
+    invalid_frames: list[dict[str, Any]] = field(default_factory=list)
+    #: Continuous runs in which consecutive radii are equal.  A plateau is a
+    #: measured shape, not an error: it is retained and reported.  A strictly
+    #: decreasing radius is a different thing (a retrograde trajectory) and the
+    #: whole segment is rejected instead.
+    plateaus: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         times = np.asarray(self.times, dtype=np.float64).reshape(-1)
@@ -41,23 +50,34 @@ class RightBoundaryTrajectory:
         valid = np.asarray(self.valid, dtype=bool).reshape(-1)
         if times.size != radii.size or times.size != valid.size:
             raise GeometryError("times, radii and valid masks must have the same length")
-        finite = np.isfinite(times) & np.isfinite(radii)
-        order = np.argsort(times[finite], kind="stable")
-        times = times[finite][order]
-        radii = radii[finite][order]
-        valid = valid[finite][order]
+        # Do not sort or drop rows.  The frame index is part of the data
+        # contract, and silently reordering it would make a gap invisible.
+        if not np.all(np.isfinite(times)):
+            raise GeometryError("right-boundary times must all be finite")
         if times.size and np.any(np.diff(times) <= 0.0):
-            raise GeometryError("right-boundary times must be strictly increasing")
-        if np.any(valid & ~(radii > 0.0)):
-            raise GeometryError("valid right-boundary radii must be positive")
+            raise GeometryError(
+                "right-boundary times must be strictly increasing; duplicate or "
+                "retrograde timestamps are not repaired"
+            )
+        requested_valid = valid.copy()
+        usable = requested_valid & np.isfinite(radii) & (radii > 0.0)
         self.times = times
         self.radii = radii
-        self.valid = valid
+        self.valid = usable
         self.segments = []
         self.isolated = []
         self.rejected = []
+        self.invalid_frames = []
+        self.plateaus = []
+        for index in np.flatnonzero(requested_valid & ~usable):
+            reason = "non-finite radius" if not np.isfinite(radii[index]) else "non-positive radius"
+            self.invalid_frames.append({
+                "index": int(index),
+                "time_s": float(times[index]),
+                "reason": reason,
+            })
         start = None
-        for index, flag in enumerate(np.append(valid, False)):
+        for index, flag in enumerate(np.append(usable, False)):
             if flag and start is None:
                 start = index
             elif not flag and start is not None:
@@ -65,12 +85,21 @@ class RightBoundaryTrajectory:
                 _t = times[run]
                 _r = radii[run]
                 if _t.size >= 2:
-                    if np.any(np.diff(_r) <= 0.0):
+                    dr = np.diff(_r)
+                    if np.any(dr < 0.0):
                         self.rejected.append(
-                            f"segment {int(_t[0]):.6g}..{int(_t[-1]):.6g}: R_b is not "
-                            "strictly increasing; no PCHIP built"
+                            f"segment {float(_t[0]):.6g}..{float(_t[-1]):.6g}: R_b "
+                            "decreases at one or more frames; a retrograde trajectory "
+                            "is not repaired and no PCHIP is built"
                         )
                     else:
+                        plateau_count = int(np.count_nonzero(dr == 0.0))
+                        if plateau_count:
+                            self.plateaus.append({
+                                "start_s": float(_t[0]),
+                                "end_s": float(_t[-1]),
+                                "n_equal_intervals": plateau_count,
+                            })
                         self.segments.append(
                             (float(_t[0]), float(_t[-1]), PchipInterpolator(_t, _r))
                         )
@@ -98,12 +127,14 @@ class RightBoundaryTrajectory:
 
     @property
     def domain(self) -> tuple[float, float] | None:
+        """Outer bounds of the valid samples, **not** a coverage interval."""
         if not self.segments:
             return None
         return self.segments[0][0], self.segments[-1][1]
 
     @property
     def domain_min(self) -> float:
+        """First valid sample time; do not use as a solve-interval start."""
         domain = self.domain
         if domain is None:
             raise GeometryError(f"case {self.case_id!r}: no continuous R_b segment")
@@ -111,6 +142,7 @@ class RightBoundaryTrajectory:
 
     @property
     def domain_max(self) -> float:
+        """Last valid sample time; do not use as a solve-interval end."""
         domain = self.domain
         if domain is None:
             raise GeometryError(f"case {self.case_id!r}: no continuous R_b segment")
@@ -121,6 +153,64 @@ class RightBoundaryTrajectory:
             if start <= t <= end:
                 return interpolator
         return None
+
+    def _segment_span_at(self, t: float) -> tuple[float, float] | None:
+        for start, end, _ in self.segments:
+            if start <= t <= end:
+                return float(start), float(end)
+        return None
+
+    @property
+    def continuous_intervals(self) -> list[tuple[float, float]]:
+        """Measured ``R_b`` runs.  There is no interval across a gap."""
+        return [(float(start), float(end)) for start, end, _ in self.segments]
+
+    def has_slope(self, t: float) -> bool:
+        return self._segment_at(float(t)) is not None
+
+    def is_covered(self, t: float) -> bool:
+        return self.has_slope(t)
+
+    def continuous_interval_containing(self, t: float) -> tuple[float, float]:
+        """Return the one continuous segment that contains ``t``.
+
+        The outer ``domain`` is deliberately *not* used for this: the earliest
+        and latest valid frames can enclose a gap, and a solve interval must
+        not be chosen by those two endpoints alone.
+        """
+        span = self._segment_span_at(float(t))
+        if span is None:
+            if any(math.isclose(time, float(t), rel_tol=0.0, abs_tol=0.0)
+                   for time, _ in self.isolated):
+                raise GeometryError(
+                    f"case {self.case_id!r}: t={t!r} s is an isolated R_b frame; "
+                    "it has no slope and cannot define a solve interval"
+                )
+            raise GeometryError(
+                f"case {self.case_id!r}: t={t!r} s is outside every continuous "
+                "R_b segment; gap filling and extrapolation are forbidden"
+            )
+        return span
+
+    def require_interval(self, start: float, end: float) -> tuple[float, float]:
+        """Require ``[start, end]`` to lie inside one continuous segment."""
+        start = float(start)
+        end = float(end)
+        if not (math.isfinite(start) and math.isfinite(end)):
+            raise GeometryError(f"case {self.case_id!r}: solve interval is not finite")
+        if end < start:
+            raise GeometryError(
+                f"case {self.case_id!r}: solve interval end={end!r} is before start={start!r}"
+            )
+        span = self.continuous_interval_containing(start)
+        if end < span[0] or end > span[1]:
+            raise GeometryError(
+                f"case {self.case_id!r}: solve interval [{start!r}, {end!r}] crosses "
+                f"the continuous R_b segment {span!r}; a single connected segment is "
+                "required"
+            )
+        # Every t between the two endpoints is inside the same PCHIP segment.
+        return span
 
     def position(self, t: float | np.ndarray) -> np.ndarray | float:
         values = np.asarray(t, dtype=np.float64)
@@ -180,8 +270,18 @@ class RightBoundaryTrajectory:
             "n_samples": int(self.times.size),
             "n_valid": int(np.count_nonzero(self.valid)),
             "segments": [[float(a), float(b)] for a, b, _ in self.segments],
+            "continuous_intervals": [
+                [float(a), float(b)] for a, b in self.continuous_intervals
+            ],
             "isolated": [[float(t), float(r)] for t, r in self.isolated],
-            "domain": None if self.domain is None else [float(self.domain[0]), float(self.domain[1])],
+            # Outer bounds only; NOT a statement that every t in between is
+            # covered.  Use continuous_intervals / require_interval.
+            "outer_bounds": (
+                None if self.domain is None
+                else [float(self.domain[0]), float(self.domain[1])]
+            ),
+            "invalid_frames": list(self.invalid_frames),
+            "plateaus": list(self.plateaus),
             "rejected": list(self.rejected),
         }
 
@@ -204,6 +304,10 @@ class ContactIntervalTable:
         n = self.times.size
         if any(array.size != n for array in (self.low, self.up, self.raw, self.valid)):
             raise GeometryError("contact interval arrays must have the same length")
+        if n and (not np.all(np.isfinite(self.times)) or np.any(np.diff(self.times) <= 0.0)):
+            raise GeometryError(
+                "contact interval times must be finite and strictly increasing"
+            )
         finite = np.isfinite(self.low) & np.isfinite(self.up) & np.isfinite(self.raw)
         bad = self.valid & (~finite | (self.low > self.up) | (self.low <= 0.0))
         if np.any(bad):

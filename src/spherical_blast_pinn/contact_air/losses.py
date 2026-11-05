@@ -40,12 +40,67 @@ def _mse(value: torch.Tensor, scale: float) -> torch.Tensor:
     return ((value / float(scale)) ** 2).mean()
 
 
+def _flatten_checked(name: str, value: torch.Tensor, size: int) -> torch.Tensor:
+    flat = value.reshape(-1)
+    if flat.numel() != int(size):
+        raise LossError(
+            f"{name} has {flat.numel()} entries but {int(size)} were expected; "
+            "shape mismatch would otherwise broadcast and compare unrelated points"
+        )
+    return flat
+
+
+def _selected_difference(
+    pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flatten prediction/target/mask and select only the valid entries.
+
+    Selection happens **after** flattening and **before** subtraction.  This is
+    what prevents ``pred`` ``[N,1]`` and ``target`` ``[N]`` from broadcasting
+    into an ``[N,N]`` cross-comparison, and it keeps NaN in invalid labels out
+    of the arithmetic entirely.
+    """
+    size = pred.numel()
+    if target.numel() != size or mask.numel() != size:
+        raise LossError(
+            f"prediction/target/mask sizes differ: {pred.numel()}, "
+            f"{target.numel()}, {mask.numel()}"
+        )
+    pred_flat = pred.reshape(-1)
+    target_flat = _flatten_checked("target", target, size)
+    mask_flat = _flatten_checked("mask", mask, size).to(torch.bool)
+    selected = mask_flat
+    if not bool(selected.any()):
+        return pred_flat[:0], target_flat[:0]
+    difference = pred_flat[selected] - target_flat[selected]
+    if not bool(torch.isfinite(difference).all()):
+        bad = int(torch.count_nonzero(~torch.isfinite(difference)))
+        raise LossError(
+            f"{bad} valid data point(s) have a non-finite prediction/target; "
+            "invalid labels must be marked by the mask, not by NaN under a true mask"
+        )
+    return difference, selected
+
+
 def _masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
                 scale: float) -> tuple[torch.Tensor, int]:
-    if mask.numel() == 0 or not bool(mask.any()):
+    difference, selected = _selected_difference(pred, target, mask)
+    count = int(selected.sum())
+    if count == 0:
         return _zero(pred), 0
-    residual = ((pred[mask] - target[mask]) / float(scale)) ** 2
-    return residual.mean(), int(mask.sum())
+    return ((difference / float(scale)) ** 2).mean(), count
+
+
+def masked_rmse(
+    pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, scale: float
+) -> tuple[float | None, int]:
+    """Validation-side RMSE using exactly the training selection logic."""
+    difference, selected = _selected_difference(pred, target, mask)
+    count = int(selected.sum())
+    if count == 0:
+        return None, 0
+    value = torch.sqrt(torch.mean((difference / float(scale)) ** 2))
+    return float(value.detach()), count
 
 
 def _air_fields_at(
@@ -58,6 +113,34 @@ def _air_fields_at(
     return net(zeta.reshape(-1, 1), t.reshape(-1, 1), r0.reshape(-1, 1), scales)
 
 
+def residual_scales(case: CaseData) -> dict[str, float]:
+    """Named scales for the three PDE residuals, with their units.
+
+    ``energy_density`` is ``E = p/(gamma-1) + rho u^2/2`` [Pa], not the
+    specific internal energy ``e`` [J/kg].  The energy residual is a
+    unit-volume energy rate, so its scale is ``E / T_star``.
+    """
+    s_rho = float(case.rho_scale)
+    s_u = float(case.u_scale)
+    s_p = float(case.p_scale)
+    s_R = float(case.length_scale)
+    gamma = float(case.gamma_air)
+    T_star = s_R / s_u
+    s_E = s_p / max(gamma - 1.0, 1.0e-12) + 0.5 * s_rho * s_u ** 2
+    return {
+        "rho": s_rho,
+        "u": s_u,
+        "p": s_p,
+        "specific_energy": float(case.e_scale),
+        "energy_density": s_E,
+        "length": s_R,
+        "time": T_star,
+        "mass_residual": s_rho / T_star,
+        "momentum_residual": s_rho * s_u / T_star,
+        "energy_residual": s_E / T_star,
+    }
+
+
 def pde_loss(
     *,
     fields: AirFields,
@@ -67,14 +150,10 @@ def pde_loss(
 ) -> TermResult:
     gamma = torch.full_like(fields.density, float(case.gamma_air))
     residuals = assemble_residuals(fields, derivatives, geometry, gamma=gamma)
-    s_rho = float(case.rho_scale)
-    s_u = float(case.u_scale)
-    s_e = float(case.e_scale)
-    s_R = float(case.length_scale)
-    T_star = s_R / s_u
-    s_frho = s_rho / T_star
-    s_fm = s_rho * s_u / T_star
-    s_fe = s_e / T_star
+    scales = residual_scales(case)
+    s_frho = scales["mass_residual"]
+    s_fm = scales["momentum_residual"]
+    s_fe = scales["energy_residual"]
     total = (
         _mse(residuals.mass, s_frho)
         + _mse(residuals.momentum, s_fm)
@@ -192,16 +271,50 @@ def contact_ic_loss(contact: ContactFields, case: CaseData) -> TermResult:
     )
 
 
-def contact_data_loss(contact: ContactFields, batch: CaseBatch, case: CaseData) -> TermResult:
+def _contact_violation_values(
+    contact: ContactFields, batch: CaseBatch, case: CaseData,
+) -> tuple[torch.Tensor, int]:
+    """Per-label interval violation, aligned one-to-one with ``t_contact``."""
     if batch.t_contact.numel() == 0:
+        return torch.zeros(0, dtype=contact.radius.dtype, device=contact.radius.device), 0
+    radius = contact.radius.reshape(-1)
+    if radius.numel() != batch.t_contact.reshape(-1).numel():
+        raise LossError(
+            f"contact prediction has {radius.numel()} rows but the batch has "
+            f"{batch.t_contact.numel()} contact labels; the prediction must be "
+            "evaluated at batch.t_contact"
+        )
+    low = _flatten_checked("low_contact", batch.low_contact, radius.numel())
+    up = _flatten_checked("up_contact", batch.up_contact, radius.numel())
+    if not bool(torch.isfinite(radius).all()):
+        raise LossError("contact prediction contains non-finite radii")
+    if not bool((low <= up).all()):
+        raise LossError("contact labels have R_c,low > R_c,up")
+    below = torch.clamp(low - radius, min=0.0)
+    above = torch.clamp(radius - up, min=0.0)
+    return (below / float(case.length_scale)) ** 2 + (
+        above / float(case.length_scale)
+    ) ** 2, int(radius.numel())
+
+
+def contact_data_loss(contact: ContactFields, batch: CaseBatch, case: CaseData) -> TermResult:
+    values, count = _contact_violation_values(contact, batch, case)
+    if count == 0:
         return TermResult(total=_zero(contact.radius), counts={"contact_data": 0})
-    below = torch.clamp(batch.low_contact - contact.radius, min=0.0)
-    above = torch.clamp(contact.radius - batch.up_contact, min=0.0)
-    term = ((below / float(case.length_scale)) ** 2 + (above / float(case.length_scale)) ** 2).mean()
+    term = values.mean()
     return TermResult(
-        total=term, counts={"contact_data": int(batch.t_contact.numel())},
+        total=term, counts={"contact_data": count},
         parts={"contact_data": float(term.detach())},
     )
+
+
+def contact_violation_rmse(
+    contact: ContactFields, batch: CaseBatch, case: CaseData
+) -> tuple[float | None, int]:
+    values, count = _contact_violation_values(contact, batch, case)
+    if count == 0:
+        return None, 0
+    return float(torch.sqrt(torch.mean(values)).detach()), count
 
 
 def combine_air(
@@ -253,8 +366,11 @@ __all__ = [
     "combine_contact",
     "contact_data_loss",
     "contact_ic_loss",
+    "contact_violation_rmse",
     "interface_loss",
+    "masked_rmse",
     "pde_loss",
+    "residual_scales",
     "right_loss",
     "schedule_weights",
 ]

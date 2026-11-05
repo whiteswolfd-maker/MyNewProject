@@ -15,12 +15,13 @@ optimizer is not accepted as isolation.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -34,7 +35,9 @@ from .losses import (
     combine_contact,
     contact_data_loss,
     contact_ic_loss,
+    contact_violation_rmse,
     interface_loss,
+    masked_rmse,
     pde_loss,
     right_loss,
     schedule_weights,
@@ -186,21 +189,40 @@ class AlternatingTrainer:
         train_cases: list[CaseData] = []
         validation_cases: list[CaseData] = []
         fraction = float(config.validation_holdout_fraction)
-        for case in cases:
-            frames = case.contact.indices()
-            if fraction > 0.0 and frames.size >= 2:
+        if fraction == 0.0:
+            # No independent validation frames by explicit choice.  The trainer
+            # reports "not evaluable" rather than pretending the training frames
+            # are a validation set.
+            train_cases = list(cases)
+        else:
+            for case in cases:
+                # Split only frames inside the actual solve window [t0, t_end]
+                # and inside a continuous R_b segment.  A contact label after a
+                # gap must not drag the validation interval across that gap.
+                frames = np.asarray([
+                    index for index in case.contact.indices()
+                    if case.t0 <= float(case.contact.times[index]) <= case.t_end
+                    and case.boundary.has_slope(float(case.contact.times[index]))
+                ], dtype=np.int64)
+                if frames.size < 2:
+                    raise TrainingError(
+                        f"case {case.case_id!r} has {frames.size} usable contact "
+                        "frame(s); an independent validation split needs at least "
+                        "two. Set validation.holdout_fraction: 0 explicitly to "
+                        "train without validation, or improve the extraction."
+                    )
                 n_validation = max(1, int(round(fraction * frames.size)))
                 n_validation = min(n_validation, frames.size - 1)
                 validation_frames = frames[-n_validation:]
                 training_frames = frames[:-n_validation]
-                if training_frames.size:
-                    train_cases.append(case.subset_frames(training_frames, role="train"))
-                    validation_cases.append(
-                        case.subset_frames(validation_frames, role="validation")
+                if training_frames.size == 0:
+                    raise TrainingError(
+                        f"case {case.case_id!r}: the frame split left no training frames"
                     )
-                    continue
-            train_cases.append(case)
-            validation_cases.append(case)
+                train_cases.append(case.subset_frames(training_frames, role="train"))
+                validation_cases.append(
+                    case.subset_frames(validation_frames, role="validation")
+                )
         if not train_cases:
             raise TrainingError("the frame split left no training frames")
         self.cases = train_cases
@@ -296,8 +318,16 @@ class AlternatingTrainer:
     ) -> None:
         target_grads = [p.grad for p in target.parameters()]
         other_grads = [p.grad for p in other.parameters()]
-        if not any(g is not None and bool(torch.isfinite(g).all()) and bool(g.abs().sum() > 0)
-                   for g in target_grads):
+        generated = [g for g in target_grads if g is not None]
+        if not generated:
+            raise TrainingError(f"{stage}: target network has no gradient at all")
+        non_finite = [name for (name, _), g in zip(target.named_parameters(), target_grads)
+                      if g is not None and not bool(torch.isfinite(g).all())]
+        if non_finite:
+            raise TrainingError(
+                f"{stage}: non-finite gradients in the target network at {non_finite[:5]}"
+            )
+        if not any(bool(g.abs().sum() > 0) for g in generated):
             raise TrainingError(f"{stage}: target network has no usable gradient")
         leaked = [name for (name, _), g in zip(other.named_parameters(), other_grads)
                   if g is not None]
@@ -415,7 +445,21 @@ class AlternatingTrainer:
                 )
             else:
                 interface = TermResult(total=torch.zeros((), dtype=torch.float64))
-            data = contact_data_loss(c_fields, batch, case)
+            if batch.t_contact.numel():
+                # The interval labels belong to batch.t_contact.  Re-evaluate
+                # R_b, dR_b/dt and ContactNet at those exact times; reusing the
+                # PDE-time prediction would compare different times.
+                r0c, rbc, rbdc = self._contact_inputs(case, batch.t_contact)
+                c_contact = self.contact_net(
+                    batch.t_contact.reshape(-1, 1), r0c, rbc, rbdc, closure,
+                    create_graph=True,
+                )
+                data = contact_data_loss(c_contact, batch, case)
+            else:
+                data = TermResult(
+                    total=torch.zeros((), dtype=torch.float64),
+                    counts={"contact_data": 0},
+                )
             contact_results.append(combine_contact(
                 pde=pde, ic=ic, interface=interface, data=data,
                 lambda_pde=lambda_pde, lambda_data=lambda_data,
@@ -440,35 +484,54 @@ class AlternatingTrainer:
             "contact_parts": dict(contact_total.parts),
             "counts": {**{f"air.{k}": v for k, v in air_total.counts.items()},
                        **{f"contact.{k}": v for k, v in contact_total.counts.items()}},
+            "scales_by_case": {
+                case.case_id: case.scale_dict() for case, _ in batches
+            },
+            "clock_by_case": {
+                case.case_id: dict(case.precursor.get("clock", {}))
+                for case, _ in batches
+            },
         }
         self.history.loops.append(record)
         return record
 
     # -- validation ------------------------------------------------------
     def evaluate(self) -> dict[str, Any]:
+        if not self._validation:
+            return {
+                "score": None,
+                "evaluable": False,
+                "reason": "no independent validation frames were configured "
+                          "(validation.holdout_fraction is 0 or no split exists)",
+                "cases": [],
+            }
         per_case: list[dict[str, Any]] = []
         with torch.no_grad():
             for sample in self._validation:
                 case = next(c for c in self.validation_cases if c.case_id == sample.case_id)
                 batch = sample.batch
                 scales = self._scales[case.case_id]
+                rho_err = u_err = p_err = None
+                n_rho = n_u = n_p = 0
                 if batch.t_data.numel():
                     r0 = _full(case.charge_radius_m, batch.t_data)
                     fields = self.air_net(
                         batch.zeta_data.reshape(-1, 1), batch.t_data.reshape(-1, 1),
                         r0.reshape(-1, 1), scales,
                     )
-                    rho_err = float(torch.sqrt(torch.mean(((fields.density - batch.rho_data)
-                                                          [batch.valid_rho] / case.rho_scale) ** 2))) if bool(batch.valid_rho.any()) else None
-                    u_err = float(torch.sqrt(torch.mean(((fields.velocity - batch.u_data)
-                                                        [batch.valid_u] / case.u_scale) ** 2))) if bool(batch.valid_u.any()) else None
-                    p_err = float(torch.sqrt(torch.mean(((fields.pressure - batch.p_data)
-                                                        [batch.valid_p] / case.p_scale) ** 2))) if bool(batch.valid_p.any()) else None
-                    air_error = sum(v for v in (rho_err, u_err, p_err) if v is not None) / max(
-                        1, sum(v is not None for v in (rho_err, u_err, p_err))
+                    rho_err, n_rho = masked_rmse(
+                        fields.density, batch.rho_data, batch.valid_rho, case.rho_scale
                     )
-                else:
-                    rho_err = u_err = p_err = air_error = None
+                    u_err, n_u = masked_rmse(
+                        fields.velocity, batch.u_data, batch.valid_u, case.u_scale
+                    )
+                    p_err, n_p = masked_rmse(
+                        fields.pressure, batch.p_data, batch.valid_p, case.p_scale
+                    )
+                components = [value for value in (rho_err, u_err, p_err) if value is not None]
+                air_error = sum(components) / len(components) if components else None
+                violation = None
+                n_contact = 0
                 if batch.t_contact.numel():
                     r0, rb, rb_dot = self._contact_inputs(case, batch.t_contact)
                     with torch.enable_grad():
@@ -477,23 +540,33 @@ class AlternatingTrainer:
                             self._closures[case.case_id], create_graph=False,
                         )
                     c_fields = _detach_contact(c_fields)
-                    below = torch.clamp(batch.low_contact - c_fields.radius, min=0.0)
-                    above = torch.clamp(c_fields.radius - batch.up_contact, min=0.0)
-                    violation = float(
-                        torch.sqrt(torch.mean((below / case.length_scale) ** 2
-                                              + (above / case.length_scale) ** 2))
-                    )
-                else:
-                    violation = None
-                score = (air_error or 0.0) + (violation or 0.0)
+                    violation, n_contact = contact_violation_rmse(c_fields, batch, case)
+                available = [value for value in (air_error, violation) if value is not None]
+                # A case with no evaluable component must not contribute a
+                # free zero to the score.
+                score = sum(available) if available else None
                 per_case.append({
                     "case_id": case.case_id,
+                    "evaluable": bool(available),
                     "air_rmse": air_error, "rho_rmse": rho_err,
                     "u_rmse": u_err, "p_rmse": p_err,
-                    "contact_violation": violation, "score": score,
+                    "n_rho": n_rho, "n_u": n_u, "n_p": n_p,
+                    "contact_violation": violation, "n_contact": n_contact,
+                    "score": score,
                 })
-        total = sum(item["score"] for item in per_case) / max(len(per_case), 1)
-        return {"score": total, "cases": per_case}
+        scores = [item["score"] for item in per_case if item["score"] is not None]
+        return {
+            "score": sum(scores) / len(scores) if scores else None,
+            "evaluable": bool(scores),
+            "n_cases": len(per_case),
+            "n_evaluable": len(scores),
+            "reason": (
+                None if scores else
+                "no validation case has any valid data or contact label; the score "
+                "is not evaluable and must not be used for best-model selection"
+            ),
+            "cases": per_case,
+        }
 
     def train(self, *, loops: int | None = None, resume_loop: int | None = None) -> dict[str, Any]:
         target = self.config.loops if loops is None else int(loops)
@@ -511,11 +584,17 @@ class AlternatingTrainer:
                 )
             if self.config.validate_every > 0 and self.loop % self.config.validate_every == 0:
                 verdict = self.evaluate()
-                if verdict["score"] < self.history.best_score:
-                    self.history.best_score = verdict["score"]
-                    self.history.best_loop = self.loop
-                    self.save(self.output_dir / "best.pt")
-                print(f"  validation score = {verdict['score']:.6e}")
+                if verdict["evaluable"] and verdict["score"] is not None:
+                    if verdict["score"] < self.history.best_score:
+                        self.history.best_score = verdict["score"]
+                        self.history.best_loop = self.loop
+                        self.save(self.output_dir / "best.pt")
+                    print(f"  validation score = {verdict['score']:.6e}")
+                else:
+                    print(
+                        "  validation not evaluable: "
+                        f"{verdict.get('reason') or 'no usable validation samples'}"
+                    )
             if self.config.checkpoint_every > 0 and self.loop % self.config.checkpoint_every == 0:
                 self.save(self.output_dir / "last.pt")
         self.save(self.output_dir / "last.pt")
@@ -526,51 +605,237 @@ class AlternatingTrainer:
         }
 
     # -- checkpoint ------------------------------------------------------
+    @staticmethod
+    def _case_signature(case: CaseData) -> str:
+        digest = hashlib.sha256()
+
+        def add(name: str, value) -> None:
+            digest.update(name.encode("utf-8"))
+            if isinstance(value, str):
+                digest.update(value.encode("utf-8"))
+                return
+            array = np.ascontiguousarray(np.asarray(value))
+            digest.update(array.dtype.str.encode("ascii"))
+            digest.update(str(array.shape).encode("ascii"))
+            digest.update(array.tobytes())
+
+        add("case_id", case.case_id)
+        add("role", case.role)
+        add("charge_radius", np.asarray([case.charge_radius_m]))
+        add("precursor", json.dumps(case.precursor, sort_keys=True, allow_nan=True))
+        add("t0", np.asarray([case.t0]))
+        add("t_end", np.asarray([case.t_end]))
+        add("initial", np.asarray([
+            case.initial.Rc0, case.initial.Rs0, case.initial.Rb0,
+            case.initial.zeta_s0,
+        ]))
+        add("boundary_times", case.boundary.times)
+        add("boundary_radii", case.boundary.radii)
+        add("boundary_valid", case.boundary.valid)
+        add("contact_times", case.contact.times)
+        add("contact_low", case.contact.low)
+        add("contact_up", case.contact.up)
+        add("contact_raw", case.contact.raw)
+        add("contact_valid", case.contact.valid)
+        add("obs_time", case.observations.time)
+        add("obs_radius", case.observations.radius)
+        add("obs_zeta", case.observations.zeta)
+        add("obs_density", case.observations.density)
+        add("obs_velocity", case.observations.velocity)
+        add("obs_pressure", case.observations.pressure)
+        add("obs_valid_density", case.observations.valid_density)
+        add("obs_valid_velocity", case.observations.valid_velocity)
+        add("obs_valid_pressure", case.observations.valid_pressure)
+        add("obs_frame", case.observations.frame_index)
+        add("notes", "\n".join(case.notes))
+        add("tolerances", json.dumps(case.tolerances, sort_keys=True))
+        return digest.hexdigest()
+
+    @staticmethod
+    def _batch_payload(batch: CaseBatch) -> dict[str, Any]:
+        names = (
+            "t_pde", "zeta_pde", "t_ic", "zeta_ic_shock", "zeta_ic_ambient",
+            "t_right", "t_data", "zeta_data", "rho_data", "u_data", "p_data",
+            "valid_rho", "valid_u", "valid_p", "t_contact", "low_contact",
+            "up_contact",
+        )
+        payload: dict[str, Any] = {"case_id": batch.case_id}
+        for name in names:
+            value = getattr(batch, name)
+            payload[name] = value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
+        return payload
+
+    @staticmethod
+    def _batch_from_payload(payload: Mapping[str, Any]) -> CaseBatch:
+        def array(name: str, dtype: str):
+            value = np.asarray(payload[name])
+            return torch.as_tensor(value, dtype=getattr(torch, dtype))
+
+        return CaseBatch(
+            case_id=str(payload["case_id"]),
+            t_pde=array("t_pde", "float64"), zeta_pde=array("zeta_pde", "float64"),
+            t_ic=array("t_ic", "float64"),
+            zeta_ic_shock=array("zeta_ic_shock", "float64"),
+            zeta_ic_ambient=array("zeta_ic_ambient", "float64"),
+            t_right=array("t_right", "float64"),
+            t_data=array("t_data", "float64"), zeta_data=array("zeta_data", "float64"),
+            rho_data=array("rho_data", "float64"), u_data=array("u_data", "float64"),
+            p_data=array("p_data", "float64"),
+            valid_rho=array("valid_rho", "bool"), valid_u=array("valid_u", "bool"),
+            valid_p=array("valid_p", "bool"),
+            t_contact=array("t_contact", "float64"),
+            low_contact=array("low_contact", "float64"),
+            up_contact=array("up_contact", "float64"),
+        )
+
+    @staticmethod
+    def _check_state_dict(module: torch.nn.Module, state: Mapping[str, Any], name: str) -> None:
+        current = module.state_dict()
+        if set(state) != set(current):
+            missing = sorted(set(current) - set(state))
+            extra = sorted(set(state) - set(current))
+            raise TrainingError(
+                f"checkpoint {name} keys do not match the current architecture; "
+                f"missing={missing[:5]}, extra={extra[:5]}"
+            )
+        for key, value in current.items():
+            saved = state[key]
+            if tuple(saved.shape) != tuple(value.shape) or saved.dtype != value.dtype:
+                raise TrainingError(
+                    f"checkpoint {name} architecture mismatch at {key!r}: saved "
+                    f"shape {tuple(saved.shape)} / dtype {saved.dtype}, current is "
+                    f"{tuple(value.shape)} / {value.dtype}"
+                )
+
+    @staticmethod
+    def _check_optimizer(
+        optimizer: torch.optim.Optimizer, state: Mapping[str, Any],
+        module: torch.nn.Module, name: str,
+    ) -> None:
+        parameters = list(module.parameters())
+        groups = state.get("param_groups", [])
+        if len(groups) != 1 or len(groups[0].get("params", [])) != len(parameters):
+            raise TrainingError(
+                f"checkpoint {name} optimizer parameter groups do not match the model"
+            )
+        for key, entry in state.get("state", {}).items():
+            if int(key) >= len(parameters):
+                raise TrainingError(f"checkpoint {name} optimizer references unknown parameter {key}")
+            parameter = parameters[int(key)]
+            for field_name in ("exp_avg", "exp_avg_sq"):
+                value = entry.get(field_name)
+                if value is not None and tuple(value.shape) != tuple(parameter.shape):
+                    raise TrainingError(
+                        f"checkpoint {name} optimizer state {field_name}[{key}] has "
+                        f"shape {tuple(value.shape)}, parameter has {tuple(parameter.shape)}"
+                    )
+
     def save(self, path: Path | str) -> Path:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "format": "spherical_blast_pinn.contact_air_checkpoint",
-            "version": 1,
+            "version": 2,
             "loop": self.loop,
             "contact_net": self.contact_net.state_dict(),
             "air_net": self.air_net.state_dict(),
             "opt_contact": self.opt_contact.state_dict(),
             "opt_air": self.opt_air.state_dict(),
+            "contact_net_describe": self.contact_net.describe(),
+            "air_net_describe": self.air_net.describe(),
             "config": {
                 name: getattr(self.config, name)
                 for name in self.config.__dataclass_fields__
             },
             "case_ids": [case.case_id for case in self.cases],
+            "case_signatures": [self._case_signature(case) for case in self.cases],
             "case_metadata": [case.as_dict() for case in self.cases],
+            "validation_case_ids": [case.case_id for case in self.validation_cases],
+            "validation_case_signatures": [
+                self._case_signature(case) for case in self.validation_cases
+            ],
+            "validation": [
+                {"case_id": sample.case_id, "batch": self._batch_payload(sample.batch)}
+                for sample in self._validation
+            ],
             "history": self.history.as_dict(),
             "torch_rng": torch.get_rng_state(),
             "generator": self.generator.get_state(),
+            "numpy_rng": np.random.get_state(),
+            "python_rng": random.getstate(),
         }
         torch.save(payload, path)
         return path
 
     def load(self, path: Path | str) -> dict[str, Any]:
-        payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+        path = Path(path)
+        payload = torch.load(path, map_location="cpu", weights_only=False)
         if payload.get("format") != "spherical_blast_pinn.contact_air_checkpoint":
             raise TrainingError(f"{path}: not a contact-air checkpoint")
-        if payload.get("version") != 1:
-            raise TrainingError(f"{path}: unsupported checkpoint version {payload.get('version')!r}")
+        if payload.get("version") != 2:
+            raise TrainingError(
+                f"{path}: checkpoint version {payload.get('version')!r} is not "
+                "supported. Rebuild it: version 1 predates the contact-label time, "
+                "broadcast, R_b-gap, energy-scale and validation fixes"
+            )
         expected = [case.case_id for case in self.cases]
         if list(payload.get("case_ids", [])) != expected:
             raise TrainingError(
                 f"{path}: checkpoint case ids {payload.get('case_ids')!r} do not match "
                 f"the current training cases {expected!r}"
             )
+        signatures = [self._case_signature(case) for case in self.cases]
+        if list(payload.get("case_signatures", [])) != signatures:
+            raise TrainingError(
+                f"{path}: training data / precursor / boundary / split signature "
+                "does not match the current cases; refusing to resume on different data"
+            )
+        validation_ids = [case.case_id for case in self.validation_cases]
+        if list(payload.get("validation_case_ids", [])) != validation_ids:
+            raise TrainingError(
+                f"{path}: checkpoint validation case ids do not match the current split"
+            )
+        validation_signatures = [
+            self._case_signature(case) for case in self.validation_cases
+        ]
+        if list(payload.get("validation_case_signatures", [])) != validation_signatures:
+            raise TrainingError(
+                f"{path}: checkpoint validation split/data signature differs from the "
+                "current one; the fixed validation frames would change"
+            )
         saved_config = payload.get("config", {})
-        for key in ("validation_holdout_fraction", "n_schedule"):
+        for key in (
+            "validation_holdout_fraction", "validation_data_points",
+            "validation_contact_points", "n_schedule", "n_pde", "n_ic_shock",
+            "n_ic_ambient", "n_right", "n_data", "n_contact", "seed",
+        ):
             saved = saved_config.get(key)
             current = getattr(self.config, key)
             if saved is None or float(saved) != float(current):
                 raise TrainingError(
                     f"{path}: checkpoint {key}={saved!r} does not match the current "
-                    f"{current!r}; the train/validation split or schedule changed"
+                    f"{current!r}; the training/validation split or sampling changed"
                 )
+        # Validate every state dict before mutating anything: a partially
+        # loaded checkpoint is worse than a refused one.
+        self._check_state_dict(self.contact_net, payload["contact_net"], "contact_net")
+        self._check_state_dict(self.air_net, payload["air_net"], "air_net")
+        self._check_optimizer(
+            self.opt_contact, payload["opt_contact"], self.contact_net, "opt_contact"
+        )
+        self._check_optimizer(self.opt_air, payload["opt_air"], self.air_net, "opt_air")
+        saved_validation = payload.get("validation", [])
+        if [entry.get("case_id") for entry in saved_validation] != validation_ids:
+            raise TrainingError(
+                f"{path}: saved validation samples do not match the current validation cases"
+            )
+        restored_validation = [
+            ValidationSample(
+                case_id=str(entry["case_id"]),
+                batch=self._batch_from_payload(entry["batch"]),
+            )
+            for entry in saved_validation
+        ]
         self.contact_net.load_state_dict(payload["contact_net"])
         self.air_net.load_state_dict(payload["air_net"])
         self.opt_contact.load_state_dict(payload["opt_contact"])
@@ -582,10 +847,15 @@ class AlternatingTrainer:
             best_score=float(history.get("best_score", float("inf")) or float("inf")),
             best_loop=history.get("best_loop"),
         )
+        self._validation = restored_validation
         if "torch_rng" in payload:
             torch.set_rng_state(payload["torch_rng"])
         if "generator" in payload:
             self.generator.set_state(payload["generator"])
+        if "numpy_rng" in payload:
+            np.random.set_state(payload["numpy_rng"])
+        if "python_rng" in payload:
+            random.setstate(payload["python_rng"])
         return {"loop": self.loop, "case_ids": expected}
 
 

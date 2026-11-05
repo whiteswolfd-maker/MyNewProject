@@ -63,6 +63,31 @@ PYTHONPATH=src python -m spherical_blast_pinn.cli.contact_air evaluate-500 \
 会拒绝无缓存训练；真实数据必须先 `extract_profiles` 再 `build-cache`。
 `smoke.yaml` 的 `synthetic: true` 只是工程夹具。
 
+### 2026-11-05 修正（新路径）
+
+- 接触面数据损失改在 `batch.t_contact` 上重新计算 `R_b`、`dR_b/dt` 和
+  `ContactNet`；PDE/interface 仍用各自 `t_pde` 时刻。
+- 预测/标签/掩码统一展平并按掩码选点后再相减；修复 `[N,1]` 与 `[N]` 广播成
+  `[N,N]` 的交叉比较。训练与验证共用同一误差选择逻辑。
+- `R_b` 的 NaN/无效帧保留为断段标志，不再删除后连接两侧；时间必须严格递增；
+  平台保段、回退拒段；求解/预测区间是包含 `t0` 的单个连续段。
+- 能量残差归一化改为单位体积总能量
+  `s_E = s_p/(gamma-1) + 0.5 s_rho s_u^2`、`s_fE=s_E/(s_R/s_u)`；
+  比内能 `e` 的 EOS 定义不变。
+- 分离状态分成三项证据记录（接触区间、受冲击空气层、环境侧右边界），
+  只有三项同时成立才是 `separated`；全环境剖面不再被当作右边界。
+- `predict-500` 改用 `load_prediction_case`，只读 `metadata`/`rb_*`；预测时间范围
+  来自连续 `R_b` 段，不依赖内部观测是否有效。`evaluate-500` 才读内部参考。
+- 验证不可评估时返回 `score: null`，不参与最佳模型选择；无法形成独立验证帧时
+  训练入口报错，而不是把训练帧当验证集。恢复训练核对数据/前置/边界/模型结构/
+  验证划分，并恢复 RNG 与固定验证点。
+- 缓存与检查点格式升到 **version 2**。旧 version 1 缓存和检查点会被拒绝，
+  必须重新 `build-cache` / 重新训练。
+- `t_cj=R_cj/D`、材料卡来源、模型时钟与 d3plot 时间轴同原点均标为未核实；
+  `p_c(t0)` 与 `p_a,sep` 的实际相对差由 `initial_compatibility()` 报告，不强行抹平。
+- `extract_profiles` 的 `x` 是球壳几何中点、场量是壳平均；缓存里明确记录
+  “shell midpoint, not cell centroid”。
+
 下面的第 1–9 节描述的是**旧 ProductNet/AirNet/FrontNet 路径**，保留用于追溯；
 它不是 `contact_air` 新路径的实现依据，也不得把旧初场、旧总损失或旧 0.5 接触面
 标签混入新路径。
