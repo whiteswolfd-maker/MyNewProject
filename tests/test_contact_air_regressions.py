@@ -19,8 +19,10 @@ from torch import nn
 from spherical_blast_pinn.config import load_config
 from spherical_blast_pinn.contact_air import cli
 from spherical_blast_pinn.contact_air.data import (
+    CaseArrays,
     PredictionCaseData,
     RightBoundaryDetection,
+    build_air_observations,
     build_case,
     classify_separation_frames,
     contact_interval_from_material,
@@ -829,6 +831,47 @@ def test_air_data_sampling_is_frame_first_then_point():
     times = sample["t"].numpy()
     assert np.count_nonzero(times == 0.0) > 60
     assert np.count_nonzero(times == 1.0) > 60
+
+
+def test_air_observations_keep_the_old_valid_supervision_mask():
+    """A material==1 point outside the old ``valid`` mask must not enter training.
+
+    ``extract_profiles`` keeps outer boundary-air field validity for R_b
+    diagnosis while ``valid`` remains False.  Training observations must not
+    turn that diagnostic access into supervision.
+    """
+    material = np.array([[0, 1, 1, 1]], dtype=np.int64)
+    valid = np.array([[False, True, False, True]], dtype=bool)
+    arrays = CaseArrays(
+        case_id="mask",
+        charge_radius_m=0.05,
+        times=np.array([1.0e-5]),
+        radius=np.array([0.10, 0.11, 0.12, 0.13]),
+        density=np.ones((1, 4)),
+        velocity=np.zeros((1, 4)),
+        pressure=np.ones((1, 4)),
+        material=material,
+        phase_material=material.copy(),
+        valid=valid,
+        valid_density=np.ones((1, 4), dtype=bool),
+        valid_velocity=np.ones((1, 4), dtype=bool),
+        valid_pressure=np.ones((1, 4), dtype=bool),
+    )
+    contact = ContactIntervalTable(
+        case_id="mask",
+        times=np.array([1.0e-5]),
+        low=np.array([0.095]),
+        up=np.array([0.105]),
+        raw=np.array([0.10]),
+        valid=np.array([True]),
+    )
+    boundary = RightBoundaryTrajectory.from_arrays(
+        case_id="mask", times=[1.0e-5], radii=[0.15], valid=[True],
+    )
+    store = build_air_observations(arrays, contact, boundary)
+    assert store.size == 2
+    assert store.radius.tolist() == [0.11, 0.13]
+    assert 0.12 not in store.radius.tolist()
 
 
 def test_contact_labels_outside_the_solve_window_are_not_sampled():

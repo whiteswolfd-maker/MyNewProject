@@ -5,10 +5,20 @@
 - Extracted profile: `F:\2-codex-coupled-handoff-pinn\2-codex-coupled-handoff-pinn\2-codex-coupled-handoff-pinn1\outputs\diagnostic_50mm_20261105\profile` (16 selected states)
 - Real frames; no synthetic substitution; no time shift.
 
+## Nomenclature
+
+- `t=0` is the first **data** frame; it is not the network start.
+- `t0=19.531333 us` is the network/precursor start, `t0=t_sep+epsilon`.
+- `p_air_IC_shocked` is the matched air state at separation (`p_a_sep`); `p_air_IC_ambient` is the undisturbed ambient pressure `p_inf`.
+- `contact_band_width` is `R_c,up-R_c,low`; it is not an ALE cell thickness and not a statistical uncertainty.  The cell thickness is `contact_cell_thickness_m`/`shock_cell_thickness_m`; the position uncertainty is `contact_position_uncertainty_m`.
+- The diagnostic sensitivity uses 0.005 kg/m3 **absolute** density tolerance, which is 0.408% of 1.225, not 0.5%.
+
 ## Theory and clock
 
 | quantity | value |
 |---|---:|
+| initial_data_frame_t_s | 0 |
+| network_t0_s | 1.95313329e-05 |
 | theoretical_t_sep_s | 1.85313329e-05 |
 | theoretical_t0_s | 1.95313329e-05 |
 | epsilon_s | 1e-06 |
@@ -36,21 +46,23 @@ Frame before t0: state 19 at 18.986206 us; frame after t0: state 20 at 19.987059
 | quantity | value |
 |---|---:|
 | p_c_t0_pa | 55397732.71324027 |
-| p_a_sep_pa | 71225390.21469861 |
-| p_air_ic_config_pa | 101320.0 |
-| p_air_ic_data_outer_median_pa | 101320.00765363831 |
-| p_c_t0_minus_p_a_sep_pa | -15827657.50145834 |
-| p_c_t0_vs_p_a_sep_relative | 0.2222193160858531 |
-| p_c_t0_minus_air_ic_config_pa | 55296412.71324027 |
-| p_c_t0_vs_air_ic_config_relative | 545.760093893015 |
-| p_c_t0_over_air_ic_config | 546.760093893015 |
-| p_c_t0_minus_air_ic_data_pa | 55296412.705586635 |
-| p_c_t0_vs_air_ic_data_relative | 545.7600525911625 |
+| p_air_IC_shocked_pa | 71225390.21469861 |
+| p_air_IC_ambient_pa | 101320.0 |
+| p_air_IC_ambient_data_outer_median_pa | 101320.00765363831 |
+| p_c_t0_minus_p_air_IC_shocked_pa | -15827657.50145834 |
+| p_c_t0_vs_p_air_IC_shocked_relative | 0.2222193160858531 |
+| p_c_t0_over_p_air_IC_shocked | 0.7777806839141469 |
+| p_c_t0_minus_p_air_IC_ambient_pa | 55296412.71324027 |
+| p_c_t0_vs_p_air_IC_ambient_relative | 545.760093893015 |
+| p_c_t0_over_p_air_IC_ambient | 546.760093893015 |
+| p_c_t0_minus_p_air_IC_ambient_data_pa | 55296412.705586635 |
+| p_c_t0_vs_p_air_IC_ambient_data_relative | 545.7600525911625 |
 | forced_equal | False |
+| note | p_air_IC_shocked is the matched air state at separation (p_a_sep); p_air_IC_ambient is the undisturbed ambient pressure p_inf.  The 22.22% compatibility difference is against p_a_sep.  The huge ratio against p_inf is expected for a shocked contact state and is not a closure target. |
 
 ## Per-frame table (strict current configuration)
 
-| # | state | t (us) | contact low/up (mm) | R_s (mm) | R_s - R_cup (mm) | R_b cand/verified | R_b failure | sep | native source/value (mm) | sup rho/u/p | field-valid rho/u/p | air withdrawn | first valid air (mm) |
+| # | state | t (us) | contact low/up (mm) | R_s (mm) | R_s - R_cup (mm) | R_b cand/verified | R_b failure | sep | native source/value (mm) | old-valid rho/u/p | diagnostic field-valid rho/u/p | air withdrawn | first valid air (mm) |
 |---|---:|---:|---|---:|---:|---|---|---|---|---:|---:|---:|---:|
 | 0 | 0 | 0.000 | 49.84/50.08 | — | — | —/False | no finite ambient run under configured density/velocity tolerances | unresolvable | air_native_resolution_fallback_m/6.418 | 0/0/0 | 2084/2084/2084 | 2084 | 50.08 |
 | 1 | 12 | 11.992 | 49.96/76.00 | 72.64 | -3.36 | —/False | no finite ambient run under configured density/velocity tolerances | unresolvable | shock_cell_thickness_m/15.260 | 0/0/0 | 1823/1823/1823 | 1898 | 81.40 |
@@ -69,6 +81,8 @@ Frame before t0: state 19 at 18.986206 us; frame after t0: state 20 at 19.987059
 | 14 | 35 | 34.993 | 95.32/169.46 | — | — | —/False | no finite ambient run under configured density/velocity tolerances | unresolvable | air_native_resolution_fallback_m/49.487 | 0/0/0 | 1099/1099/1099 | 1202 | 193.11 |
 | 15 | 40 | 39.947 | 101.80/181.01 | — | — | —/False | no finite ambient run under configured density/velocity tolerances | unresolvable | air_native_resolution_fallback_m/49.192 | 0/0/0 | 986/986/986 | 1160 | 257.73 |
 
+The `old-valid` columns are `legacy material==1 & valid & field mask`. They are **not** final training counts.  Because the strict R_b is absent, `build_air_observations` has no [R_c,raw, R_b] geometric interval and the actual observation store is empty on every frame.  See `raw_review/` for the staged material/field/protection/geometry counts.
+
 ## Ambient verification
 
 - t=0 ambient field-valid shells: 2084
@@ -80,6 +94,6 @@ Frame before t0: state 19 at 18.986206 us; frame after t0: state 20 at 19.987059
 
 ## Conclusion
 
-The blocking item is **not a d3plot read failure**: all 16 selected real states read, and the air fields are finite where the extractor marks them valid. The first-order blockers are data-side: (a) the contact mixing band is about 40 mm wide and its upper edge can equal or exceed the detected shock (t0: 111.66 mm vs 109.24 mm), so there is no resolved shocked-air layer; (b) the first pure-air shells outside the contact are contaminated/invalid (first valid air 126.4 mm), and no selected frame has a training-valid air point; (c) the strict ambient tolerances are incompatible with the measured radial air-density profile (1.216-1.225 kg/m3), so no ambient run or R_b is verified. The old shock supervision leaves only 4/16 frames 'confirmed', and the frame immediately after t0 has all air labels withdrawn. The theory clock is not proven incompatible: R_cup reaches R_sep at 18.18 us vs t_sep=18.53 us, and reaches Rc0/Rs0 at 20.22/20.73 us vs t0=19.53 us, but this agreement is with the broad upper bracket edge, not with the reconstruction centre. No version-4 cache was written.
+The blocking item is **not a d3plot read failure**: all 16 selected real states read, and the air fields are finite where the extractor marks them valid. The first-order blockers are data-side: (a) the contact mixing band is about 40 mm wide and its upper edge can equal or exceed the detected shock (t0: 111.66 mm vs 109.24 mm), so there is no resolved shocked-air layer.  This is a bracket width, not an ALE cell thickness and not a statistical uncertainty: at state 19 the bracket is 40.08 mm, the contact cell thickness is 21.57 mm, the shock cell thickness is 32.90 mm, and the position uncertainty is +/-20.04 mm. (b) the first pure-air shells outside the contact are contaminated/invalid (first valid air 126.4 mm), and no selected frame has a material1 point passing the old valid mask; the actual final training count is 0 because the geometric R_b interval is empty, not because a material count was substituted for it.  The raw-cell review shows a transition spread over several coarse cells; this is a resolution statement, not proof that no physical layer exists. (c) the strict ambient tolerances are incompatible with the measured radial air-density profile (1.216-1.225 kg/m3), so no ambient run or R_b is verified. The old shock supervision leaves only 4/16 frames 'confirmed', and the frame immediately after t0 has all air labels withdrawn. The theory clock is not proven incompatible: R_cup reaches R_sep at 18.18 us vs t_sep=18.53 us, and reaches Rc0/Rs0 at 20.22/20.73 us vs t0=19.53 us, but this agreement is with the broad upper bracket edge, not with the reconstruction centre. No version-4 cache was written.
 
 A diagnostic tolerance relaxation is included in `diagnostic.json`; it is not an accepted configuration and no cache was built from it.

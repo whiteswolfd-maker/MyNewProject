@@ -939,6 +939,9 @@ def build_air_observations(
     times = np.asarray(arrays.times, dtype=np.float64).reshape(-1)
     radius = np.asarray(arrays.radius, dtype=np.float64).reshape(-1)
     mat = np.asarray(arrays.material)
+    valid = np.asarray(arrays.valid, dtype=bool)
+    if valid.shape != mat.shape:
+        raise CaseDataError("valid must have the same shape as material")
     obs_t, obs_r, obs_z = [], [], []
     obs_rho, obs_u, obs_p = [], [], []
     obs_vd, obs_vu, obs_vp, obs_dom, obs_frame = [], [], [], [], []
@@ -952,7 +955,11 @@ def build_air_observations(
         raw = float(contact.raw[frame])
         if not (rb > raw):
             continue
-        air = mat[frame] == 1
+        # Training observations keep the old supervision restrictions:
+        # material==1 is the old supervised air label; ``valid`` additionally
+        # removes the front protection bands and contaminated shells.  R_b and
+        # separation use ``phase_material`` and field validity separately.
+        air = (mat[frame] == 1) & valid[frame]
         if not np.any(air):
             continue
         indices = np.flatnonzero(air)

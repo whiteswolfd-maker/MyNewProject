@@ -131,9 +131,10 @@ def sensitivity_boundary_reports(case, contact_up, valid):
 
     The measured initial air density is 1.216-1.225 kg/m3 (0.7% radial
     variation), so the 1e-9 kg/m3 configured tolerance cannot identify an
-    ambient run.  This sensitivity uses 0.5% density and 1e-4 m/s velocity
-    tolerances to ask whether the boundary evidence itself is otherwise
-    present.  It is reported as a diagnostic, not as an accepted setting.
+    ambient run.  This sensitivity uses a 0.005 kg/m3 absolute density
+    tolerance (0.408% of 1.225) and 1e-4 m/s velocity to ask whether the
+    boundary evidence itself is otherwise present.  It is reported as a
+    diagnostic, not as an accepted setting.
     """
     reports = []
     for frame in range(case.times.size):
@@ -269,9 +270,15 @@ def frame_counts(case, material, frame: int) -> dict[str, Any]:
         & np.isfinite(case.velocity[frame])
         & np.isfinite(case.pressure[frame])
     )
-    train_air = phase_air & np.asarray(case.valid[frame], dtype=bool)
+    # Training observations use the legacy material label and the legacy
+    # ``valid`` mask.  ``phase_air`` is a diagnostic field, not a training
+    # eligibility mask.
+    material1 = np.asarray(case.material[frame]) == 1
+    train_air = material1 & np.asarray(case.valid[frame], dtype=bool)
     return {
         "n_phase_air": int(np.count_nonzero(phase_air)),
+        "n_material1": int(np.count_nonzero(material1)),
+        "n_material1_field_valid_all": int(np.count_nonzero(material1 & state_ok)),
         "n_field_valid_air_all": int(np.count_nonzero(phase_air & state_ok)),
         "n_field_valid_air_rho": int(np.count_nonzero(phase_air & fv_d)),
         "n_field_valid_air_u": int(np.count_nonzero(phase_air & fv_u)),
@@ -488,6 +495,8 @@ def main() -> int:
             "separation_sensitivity_status": str(sens_frame["status"]),
             "separation_sensitivity_reasons": list(sens_frame["reasons"]),
             "n_phase_air": counts["n_phase_air"],
+            "n_material1": counts["n_material1"],
+            "n_material1_field_valid_all": counts["n_material1_field_valid_all"],
             "n_field_valid_air_all": counts["n_field_valid_air_all"],
             "n_field_valid_air_rho": counts["n_field_valid_air_rho"],
             "n_field_valid_air_u": counts["n_field_valid_air_u"],
@@ -591,24 +600,35 @@ def main() -> int:
         },
     }
 
-    p_air_config = float(tolerances["ambient_pressure_pa"])
-    p_air_data = float(ambient_t0.get("p_min_pa") or p_air_config)
+    p_inf_config = float(tolerances["ambient_pressure_pa"])
+    p_inf_data = float(frames[0]["outer100_p_median"])
     pressure_comparison = {
         "p_c_t0_pa": float(precursor.p_c_t0),
-        "p_a_sep_pa": float(precursor.p_sep),
-        "p_air_ic_config_pa": p_air_config,
-        "p_air_ic_data_outer_median_pa": float(frames[0]["outer100_p_median"]),
-        "p_c_t0_minus_p_a_sep_pa": float(precursor.p_c_t0 - precursor.p_sep),
-        "p_c_t0_vs_p_a_sep_relative": float(abs(precursor.p_c_t0 - precursor.p_sep) / precursor.p_sep),
-        "p_c_t0_minus_air_ic_config_pa": float(precursor.p_c_t0 - p_air_config),
-        "p_c_t0_vs_air_ic_config_relative": float(abs(precursor.p_c_t0 - p_air_config) / p_air_config),
-        "p_c_t0_over_air_ic_config": float(precursor.p_c_t0 / p_air_config),
-        "p_c_t0_minus_air_ic_data_pa": float(precursor.p_c_t0 - float(frames[0]["outer100_p_median"])),
-        "p_c_t0_vs_air_ic_data_relative": float(
-            abs(precursor.p_c_t0 - float(frames[0]["outer100_p_median"]))
-            / float(frames[0]["outer100_p_median"])
+        "p_air_IC_shocked_pa": float(precursor.p_sep),
+        "p_air_IC_ambient_pa": p_inf_config,
+        "p_air_IC_ambient_data_outer_median_pa": p_inf_data,
+        "p_c_t0_minus_p_air_IC_shocked_pa": float(precursor.p_c_t0 - precursor.p_sep),
+        "p_c_t0_vs_p_air_IC_shocked_relative": float(
+            abs(precursor.p_c_t0 - precursor.p_sep) / precursor.p_sep
+        ),
+        "p_c_t0_over_p_air_IC_shocked": float(precursor.p_c_t0 / precursor.p_sep),
+        "p_c_t0_minus_p_air_IC_ambient_pa": float(precursor.p_c_t0 - p_inf_config),
+        "p_c_t0_vs_p_air_IC_ambient_relative": float(
+            abs(precursor.p_c_t0 - p_inf_config) / p_inf_config
+        ),
+        "p_c_t0_over_p_air_IC_ambient": float(precursor.p_c_t0 / p_inf_config),
+        "p_c_t0_minus_p_air_IC_ambient_data_pa": float(precursor.p_c_t0 - p_inf_data),
+        "p_c_t0_vs_p_air_IC_ambient_data_relative": float(
+            abs(precursor.p_c_t0 - p_inf_data) / p_inf_data
         ),
         "forced_equal": False,
+        "note": (
+            "p_air_IC_shocked is the matched air state at separation (p_a_sep); "
+            "p_air_IC_ambient is the undisturbed ambient pressure p_inf.  "
+            "The 22.22% compatibility difference is against p_a_sep.  The huge "
+            "ratio against p_inf is expected for a shocked contact state and is "
+            "not a closure target."
+        ),
     }
 
     # Linear interpolations of the contact bracket at the theoretical times.
@@ -635,6 +655,8 @@ def main() -> int:
         return None
 
     timing = {
+        "initial_data_frame_t_s": 0.0,
+        "network_t0_s": float(precursor.t0),
         "theoretical_t_sep_s": float(precursor.t_sep),
         "theoretical_t0_s": float(precursor.t0),
         "t0_definition": "t0 = t_sep + epsilon_s",
@@ -698,11 +720,11 @@ def main() -> int:
             sum(1 for item in frames if item["contact_up_ge_shock_radius"])
         ),
         "blocking": [
-            "contact/interface resolution: at t0 the contact bracket upper edge is 111.66 mm while the confirmed shock of state 19 is 109.24 mm; R_c,up >= R_s leaves no pure-air layer to verify",
+            "contact/interface resolution: at t0 the contact bracket upper edge is 111.66 mm while state 19's confirmed shock is 109.24 mm (reliable range 103.0-109.24 mm); the current shell representation has no resolved pure-air layer. Raw cells span 20-50 mm; this is a resolution statement, not proof that no physical layer exists",
             "strict ambient verification: 0 ambient cells in every selected frame",
-            "air-side field validity: the first pure-air shells immediately outside the contact are contaminated/invalid; first valid air is 126.4 mm at t0 while contact_up is 111.6 mm; no selected frame has a training-valid air point",
-            "old shock supervision: only 4 of 16 selected frames have confirmed shock supervision; state 20 (19.987 us, immediately after t0) has all air labels withdrawn",
-            "R_b: no strict verified candidate and no continuous R_b segment at t0; build-cache fails before writing a cache",
+            "air-side field validity: the first pure-air shells immediately outside the contact are contaminated/invalid; first valid air is 126.4 mm at t0 while contact_up is 111.6 mm; no selected frame has a material1 point passing old valid",
+            "old shock supervision: only 4 of 16 selected frames have confirmed shock supervision; state 20 (19.987 us, immediately after t0) is doubtful and has all air labels withdrawn",
+            "R_b: no strict verified candidate and no continuous R_b segment at t0; actual AirObservationStore.size=0 and final field-valid counts are 0/0/0 because the geometric range is empty, not because a material count was substituted",
         ],
     }
 
@@ -729,10 +751,11 @@ def main() -> int:
         },
         "sensitivity_boundary": {
             "note": (
-                "diagnostic only: ambient tolerance widened to 0.5% density and "
-                "1e-4 m/s velocity because the measured initial air density spans "
-                "1.216-1.225 kg/m3. This is NOT an accepted configuration and no "
-                "cache was built from it."
+                "diagnostic only: ambient tolerance widened to 0.005 kg/m3 "
+                "absolute density (0.408% of 1.225) and 1e-4 m/s velocity because "
+                "the measured initial air density spans 1.216-1.225 kg/m3. This is "
+                "NOT an accepted configuration and no cache was built from it. "
+                "The t=0 false positive is analyzed in raw_review/report.md."
             ),
             "tolerances": sens_tol,
             "separation_status": sensitivity_sep["status"],
@@ -759,7 +782,8 @@ def main() -> int:
         "n_field_valid_air_p_between_contact_up_and_shock",
         "air_native_resolution_source", "air_native_resolution_m",
         "air_native_fallback_m", "air_native_fallback_applicable",
-        "n_phase_air", "n_field_valid_air_all", "n_field_valid_air_rho",
+        "n_phase_air", "n_material1", "n_material1_field_valid_all",
+        "n_field_valid_air_all", "n_field_valid_air_rho",
         "n_field_valid_air_u", "n_field_valid_air_p",
         "n_training_valid_air", "n_training_valid_air_rho",
         "n_training_valid_air_u", "n_training_valid_air_p",
@@ -787,11 +811,33 @@ def main() -> int:
     lines.append(f"- Extracted profile: `{PROFILE}` (16 selected states)")
     lines.append("- Real frames; no synthetic substitution; no time shift.")
     lines.append("")
+    lines.append("## Nomenclature")
+    lines.append("")
+    lines.append("- `t=0` is the first **data** frame; it is not the network start.")
+    lines.append(
+        "- `t0=19.531333 us` is the network/precursor start, `t0=t_sep+epsilon`."
+    )
+    lines.append(
+        "- `p_air_IC_shocked` is the matched air state at separation (`p_a_sep`); "
+        "`p_air_IC_ambient` is the undisturbed ambient pressure `p_inf`."
+    )
+    lines.append(
+        "- `contact_band_width` is `R_c,up-R_c,low`; it is not an ALE cell "
+        "thickness and not a statistical uncertainty.  The cell thickness is "
+        "`contact_cell_thickness_m`/`shock_cell_thickness_m`; the position "
+        "uncertainty is `contact_position_uncertainty_m`."
+    )
+    lines.append(
+        "- The diagnostic sensitivity uses 0.005 kg/m3 **absolute** density "
+        "tolerance, which is 0.408% of 1.225, not 0.5%."
+    )
+    lines.append("")
     lines.append("## Theory and clock")
     lines.append("")
     lines.append("| quantity | value |")
     lines.append("|---|---:|")
     for key in (
+        "initial_data_frame_t_s", "network_t0_s",
         "theoretical_t_sep_s", "theoretical_t0_s", "epsilon_s", "t_cj_s",
         "surface_arrival_ref_s", "theory_R_sep_m", "theory_Rc0_m", "theory_Rs0_m",
         "contact_up_crosses_R_sep_s", "contact_up_crosses_Rc0_s",
@@ -823,7 +869,7 @@ def main() -> int:
     lines.append(
         "| # | state | t (us) | contact low/up (mm) | R_s (mm) | R_s - R_cup (mm) | "
         "R_b cand/verified | R_b failure | sep | native source/value (mm) | "
-        "sup rho/u/p | field-valid rho/u/p | air withdrawn | first valid air (mm) |"
+        "old-valid rho/u/p | diagnostic field-valid rho/u/p | air withdrawn | first valid air (mm) |"
     )
     lines.append("|---|---:|---:|---|---:|---:|---|---|---|---|---:|---:|---:|---:|")
     for item in frames:
@@ -854,6 +900,14 @@ def main() -> int:
             f"{item['n_air_withdrawn']} | {first_valid} |"
         )
     lines.append("")
+    lines.append(
+        "The `old-valid` columns are `legacy material==1 & valid & field mask`. "
+        "They are **not** final training counts.  Because the strict R_b is absent, "
+        "`build_air_observations` has no [R_c,raw, R_b] geometric interval and the "
+        "actual observation store is empty on every frame.  See `raw_review/` for "
+        "the staged material/field/protection/geometry counts."
+    )
+    lines.append("")
     lines.append("## Ambient verification")
     lines.append("")
     lines.append(f"- t=0 ambient field-valid shells: {ambient_t0['n_phase_air_field_valid']}")
@@ -880,9 +934,18 @@ def main() -> int:
         "them valid. The first-order blockers are data-side: (a) the contact "
         "mixing band is about 40 mm wide and its upper edge can equal or exceed "
         "the detected shock (t0: 111.66 mm vs 109.24 mm), so there is no "
-        "resolved shocked-air layer; (b) the first pure-air shells outside the "
+        "resolved shocked-air layer.  This is a bracket width, not an ALE cell "
+        "thickness and not a statistical uncertainty: at state 19 the bracket is "
+        "40.08 mm, the contact cell thickness is 21.57 mm, the shock cell "
+        "thickness is 32.90 mm, and the position uncertainty is +/-20.04 mm. "
+        "(b) the first pure-air shells outside the "
         "contact are contaminated/invalid (first valid air 126.4 mm), and no "
-        "selected frame has a training-valid air point; (c) the strict ambient "
+        "selected frame has a material1 point passing the old valid mask; the "
+        "actual final training count is 0 because the geometric R_b interval is "
+        "empty, not because a material count was substituted for it.  The raw-cell "
+        "review shows a transition spread over several coarse cells; this is a "
+        "resolution statement, not proof that no physical layer exists. "
+        "(c) the strict ambient "
         "tolerances are incompatible with the measured radial air-density "
         "profile (1.216-1.225 kg/m3), so no ambient run or R_b is verified. The "
         "old shock supervision leaves only 4/16 frames 'confirmed', and the "

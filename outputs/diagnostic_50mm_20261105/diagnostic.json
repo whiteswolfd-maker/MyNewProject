@@ -288,6 +288,8 @@
     }
   },
   "timing": {
+    "initial_data_frame_t_s": 0.0,
+    "network_t0_s": 1.953133291397989e-05,
     "theoretical_t_sep_s": 1.8531332913979888e-05,
     "theoretical_t0_s": 1.953133291397989e-05,
     "t0_definition": "t0 = t_sep + epsilon_s",
@@ -340,17 +342,19 @@
   },
   "pressure_comparison": {
     "p_c_t0_pa": 55397732.71324027,
-    "p_a_sep_pa": 71225390.21469861,
-    "p_air_ic_config_pa": 101320.0,
-    "p_air_ic_data_outer_median_pa": 101320.00765363831,
-    "p_c_t0_minus_p_a_sep_pa": -15827657.50145834,
-    "p_c_t0_vs_p_a_sep_relative": 0.2222193160858531,
-    "p_c_t0_minus_air_ic_config_pa": 55296412.71324027,
-    "p_c_t0_vs_air_ic_config_relative": 545.760093893015,
-    "p_c_t0_over_air_ic_config": 546.760093893015,
-    "p_c_t0_minus_air_ic_data_pa": 55296412.705586635,
-    "p_c_t0_vs_air_ic_data_relative": 545.7600525911625,
-    "forced_equal": false
+    "p_air_IC_shocked_pa": 71225390.21469861,
+    "p_air_IC_ambient_pa": 101320.0,
+    "p_air_IC_ambient_data_outer_median_pa": 101320.00765363831,
+    "p_c_t0_minus_p_air_IC_shocked_pa": -15827657.50145834,
+    "p_c_t0_vs_p_air_IC_shocked_relative": 0.2222193160858531,
+    "p_c_t0_over_p_air_IC_shocked": 0.7777806839141469,
+    "p_c_t0_minus_p_air_IC_ambient_pa": 55296412.71324027,
+    "p_c_t0_vs_p_air_IC_ambient_relative": 545.760093893015,
+    "p_c_t0_over_p_air_IC_ambient": 546.760093893015,
+    "p_c_t0_minus_p_air_IC_ambient_data_pa": 55296412.705586635,
+    "p_c_t0_vs_p_air_IC_ambient_data_relative": 545.7600525911625,
+    "forced_equal": false,
+    "note": "p_air_IC_shocked is the matched air state at separation (p_a_sep); p_air_IC_ambient is the undisturbed ambient pressure p_inf.  The 22.22% compatibility difference is against p_a_sep.  The huge ratio against p_inf is expected for a shocked contact state and is not a closure target."
   },
   "ambient_t0": {
     "time_s": 0.0,
@@ -495,11 +499,11 @@
     "n_frames_with_valid_training_air": 0,
     "n_frames_contact_up_ge_shock": 3,
     "blocking": [
-      "contact/interface resolution: at t0 the contact bracket upper edge is 111.66 mm while the confirmed shock of state 19 is 109.24 mm; R_c,up >= R_s leaves no pure-air layer to verify",
+      "contact/interface resolution: at t0 the contact bracket upper edge is 111.66 mm while state 19's confirmed shock is 109.24 mm (reliable range 103.0-109.24 mm); the current shell representation has no resolved pure-air layer. Raw cells span 20-50 mm; this is a resolution statement, not proof that no physical layer exists",
       "strict ambient verification: 0 ambient cells in every selected frame",
-      "air-side field validity: the first pure-air shells immediately outside the contact are contaminated/invalid; first valid air is 126.4 mm at t0 while contact_up is 111.6 mm; no selected frame has a training-valid air point",
-      "old shock supervision: only 4 of 16 selected frames have confirmed shock supervision; state 20 (19.987 us, immediately after t0) has all air labels withdrawn",
-      "R_b: no strict verified candidate and no continuous R_b segment at t0; build-cache fails before writing a cache"
+      "air-side field validity: the first pure-air shells immediately outside the contact are contaminated/invalid; first valid air is 126.4 mm at t0 while contact_up is 111.6 mm; no selected frame has a material1 point passing old valid",
+      "old shock supervision: only 4 of 16 selected frames have confirmed shock supervision; state 20 (19.987 us, immediately after t0) is doubtful and has all air labels withdrawn",
+      "R_b: no strict verified candidate and no continuous R_b segment at t0; actual AirObservationStore.size=0 and final field-valid counts are 0/0/0 because the geometric range is empty, not because a material count was substituted"
     ]
   },
   "frames": [
@@ -554,6 +558,8 @@
         "the disturbed air samples do not form a continuous run starting at the contact-side air sample"
       ],
       "n_phase_air": 2084,
+      "n_material1": 0,
+      "n_material1_field_valid_all": 0,
       "n_field_valid_air_all": 2084,
       "n_field_valid_air_rho": 2084,
       "n_field_valid_air_u": 2084,
@@ -632,6 +638,8 @@
         "the disturbed air samples do not form a continuous run starting at the contact-side air sample"
       ],
       "n_phase_air": 1898,
+      "n_material1": 2,
+      "n_material1_field_valid_all": 0,
       "n_field_valid_air_all": 1823,
       "n_field_valid_air_rho": 1823,
       "n_field_valid_air_u": 1823,
@@ -710,6 +718,8 @@
         "the disturbed air samples do not form a continuous run starting at the contact-side air sample"
       ],
       "n_phase_air": 1841,
+      "n_material1": 0,
+      "n_material1_field_valid_all": 0,
       "n_field_valid_air_all": 1769,
       "n_field_valid_air_rho": 1769,
       "n_field_valid_air_u": 1769,
@@ -788,6 +798,8 @@
         "the disturbed air samples do not form a continuous run starting at the contact-side air sample"
       ],
       "n_phase_air": 1772,
+      "n_material1": 0,
+      "n_material1_field_valid_all": 0,
       "n_field_valid_air_all": 1647,
       "n_field_valid_air_rho": 1647,
       "n_field_valid_air_u": 1647,
@@ -866,6 +878,8 @@
         "the disturbed air samples do not form a continuous run starting at the contact-side air sample"
       ],
       "n_phase_air": 1732,
+      "n_material1": 180,
+      "n_material1_field_valid_all": 0,
       "n_field_valid_air_all": 1448,
       "n_field_valid_air_rho": 1448,
       "n_field_valid_air_u": 1448,
@@ -944,6 +958,8 @@
         "the disturbed air samples do not form a continuous run starting at the contact-side air sample"
       ],
       "n_phase_air": 1695,
+      "n_material1": 0,
+      "n_material1_field_valid_all": 0,
       "n_field_valid_air_all": 1448,
       "n_field_valid_air_rho": 1448,
       "n_field_valid_air_u": 1448,
@@ -1022,6 +1038,8 @@
         "the disturbed air samples do not form a continuous run starting at the contact-side air sample"
       ],
       "n_phase_air": 1657,
+      "n_material1": 66,
+      "n_material1_field_valid_all": 0,
       "n_field_valid_air_all": 1448,
       "n_field_valid_air_rho": 1448,
       "n_field_valid_air_u": 1448,
@@ -1100,6 +1118,8 @@
         "the disturbed air samples do not form a continuous run starting at the contact-side air sample"
       ],
       "n_phase_air": 1620,
+      "n_material1": 0,
+      "n_material1_field_valid_all": 0,
       "n_field_valid_air_all": 1448,
       "n_field_valid_air_rho": 1448,
       "n_field_valid_air_u": 1448,
@@ -1178,6 +1198,8 @@
         "the disturbed air samples do not form a continuous run starting at the contact-side air sample"
       ],
       "n_phase_air": 1593,
+      "n_material1": 0,
+      "n_material1_field_valid_all": 0,
       "n_field_valid_air_all": 1448,
       "n_field_valid_air_rho": 1448,
       "n_field_valid_air_u": 1448,
@@ -1256,6 +1278,8 @@
         "the disturbed air samples do not form a continuous run starting at the contact-side air sample"
       ],
       "n_phase_air": 1570,
+      "n_material1": 123,
+      "n_material1_field_valid_all": 1,
       "n_field_valid_air_all": 1448,
       "n_field_valid_air_rho": 1448,
       "n_field_valid_air_u": 1448,
@@ -1334,6 +1358,8 @@
         "the disturbed air samples do not form a continuous run starting at the contact-side air sample"
       ],
       "n_phase_air": 1523,
+      "n_material1": 0,
+      "n_material1_field_valid_all": 0,
       "n_field_valid_air_all": 1376,
       "n_field_valid_air_rho": 1376,
       "n_field_valid_air_u": 1376,
@@ -1412,6 +1438,8 @@
         "the disturbed air samples do not form a continuous run starting at the contact-side air sample"
       ],
       "n_phase_air": 1475,
+      "n_material1": 0,
+      "n_material1_field_valid_all": 0,
       "n_field_valid_air_all": 1292,
       "n_field_valid_air_rho": 1292,
       "n_field_valid_air_u": 1292,
@@ -1490,6 +1518,8 @@
         "the disturbed air samples do not form a continuous run starting at the contact-side air sample"
       ],
       "n_phase_air": 1412,
+      "n_material1": 0,
+      "n_material1_field_valid_all": 0,
       "n_field_valid_air_all": 1099,
       "n_field_valid_air_rho": 1099,
       "n_field_valid_air_u": 1099,
@@ -1568,6 +1598,8 @@
         "the disturbed air samples do not form a continuous run starting at the contact-side air sample"
       ],
       "n_phase_air": 1312,
+      "n_material1": 0,
+      "n_material1_field_valid_all": 0,
       "n_field_valid_air_all": 1099,
       "n_field_valid_air_rho": 1099,
       "n_field_valid_air_u": 1099,
@@ -1646,6 +1678,8 @@
         "the disturbed air samples do not form a continuous run starting at the contact-side air sample"
       ],
       "n_phase_air": 1202,
+      "n_material1": 0,
+      "n_material1_field_valid_all": 0,
       "n_field_valid_air_all": 1099,
       "n_field_valid_air_rho": 1099,
       "n_field_valid_air_u": 1099,
@@ -1724,6 +1758,8 @@
         "the disturbed air samples do not form a continuous run starting at the contact-side air sample"
       ],
       "n_phase_air": 1160,
+      "n_material1": 0,
+      "n_material1_field_valid_all": 0,
       "n_field_valid_air_all": 986,
       "n_field_valid_air_rho": 986,
       "n_field_valid_air_u": 986,
@@ -1760,7 +1796,7 @@
     }
   },
   "sensitivity_boundary": {
-    "note": "diagnostic only: ambient tolerance widened to 0.5% density and 1e-4 m/s velocity because the measured initial air density spans 1.216-1.225 kg/m3. This is NOT an accepted configuration and no cache was built from it.",
+    "note": "diagnostic only: ambient tolerance widened to 0.005 kg/m3 absolute density (0.408% of 1.225) and 1e-4 m/s velocity because the measured initial air density spans 1.216-1.225 kg/m3. This is NOT an accepted configuration and no cache was built from it. The t=0 false positive is analyzed in raw_review/report.md.",
     "tolerances": {
       "ambient_pressure_pa": 101320.0,
       "ambient_density_kg_m3": 1.225,
