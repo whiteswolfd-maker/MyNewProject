@@ -53,6 +53,7 @@ def _write_profile(directory, *, times, precursor):
     np.savez(
         directory / "material.npz",
         material=material,
+        material_phase=material,
         valid=valid,
         contact_radius=np.full(n_t, 0.1075),
         shock_radius=np.full(n_t, 0.16),

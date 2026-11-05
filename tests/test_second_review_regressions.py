@@ -471,6 +471,8 @@ def test_the_air_group_survives_every_resolved_frame(tmp_path, monkeypatch):
     assert not z["valid"][outside].any(), "外侧空气不能进入训练监督"
     assert z["field_valid_pressure"][outside].any(), "外侧空气压力有效性被丢弃"
     assert np.isfinite(raw["P"][outside]).any(), "外侧空气压力场量被丢弃"
+    assert "air_native_resolution_fallback_m" in z
+    assert z["air_native_resolution_fallback_applicable"].any()
 
 
 def test_contaminated_shells_are_invalid_and_the_hole_is_recorded(tmp_path, monkeypatch):
