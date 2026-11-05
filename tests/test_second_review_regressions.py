@@ -464,6 +464,13 @@ def test_the_air_group_survives_every_resolved_frame(tmp_path, monkeypatch):
             assert z["shock_compression"][i] > 1.0
         assert int(((z["material"][i] == 0) & finite[i]).sum()) > 0
     assert int(((z["material"] == 1) & finite).sum()) > 0
+    # 激波外纯空气仍是 material==2 / valid=False，但场量与逐字段有效性必须保留，
+    # 否则下游无法区分“环境态”与“缺失场量”，只能靠标签猜 R_b。
+    outside = (z["material"] == 2) & (z["alpha_product"] <= 0.05)
+    assert outside.any()
+    assert not z["valid"][outside].any(), "外侧空气不能进入训练监督"
+    assert z["field_valid_pressure"][outside].any(), "外侧空气压力有效性被丢弃"
+    assert np.isfinite(raw["P"][outside]).any(), "外侧空气压力场量被丢弃"
 
 
 def test_contaminated_shells_are_invalid_and_the_hole_is_recorded(tmp_path, monkeypatch):

@@ -80,6 +80,13 @@ class CaseArrays:
     rb_times: np.ndarray | None = None
     rb_radius: np.ndarray | None = None
     rb_valid: np.ndarray | None = None
+    #: Per-frame original radial resolution (e.g. ALE cell thickness at the
+    #: shock).  ``None`` means the extractor did not provide it; shell spacing
+    #: must not be substituted for it.
+    air_native_resolution_m: np.ndarray | None = None
+    #: ``(n_frames, n_radial)`` air-shell coverage.  Optional contribution
+    #: evidence alongside the native resolution.
+    air_coverage: np.ndarray | None = None
     source: dict[str, Any] = field(default_factory=dict)
 
 
@@ -414,6 +421,9 @@ class CaseData:
             "boundary": self.boundary.as_dict(),
             "observations": self.observations.size,
             "scales": self.scale_dict(),
+            # Full precursor inputs are needed for config/cache and
+            # training/prediction compatibility checks.
+            "precursor": dict(self.precursor),
             "initial_compatibility": self.initial_compatibility(),
             "p_c_at_t0_pa": self.p_c_at_t0,
             "p_a_sep_pa": self.p_scale,
@@ -570,7 +580,13 @@ class RightBoundaryDetection:
     evidence: str
     reasons: tuple[str, ...]
     n_ambient_cells: int
-    n_disturbed_air_cells: int
+    n_disturbed_air_samples: int
+    #: The outermost run that *could* be the boundary, even when it cannot be
+    #: verified.  ``identified`` is reserved for a verified ambient-state
+    #: boundary; a material label alone is never verification.
+    candidate_radius: float = float("nan")
+    candidate_evidence: str = ""
+    verification: str = "not_verified"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -579,7 +595,12 @@ class RightBoundaryDetection:
             "evidence": self.evidence,
             "reasons": list(self.reasons),
             "n_ambient_cells": self.n_ambient_cells,
-            "n_disturbed_air_cells": self.n_disturbed_air_cells,
+            "n_disturbed_air_samples": self.n_disturbed_air_samples,
+            "candidate_radius_m": (
+                self.candidate_radius if math.isfinite(self.candidate_radius) else None
+            ),
+            "candidate_evidence": self.candidate_evidence,
+            "verification": self.verification,
         }
 
 
@@ -611,21 +632,17 @@ def detect_right_boundary_report(
 ) -> RightBoundaryDetection:
     """Locate the environmental-side right boundary with radial evidence.
 
-    A point is not a boundary merely because it looks ambient.  The candidate
-    must
+    A point is not a boundary merely because its material label is 2.  The
+    only verified boundary is a continuous outward run with finite
+    ``(rho,u,p)`` **inside the ambient tolerances**, connected to a disturbed
+    air region on its inner side.  ``material==2`` is at most a *candidate
+    location*:
 
-    * be part of a continuous outward run ending at the outer radial edge;
-    * have a radially connected shocked-air region inside it;
-    * not sit inside a missing/invalid air gap.
-
-    Two evidence tiers are separated:
-
-    ``ambient_state``
-        finite ``(rho,u,p)`` inside the ambient tolerances.
-    ``unlabelled_ambient_region``
-        contiguous ``material==2`` shells at the outer edge, preceded by
-        shocked air.  The extractor leaves this region unlabelled and often
-        without fields, so this is weaker evidence and is reported as such.
+    * finite fields that disagree with the ambient state are a counter-proof,
+      not an invitation to fall back to the label;
+    * missing/invalid fields leave the candidate unverified; they never enter
+      the valid ``R_b`` trajectory or the ambient boundary condition;
+    * a purely label-based candidate is reported with ``identified=False``.
     """
     r = np.asarray(radius, dtype=np.float64).reshape(-1)
     p = np.asarray(pressure, dtype=np.float64).reshape(-1)
@@ -661,34 +678,47 @@ def detect_right_boundary_report(
         disturbed &= r > float(contact_radius)
     n_disturbed = int(np.count_nonzero(disturbed))
     reasons: list[str] = []
-    start = _trailing_true_run(ambient, min_cells=min_ambient_cells)
-    evidence = "finite ambient state in a continuous run to the outer radial edge"
-    if start < 0:
-        # Weaker but auditable: the extractor's unlabelled ambient region.
-        start = _trailing_true_run(mat == 2, min_cells=min_ambient_cells)
-        evidence = (
-            "material==2 unlabelled ambient region at the outer radial edge; "
-            "ambient state is not available for these shells"
+    ambient_start = _trailing_true_run(ambient, min_cells=min_ambient_cells)
+    label_start = _trailing_true_run(mat == 2, min_cells=min_ambient_cells)
+    if ambient_start >= 0:
+        start = ambient_start
+        candidate_evidence = (
+            "finite ambient state in a continuous run to the outer radial edge"
         )
-        if start < 0:
-            reasons.append(
-                "ambient cells do not form a continuous run to the outer radial "
-                "edge (isolated or interrupted run); neither a finite ambient "
-                "state nor an unlabelled ambient region is identifiable"
-            )
-            return RightBoundaryDetection(
-                float("nan"), False, "", tuple(reasons), 0, n_disturbed
-            )
+        verified = True
+        verification = "verified_ambient_state"
+    elif label_start >= 0:
+        start = label_start
+        candidate_evidence = (
+            "material==2 outer run; this is only a candidate location, not proof "
+            "of an ambient state"
+        )
+        verified = False
+        verification = "unverified_material_label"
+    else:
+        reasons.append(
+            "neither finite ambient state nor a material==2 outer run reaches "
+            "the outer radial edge; any ambient point is isolated or the run is "
+            "interrupted"
+        )
+        return RightBoundaryDetection(
+            float("nan"), False, "", tuple(reasons), 0, n_disturbed,
+            candidate_radius=float("nan"), candidate_evidence="",
+            verification="no_candidate",
+        )
+    candidate = float(r[start])
     n_ambient = int(r.size - start)
     inside = np.arange(r.size) < start
     disturbed_inside = np.flatnonzero(disturbed & inside)
     if disturbed_inside.size == 0:
         reasons.append(
-            "no disturbed air cell lies inside the ambient run; an all-ambient "
+            "no disturbed air cell lies inside the candidate run; an all-ambient "
             "profile is not evidence of a shock outer edge"
         )
         return RightBoundaryDetection(
-            float("nan"), False, "", tuple(reasons), n_ambient, n_disturbed
+            float("nan"), False, "", tuple(reasons), n_ambient, n_disturbed,
+            candidate_radius=candidate, candidate_evidence=candidate_evidence,
+            verification="unverified_no_shocked_air",
         )
     last_disturbed = int(disturbed_inside[-1])
     between = np.arange(last_disturbed + 1, start)
@@ -697,7 +727,7 @@ def detect_right_boundary_report(
         if bad_label.size:
             reasons.append(
                 "product/mixed cells interrupt the radial path from shocked air "
-                f"to the ambient run at r={r[bad_label[:3]].tolist()} m"
+                f"to the candidate run at r={r[bad_label[:3]].tolist()} m"
             )
         bad_air = between[(mat[between] == 1) & ~state_ok[between]]
         if bad_air.size:
@@ -707,17 +737,46 @@ def detect_right_boundary_report(
             )
     if reasons:
         return RightBoundaryDetection(
-            float("nan"), False, "", tuple(reasons), n_ambient, n_disturbed
+            float("nan"), False, "", tuple(reasons), n_ambient, n_disturbed,
+            candidate_radius=candidate, candidate_evidence=candidate_evidence,
+            verification="unverified_radial_connectivity",
         )
-    candidate = float(r[start])
+    if not verified:
+        # The label-only candidate must not override field evidence.
+        candidate_state = slice(start, None)
+        if np.all(state_ok[candidate_state]):
+            reasons.append(
+                "the material==2 candidate has finite fields that are not ambient; "
+                "material==2 cannot override this counter-evidence"
+            )
+            verification = "rejected_non_ambient_fields"
+        else:
+            missing = int(
+                np.count_nonzero(~state_ok[candidate_state])
+            )
+            reasons.append(
+                f"the material==2 candidate has {missing} shell(s) with missing "
+                "or invalid fields; the ambient state cannot be verified and the "
+                "candidate is not a valid R_b boundary"
+            )
+            verification = "unverified_missing_fields"
+        return RightBoundaryDetection(
+            float("nan"), False, "", tuple(reasons), n_ambient, n_disturbed,
+            candidate_radius=candidate, candidate_evidence=candidate_evidence,
+            verification=verification,
+        )
     if contact_radius is not None and math.isfinite(float(contact_radius)):
         if candidate <= float(contact_radius):
             reasons.append("the ambient run is not outside the contact interval")
             return RightBoundaryDetection(
-                float("nan"), False, "", tuple(reasons), n_ambient, n_disturbed
+                float("nan"), False, "", tuple(reasons), n_ambient, n_disturbed,
+                candidate_radius=candidate, candidate_evidence=candidate_evidence,
+                verification="rejected_inside_contact",
             )
     return RightBoundaryDetection(
-        candidate, True, evidence, tuple(reasons), n_ambient, n_disturbed
+        candidate, True, candidate_evidence, tuple(reasons), n_ambient, n_disturbed,
+        candidate_radius=candidate, candidate_evidence=candidate_evidence,
+        verification="verified_ambient_state",
     )
 
 
@@ -917,7 +976,16 @@ def classify_separation_frames(
     valid_density: np.ndarray,
     valid_velocity: np.ndarray,
     valid_pressure: np.ndarray,
-    min_shocked_air_cells: int = 2,
+    ambient_pressure: float,
+    ambient_density: float,
+    tol_pressure: float,
+    tol_density: float,
+    tol_velocity: float,
+    min_shocked_air_samples: int = 2,
+    air_native_resolution_m: np.ndarray | None = None,
+    air_coverage: np.ndarray | None = None,
+    min_air_coverage: float = 0.5,
+    min_air_layer_native_cells: float = 1.0,
 ) -> dict[str, Any]:
     """Classify each frame as separated / not separated / unresolvable.
 
@@ -925,11 +993,15 @@ def classify_separation_frames(
     flag:
 
     1. is the contact interval locatable?
-    2. is the shocked air layer between the contact and ``R_b`` resolvable?
+    2. is the **shocked** air layer between the contact and ``R_b`` resolvable?
     3. is the environmental-side right boundary identifiable?
 
-    The frame times are the extraction's own times.  No theoretical ``t_sep``
-    is used to shift or invent an event alignment.
+    An air shell sample contributes shocked-layer evidence only if its material
+    label is air, its fields are valid, and at least one field differs from the
+    ambient state by more than the same tolerances used for ``R_b``.  Finite
+    but entirely ambient air is not a shocked layer.  The layer must also be
+    backed by a native-resolution estimate; counting several shell samples is
+    not the same as resolving several original ALE cells.
     """
     r = np.asarray(radius, dtype=np.float64).reshape(-1)
     mat = np.asarray(material)
@@ -941,6 +1013,20 @@ def classify_separation_frames(
     vp = np.asarray(valid_pressure, dtype=bool)
     if r.size < 2:
         raise CaseDataError(f"case {case_id!r}: radial axis is too short for separation")
+    native = (
+        None if air_native_resolution_m is None
+        else np.asarray(air_native_resolution_m, dtype=np.float64).reshape(-1)
+    )
+    if native is not None and native.size != np.asarray(times).size:
+        raise CaseDataError(
+            "air_native_resolution_m must have one value per frame"
+        )
+    coverage = (
+        None if air_coverage is None
+        else np.asarray(air_coverage, dtype=np.float64)
+    )
+    if coverage is not None and coverage.shape != mat.shape:
+        raise CaseDataError("air_coverage must have the same shape as material")
     shell_width = float(np.median(np.diff(r)))
     frames: list[dict[str, Any]] = []
     counts = {"separated": 0, "not_separated": 0, "unresolvable": 0}
@@ -957,9 +1043,28 @@ def classify_separation_frames(
             reasons.append(f"environmental-side right boundary is not identifiable ({detail})")
         n_air = 0
         n_air_valid = 0
+        n_disturbed = 0
+        n_ambient = 0
         connected = False
+        disturbed_connected = False
         layer_ok = False
+        coverage_ok = False
+        coverage_available = coverage is not None
+        resolution_ok = False
+        native_value = float("nan")
+        layer_thickness = float("nan")
         contact_up = float(contact.up[frame]) if contact_ok else float("nan")
+        state_valid = (
+            vd[frame] & vu[frame] & vp[frame]
+            & np.isfinite(rho[frame]) & np.isfinite(u[frame]) & np.isfinite(p[frame])
+        )
+        ambient_cell = (
+            state_valid
+            & (np.abs(p[frame] - float(ambient_pressure)) <= float(tol_pressure))
+            & (np.abs(rho[frame] - float(ambient_density)) <= float(tol_density))
+            & (np.abs(u[frame]) <= float(tol_velocity))
+        )
+        disturbed_cell = state_valid & ~ambient_cell
         if contact_ok and rb_ok and rb > contact_up:
             air_mask = (
                 (mat[frame] == 1) & (r >= float(contact.low[frame])) & (r < rb)
@@ -968,32 +1073,73 @@ def classify_separation_frames(
             n_air = int(air_indices.size)
             if air_indices.size:
                 connected = bool(np.all(np.diff(air_indices) == 1))
-                fields_ok = (
-                    vd[frame, air_indices] & vu[frame, air_indices]
-                    & vp[frame, air_indices]
-                    & np.isfinite(rho[frame, air_indices])
-                    & np.isfinite(u[frame, air_indices])
-                    & np.isfinite(p[frame, air_indices])
-                )
+                fields_ok = state_valid[air_indices]
                 n_air_valid = int(np.count_nonzero(fields_ok))
+                disturbed_indices = air_indices[disturbed_cell[air_indices]]
+                n_disturbed = int(disturbed_indices.size)
+                n_ambient = int(np.count_nonzero(ambient_cell[air_indices]))
+                disturbed_connected = bool(
+                    disturbed_indices.size
+                    and int(disturbed_indices[0]) == int(air_indices[0])
+                    and np.all(np.diff(disturbed_indices) == 1)
+                )
+                layer_thickness = float(rb - contact_up)
+                if native is not None and np.isfinite(native[frame]) and native[frame] > 0.0:
+                    native_value = float(native[frame])
+                    resolution_ok = layer_thickness >= (
+                        float(min_air_layer_native_cells) * native_value
+                    )
+                if coverage is not None:
+                    values = coverage[frame, air_indices]
+                    coverage_ok = bool(
+                        np.all(np.isfinite(values))
+                        and np.all(values >= float(min_air_coverage))
+                    )
+                else:
+                    coverage_ok = True
                 if not connected:
                     reasons.append(
-                        "pure-air cells between the contact and R_b are not "
+                        "pure-air shell samples between the contact and R_b are not "
                         "radially contiguous"
                     )
                 if n_air_valid != n_air:
                     reasons.append(
-                        f"{n_air - n_air_valid} air cell(s) in the layer have "
+                        f"{n_air - n_air_valid} air shell sample(s) in the layer have "
                         "missing/invalid fields"
                     )
-                if n_air_valid < int(min_shocked_air_cells):
+                if n_disturbed < int(min_shocked_air_samples):
                     reasons.append(
-                        f"only {n_air_valid} valid air cell(s); at least "
-                        f"{int(min_shocked_air_cells)} are required to resolve the layer"
+                        f"only {n_disturbed} air sample(s) differ from the ambient "
+                        f"state; at least {int(min_shocked_air_samples)} are required "
+                        "as shocked-layer evidence"
+                    )
+                if not disturbed_connected:
+                    reasons.append(
+                        "the disturbed air samples do not form a continuous run "
+                        "starting at the contact-side air sample"
+                    )
+                if native is None:
+                    reasons.append(
+                        "no native radial-resolution estimate is available; shell "
+                        "count alone cannot establish that the air layer is resolvable"
+                    )
+                elif not (np.isfinite(native[frame]) and native[frame] > 0.0):
+                    reasons.append("the native radial resolution for this frame is invalid")
+                elif not resolution_ok:
+                    reasons.append(
+                        f"air-layer thickness {layer_thickness:.6g} m is below "
+                        f"{float(min_air_layer_native_cells):g} x native resolution "
+                        f"{native_value:.6g} m"
+                    )
+                if coverage is not None and not coverage_ok:
+                    reasons.append(
+                        f"air-shell coverage is below {float(min_air_coverage):g} "
+                        "for at least one layer sample"
                     )
                 layer_ok = (
-                    connected and n_air_valid >= int(min_shocked_air_cells)
-                    and n_air_valid == n_air
+                    connected and disturbed_connected and n_air_valid == n_air
+                    and n_disturbed >= int(min_shocked_air_samples)
+                    and resolution_ok and coverage_ok
                 )
             else:
                 # No air cell at all between the contact bracket and R_b.  This
@@ -1003,8 +1149,8 @@ def classify_separation_frames(
                 proximity = contact_up >= rb - 1.5 * shell_width
                 if proximity and contact_ok and rb_ok:
                     reasons.append(
-                        "no pure-air cell between the contact upper bound and the "
-                        "environmental boundary; the contact interval reaches R_b"
+                        "no pure-air shell between the contact upper bound and the "
+                        "verified environmental boundary; the contact interval reaches R_b"
                     )
                     status = "not_separated"
                     counts[status] += 1
@@ -1014,27 +1160,40 @@ def classify_separation_frames(
                         "contact_locatable": contact_ok,
                         "shocked_air_resolvable": False,
                         "right_boundary_identified": rb_ok,
-                        "n_air_cells": 0,
-                        "n_valid_air_cells": 0,
+                        "n_air_shell_samples": 0,
+                        "n_valid_air_shell_samples": 0,
+                        "n_disturbed_air_samples": 0,
+                        "n_ambient_air_samples": 0,
                         "radially_connected": False,
+                        "disturbed_connected": False,
+                        "layer_thickness_m": None,
+                        "native_resolution_m": (
+                            native_value if np.isfinite(native_value) else None
+                        ),
+                        "resolution_verified": False,
+                        "coverage_available": coverage_available,
+                        "coverage_verified": False,
                         "boundary_evidence": report.evidence if report else "",
                         "reasons": reasons,
                     })
                     continue
                 reasons.append(
-                    "no pure-air cell between the contact bracket and R_b, but "
+                    "no pure-air shell between the contact bracket and R_b, but "
                     "the bracket is not adjacent to R_b; layer state is unknown"
                 )
         if contact_ok and rb_ok and layer_ok and rb > contact_up:
             status = "separated"
             evidence = (
-                "contact interval locatable; a connected pure-air layer with "
-                "finite fields lies between the contact and the identified "
-                "environmental boundary"
+                "contact interval locatable; a connected, native-resolution-backed "
+                "air layer with fields outside the ambient tolerances lies between "
+                "the contact and the verified environmental boundary"
             )
         elif contact_ok and rb_ok:
             status = "unresolvable"
-            evidence = "contact and boundary exist but the air layer is not resolvable"
+            evidence = (
+                "contact and boundary exist but shocked-air evidence, native "
+                "resolution or radial connectivity is insufficient"
+            )
         else:
             status = "unresolvable"
             evidence = "one or more of contact/boundary is missing"
@@ -1045,9 +1204,21 @@ def classify_separation_frames(
             "contact_locatable": contact_ok,
             "shocked_air_resolvable": bool(layer_ok),
             "right_boundary_identified": rb_ok,
-            "n_air_cells": int(n_air),
-            "n_valid_air_cells": int(n_air_valid),
+            "n_air_shell_samples": int(n_air),
+            "n_valid_air_shell_samples": int(n_air_valid),
+            "n_disturbed_air_samples": int(n_disturbed),
+            "n_ambient_air_samples": int(n_ambient),
             "radially_connected": bool(connected),
+            "disturbed_connected": bool(disturbed_connected),
+            "layer_thickness_m": (
+                layer_thickness if math.isfinite(layer_thickness) else None
+            ),
+            "native_resolution_m": (
+                native_value if math.isfinite(native_value) else None
+            ),
+            "resolution_verified": bool(resolution_ok),
+            "coverage_available": bool(coverage_available),
+            "coverage_verified": bool(coverage_available and coverage_ok),
             "boundary_evidence": report.evidence if report else "",
             "reasons": reasons if status != "separated" else [evidence],
         })
@@ -1083,9 +1254,13 @@ def classify_separation_frames(
         "frame_times": "raw extraction frame times; no theoretical t_sep shift",
         "uses_theoretical_tsep_for_alignment": False,
         "basis": (
-            "locatable contact interval + connected pure-air layer with finite "
-            "fields + identified environmental boundary; each condition is "
-            "recorded separately"
+            "locatable contact interval + connected air layer with valid fields, "
+            "non-ambient shocked-state evidence, native-resolution support and a "
+            "verified environmental boundary; each condition is recorded separately"
+        ),
+        "native_resolution_source": (
+            "per-frame original ALE cell thickness from the extractor; shell "
+            "spacing is not used as a substitute"
         ),
         "frames": frames,
     }
@@ -1172,14 +1347,14 @@ def build_case(
                 boundary_reports.append(RightBoundaryDetection(
                     radius=float(boundary.position(float(t))), identified=True,
                     evidence="supplied R_b samples (continuous segment)",
-                    reasons=(), n_ambient_cells=0, n_disturbed_air_cells=0,
+                    reasons=(), n_ambient_cells=0, n_disturbed_air_samples=0,
                 ))
             else:
                 boundary_reports.append(RightBoundaryDetection(
                     radius=float("nan"), identified=False,
                     evidence="",
                     reasons=("no continuous supplied R_b segment at this frame",),
-                    n_ambient_cells=0, n_disturbed_air_cells=0,
+                    n_ambient_cells=0, n_disturbed_air_samples=0,
                 ))
     initial = build_initial_geometry(
         t0=precursor.t0, Rc0=precursor.Rc0, Rs0=precursor.Rs0,
@@ -1194,7 +1369,23 @@ def build_case(
         contact=contact, boundary=boundary, boundary_reports=boundary_reports,
         valid_density=valid_density, valid_velocity=valid_velocity,
         valid_pressure=valid_pressure,
-        min_shocked_air_cells=int(tolerances.get("min_shocked_air_cells", 2)),
+        ambient_pressure=float(tolerances["ambient_pressure_pa"]),
+        ambient_density=float(tolerances["ambient_density_kg_m3"]),
+        tol_pressure=float(tolerances["pressure_pa"]),
+        tol_density=float(tolerances["density_kg_m3"]),
+        tol_velocity=float(tolerances["velocity_m_s"]),
+        min_shocked_air_samples=int(
+            tolerances.get(
+                "min_shocked_air_samples",
+                tolerances.get("min_shocked_air_cells", 2),
+            )
+        ),
+        air_native_resolution_m=arrays.air_native_resolution_m,
+        air_coverage=arrays.air_coverage,
+        min_air_coverage=float(tolerances.get("min_air_coverage", 0.5)),
+        min_air_layer_native_cells=float(
+            tolerances.get("min_air_layer_native_cells", 1.0)
+        ),
     )
     separation["t0_s"] = float(precursor.t0)
     separation["theoretical_t_sep_s"] = float(precursor.t_sep)
@@ -1225,7 +1416,7 @@ def save_case(case: CaseData, path: Path | str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     metadata = {
         "format": "spherical_blast_pinn.contact_air_case",
-        "version": 2,
+        "version": 3,
         "units": {
             "time": "s", "radius": "m", "density": "kg/m^3",
             "velocity": "m/s", "pressure": "Pa", "specific_energy": "J/kg",
@@ -1237,9 +1428,10 @@ def save_case(case: CaseData, path: Path | str) -> Path:
             "metadata", "rb_times", "rb_radius", "rb_valid",
         ],
         "cache_rebuild_reason": (
-            "version 2: R_b gaps are break markers, separation status is per-frame "
-            "evidence, the solve interval is one continuous R_b segment, and the "
-            "energy residual scale is E/T_star rather than e/T_star"
+            "version 3: verified ambient-state R_b (material labels alone are not "
+            "enough), shocked-air evidence with native radial resolution, outer-air "
+            "fields retained for boundary verification, and the solve interval is "
+            "one continuous R_b segment; version 2 caches must be rebuilt"
         ),
     }
     np.savez(
@@ -1276,11 +1468,11 @@ def load_case(path: Path | str, *, role: str | None = None) -> CaseData:
         metadata = json.loads(str(archive["metadata"]))
         if metadata.get("format") != "spherical_blast_pinn.contact_air_case":
             raise CaseDataError(f"{path}: not a contact-air case cache")
-        if metadata.get("version") != 2:
+        if metadata.get("version") != 3:
             raise CaseDataError(
                 f"{path}: cache version {metadata.get('version')!r} is not supported. "
-                "Rebuild it with build-cache: version 1 predates the R_b gap, "
-                "separation-evidence and energy-scale fixes"
+                "Rebuild it with build-cache: version 3 requires verified "
+                "ambient-state R_b evidence, native resolution and outer-air fields"
             )
         case_meta = metadata["case"]
         precursor = metadata["precursor"]
@@ -1342,7 +1534,7 @@ def load_prediction_case(path: Path | str, *, role: str | None = None) -> Predic
         metadata = json.loads(str(archive["metadata"]))
         if metadata.get("format") != "spherical_blast_pinn.contact_air_case":
             raise CaseDataError(f"{path}: not a contact-air case cache")
-        if metadata.get("version") != 2:
+        if metadata.get("version") != 3:
             raise CaseDataError(
                 f"{path}: cache version {metadata.get('version')!r} is not supported "
                 "for boundary-only prediction; rebuild it with build-cache"
@@ -1417,6 +1609,18 @@ def build_case_from_profile(
             if "contact_mixing_band_outer_m" in archive.files else None
         alpha = np.asarray(archive["alpha_product"], dtype=np.float64) \
             if "alpha_product" in archive.files else None
+        native_resolution = np.asarray(
+            archive["shock_cell_thickness_m"], dtype=np.float64
+        ) if "shock_cell_thickness_m" in archive.files else None
+        native_source = "shock_cell_thickness_m"
+        if native_resolution is None and "contact_native_resolution_m" in archive.files:
+            native_resolution = np.asarray(
+                archive["contact_native_resolution_m"], dtype=np.float64
+            )
+            native_source = "contact_native_resolution_m"
+        air_coverage = np.asarray(archive["coverage_air"], dtype=np.float64) \
+            if "coverage_air" in archive.files else None
+        shell_count_available = "shell_count" in archive.files
         eligible = np.asarray(archive["contact_has_supervision"], dtype=bool) \
             if "contact_has_supervision" in archive.files else None
     if eligible is None:
@@ -1431,6 +1635,18 @@ def build_case_from_profile(
     if eligible.shape != (case.times.size,):
         raise CaseDataError(
             "contact_has_supervision must have one boolean per frame"
+        )
+    if native_resolution is not None:
+        native_resolution = np.asarray(native_resolution, dtype=np.float64).reshape(-1)
+        if native_resolution.size != case.times.size:
+            raise CaseDataError(
+                "the native radial-resolution array must have one value per frame"
+            )
+    else:
+        native_source = None
+    if air_coverage is not None and air_coverage.shape != np.asarray(case.material).shape:
+        raise CaseDataError(
+            "coverage_air must have the same shape as the material mask"
         )
     extraction_source = case.source or {}
     # ``material==2`` is ambiguous in the real extractor (mixing band AND
@@ -1486,6 +1702,19 @@ def build_case_from_profile(
         "fields_are_shell_averaged": True,
         "material_partition_source": extraction_source.get("material_masks_from"),
         "profile_layout": extraction_source.get("profile_layout"),
+        "air_native_resolution_source": native_source,
+        "air_native_resolution_is_original_ale": native_source is not None,
+        "air_coverage_available": air_coverage is not None,
+        "shell_count_available": bool(shell_count_available),
+        "shell_count_is_original_cell_count": False,
+        "raw_cell_ids_available": False,
+        "raw_cell_radial_ranges_available": False,
+        "radial_support_note": (
+            "material.npz provides shell_count, coverage_air and per-frame native "
+            "cell thickness at the shock/contact, but not original ALE cell IDs or "
+            "per-cell radial ranges. Native thickness is used as the resolution "
+            "floor; shell count alone is not treated as independent cells."
+        ),
     }
     if source:
         source_payload.update(dict(source))
@@ -1499,6 +1728,8 @@ def build_case_from_profile(
         valid_velocity=field_validity.get("velocity"),
         valid_pressure=field_validity.get("pressure"),
         contact_low=low, contact_up=up, contact_raw=raw, contact_valid=valid,
+        air_native_resolution_m=native_resolution,
+        air_coverage=air_coverage,
         source={"profile_dir": str(directory), "extraction": case.source},
     )
     return build_case(
@@ -1570,7 +1801,16 @@ def synthetic_case(
         contact_low=contact_low, contact_up=contact_up, contact_raw=rc,
         contact_valid=np.ones(times.size, dtype=bool),
         rb_times=times, rb_radius=rb, rb_valid=np.ones(times.size, dtype=bool),
-        source={"synthetic": True, "note": "analytic engineering fixture, not TNT data"},
+        # This is a synthetic resolution, not a measured ALE cell thickness.
+        air_native_resolution_m=np.full(
+            times.size, max(5.0e-4 * charge_radius_m, 1.0e-6), dtype=np.float64
+        ),
+        air_coverage=np.ones((times.size, radius.size), dtype=np.float64),
+        source={
+            "synthetic": True,
+            "note": "analytic engineering fixture, not TNT data",
+            "air_native_resolution": "synthetic fixture value, not a measured ALE cell",
+        },
     )
     tol = dict(tolerances or {
         "ambient_pressure_pa": precursor.air_pressure,
@@ -1579,6 +1819,9 @@ def synthetic_case(
         "density_kg_m3": 1.0e-9,
         "velocity_m_s": 1.0e-6,
         "min_ambient_cells": 2,
+        "min_shocked_air_samples": 2,
+        "min_air_coverage": 0.5,
+        "min_air_layer_native_cells": 1.0,
     })
     return build_case(
         arrays, precursor=precursor, role=role, tolerances=tol,

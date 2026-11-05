@@ -112,6 +112,125 @@ def _select_specs(section: Mapping[str, Any], which: str) -> list[dict[str, Any]
     return selected
 
 
+_SHARED_PRECURSOR_SCALARS = (
+    "epsilon_s", "shock_model", "air_density", "air_pressure", "gamma_air",
+    "material_source", "material_source_verified",
+)
+_SHARED_DERIVED_SCALARS = (
+    "V_cj", "V_sep", "p_sep", "u_c_sep", "D_s_sep", "t0", "R_sep", "Rc0", "Rs0",
+)
+
+
+def _value_mismatch(a: Any, b: Any) -> bool:
+    if isinstance(a, bool) or isinstance(b, bool):
+        return bool(a) != bool(b)
+    if isinstance(a, str) or isinstance(b, str):
+        return str(a) != str(b)
+    try:
+        left, right = float(a), float(b)
+    except (TypeError, ValueError):
+        return a != b
+    return not math.isclose(left, right, rel_tol=1.0e-12, abs_tol=1.0e-18)
+
+
+def _compare_shared_precursor(
+    cached: Mapping[str, Any], expected: Mapping[str, Any], *, label: str,
+) -> None:
+    """Compare material/air/detonation/precursor inputs by field name."""
+    problems: list[str] = []
+    for key in _SHARED_PRECURSOR_SCALARS:
+        if key not in cached or key not in expected:
+            problems.append(f"{key}: missing")
+        elif _value_mismatch(cached[key], expected[key]):
+            problems.append(f"{key}: cache={cached[key]!r}, config={expected[key]!r}")
+    for block in ("jwl", "detonation"):
+        left = cached.get(block, {})
+        right = expected.get(block, {})
+        if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+            problems.append(f"{block}: missing or malformed")
+            continue
+        for key in sorted(set(left) | set(right)):
+            if key not in left or key not in right:
+                problems.append(f"{block}.{key}: missing")
+            elif _value_mismatch(left[key], right[key]):
+                problems.append(
+                    f"{block}.{key}: cache={left[key]!r}, config={right[key]!r}"
+                )
+    if problems:
+        raise CommandError(
+            f"{label}: cached precursor does not match the current configuration "
+            f"({', '.join(problems[:8])}). Re-run build-cache for this case."
+        )
+
+
+def _compare_cached_precursor(
+    cached: Mapping[str, Any], expected: Mapping[str, Any], *, label: str,
+) -> None:
+    _compare_shared_precursor(cached, expected, label=label)
+    problems: list[str] = []
+    for key in _SHARED_DERIVED_SCALARS:
+        if key not in cached or key not in expected:
+            problems.append(f"{key}: missing")
+        elif _value_mismatch(cached[key], expected[key]):
+            problems.append(f"{key}: cache={cached[key]!r}, config={expected[key]!r}")
+    if problems:
+        raise CommandError(
+            f"{label}: cached derived precursor does not match the current "
+            f"configuration ({', '.join(problems[:8])}). Re-run build-cache."
+        )
+
+
+def _cache_metadata(path: Path) -> Mapping[str, Any]:
+    with np.load(path, allow_pickle=False) as archive:
+        if "metadata" not in archive.files:
+            raise CommandError(f"{path}: cache has no metadata")
+        return json.loads(str(archive["metadata"]))
+
+
+def _cache_is_synthetic(path: Path) -> bool:
+    """Inspect only the metadata; no training/internal array is read."""
+    try:
+        metadata = _cache_metadata(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    case_meta = metadata.get("case", {})
+    source = case_meta.get("source", {}) if isinstance(case_meta, Mapping) else {}
+    return bool(isinstance(source, Mapping) and source.get("synthetic", False))
+
+
+def _reject_synthetic_cache(
+    case: CaseData | PredictionCaseData, spec: Mapping[str, Any], *, allow_synthetic: bool,
+) -> None:
+    if not bool(case.source.get("synthetic", False)):
+        return
+    if not bool(spec.get("synthetic", False)):
+        raise CommandError(
+            f"case {case.case_id!r}: a synthetic cache was loaded while the case "
+            "is configured with synthetic: false; regenerate a real cache or set "
+            "synthetic: true deliberately"
+        )
+    if not allow_synthetic:
+        raise CommandError(
+            f"case {case.case_id!r}: --no-synthetic forbids loading a synthetic cache"
+        )
+
+
+def _check_cached_case(
+    case: CaseData | PredictionCaseData, section: Mapping[str, Any], *,
+    case_id: str, radius: float, label: str,
+) -> None:
+    if str(case.case_id) != str(case_id):
+        raise CommandError(
+            f"{label}: cache case_id={case.case_id!r}, config says {case_id!r}"
+        )
+    if abs(float(case.charge_radius_m) - float(radius)) > 1.0e-12 * max(radius, 1.0):
+        raise CommandError(
+            f"{label}: cache R0={case.charge_radius_m!r}, config says {radius!r}"
+        )
+    expected = compute_precursor(_precursor_config(section, radius)).as_dict()
+    _compare_cached_precursor(case.precursor, expected, label=label)
+
+
 def _make_case(
     section: Mapping[str, Any], spec: Mapping[str, Any], config: Config, *,
     allow_synthetic: bool,
@@ -129,11 +248,17 @@ def _make_case(
         path = _resolve(config, cached)
         if not path.is_file():
             raise CommandError(f"case {case_id!r}: cache {path} does not exist")
-        case = load_case(path, role=role)
-        if abs(case.charge_radius_m - radius) > 1.0e-12 * max(radius, 1.0):
+        if (not bool(spec.get("synthetic", False)) or not allow_synthetic) and _cache_is_synthetic(path):
             raise CommandError(
-                f"case {case_id!r}: cache R0={case.charge_radius_m!r}, config says {radius!r}"
+                f"case {case_id!r}: cache {path} is synthetic, but synthetic:false "
+                "or --no-synthetic forbids loading it"
             )
+        case = load_case(path, role=role)
+        _reject_synthetic_cache(case, spec, allow_synthetic=allow_synthetic)
+        _check_cached_case(
+            case, section, case_id=case_id, radius=radius,
+            label=f"case {case_id!r} cache {path}",
+        )
         return case
     if not bool(spec.get("synthetic", False)) or not allow_synthetic:
         raise CommandError(
@@ -176,11 +301,17 @@ def _make_prediction_case(
         path = _resolve(config, cached)
         if not path.is_file():
             raise CommandError(f"case {case_id!r}: cache {path} does not exist")
-        case = load_prediction_case(path, role=role)
-        if abs(case.charge_radius_m - radius) > 1.0e-12 * max(radius, 1.0):
+        if (not bool(spec.get("synthetic", False)) or not allow_synthetic) and _cache_is_synthetic(path):
             raise CommandError(
-                f"case {case_id!r}: cache R0={case.charge_radius_m!r}, config says {radius!r}"
+                f"case {case_id!r}: prediction cache {path} is synthetic, but "
+                "synthetic:false or --no-synthetic forbids loading it"
             )
+        case = load_prediction_case(path, role=role)
+        _reject_synthetic_cache(case, spec, allow_synthetic=allow_synthetic)
+        _check_cached_case(
+            case, section, case_id=case_id, radius=radius,
+            label=f"case {case_id!r} prediction cache {path}",
+        )
         return case
     if not bool(spec.get("synthetic", False)) or not allow_synthetic:
         raise CommandError(
@@ -427,19 +558,62 @@ def _load_checkpoint(path: Path, contact: ContactNet, air: AirNet) -> dict[str, 
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if payload.get("format") != "spherical_blast_pinn.contact_air_checkpoint":
         raise CommandError(f"{path}: not a contact-air checkpoint")
-    if payload.get("version") != 2:
+    if payload.get("version") != 3:
         raise CommandError(
             f"{path}: checkpoint version {payload.get('version')!r} is not supported; "
-            "rebuild it after the contact-label/broadcast/R_b/energy-scale fixes"
+            "retrain: version 3 carries the shared-physics metadata required for "
+            "prediction compatibility"
         )
     # Validate both state dicts before touching either model.
     _check_checkpoint_state(contact, payload["contact_net"], "contact_net", Path(path))
     _check_checkpoint_state(air, payload["air_net"], "air_net", Path(path))
+    for key, module in (("contact_net", contact), ("air_net", air)):
+        saved_describe = payload.get(f"{key}_describe")
+        if saved_describe is not None and saved_describe != module.describe():
+            raise CommandError(
+                f"{path}: {key} model convention/architecture metadata does not "
+                "match the configured network"
+            )
     contact.load_state_dict(payload["contact_net"])
     air.load_state_dict(payload["air_net"])
     contact.eval()
     air.eval()
     return payload
+
+
+def _check_prediction_compatibility(
+    case: PredictionCaseData, payload: Mapping[str, Any],
+    contact: ContactNet, air: AirNet,
+) -> None:
+    """Compare only shared physics and model conventions.
+
+    The 500 mm radius and its measured boundary are intentionally *not*
+    compared with the training case signatures: cross-radius prediction is
+    the point.  What must match are the material/JWL/detonation/air inputs and
+    the network parameterisation.
+    """
+    metadata = list(payload.get("case_metadata", []) or [])
+    references = [
+        (str(item.get("case_id", "<unknown>")), item.get("precursor"))
+        for item in metadata
+        if isinstance(item, Mapping) and isinstance(item.get("precursor"), Mapping)
+    ]
+    if not references:
+        raise CommandError(
+            "checkpoint has no training-case precursor metadata; retrain with the "
+            "current version before predicting"
+        )
+    for case_id, reference in references:
+        _compare_shared_precursor(
+            case.precursor, reference,
+            label=f"prediction physics vs training case {case_id!r}",
+        )
+    for key, module in (("contact_net", contact), ("air_net", air)):
+        saved_describe = payload.get(f"{key}_describe")
+        if saved_describe is not None and saved_describe != module.describe():
+            raise CommandError(
+                f"checkpoint {key} model convention does not match the prediction model"
+            )
 
 
 def command_predict_500(args) -> int:
@@ -455,6 +629,7 @@ def command_predict_500(args) -> int:
     case = _make_prediction_case(section, spec, config, allow_synthetic=True)
     contact, air = _networks(section)
     payload = _load_checkpoint(Path(args.checkpoint), contact, air)
+    _check_prediction_compatibility(case, payload, contact, air)
     n_t = int(args.n_times)
     n_z = int(args.n_zeta)
     times = np.linspace(case.t0, case.t_end, n_t)

@@ -45,7 +45,9 @@ contact_air:
     density_kg_m3: 1.0e-9
     velocity_m_s: 1.0e-6
     min_ambient_cells: 2
-    min_shocked_air_cells: 2     # fewer -> shocked-air layer is unresolvable
+    min_shocked_air_samples: 2   # fewer non-ambient shell samples -> unresolvable
+    min_air_coverage: 0.5        # shell-average contribution floor for layer evidence
+    min_air_layer_native_cells: 1.0  # layer thickness / native ALE cell thickness
 
   cases:
     # Real runs: set cache to a .npz produced by build-cache.  No synthetic

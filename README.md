@@ -75,14 +75,23 @@ PYTHONPATH=src python -m spherical_blast_pinn.cli.contact_air evaluate-500 \
   `s_E = s_p/(gamma-1) + 0.5 s_rho s_u^2`、`s_fE=s_E/(s_R/s_u)`；
   比内能 `e` 的 EOS 定义不变。
 - 分离状态分成三项证据记录（接触区间、受冲击空气层、环境侧右边界），
-  只有三项同时成立才是 `separated`；全环境剖面不再被当作右边界。
+  只有三项同时成立才是 `separated`；`material==2` 只是候选位置，不能证明环境态。
+  外侧场量有限但非环境时直接否决；场量缺失时记为无法验证，不进入 `R_b`。
+  受冲击空气层要求连续、非环境、字段有效，并有原始径向分辨率支持；球壳样本数
+  本身不等于原始 ALE 单元数。
+- `extract_profiles` 现在保留激波外纯空气的壳平均场量和逐字段有效性
+  （`valid` 仍为 False，不进入训练监督），供 `R_b` 用真实场量核实环境态；
+  不再用环境常数填充。`material.npz` 同时记录 `coverage_air`、原始单元厚度、
+  `shell_count` 以及“没有原始单元 ID/逐单元径向范围”的差距。
 - `predict-500` 改用 `load_prediction_case`，只读 `metadata`/`rb_*`；预测时间范围
   来自连续 `R_b` 段，不依赖内部观测是否有效。`evaluate-500` 才读内部参考。
+  预测还会核对缓存与当前配置、检查点与预测案例的共同物理参数和网络约定，
+  但不要求 500 mm 的半径/边界与训练签名相同。
 - 验证不可评估时返回 `score: null`，不参与最佳模型选择；无法形成独立验证帧时
   训练入口报错，而不是把训练帧当验证集。恢复训练核对数据/前置/边界/模型结构/
-  验证划分，并恢复 RNG 与固定验证点。
-- 缓存与检查点格式升到 **version 2**。旧 version 1 缓存和检查点会被拒绝，
-  必须重新 `build-cache` / 重新训练。
+  验证划分，并恢复 RNG、固定验证点和 `best_score`（0.0 是有效值）。
+- 缓存与检查点格式升到 **version 3**。旧 version 1/2 缓存和检查点会被拒绝，
+  受本轮右边界/分离判据影响，必须重新 `build-cache` / 重新训练。
 - `t_cj=R_cj/D`、材料卡来源、模型时钟与 d3plot 时间轴同原点均标为未核实；
   `p_c(t0)` 与 `p_a,sep` 的实际相对差由 `initial_compatibility()` 报告，不强行抹平。
 - `extract_profiles` 的 `x` 是球壳几何中点、场量是壳平均；缓存里明确记录

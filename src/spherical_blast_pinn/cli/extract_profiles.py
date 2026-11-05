@@ -1040,12 +1040,16 @@ def extract_case(
     energy = np.full_like(rho, np.nan)
     pressure = np.full_like(rho, np.nan)
     product_here = material == 0
-    air_here = material == 1
+    # **边界诊断需要外侧纯空气的状态。** 激波以外的纯空气壳层在监督里仍是
+    # material==2 / valid=False，但这里保留它们的壳平均场量。否则下游只能看到
+    # 标签 2 和 NaN，无法区分“环境态”与“缺失场量”，右边界会被迫靠标签猜测。
+    # 这些值只进入逐字段有效性，不进入 ``valid`` 训练监督。
+    air_state_here = alpha_product <= PURE_AIR_THRESHOLD
     for key, target in (
         ("density", rho), ("velocity", vel), ("specific_energy", energy), ("pressure", pressure)
     ):
         target[product_here] = stack(PRODUCT, key)[product_here]
-        target[air_here] = stack(AIR, key)[air_here]
+        target[air_state_here] = stack(AIR, key)[air_state_here]
 
     finite = np.isfinite(rho) & np.isfinite(vel) & np.isfinite(energy) & np.isfinite(pressure)
     # **有效必须蕴含"有状态"。** 一个标着产物或空气、却四项场量全空的壳层不是监督，
@@ -1066,11 +1070,16 @@ def extract_case(
         float(np.count_nonzero(labelled_without_state)) / max(1, int(np.count_nonzero(material != 2)))
     )
 
+    # 外侧纯空气壳层只用于边界识别：位置标签仍是 material==2 且
+    # ``valid=False``（不进训练监督），但逐字段有效性保留，供下游核实环境态。
+    boundary_air_location = air_state_here & ~np.asarray(shell_empty, dtype=bool)[order]
+    boundary_air_location = boundary_air_location & ~contaminated_shells
+    field_location_valid = location_valid | boundary_air_location
     # 逐字段有效性。数值上每项 = 位置可用 且 该字段有限。
-    field_valid_density = location_valid & np.isfinite(rho)
-    field_valid_velocity = location_valid & np.isfinite(vel)
-    field_valid_energy = location_valid & np.isfinite(energy)
-    field_valid_pressure = location_valid & np.isfinite(pressure)
+    field_valid_density = field_location_valid & np.isfinite(rho)
+    field_valid_velocity = field_location_valid & np.isfinite(vel)
+    field_valid_energy = field_location_valid & np.isfinite(energy)
+    field_valid_pressure = field_location_valid & np.isfinite(pressure)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1098,6 +1107,9 @@ def extract_case(
         field_valid_velocity=field_valid_velocity,
         field_valid_energy=field_valid_energy,
         field_valid_pressure=field_valid_pressure,
+        # 外侧纯空气的“位置可诊断”掩码：material==2/valid=False，但场量可用，
+        # 只服务于 R_b/环境边界核实，不进入训练监督。
+        boundary_air_location_valid=boundary_air_location,
         shell_count=np.asarray(shell_count, dtype=np.int64)[order],
         # §9：接触面由**逐帧几何重构**给出（球对称 PLIC，由产物体积分数闭式切分）。
         # 下面这一组是重构自己的证据：定位状态、位置不确定性、混合带、原始分辨率、
@@ -1293,6 +1305,21 @@ def extract_case(
             "air": int(np.count_nonzero((material == 1) & finite)),
         },
         "valid_shell_fraction": float(np.mean(valid)),
+        "boundary_air_field_access": {
+            "material_code": 2,
+            "training_valid": False,
+            "fields_written": ["rho", "u", "P", "e"],
+            "field_validity_arrays": [
+                "field_valid_density", "field_valid_velocity",
+                "field_valid_energy", "field_valid_pressure",
+            ],
+            "purpose": (
+                "outer pure-air shells are unlabelled for training but keep their "
+                "shell-averaged fields so R_b detection can verify an ambient state; "
+                "material==2 alone is never treated as environmental proof"
+            ),
+            "location_mask": "boundary_air_location_valid",
+        },
         "labelled_without_state_fraction": float(labelled_without_state_fraction),
         "empty_shell_fraction": float(np.mean(empty_shells)),
         "contaminated_shell_fraction": float(np.mean(contaminated_shells)),

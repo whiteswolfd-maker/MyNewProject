@@ -735,7 +735,7 @@ class AlternatingTrainer:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "format": "spherical_blast_pinn.contact_air_checkpoint",
-            "version": 2,
+            "version": 3,
             "loop": self.loop,
             "contact_net": self.contact_net.state_dict(),
             "air_net": self.air_net.state_dict(),
@@ -772,11 +772,11 @@ class AlternatingTrainer:
         payload = torch.load(path, map_location="cpu", weights_only=False)
         if payload.get("format") != "spherical_blast_pinn.contact_air_checkpoint":
             raise TrainingError(f"{path}: not a contact-air checkpoint")
-        if payload.get("version") != 2:
+        if payload.get("version") != 3:
             raise TrainingError(
                 f"{path}: checkpoint version {payload.get('version')!r} is not "
-                "supported. Rebuild it: version 1 predates the contact-label time, "
-                "broadcast, R_b-gap, energy-scale and validation fixes"
+                "supported. Retrain: version 3 adds shared-physics metadata "
+                "required for prediction compatibility checks"
             )
         expected = [case.case_id for case in self.cases]
         if list(payload.get("case_ids", [])) != expected:
@@ -842,9 +842,13 @@ class AlternatingTrainer:
         self.opt_air.load_state_dict(payload["opt_air"])
         self.loop = int(payload["loop"])
         history = payload.get("history", {})
+        saved_best = history.get("best_score", None)
+        # ``0.0`` is a valid best score.  Only ``None`` means "no usable best
+        # score"; using ``saved_best or inf`` would silently turn 0 into inf.
+        best_score = float("inf") if saved_best is None else float(saved_best)
         self.history = TrainingHistory(
             loops=list(history.get("loops", [])),
-            best_score=float(history.get("best_score", float("inf")) or float("inf")),
+            best_score=best_score,
             best_loop=history.get("best_loop"),
         )
         self._validation = restored_validation

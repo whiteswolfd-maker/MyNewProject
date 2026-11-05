@@ -331,8 +331,11 @@ def test_energy_residual_scale_is_energy_density_over_time():
 # ---------------------------------------------------------------------------
 # 5. separation and right-boundary evidence
 # ---------------------------------------------------------------------------
-def _separation_case(material, *, contact_low, contact_up, rb, identified=True,
-                     times=None):
+def _separation_case(
+    material, *, contact_low, contact_up, rb, identified=True, times=None,
+    density_value=2.0, pressure_value=2.0, native_resolution=0.01,
+    coverage=True, ambient_pressure=1.0, ambient_density=1.0,
+):
     r = np.linspace(0.10, 0.15, len(material))
     t = times if times is not None else np.array([1.0e-5])
     contact = ContactIntervalTable(
@@ -343,18 +346,28 @@ def _separation_case(material, *, contact_low, contact_up, rb, identified=True,
     report = RightBoundaryDetection(
         radius=rb, identified=identified, evidence="test evidence" if identified else "",
         reasons=() if identified else ("no boundary",), n_ambient_cells=2,
-        n_disturbed_air_cells=3,
+        n_disturbed_air_samples=3,
     )
     return classify_separation_frames(
         case_id="s", times=t, radius=r, material=np.asarray([material]),
-        density=np.full((1, len(material)), 1.0),
+        density=np.full((1, len(material)), density_value),
         velocity=np.zeros((1, len(material))),
-        pressure=np.full((1, len(material)), 1.0),
+        pressure=np.full((1, len(material)), pressure_value),
         contact=contact, boundary=None, boundary_reports=[report],
         valid_density=np.ones((1, len(material)), dtype=bool),
         valid_velocity=np.ones((1, len(material)), dtype=bool),
         valid_pressure=np.ones((1, len(material)), dtype=bool),
-        min_shocked_air_cells=2,
+        ambient_pressure=ambient_pressure, ambient_density=ambient_density,
+        tol_pressure=0.1, tol_density=0.1, tol_velocity=0.1,
+        min_shocked_air_samples=2,
+        air_native_resolution_m=(
+            None if native_resolution is None
+            else np.array([native_resolution], dtype=np.float64)
+        ),
+        air_coverage=(
+            None if not coverage
+            else np.ones((1, len(material)), dtype=np.float64)
+        ),
     )
 
 
@@ -363,7 +376,9 @@ def test_separated_requires_contact_layer_and_boundary_together():
         [0, 0, 1, 1, 1, 2], contact_low=0.10, contact_up=0.105, rb=0.15
     )
     assert separated["status"] == "separated"
-    assert separated["frames"][0]["n_valid_air_cells"] >= 2
+    assert separated["frames"][0]["n_valid_air_shell_samples"] >= 2
+    assert separated["frames"][0]["n_disturbed_air_samples"] >= 2
+    assert separated["frames"][0]["resolution_verified"] is True
     assert separated["frame_times"].startswith("raw extraction frame times")
 
     not_separated = _separation_case(
@@ -380,6 +395,48 @@ def test_separated_requires_contact_layer_and_boundary_together():
     assert unresolved["frames"][0]["right_boundary_identified"] is False
 
 
+def test_static_ambient_air_between_contact_and_rb_is_not_a_shocked_layer():
+    result = _separation_case(
+        [0, 0, 1, 1, 1, 2], contact_low=0.10, contact_up=0.105, rb=0.15,
+        density_value=1.0, pressure_value=1.0,
+    )
+    frame = result["frames"][0]
+    assert frame["shocked_air_resolvable"] is False
+    assert frame["n_disturbed_air_samples"] == 0
+    assert result["status"] == "unresolvable"
+
+
+def test_more_shells_do_not_override_too_coarse_native_resolution():
+    # Same measured layer, same original mesh resolution; one fixture has more
+    # shell samples.  Shell count alone must not turn unresolvable into
+    # separated.
+    coarse = _separation_case(
+        [0, 0, 1, 1, 2, 2], contact_low=0.10, contact_up=0.105, rb=0.15,
+        native_resolution=0.10,
+    )
+    many = _separation_case(
+        [0, 0] + [1] * 8 + [2] * 6, contact_low=0.10, contact_up=0.105, rb=0.15,
+        native_resolution=0.10,
+    )
+    assert coarse["frames"][0]["n_disturbed_air_samples"] >= 2
+    assert many["frames"][0]["n_disturbed_air_samples"] > coarse["frames"][0]["n_disturbed_air_samples"]
+    assert coarse["frames"][0]["resolution_verified"] is False
+    assert many["frames"][0]["resolution_verified"] is False
+    assert coarse["status"] == "unresolvable"
+    assert many["status"] == "unresolvable"
+
+
+def test_shell_count_without_native_resolution_is_not_resolvable():
+    result = _separation_case(
+        [0, 0, 1, 1, 1, 2], contact_low=0.10, contact_up=0.105, rb=0.15,
+        native_resolution=None,
+    )
+    frame = result["frames"][0]
+    assert frame["shocked_air_resolvable"] is False
+    assert frame["resolution_verified"] is False
+    assert result["status"] == "unresolvable"
+
+
 def test_an_all_ambient_profile_is_not_a_right_boundary():
     r = np.linspace(0.1, 0.2, 6)
     report = detect_right_boundary_report(
@@ -391,7 +448,7 @@ def test_an_all_ambient_profile_is_not_a_right_boundary():
     assert "all-ambient" in " ".join(report.reasons)
 
 
-def test_a_material_transition_is_reported_as_weaker_evidence_not_hidden():
+def test_material_2_candidate_with_missing_fields_is_not_identified():
     r = np.linspace(0.1, 0.2, 6)
     pressure = np.array([1.0e7, 1.0e7, 1.0e7, np.nan, np.nan, np.nan])
     density = np.array([5.0, 5.0, 5.0, np.nan, np.nan, np.nan])
@@ -401,10 +458,67 @@ def test_a_material_transition_is_reported_as_weaker_evidence_not_hidden():
         ambient_pressure=101320.0, ambient_density=1.225,
         tol_pressure=1.0, tol_density=1.0e-9, tol_velocity=1.0e-9,
     )
+    assert not report.identified
+    assert report.candidate_radius == pytest.approx(r[3])
+    assert report.verification == "unverified_missing_fields"
+    assert "material==2" not in report.evidence
+
+
+def test_material_2_candidate_with_finite_non_ambient_fields_is_rejected():
+    r = np.linspace(0.1, 0.2, 6)
+    pressure = np.array([1.0e7, 1.0e7, 1.0e7, 5.0e6, 4.0e6, 3.0e6])
+    density = np.array([5.0, 5.0, 5.0, 2.0, 1.8, 1.6])
+    material = np.array([1, 1, 1, 2, 2, 2])
+    report = detect_right_boundary_report(
+        r, pressure, np.zeros(6), density, material,
+        ambient_pressure=101320.0, ambient_density=1.225,
+        tol_pressure=1.0, tol_density=1.0e-9, tol_velocity=1.0e-9,
+    )
+    assert not report.identified
+    assert report.verification == "rejected_non_ambient_fields"
+    assert "counter-evidence" in " ".join(report.reasons)
+
+
+def test_material_2_with_verified_ambient_fields_is_an_ambient_boundary():
+    r = np.linspace(0.1, 0.2, 6)
+    pressure = np.array([1.0e7, 1.0e7, 1.0e7, 101320.0, 101320.0, 101320.0])
+    density = np.array([5.0, 5.0, 5.0, 1.225, 1.225, 1.225])
+    material = np.array([1, 1, 1, 2, 2, 2])
+    report = detect_right_boundary_report(
+        r, pressure, np.zeros(6), density, material,
+        ambient_pressure=101320.0, ambient_density=1.225,
+        tol_pressure=1.0, tol_density=1.0e-9, tol_velocity=1.0e-9,
+    )
     assert report.identified
+    assert report.verification == "verified_ambient_state"
     assert report.radius == pytest.approx(r[3])
-    assert "material==2" in report.evidence
-    assert "not available" in report.evidence
+
+
+def test_product_or_missing_air_interrupts_radial_connectivity():
+    r = np.linspace(0.1, 0.2, 6)
+    ambient = np.array([101320.0, 101320.0, 101320.0])
+    good_p = np.array([1.0e7, 1.0e7])
+    good_rho = np.array([5.0, 5.0])
+    material = np.array([1, 1, 0, 2, 2, 2])
+    report = detect_right_boundary_report(
+        r, np.concatenate([good_p, [1.0], ambient]),
+        np.zeros(6), np.concatenate([good_rho, [5.0], [1.225] * 3]), material,
+        ambient_pressure=101320.0, ambient_density=1.225,
+        tol_pressure=1.0, tol_density=1.0e-9, tol_velocity=1.0e-9,
+    )
+    assert not report.identified
+    assert "product/mixed" in " ".join(report.reasons)
+
+    material = np.array([1, 1, 1, 2, 2, 2])
+    pressure = np.array([1.0e7, 1.0e7, np.nan] + list(ambient))
+    density = np.array([5.0, 5.0, np.nan, 1.225, 1.225, 1.225])
+    report = detect_right_boundary_report(
+        r, pressure, np.zeros(6), density, material,
+        ambient_pressure=101320.0, ambient_density=1.225,
+        tol_pressure=1.0, tol_density=1.0e-9, tol_velocity=1.0e-9,
+    )
+    assert not report.identified
+    assert "missing or invalid air cells" in " ".join(report.reasons)
 
 
 def test_material_2_outside_the_shock_is_not_treated_as_contact_mixing():
@@ -456,6 +570,66 @@ def _strip_cache(full: Path, target: Path, *, t_end_override=None) -> Path:
     return target
 
 
+def _config_for_cache(
+    tmp_path, cache: Path, *, case_id: str = "tnt_50mm", radius: float = 0.05,
+    synthetic: bool = True, precursor_override=None, air_width=None,
+    role: str = "train",
+) -> Path:
+    section = load_config(SMOKE).section("contact_air")
+    section["cases"] = [{
+        "case_id": case_id, "role": role, "charge_radius_m": radius,
+        "cache": str(cache), "synthetic": synthetic,
+    }]
+    if precursor_override:
+        for key, value in precursor_override.items():
+            if isinstance(value, dict):
+                section["precursor"].setdefault(key, {}).update(value)
+            else:
+                section["precursor"][key] = value
+    if air_width is not None:
+        section["networks"]["air"]["width"] = int(air_width)
+    path = tmp_path / "case_config.yaml"
+    path.write_text(yaml.safe_dump({"contact_air": section}), encoding="utf-8")
+    return path
+
+
+def test_synthetic_false_and_no_synthetic_reject_synthetic_caches(tmp_path, capsys):
+    case = synthetic_case_for(0.05, case_id="tnt_50mm", role="train",
+                              n_frames=7, n_radial=100)
+    cache = save_case(case, tmp_path / "synthetic.npz")
+
+    config = _config_for_cache(tmp_path, cache, synthetic=False)
+    assert cli.main([
+        "train", "--config", str(config), "--cases", "50", "--max-loops", "0",
+        "--output-dir", str(tmp_path / "train_false"),
+    ]) == 6
+    assert "synthetic" in capsys.readouterr().err
+
+    config = _config_for_cache(tmp_path, cache, synthetic=True)
+    assert cli.main([
+        "train", "--config", str(config), "--cases", "50", "--max-loops", "0",
+        "--no-synthetic", "--output-dir", str(tmp_path / "train_no_synth"),
+    ]) == 6
+    assert "no-synthetic" in capsys.readouterr().err.lower()
+
+
+def test_changed_material_parameters_refuse_an_old_cache(tmp_path, capsys):
+    case = synthetic_case_for(0.05, case_id="tnt_50mm", role="train",
+                              n_frames=7, n_radial=100)
+    cache = save_case(case, tmp_path / "synthetic.npz")
+    config = _config_for_cache(
+        tmp_path, cache, synthetic=True,
+        precursor_override={"jwl": {"A": 3.7120e11 * 1.01}},
+    )
+    assert cli.main([
+        "train", "--config", str(config), "--cases", "50", "--max-loops", "0",
+        "--output-dir", str(tmp_path / "train_changed"),
+    ]) == 6
+    error = capsys.readouterr().err
+    assert "jwl.A" in error
+    assert "build-cache" in error
+
+
 def test_old_version_1_case_cache_is_refused_not_silently_reinterpreted(tmp_path):
     from spherical_blast_pinn.contact_air.data import CaseDataError, load_case
 
@@ -486,7 +660,7 @@ def test_prediction_loader_reads_only_boundary_fields_and_ignores_internal_t_end
 
 
 def test_predict_500_runs_without_any_internal_reference_arrays(tmp_path, monkeypatch):
-    case = synthetic_case_for(0.5, case_id="r500", role="test", n_frames=9, n_radial=160)
+    case = synthetic_case_for(0.5, case_id="tnt_500mm", role="test", n_frames=9, n_radial=160)
     full = save_case(case, tmp_path / "full.npz")
     mini = _strip_cache(full, tmp_path / "mini.npz", t_end_override=123456.0)
 
@@ -497,7 +671,7 @@ def test_predict_500_runs_without_any_internal_reference_arrays(tmp_path, monkey
     section = load_config(SMOKE).section("contact_air")
     section["cases"] = [{
         "case_id": "tnt_500mm", "role": "test", "charge_radius_m": 0.5,
-        "cache": str(mini), "synthetic": False,
+        "cache": str(mini), "synthetic": True,
     }]
     config_path = tmp_path / "predict.yaml"
     config_path.write_text(yaml.safe_dump({"contact_air": section}), encoding="utf-8")
@@ -661,6 +835,76 @@ def test_resume_restores_the_fixed_validation_points_and_rng(tmp_path):
         assert torch.equal(sample.batch.t_contact, t_contact)
 
 
+def test_best_score_zero_survives_checkpoint_round_trip(tmp_path):
+    trainer = _trainer(tmp_path, fraction=0.3)
+    trainer.step()
+    trainer.history.best_score = 0.0
+    trainer.history.best_loop = 7
+    checkpoint = trainer.save(tmp_path / "zero_best.pt")
+    fresh = _trainer(tmp_path / "fresh", fraction=0.3)
+    fresh.load(checkpoint)
+    assert fresh.history.best_score == 0.0
+    assert fresh.history.best_loop == 7
+
+
+def test_prediction_refuses_checkpoint_with_different_shared_physics(tmp_path, capsys):
+    from spherical_blast_pinn.contact_air.data import synthetic_case
+    from spherical_blast_pinn.contact_air.precursor import (
+        PrecursorConfig,
+        compute_precursor,
+    )
+    from spherical_blast_pinn.contact_air.testing import (
+        DEFAULT_PRECURSOR, DEFAULT_TOLERANCES,
+    )
+
+    checkpoint = _trainer(tmp_path / "train", fraction=0.0)
+    checkpoint.step()
+    checkpoint_path = checkpoint.save(tmp_path / "last.pt")
+
+    payload = dict(DEFAULT_PRECURSOR)
+    payload["charge_radius_m"] = 0.5
+    payload["epsilon_s"] = 2.0e-6
+    predictor = compute_precursor(PrecursorConfig.from_mapping(payload))
+    prediction_case = synthetic_case(
+        case_id="tnt_500mm", charge_radius_m=0.5, precursor=predictor,
+        role="test", n_frames=7, n_radial=120, tolerances=DEFAULT_TOLERANCES,
+    )
+    full = save_case(prediction_case, tmp_path / "prediction_full.npz")
+    mini = _strip_cache(full, tmp_path / "prediction_mini.npz")
+    config = _config_for_cache(
+        tmp_path, mini, case_id="tnt_500mm", radius=0.5, role="test",
+        synthetic=True, precursor_override={"epsilon_s": 2.0e-6},
+    )
+    code = cli.main([
+        "predict-500", "--config", str(config), "--checkpoint", str(checkpoint_path),
+        "--output", str(tmp_path / "bad_prediction.npz"),
+    ])
+    assert code == 6
+    error = capsys.readouterr().err
+    assert "epsilon_s" in error
+    assert "prediction physics" in error
+
+
+def test_prediction_refuses_incompatible_network_convention(tmp_path, capsys):
+    prediction_case = synthetic_case_for(
+        0.5, case_id="tnt_500mm", role="test", n_frames=7, n_radial=120
+    )
+    full = save_case(prediction_case, tmp_path / "prediction_full.npz")
+    mini = _strip_cache(full, tmp_path / "prediction_mini.npz")
+    checkpoint = _trainer(tmp_path / "train", fraction=0.0)
+    checkpoint.step()
+    checkpoint_path = checkpoint.save(tmp_path / "last.pt")
+    config = _config_for_cache(
+        tmp_path, mini, case_id="tnt_500mm", radius=0.5, role="test",
+        synthetic=True, air_width=9,
+    )
+    assert cli.main([
+        "predict-500", "--config", str(config), "--checkpoint", str(checkpoint_path),
+        "--output", str(tmp_path / "bad_prediction.npz"),
+    ]) == 6
+    assert "architecture" in capsys.readouterr().err.lower()
+
+
 # ---------------------------------------------------------------------------
 # 8. clock and initial compatibility reporting
 # ---------------------------------------------------------------------------
@@ -712,7 +956,9 @@ def _write_real_style_profile(directory, *, times, precursor):
     """A fixture with the real extractor's material==2 ambiguity.
 
     material==2 is used for both the contact mixing band and every shell
-    outside the detected shock; the outside shells have no valid state.
+    outside the detected shock.  The outside shells are still unlabelled for
+    training, but their shell-averaged fields and per-field validity are
+    retained so R_b can be verified.
     """
     directory.mkdir(parents=True, exist_ok=True)
     grid = np.linspace(0.02, 0.20, 120)
@@ -729,22 +975,33 @@ def _write_real_style_profile(directory, *, times, precursor):
     energy = np.full((n_t, grid.size), np.nan)
     air = material == 1
     product = material == 0
+    outside_air = (material == 2) & (alpha <= 0.05)
     pressure[air] = precursor.p_sep
     density[air] = precursor.rho_a_sep
     energy[air] = precursor.e_a_sep
     pressure[product] = precursor.p_sep
     density[product] = precursor.rho_a_sep
     energy[product] = precursor.e_a_sep
+    pressure[outside_air] = precursor.air_pressure
+    density[outside_air] = precursor.air_density
+    energy[outside_air] = precursor.air_pressure / (
+        (precursor.gamma_air - 1.0) * precursor.air_density
+    )
     np.savez(
         directory / "raw_line.npz", t=np.asarray(times, dtype=float), x=grid,
         rho=density, u=velocity, P=pressure, e=energy,
     )
-    field_valid = material != 2
+    training_valid = material != 2
+    field_valid = training_valid | outside_air
+    coverage_air = np.ones((n_t, grid.size), dtype=np.float64)
     np.savez(
         directory / "material.npz",
-        alpha_product=alpha, material=material, valid=field_valid,
+        alpha_product=alpha, material=material, valid=training_valid,
         field_valid_density=field_valid, field_valid_velocity=field_valid,
         field_valid_energy=field_valid, field_valid_pressure=field_valid,
+        boundary_air_location_valid=outside_air,
+        coverage_air=coverage_air,
+        shock_cell_thickness_m=np.full(n_t, 0.002),
         contact_radius=np.full(n_t, 0.1075),
         shock_radius=np.full(n_t, 0.16),
         contact_mixing_band_inner_m=np.full(n_t, 0.105),
@@ -772,7 +1029,7 @@ def _write_real_style_profile(directory, *, times, precursor):
     return directory
 
 
-def test_real_style_profile_uses_band_and_transition_boundary_not_material_2(tmp_path):
+def test_real_style_profile_verifies_outer_air_by_state_not_label(tmp_path):
     from spherical_blast_pinn.contact_air.data import build_case_from_profile
     from spherical_blast_pinn.contact_air.testing import (
         DEFAULT_TOLERANCES, default_precursor,
@@ -789,11 +1046,21 @@ def test_real_style_profile_uses_band_and_transition_boundary_not_material_2(tmp
     assert case.contact.n_valid == len(times)
     assert np.all(case.contact.low > 0.10) and np.all(case.contact.low < 0.105)
     assert np.all(case.contact.up > 0.107) and np.all(case.contact.up < 0.112)
-    assert case.separation["status"] in (
-        "separated", "separated_with_unresolvable_frames", "mixed"
-    )
+    assert case.separation["status"] == "separated"
     assert case.separation["right_boundary_identified_count"] == len(times)
+    assert all(
+        frame["shocked_air_resolvable"]
+        for frame in case.separation["frames"]
+    )
+    assert all(
+        "finite ambient state" in frame["boundary_evidence"]
+        for frame in case.separation["frames"]
+    )
     assert case.source["fields_are_shell_averaged"] is True
+    assert case.source["air_native_resolution_source"] == "shock_cell_thickness_m"
+    assert case.source["raw_cell_ids_available"] is False
+    assert case.source["raw_cell_radial_ranges_available"] is False
+    assert case.source["shell_count_is_original_cell_count"] is False
 
 
 def test_profile_bridge_reports_shell_midpoint_support_not_cell_centres(tmp_path):

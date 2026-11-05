@@ -241,6 +241,13 @@ class PrecursorResult:
                 "omega": self.config.jwl.omega,
                 "rho_tnt": self.config.jwl.rho_tnt,
             },
+            "detonation": {
+                "velocity": self.config.detonation.velocity,
+                "cj_pressure": self.config.detonation.cj_pressure,
+                "cj_density": self.config.detonation.cj_density,
+            },
+            "material_source": self.config.material_source,
+            "material_source_verified": bool(self.config.material_source_verified),
             "V_cj": self.V_cj,
             "V_sep": self.V_sep,
             "C": self.C,
