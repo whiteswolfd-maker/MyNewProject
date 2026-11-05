@@ -80,10 +80,16 @@ class CaseArrays:
     rb_times: np.ndarray | None = None
     rb_radius: np.ndarray | None = None
     rb_valid: np.ndarray | None = None
+    #: Material attribution from the ALE volume fraction only.  Unlike
+    #: ``material`` it is not withdrawn when old shock supervision fails.
+    phase_material: np.ndarray | None = None
     #: Per-frame original radial resolution (e.g. ALE cell thickness at the
     #: shock).  ``None`` means the extractor did not provide it; shell spacing
     #: must not be substituted for it.
     air_native_resolution_m: np.ndarray | None = None
+    #: Per-frame source and rejection/fallback reason for the resolution above.
+    air_native_resolution_source: np.ndarray | None = None
+    air_native_resolution_reason: np.ndarray | None = None
     #: ``(n_frames, n_radial)`` air-shell coverage.  Optional contribution
     #: evidence alongside the native resolution.
     air_coverage: np.ndarray | None = None
@@ -629,6 +635,7 @@ def detect_right_boundary_report(
     valid_velocity: np.ndarray | None = None,
     valid_pressure: np.ndarray | None = None,
     contact_radius: float | None = None,
+    material_is_phase: bool = False,
 ) -> RightBoundaryDetection:
     """Locate the environmental-side right boundary with radial evidence.
 
@@ -666,20 +673,31 @@ def detect_right_boundary_report(
         state_ok &= np.asarray(valid_velocity, dtype=bool).reshape(-1)
     if valid_pressure is not None:
         state_ok &= np.asarray(valid_pressure, dtype=bool).reshape(-1)
-    ambient = (
+    # material==2 is never proof of a pure-air/environment state.  With phase
+    # labels it is a mixed region; without them it is an ambiguous legacy label.
+    field_ambient = (
         state_ok
-        & np.isin(mat, (1, 2))
         & (np.abs(p - float(ambient_pressure)) <= float(tol_pressure))
         & (np.abs(rho - float(ambient_density)) <= float(tol_density))
         & (np.abs(u) <= float(tol_velocity))
     )
+    # material==2 never counts as pure air; only phase/material 1 can be an
+    # ambient candidate.  The field-based ambient test is kept separately so a
+    # label-only candidate can be reported honestly as unverified.
+    ambient = field_ambient & (mat == 1)
     disturbed = (mat == 1) & state_ok & ~ambient
     if contact_radius is not None and math.isfinite(float(contact_radius)):
         disturbed &= r > float(contact_radius)
     n_disturbed = int(np.count_nonzero(disturbed))
     reasons: list[str] = []
     ambient_start = _trailing_true_run(ambient, min_cells=min_ambient_cells)
-    label_start = _trailing_true_run(mat == 2, min_cells=min_ambient_cells)
+    # With explicit phase labels, material==2 is a mixed region, never an air
+    # candidate.  The legacy label fallback remains only for old arrays and is
+    # still rejected unless the fields verify an ambient state.
+    label_start = (
+        -1 if material_is_phase
+        else _trailing_true_run(mat == 2, min_cells=min_ambient_cells)
+    )
     if ambient_start >= 0:
         start = ambient_start
         candidate_evidence = (
@@ -723,11 +741,12 @@ def detect_right_boundary_report(
     last_disturbed = int(disturbed_inside[-1])
     between = np.arange(last_disturbed + 1, start)
     if between.size:
-        bad_label = between[~np.isin(mat[between], (1, 2))]
+        bad_label = between[mat[between] != 1]
         if bad_label.size:
             reasons.append(
-                "product/mixed cells interrupt the radial path from shocked air "
-                f"to the candidate run at r={r[bad_label[:3]].tolist()} m"
+                "non-air / mixed / unknown cells interrupt the radial path from "
+                "shocked air to the candidate run at "
+                f"r={r[bad_label[:3]].tolist()} m"
             )
         bad_air = between[(mat[between] == 1) & ~state_ok[between]]
         if bad_air.size:
@@ -745,11 +764,19 @@ def detect_right_boundary_report(
         # The label-only candidate must not override field evidence.
         candidate_state = slice(start, None)
         if np.all(state_ok[candidate_state]):
-            reasons.append(
-                "the material==2 candidate has finite fields that are not ambient; "
-                "material==2 cannot override this counter-evidence"
-            )
-            verification = "rejected_non_ambient_fields"
+            if np.any(~field_ambient[candidate_state]):
+                reasons.append(
+                    "the material==2 candidate has finite fields that are not "
+                    "ambient; material==2 cannot override this counter-evidence"
+                )
+                verification = "rejected_non_ambient_fields"
+            else:
+                reasons.append(
+                    "the material==2 candidate has ambient-like fields, but a "
+                    "material label alone cannot prove a pure-air cell; it is "
+                    "only a candidate"
+                )
+                verification = "unverified_material_label"
         else:
             missing = int(
                 np.count_nonzero(~state_ok[candidate_state])
@@ -797,6 +824,7 @@ def detect_right_boundary(
     valid_velocity: np.ndarray | None = None,
     valid_pressure: np.ndarray | None = None,
     contact_radius: float | None = None,
+    material_is_phase: bool = False,
 ) -> tuple[float, bool, str]:
     """Backward-compatible tuple wrapper around :func:`detect_right_boundary_report`."""
     report = detect_right_boundary_report(
@@ -806,6 +834,7 @@ def detect_right_boundary(
         tol_velocity=tol_velocity, min_ambient_cells=min_ambient_cells,
         valid_density=valid_density, valid_velocity=valid_velocity,
         valid_pressure=valid_pressure, contact_radius=contact_radius,
+        material_is_phase=material_is_phase,
     )
     reason = report.evidence if report.identified else "; ".join(report.reasons)
     return report.radius, report.identified, reason
@@ -961,6 +990,91 @@ def build_air_observations(
     )
 
 
+def select_air_native_resolution(
+    n_frames: int,
+    *,
+    primary: np.ndarray | None,
+    primary_source: str = "shock_cell_thickness_m",
+    fallback: np.ndarray | None = None,
+    fallback_applicable: np.ndarray | None = None,
+    fallback_source: str = "air_native_resolution_fallback_m",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Select a native resolution per frame, with an explicit fallback gate.
+
+    The shock-side cell thickness is the primary source.  A fallback is used
+    **only** on frames where it is both finite/positive and explicitly marked
+    applicable to the air layer; a contact/product-side thickness is never
+    substituted unconditionally.  The returned reason explains every frame
+    that could not be resolved.
+    """
+    count = int(n_frames)
+    values = np.full(count, np.nan, dtype=np.float64)
+    sources = np.full(count, "", dtype=object)
+    reasons = np.full(count, "", dtype=object)
+
+    def prepare(array, name: str) -> np.ndarray | None:
+        if array is None:
+            return None
+        flat = np.asarray(array, dtype=np.float64).reshape(-1)
+        if flat.size != count:
+            raise CaseDataError(f"{name} must have one value per frame")
+        return flat
+
+    primary_values = prepare(primary, "primary native resolution")
+    fallback_values = prepare(fallback, "fallback native resolution")
+    if fallback_values is not None:
+        if fallback_applicable is None:
+            applicable = np.zeros(count, dtype=bool)
+        else:
+            applicable = np.asarray(fallback_applicable, dtype=bool).reshape(-1)
+            if applicable.size != count:
+                raise CaseDataError(
+                    "fallback_applicable must have one value per frame"
+                )
+    else:
+        applicable = np.zeros(count, dtype=bool)
+    for frame in range(count):
+        if (
+            primary_values is not None
+            and np.isfinite(primary_values[frame])
+            and primary_values[frame] > 0.0
+        ):
+            values[frame] = float(primary_values[frame])
+            sources[frame] = primary_source
+            reasons[frame] = "primary source valid"
+            continue
+        if (
+            fallback_values is not None
+            and bool(applicable[frame])
+            and np.isfinite(fallback_values[frame])
+            and fallback_values[frame] > 0.0
+        ):
+            values[frame] = float(fallback_values[frame])
+            sources[frame] = fallback_source
+            reasons[frame] = (
+                "primary source invalid/absent; fallback explicitly applicable "
+                "to the air-side grid"
+            )
+            continue
+        primary_state = (
+            "missing" if primary_values is None else
+            ("non-positive" if np.isfinite(primary_values[frame]) else "non-finite")
+        )
+        if fallback_values is None:
+            fallback_state = "absent"
+        elif not bool(applicable[frame]):
+            fallback_state = "not applicable to the air layer"
+        elif not np.isfinite(fallback_values[frame]) or fallback_values[frame] <= 0.0:
+            fallback_state = "invalid"
+        else:
+            fallback_state = "unusable"
+        reasons[frame] = (
+            f"primary {primary_source} is {primary_state}; fallback "
+            f"{fallback_source} is {fallback_state}; no native resolution claimed"
+        )
+    return values, sources, reasons
+
+
 def classify_separation_frames(
     *,
     case_id: str,
@@ -983,6 +1097,8 @@ def classify_separation_frames(
     tol_velocity: float,
     min_shocked_air_samples: int = 2,
     air_native_resolution_m: np.ndarray | None = None,
+    air_native_resolution_source: Sequence[str] | None = None,
+    air_native_resolution_reason: Sequence[str] | None = None,
     air_coverage: np.ndarray | None = None,
     min_air_coverage: float = 0.5,
     min_air_layer_native_cells: float = 1.0,
@@ -1021,6 +1137,19 @@ def classify_separation_frames(
         raise CaseDataError(
             "air_native_resolution_m must have one value per frame"
         )
+    native_sources = (
+        None if air_native_resolution_source is None
+        else np.asarray(air_native_resolution_source, dtype=object).reshape(-1)
+    )
+    native_reasons = (
+        None if air_native_resolution_reason is None
+        else np.asarray(air_native_resolution_reason, dtype=object).reshape(-1)
+    )
+    n_frames_expected = int(np.asarray(times).size)
+    if native_sources is not None and native_sources.size != n_frames_expected:
+        raise CaseDataError("air_native_resolution_source must have one value per frame")
+    if native_reasons is not None and native_reasons.size != n_frames_expected:
+        raise CaseDataError("air_native_resolution_reason must have one value per frame")
     coverage = (
         None if air_coverage is None
         else np.asarray(air_coverage, dtype=np.float64)
@@ -1170,6 +1299,12 @@ def classify_separation_frames(
                         "native_resolution_m": (
                             native_value if np.isfinite(native_value) else None
                         ),
+                        "native_resolution_source": (
+                            str(native_sources[frame]) if native_sources is not None else None
+                        ),
+                        "native_resolution_reason": (
+                            str(native_reasons[frame]) if native_reasons is not None else None
+                        ),
                         "resolution_verified": False,
                         "coverage_available": coverage_available,
                         "coverage_verified": False,
@@ -1215,6 +1350,12 @@ def classify_separation_frames(
             ),
             "native_resolution_m": (
                 native_value if math.isfinite(native_value) else None
+            ),
+            "native_resolution_source": (
+                str(native_sources[frame]) if native_sources is not None else None
+            ),
+            "native_resolution_reason": (
+                str(native_reasons[frame]) if native_reasons is not None else None
             ),
             "resolution_verified": bool(resolution_ok),
             "coverage_available": bool(coverage_available),
@@ -1279,12 +1420,18 @@ def build_case(
     times = np.asarray(arrays.times, dtype=np.float64).reshape(-1)
     if times.size < 2 or np.any(np.diff(times) <= 0.0):
         raise CaseDataError("frame times must be finite and strictly increasing")
+    phase_material = (
+        arrays.phase_material if arrays.phase_material is not None else arrays.material
+    )
+    phase_is_explicit = arrays.phase_material is not None
+    if np.asarray(phase_material).shape != np.asarray(arrays.material).shape:
+        raise CaseDataError("phase_material must have the same shape as material")
     if arrays.contact_low is None:
         low, up, raw, cvalid = [], [], [], []
         reasons: list[str] = []
         for frame in range(times.size):
             lo, hi, rr, ok, reason = contact_interval_from_material(
-                arrays.radius, arrays.material[frame]
+                arrays.radius, phase_material[frame]
             )
             low.append(lo); up.append(hi); raw.append(rr); cvalid.append(ok)
             reasons.append(reason)
@@ -1316,7 +1463,7 @@ def build_case(
             )
             report = detect_right_boundary_report(
                 arrays.radius, arrays.pressure[frame], arrays.velocity[frame],
-                arrays.density[frame], arrays.material[frame],
+                arrays.density[frame], phase_material[frame],
                 ambient_pressure=float(tolerances["ambient_pressure_pa"]),
                 ambient_density=float(tolerances["ambient_density_kg_m3"]),
                 tol_pressure=float(tolerances["pressure_pa"]),
@@ -1327,6 +1474,7 @@ def build_case(
                 valid_velocity=valid_velocity[frame],
                 valid_pressure=valid_pressure[frame],
                 contact_radius=contact_up,
+                material_is_phase=phase_is_explicit,
             )
             boundary_reports.append(report)
             rb_t.append(t); rb_r.append(report.radius); rb_v.append(report.identified)
@@ -1364,7 +1512,7 @@ def build_case(
     obs = build_air_observations(arrays, contact, boundary)
     separation = classify_separation_frames(
         case_id=arrays.case_id, times=times, radius=arrays.radius,
-        material=arrays.material, density=arrays.density,
+        material=phase_material, density=arrays.density,
         velocity=arrays.velocity, pressure=arrays.pressure,
         contact=contact, boundary=boundary, boundary_reports=boundary_reports,
         valid_density=valid_density, valid_velocity=valid_velocity,
@@ -1381,6 +1529,8 @@ def build_case(
             )
         ),
         air_native_resolution_m=arrays.air_native_resolution_m,
+        air_native_resolution_source=arrays.air_native_resolution_source,
+        air_native_resolution_reason=arrays.air_native_resolution_reason,
         air_coverage=arrays.air_coverage,
         min_air_coverage=float(tolerances.get("min_air_coverage", 0.5)),
         min_air_layer_native_cells=float(
@@ -1416,7 +1566,7 @@ def save_case(case: CaseData, path: Path | str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     metadata = {
         "format": "spherical_blast_pinn.contact_air_case",
-        "version": 3,
+        "version": 4,
         "units": {
             "time": "s", "radius": "m", "density": "kg/m^3",
             "velocity": "m/s", "pressure": "Pa", "specific_energy": "J/kg",
@@ -1428,10 +1578,9 @@ def save_case(case: CaseData, path: Path | str) -> Path:
             "metadata", "rb_times", "rb_radius", "rb_valid",
         ],
         "cache_rebuild_reason": (
-            "version 3: verified ambient-state R_b (material labels alone are not "
-            "enough), shocked-air evidence with native radial resolution, outer-air "
-            "fields retained for boundary verification, and the solve interval is "
-            "one continuous R_b segment; version 2 caches must be rebuilt"
+            "version 4: material_phase is carried separately from the legacy supervised "
+            "material labels, per-frame native-resolution source selection, and "
+            "verified ambient-state R_b evidence; older caches must be rebuilt"
         ),
     }
     np.savez(
@@ -1468,11 +1617,11 @@ def load_case(path: Path | str, *, role: str | None = None) -> CaseData:
         metadata = json.loads(str(archive["metadata"]))
         if metadata.get("format") != "spherical_blast_pinn.contact_air_case":
             raise CaseDataError(f"{path}: not a contact-air case cache")
-        if metadata.get("version") != 3:
+        if metadata.get("version") != 4:
             raise CaseDataError(
                 f"{path}: cache version {metadata.get('version')!r} is not supported. "
-                "Rebuild it with build-cache: version 3 requires verified "
-                "ambient-state R_b evidence, native resolution and outer-air fields"
+                "Rebuild it with build-cache: version 4 requires material_phase and "
+                "per-frame native-resolution selection"
             )
         case_meta = metadata["case"]
         precursor = metadata["precursor"]
@@ -1534,7 +1683,7 @@ def load_prediction_case(path: Path | str, *, role: str | None = None) -> Predic
         metadata = json.loads(str(archive["metadata"]))
         if metadata.get("format") != "spherical_blast_pinn.contact_air_case":
             raise CaseDataError(f"{path}: not a contact-air case cache")
-        if metadata.get("version") != 3:
+        if metadata.get("version") != 4:
             raise CaseDataError(
                 f"{path}: cache version {metadata.get('version')!r} is not supported "
                 "for boundary-only prediction; rebuild it with build-cache"
@@ -1609,18 +1758,32 @@ def build_case_from_profile(
             if "contact_mixing_band_outer_m" in archive.files else None
         alpha = np.asarray(archive["alpha_product"], dtype=np.float64) \
             if "alpha_product" in archive.files else None
-        native_resolution = np.asarray(
+        primary_resolution = np.asarray(
             archive["shock_cell_thickness_m"], dtype=np.float64
         ) if "shock_cell_thickness_m" in archive.files else None
-        native_source = "shock_cell_thickness_m"
-        if native_resolution is None and "contact_native_resolution_m" in archive.files:
-            native_resolution = np.asarray(
+        fallback_resolution = np.asarray(
+            archive["air_native_resolution_fallback_m"], dtype=np.float64
+        ) if "air_native_resolution_fallback_m" in archive.files else None
+        fallback_applicable = np.asarray(
+            archive["air_native_resolution_fallback_applicable"], dtype=bool
+        ) if "air_native_resolution_fallback_applicable" in archive.files else None
+        fallback_source = "air_native_resolution_fallback_m"
+        if fallback_resolution is None and "contact_native_resolution_m" in archive.files:
+            # Contact-side thickness is never used unconditionally.  It is
+            # considered only when the export explicitly marks it applicable to
+            # the air layer for that frame.
+            fallback_resolution = np.asarray(
                 archive["contact_native_resolution_m"], dtype=np.float64
             )
-            native_source = "contact_native_resolution_m"
+            fallback_applicable = np.asarray(
+                archive["contact_native_resolution_air_applicable"], dtype=bool
+            ) if "contact_native_resolution_air_applicable" in archive.files else None
+            fallback_source = "contact_native_resolution_m"
         air_coverage = np.asarray(archive["coverage_air"], dtype=np.float64) \
             if "coverage_air" in archive.files else None
         shell_count_available = "shell_count" in archive.files
+        phase_from_archive = np.asarray(archive["material_phase"]) \
+            if "material_phase" in archive.files else None
         eligible = np.asarray(archive["contact_has_supervision"], dtype=bool) \
             if "contact_has_supervision" in archive.files else None
     if eligible is None:
@@ -1636,17 +1799,39 @@ def build_case_from_profile(
         raise CaseDataError(
             "contact_has_supervision must have one boolean per frame"
         )
-    if native_resolution is not None:
-        native_resolution = np.asarray(native_resolution, dtype=np.float64).reshape(-1)
-        if native_resolution.size != case.times.size:
-            raise CaseDataError(
-                "the native radial-resolution array must have one value per frame"
-            )
-    else:
-        native_source = None
+    native_resolution, native_sources, native_reasons = select_air_native_resolution(
+        case.times.size,
+        primary=primary_resolution,
+        primary_source="shock_cell_thickness_m",
+        fallback=fallback_resolution,
+        fallback_applicable=fallback_applicable,
+        fallback_source=fallback_source,
+    )
     if air_coverage is not None and air_coverage.shape != np.asarray(case.material).shape:
         raise CaseDataError(
             "coverage_air must have the same shape as the material mask"
+        )
+    phase_material = (
+        case.material_phase
+        if getattr(case, "material_phase", None) is not None
+        else phase_from_archive
+    )
+    if phase_material is not None:
+        phase_array = np.asarray(phase_material)
+        if not np.issubdtype(phase_array.dtype, np.integer):
+            raise CaseDataError("material_phase must be an integer material-code array")
+        unknown = sorted(set(np.unique(phase_array).tolist()) - {0, 1, 2})
+        if unknown:
+            raise CaseDataError(
+                f"material_phase contains unknown codes {unknown}; expected 0/1/2"
+            )
+    phase_is_explicit = phase_material is not None
+    phase_source = "material_phase"
+    if phase_material is None:
+        raise CaseDataError(
+            "material.npz has no material_phase; re-run extract_profiles so the "
+            "volume-fraction material attribution is carried separately from the "
+            "legacy supervised material labels"
         )
     extraction_source = case.source or {}
     # ``material==2`` is ambiguous in the real extractor (mixing band AND
@@ -1654,7 +1839,7 @@ def build_case_from_profile(
     # fraction when available; fall back to the legacy label only for old
     # fixtures that really encoded the mixing band as 2.
     mixed_frames = None
-    if alpha is not None and alpha.shape == np.asarray(case.material).shape:
+    if alpha is not None and alpha.shape == np.asarray(phase_material).shape:
         metadata_raw = extraction_source.get("metadata_raw", {}) or {}
         partition = (metadata_raw.get("material_partition_source") or {}).get(
             "detail", {}
@@ -1671,13 +1856,13 @@ def build_case_from_profile(
         # pure shell representatives.  Only if that is unusable fall back to
         # the explicit mixed mask / legacy material label.
         lo, hi, rr, ok, _ = contact_interval_from_band(
-            np.asarray(case.radius), np.asarray(case.material)[frame],
+            np.asarray(case.radius), np.asarray(phase_material)[frame],
             float(low[frame]), float(up[frame]),
         )
         if not ok:
             mixed = None if mixed_frames is None else mixed_frames[frame]
             lo, hi, rr, ok, _ = contact_interval_from_material(
-                np.asarray(case.radius), np.asarray(case.material)[frame],
+                np.asarray(case.radius), np.asarray(phase_material)[frame],
                 mixed=mixed,
             )
         if ok:
@@ -1702,18 +1887,31 @@ def build_case_from_profile(
         "fields_are_shell_averaged": True,
         "material_partition_source": extraction_source.get("material_masks_from"),
         "profile_layout": extraction_source.get("profile_layout"),
-        "air_native_resolution_source": native_source,
-        "air_native_resolution_is_original_ale": native_source is not None,
+        "air_native_resolution_sources": sorted(set(str(v) for v in native_sources if str(v))),
+        "air_native_resolution_primary_source": "shock_cell_thickness_m",
+        "air_native_resolution_fallback_source": (
+            fallback_source if fallback_resolution is not None else None
+        ),
+        "air_native_resolution_fallback_available": fallback_resolution is not None,
+        "air_native_resolution_is_original_ale": any(
+            str(v) in (
+                "shock_cell_thickness_m", "air_native_resolution_fallback_m",
+                "contact_native_resolution_m",
+            )
+            for v in native_sources
+        ),
         "air_coverage_available": air_coverage is not None,
+        "material_phase_source": phase_source,
         "shell_count_available": bool(shell_count_available),
         "shell_count_is_original_cell_count": False,
         "raw_cell_ids_available": False,
         "raw_cell_radial_ranges_available": False,
         "radial_support_note": (
-            "material.npz provides shell_count, coverage_air and per-frame native "
-            "cell thickness at the shock/contact, but not original ALE cell IDs or "
-            "per-cell radial ranges. Native thickness is used as the resolution "
-            "floor; shell count alone is not treated as independent cells."
+            "material.npz provides shell_count, coverage_air, per-frame thickness at "
+            "the shock/contact and an explicitly gated air-side fallback. It does "
+            "not provide original ALE cell IDs or per-cell radial ranges. Native "
+            "thickness is used as the resolution floor; shell count alone is not "
+            "treated as independent cells."
         ),
     }
     if source:
@@ -1723,12 +1921,17 @@ def build_case_from_profile(
         times=np.asarray(case.times), radius=np.asarray(case.radius),
         density=np.asarray(case.density), velocity=np.asarray(case.velocity),
         pressure=np.asarray(case.pressure), material=np.asarray(case.material),
+        phase_material=(
+            np.asarray(phase_material) if phase_is_explicit else None
+        ),
         valid=np.asarray(case.valid),
         valid_density=field_validity.get("density"),
         valid_velocity=field_validity.get("velocity"),
         valid_pressure=field_validity.get("pressure"),
         contact_low=low, contact_up=up, contact_raw=raw, contact_valid=valid,
         air_native_resolution_m=native_resolution,
+        air_native_resolution_source=native_sources,
+        air_native_resolution_reason=native_reasons,
         air_coverage=air_coverage,
         source={"profile_dir": str(directory), "extraction": case.source},
     )
@@ -1797,6 +2000,7 @@ def synthetic_case(
     arrays = CaseArrays(
         case_id=case_id, charge_radius_m=charge_radius_m, times=times, radius=radius,
         density=density, velocity=velocity, pressure=pressure, material=mat,
+        phase_material=mat.copy(),
         valid=valid, valid_density=valid, valid_velocity=valid, valid_pressure=valid,
         contact_low=contact_low, contact_up=contact_up, contact_raw=rc,
         contact_valid=np.ones(times.size, dtype=bool),
@@ -1804,6 +2008,12 @@ def synthetic_case(
         # This is a synthetic resolution, not a measured ALE cell thickness.
         air_native_resolution_m=np.full(
             times.size, max(5.0e-4 * charge_radius_m, 1.0e-6), dtype=np.float64
+        ),
+        air_native_resolution_source=np.full(
+            times.size, "synthetic_fixture", dtype=object
+        ),
+        air_native_resolution_reason=np.full(
+            times.size, "synthetic fixture resolution, not measured", dtype=object
         ),
         air_coverage=np.ones((times.size, radius.size), dtype=np.float64),
         source={

@@ -738,6 +738,8 @@ def extract_case(
     mixed_fraction: list[float] = []
     unreacted_cells: list[int] = []
     state_indices: list[int] = []
+    air_native_resolution_fallback: list[float] = []
+    air_native_resolution_fallback_applicable: list[bool] = []
 
     shock_provenance: dict[str, Any] = {}
     implied_radius = float("nan")
@@ -897,6 +899,24 @@ def extract_case(
             air_thickness = np.array(
                 [_mesh_cell_thickness(cell_thickness_table, float(c)) for c in centres]
             )
+        # Per-frame air-side fallback for native resolution.  Only the first
+        # pure-air shell strictly outside the contact is used: it is an
+        # original-mesh cell on the air side, not the product side.  This is
+        # explicitly marked applicable so the consumer never substitutes a
+        # contact/product-side thickness unconditionally.
+        fallback_value = float("nan")
+        fallback_ok = False
+        if np.isfinite(contact_r):
+            candidates = np.flatnonzero(
+                (centres > contact_r) & (alpha_profile <= PURE_AIR_THRESHOLD)
+            )
+            if candidates.size:
+                candidate_value = float(air_thickness[int(candidates[0])])
+                if np.isfinite(candidate_value) and candidate_value > 0.0:
+                    fallback_value = candidate_value
+                    fallback_ok = True
+        air_native_resolution_fallback.append(fallback_value)
+        air_native_resolution_fallback_applicable.append(bool(fallback_ok))
         detection = detect_shock(
             centres,
             np.asarray(air_profile.pressure, dtype=np.float64),
@@ -997,6 +1017,10 @@ def extract_case(
     # 但下面会被标成无效，永远不进监督。
     mixed = (alpha_product > PURE_AIR_THRESHOLD) & (alpha_product < PURE_PRODUCT_THRESHOLD)
     material[mixed] = 2
+    # **材料归属与监督资格解耦。** 这一刻的分类只来自体积分数：0 纯产物、
+    # 1 纯空气、2 混合区。后面的 ``material`` 会因旧激波监督失败/激波外区域而
+    # 被撤标为 2；那份撤标只服务于旧消费者，不能反过来当作材料归属。
+    material_phase = material.copy()
 
     band_width = 2.0 * float(np.median(np.diff(grid.edges)))
     valid = (material != 2) & ~empty
@@ -1100,6 +1124,8 @@ def extract_case(
         output_dir / "material.npz",
         alpha_product=alpha_product,
         material=material,
+        # 仅由体积分数决定的材料归属，不受 shock_has_supervision/旧撤标影响。
+        material_phase=material_phase,
         valid=valid,
         # 逐字段有效性（§11.1）。``valid`` 是"四项联合可用"，这三个是"这一项自己
         # 可用"。下游按字段各自取点，不再因为 e 缺失而丢掉同一位置的 rho 与 u。
@@ -1121,6 +1147,12 @@ def extract_case(
         contact_mixing_band_inner_m=np.asarray(contact_band_lo, dtype=np.float64)[order],
         contact_mixing_band_outer_m=np.asarray(contact_band_hi, dtype=np.float64)[order],
         contact_native_resolution_m=np.asarray(contact_native_resolution, dtype=np.float64)[order],
+        air_native_resolution_fallback_m=np.asarray(
+            air_native_resolution_fallback, dtype=np.float64
+        )[order],
+        air_native_resolution_fallback_applicable=np.asarray(
+            air_native_resolution_fallback_applicable, dtype=bool
+        )[order],
         contact_mixing_cell_count=np.asarray(contact_mixing_cells, dtype=np.int64)[order],
         contact_is_sub_cell=np.asarray(contact_sub_cell, dtype=bool)[order],
         contact_has_supervision=np.asarray(contact_supervision, dtype=bool)[order],
@@ -1260,6 +1292,12 @@ def extract_case(
             },
         ),
         "material_partition_is_volume_fraction_based": True,
+        "material_phase_source": (
+            "material_phase is fixed from the ALE volume fraction only "
+            "(0 product >=95%, 1 pure air <=5%, 2 mixed); it is written before "
+            "any shock-supervision withdrawal and is not changed by "
+            "shock_has_supervision"
+        ),
         "material_partition_source_note": (
             "ALE material volume fraction read from the d3plot history variables, "
             "summed over the explosive parts; pure product alpha >= 0.95, pure air "
@@ -1305,6 +1343,15 @@ def extract_case(
             "air": int(np.count_nonzero((material == 1) & finite)),
         },
         "valid_shell_fraction": float(np.mean(valid)),
+        "air_native_resolution_fallback": {
+            "array": "air_native_resolution_fallback_m",
+            "applicability": "air_native_resolution_fallback_applicable",
+            "source": (
+                "first pure-air shell strictly outside the contact; original-mesh "
+                "cell thickness at that shell. It is air-side, not product-side, "
+                "and is only usable where the applicability flag is true."
+            ),
+        },
         "boundary_air_field_access": {
             "material_code": 2,
             "training_valid": False,

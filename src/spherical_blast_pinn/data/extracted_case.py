@@ -174,6 +174,10 @@ class ExtractedCase:
     shock_valid: np.ndarray
     material: np.ndarray            # (N_t, N_r) int：0 产物、1 空气、2 未受扰动
     valid: np.ndarray               # (N_t, N_r) bool
+    #: Material attribution fixed only by the ALE volume fraction, independent of
+    #: ``shock_has_supervision`` and of the legacy ``material`` withdrawal.
+    #: ``None`` means the export predates this separation.
+    material_phase: np.ndarray | None = None
     source: dict[str, Any] = field(default_factory=dict)
     detector: DetectorSettings = field(default_factory=DetectorSettings)
 
@@ -1056,6 +1060,12 @@ def validate_case_object(case: Any, *, path: Any = "<case>") -> None:
         dtype=np.integer, allowed=MATERIAL_CODES,
     )
     _check_domain("valid", np.asarray(getattr(case, "valid", None)), dtype=np.bool_)
+    phase = getattr(case, "material_phase", None)
+    if phase is not None:
+        _check_domain(
+            "material_phase", np.asarray(phase), dtype=np.integer,
+            allowed=MATERIAL_CODES,
+        )
 
     # 逐字段有效性：每一张都必须是 ``(n_t, n_x)`` 的真布尔量。``None`` 表示"没记录"，
     # 与"都有效"不是一回事，所以是整体缺省而不是就地补一张。
@@ -1344,6 +1354,26 @@ def _load_with_volume_fraction_partition(
         valid_raw, name="'valid'", layout=layout, times=times, radius=radius,
         path=companion,
     )
+    material_phase = None
+    if "material_phase" in block.files:
+        phase_raw = np.asarray(block["material_phase"])
+        if not np.issubdtype(phase_raw.dtype, np.integer):
+            raise DataError(
+                f"{companion}: 'material_phase' has dtype {phase_raw.dtype}, not an "
+                "integer type"
+            )
+        unknown_phase = sorted(
+            set(np.unique(phase_raw).tolist()) - set(MATERIAL_CODES)
+        )
+        if unknown_phase:
+            raise DataError(
+                f"{companion}: 'material_phase' contains {unknown_phase}, which this "
+                f"reader does not define (known: {sorted(MATERIAL_CODES)})"
+            )
+        material_phase = normalise_to_layout(
+            phase_raw, name="'material_phase'", layout=layout, times=times,
+            radius=radius, path=companion,
+        )
 
     contact_radius = np.asarray(block["contact_radius"], dtype=np.float64)
     shock_radius = np.asarray(block["shock_radius"], dtype=np.float64)
@@ -1504,11 +1534,16 @@ def _load_with_volume_fraction_partition(
         shock_valid=shock_valid,
         material=material,
         valid=valid,
+        material_phase=material_phase,
         source={
             "directory": str(directory),
             "npz": str(npz_path),
             "metadata": str(meta_path),
             "material_companion": str(companion),
+            "material_phase_source": (
+                "volume-fraction phase record, independent of shock supervision"
+                if material_phase is not None else None
+            ),
             "field_map": mapping.mapping,
             "metadata_raw": dict(metadata),
             "profile_layout": {
