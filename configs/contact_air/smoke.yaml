@@ -1,0 +1,62 @@
+# Tiny synthetic engineering check for the ContactNet/AirNet path.
+# It is not a training result and must not be reported as TNT validation.
+inherits: base.yaml
+
+contact_air:
+  cases:
+    - case_id: tnt_50mm
+      role: train
+      charge_radius_m: 0.050
+      cache: null
+      synthetic: true
+      duration_s: 2.0e-5
+      n_frames: 21
+      n_radial: 200
+    - case_id: tnt_80mm
+      role: train
+      charge_radius_m: 0.080
+      cache: null
+      synthetic: true
+      duration_s: 2.0e-5
+      n_frames: 21
+      n_radial: 240
+    - case_id: tnt_100mm
+      role: train
+      charge_radius_m: 0.100
+      cache: null
+      synthetic: true
+      duration_s: 2.0e-5
+      n_frames: 21
+      n_radial: 280
+    - case_id: tnt_500mm
+      role: test
+      charge_radius_m: 0.500
+      cache: null
+      synthetic: true
+      duration_s: 2.0e-5
+      n_frames: 21
+      n_radial: 600
+  networks:
+    contact:
+      width: 8
+      depth: 1
+    air:
+      width: 8
+      depth: 1
+  sampling:
+    n_pde: 16
+    n_ic_shock: 8
+    n_ic_ambient: 8
+    n_right: 8
+    n_data: 16
+    n_contact: 8
+  training:
+    loops: 4
+    log_every: 1
+    checkpoint_every: 2
+    validate_every: 2
+    seed: 7
+  output_dir: outputs/contact_air_smoke
+  validation:
+    data_points: 32
+    contact_points: 32

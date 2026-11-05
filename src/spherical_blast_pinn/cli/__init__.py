@@ -10,6 +10,7 @@ TRAINING_COMMANDS = (
     "train",
     "predict",
     "compare",
+    "contact_air",
 )
 
 #: Legacy extracted-profile audit.  ``audit_data`` and ``validate_eos``'s data

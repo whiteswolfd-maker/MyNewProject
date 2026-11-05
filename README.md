@@ -8,6 +8,67 @@
 
 ---
 
+## 新方案入口：ContactNet + AirNet（2026-11-04 契约）
+
+这是本任务要求的新路径，实现在 `src/spherical_blast_pinn/contact_air/`，**不**导入
+旧的 `models/`、`losses/objective.py` 或联合总损失训练器：
+
+```text
+ContactNet: (t, R0) -> R_c = R_b(t) * sigmoid(raw)
+AirNet:     (zeta, t, R0) -> (rho, u, p),  e = p / ((gamma_a-1) rho)
+```
+
+- `R_b(t)`、`dR_b/dt` 来自每个工况自己的连续有效段（PCHIP，禁止外推）；`R_c`
+  的位置区间 `[R_c,low, R_c,up]` 来自提取器，`R_raw` 只用于观测映射。
+- 前置模块：CJ 状态、JWL 等熵释律、空气强冲击/精确 Hugoniot 匹配、
+  `R_sep = R0 V_sep^(1/3)`、`t_sep`、`t0 = t_sep + epsilon`。
+- 两个持久 Adam：先更新 AirNet（`L_a`），再更新 ContactNet（`L_c`）。每次更新后
+  检查非目标网络**没有梯度**且参数未移动；PDE 与 interface 在每个阶段只记一次。
+- 500 mm 只允许 `role: test`，训练入口拒绝；`predict-500` 只读 `R_b`、工况物理量
+  和已训练网络，不读 500 mm 的 `R_raw`、区间或内部场。
+
+命令（Windows Git Bash 示例）：
+
+```bash
+# 50 mm 前置检查（没有真实 R_b(t0) 时明确报告 IC 未核实）
+PYTHONPATH=src python -m spherical_blast_pinn.cli.contact_air precheck \
+  --config configs/contact_air/base.yaml --case tnt_50mm
+
+# 先从原始 d3plot 提取剖面（沿用现有提取器）
+PYTHONPATH=src python -m spherical_blast_pinn.cli.extract_profiles \
+  --config configs/base.yaml --case tnt_50mm \
+  --deck <input.k> --d3plot-dir <MECH> --out <profile_dir> \
+  --charge-radius 0.05 --shells 2500 --stride 1
+
+# 再从 extract_profiles 输出建立 ContactNet/AirNet 缓存
+PYTHONPATH=src python -m spherical_blast_pinn.cli.contact_air build-cache \
+  --config configs/contact_air/base.yaml --case tnt_50mm \
+  --profile-dir <profile_dir> --out <cache.npz>
+
+# 合成/小批量工程检查（不是真实 TNT 精度结果）
+PYTHONPATH=src python -m spherical_blast_pinn.cli.contact_air train \
+  --config configs/contact_air/smoke.yaml --cases three \
+  --max-loops 4 --output-dir outputs/contact_air_smoke
+
+# 500 mm 给定边界预测与先落盘再评估
+PYTHONPATH=src python -m spherical_blast_pinn.cli.contact_air predict-500 \
+  --config configs/contact_air/base.yaml --checkpoint <last.pt> --output <pred.npz>
+PYTHONPATH=src python -m spherical_blast_pinn.cli.contact_air evaluate-500 \
+  --config configs/contact_air/base.yaml --prediction <pred.npz> --output <eval.json>
+```
+
+配置文件：`configs/contact_air/base.yaml`（50/80/100 训练，500 测试）、
+`configs/contact_air/smoke.yaml`（小网络、小采样、纯合成工程检查）。
+**当前没有真实 d3plot 缓存**：`base.yaml` 的 `cache: null` + `synthetic: false`
+会拒绝无缓存训练；真实数据必须先 `extract_profiles` 再 `build-cache`。
+`smoke.yaml` 的 `synthetic: true` 只是工程夹具。
+
+下面的第 1–9 节描述的是**旧 ProductNet/AirNet/FrontNet 路径**，保留用于追溯；
+它不是 `contact_air` 新路径的实现依据，也不得把旧初场、旧总损失或旧 0.5 接触面
+标签混入新路径。
+
+---
+
 ## 一、物理方案
 
 **唯一初始化方案（2026-10-21 决策，2026-10-25 定稿）。**
@@ -164,16 +225,13 @@ L   = (L_50 + L_80 + L_100) / 3
 每次 Adam 更新，三个半径都参与并等权：一次采样、一个联合损失、一次优化器
 更新。
 
-> **2026-11-05 未解决的方案冲突（未擅自改写）。** 本轮清理提示词要求
-> “两个网络分别保留最终确定的训练目标和更新流程”，并明确不要把训练改成
-> “单一总损失、一次反向传播”。当前仓库的实现仍是后者：
-> `training/trainer.py:355-415` 对 `total_loss_for_cases` 做一次
-> `backward()`、一次 `Adam.step()`；`losses/objective.py` 没有按
-> ProductNet/AirNet 拆分目标。仓库内没有给出每个网络各自应承担哪些损失项、
-> 如何交替/冻结的完整定义，所以这里只记录冲突，没有自行发明第三套训练方案。
-> 在同一处还有两项未落地：`AirNet` 输出 `rho/u/e`（压力由 EOS 得出，不是直接
-> 输出 `p`）；模型只有 `R_c`/`R_s`，没有环境侧右边界 `R_b`（`evaluation/checks.py`
-> 里的 `R_box` 只是诊断控制体）。这三项需要在拿到明确最终方案后单独实现。
+> **路径说明（2026-11-05）。** 这一段描述的是**旧 ProductNet/AirNet/FrontNet
+> 训练器**：`training/trainer.py:355-415` 对 `total_loss_for_cases` 做一次
+> `backward()`、一次 `Adam.step()`。它不是 2026-11-04 新方案。
+> 新方案在 `src/spherical_blast_pinn/contact_air/`：两个持久 Adam 交替更新
+> AirNet 与 ContactNet，AirNet 直接输出 `(rho,u,p)`，模型显式使用 `R_b(t)`，
+> 并对每个阶段做非目标网络梯度隔离。运行入口见文首“新方案入口”；旧训练器
+> 不得被当作新方案的默认路径。
 
 **独立检查与选模型。** 每 500 步（`training.check_every`）在一套**固定**的检查
 点上跑一次完整物理验收：一次采样、全程复用、独立的随机种子、取**开发帧**、
@@ -605,6 +663,8 @@ e = p / ((gamma - 1) rho)                空气（理想气体）
 
 ```
 src/spherical_blast_pinn/
+  contact_air/        新方案：precursor.py / geometry.py / data.py / models.py /
+                      mapping.py / losses.py / sampling.py / trainer.py / cli.py
   physics/
     material.py       材料参数与物理零点（唯一的一份数值来源）
     eos.py            一般 JWL 与理想气体，及其导数与声速

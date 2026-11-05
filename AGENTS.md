@@ -1,10 +1,38 @@
 # 自由空气中球形 TNT 爆炸的双场 PINN
 
-本仓库只有一套实现：`src/spherical_blast_pinn/`，一个连续耦合的一维球对称
-Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现整体保留在
-`_legacy_v1_backup/`，新路径**不**引用它，也不要恢复它。
+本仓库有两条明确分开的实现：
+
+* **新方案（2026-11-04，当前任务）**：`src/spherical_blast_pinn/contact_air/`。
+  共享 ``ContactNet(t,R0)->R_c`` 与 ``AirNet(zeta,t,R0)->(rho,u,p)``；两个持久
+  Adam 交替更新；``R_b(t)`` 是测量几何；前置为 CJ + JWL 等熵释放 + 空气
+  Hugoniot 匹配。入口：
+  ``python -m spherical_blast_pinn.cli.contact_air ...``，配置在
+  ``configs/contact_air/``。**旧 ProductNet/FrontNet、旧总损失一次反传、
+  0.5/PLIC 单点接触面标签不得进入这条路径。**
+* **旧路径（历史/追溯）**：``models/``、``training/trainer.py``、
+  ``configs/base.yaml``。其物理选择见下面“不得改变的物理选择”；这些选择
+  **不**适用于 ``contact_air`` 新方案。
 
 `README.md` 是方法、数据状态与已知限制的权威说明。
+
+## 新方案 ContactNet/AirNet（2026-11-04）
+
+* 物理时钟：``t`` 是与 d3plot 同一零点的物理秒；前置给 ``t_sep``、``t0=t_sep+epsilon``；
+  不做时间归一化，不乘 ``R0/100mm``。
+* 前置：CJ 密度/压力/质点速度、JWL 等熵释律、强冲击或精确空气 Hugoniot；
+  ``R_sep=R0 V_sep^(1/3)``；``t_sep`` 从 CJ 半径的均匀球膨胀积分得到，
+  ``R0/D`` 只作为表面到达参考时间单独报告。
+* ``R_c=R_b sigmoid(raw)``；``dR_c/dt`` 必须包含 ``dR_b/dt`` 和 sigmoid 的完整
+  乘积导数。``AirNet`` 的 ``t``/``zeta`` 导数在固定 ``zeta,R0`` 下求，不能把
+  detached 的乘积通量拿去求导。
+* 一个 loop：先 AirNet 更新（``L_a``，ContactNet 几何 detached），再 ContactNet
+  更新（``L_c``，AirNet 场/导数 detached，几何保留梯度）。每次 backward 后检查
+  非目标网络没有梯度、参数未移动。
+* 500 mm 只能是 ``role: test``；训练入口拒绝。``predict-500`` 只读 ``R_b``/物理
+  参数/已训练网络；先保存预测，再由 ``evaluate-500`` 读参考内部场和区间。
+* 当前没有真实 d3plot 缓存；``base.yaml`` 的 ``synthetic: false`` 会拒绝无缓存训练；``smoke.yaml`` 的 ``synthetic: true`` 只是工程夹具。
+  真实工况必须先 ``extract_profiles`` 再 ``build-cache``，不能把合成结果写成
+  TNT 精度验证。
 
 ## 不得改变的物理选择
 
@@ -109,10 +137,10 @@ Euler PINN（Python 3.10+、PyTorch、`float64`）。第一版顺序耦合实现
   ``check_shared_compatibility`` 直接比较完整 EOS、环境态与初始热力学状态，
   第一份 case 也与共享模型核对；无量纲前沿恰好相同不能代替材料一致性。
   参考尺度 ``rho_*/U_*/e_*`` 是数值归一化量，不强制等于实际初态。
-  **已知冲突（未改写）**：当前实现是“一个联合损失、一次 ``backward``、一次
-  Adam 更新”；2026-11-05 清理提示词要求“两个网络分别保留训练目标与更新流程”。
-  仓库内没有按网络拆分损失、交替/冻结的完整定义，所以没有自行发明新训练方案；
-  详细位置与影响见 ``README.md`` 第五节末尾的冲突说明。
+  **这是旧路径的装配，不是新方案。** 旧实现是“一个联合损失、一次
+  ``backward``、一次 Adam 更新”；新方案的交替两网训练在
+  ``contact_air/trainer.py``，入口见上节。不要把旧 ``train`` 命令当成
+  ContactNet/AirNet 的默认训练路径。
 * **诊断模式**（``--diagnostic``）：只限制运行身份与步数（默认上限 100），
   检查点与清单记录 ``diagnostic``；它不再承担"科研资格"门槛。正式装配不会因
   ``training_qualified=False`` 被拒绝。

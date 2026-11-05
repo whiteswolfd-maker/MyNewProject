@@ -1,0 +1,100 @@
+# ContactNet + AirNet scheme (2026-11-04).
+#
+# This file is the default entry for the new scheme.  It does not inherit the
+# legacy product/air/front configuration.  The JWL/detonation/air values here
+# are the material-card inputs for the precursor; they are not results from the
+# Yue thesis table.  Real d3plot caches are not committed; `cache: null` with
+# `synthetic: true` is an engineering fixture only.
+contact_air:
+  version: 1
+
+  precursor:
+    epsilon_s: 1.0e-6
+    shock_model: strong          # "strong" or "exact"; exact is a documented cross-check
+    v_max: 100.0
+    integration_limit: 200
+    root_tolerance: 1.0e-12
+    jwl:
+      A: 3.7120e11
+      B: 3.7471e09
+      C: null                    # closed from p(V_CJ)=p_CJ; record this assumption
+      R1: 4.15
+      R2: 0.95
+      omega: 0.30
+      rho_tnt: 1630.0
+    detonation:
+      velocity: 6930.0
+      cj_pressure: 2.1e10
+      cj_density: 2200.0
+    air:
+      density: 1.225
+      pressure: 101320.0
+      gamma: 1.4
+
+  tolerances:
+    ambient_pressure_pa: 101320.0
+    ambient_density_kg_m3: 1.225
+    pressure_pa: 0.10132          # 1e-6 relative; calibrate on training data
+    density_kg_m3: 1.0e-9
+    velocity_m_s: 1.0e-6
+    min_ambient_cells: 2
+
+  cases:
+    # Real runs: set cache to a .npz produced by build-cache.  No synthetic
+    # fallback is allowed in the base configuration.
+    - case_id: tnt_50mm
+      role: train
+      charge_radius_m: 0.050
+      cache: null
+      synthetic: false
+    - case_id: tnt_80mm
+      role: train
+      charge_radius_m: 0.080
+      cache: null
+      synthetic: false
+    - case_id: tnt_100mm
+      role: train
+      charge_radius_m: 0.100
+      cache: null
+      synthetic: false
+    - case_id: tnt_500mm
+      role: test
+      charge_radius_m: 0.500
+      cache: null
+      synthetic: false
+
+  networks:
+    dtype: float64
+    contact:
+      width: 50
+      depth: 5
+    air:
+      width: 32
+      depth: 10
+
+  sampling:
+    n_pde: 512
+    n_ic_shock: 128
+    n_ic_ambient: 128
+    n_right: 128
+    n_data: 128
+    n_contact: 128
+
+  training:
+    loops: 2000
+    learning_rate: 1.0e-4
+    n_schedule: 2000
+    log_every: 50
+    checkpoint_every: 100
+    validate_every: 100
+    seed: 20261105
+    gradient_clip: 0.0
+
+  output_dir: outputs/contact_air
+
+  validation:
+    # Whole-frame holdout: the last contiguous contact/observation frames of
+    # each training case are reserved for validation.  0 disables the split.
+    holdout_fraction: 0.3
+    data_points: 256
+    contact_points: 256

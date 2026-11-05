@@ -1,0 +1,25 @@
+{
+  "case_id": "tnt_500mm",
+  "synthetic": true,
+  "prediction": "outputs/contact_air_smoke/pred500.npz",
+  "air": {
+    "n_observations": 188,
+    "n_in_domain": 188,
+    "rho_n": 188,
+    "rho_rmse": 0.47303263522553163,
+    "rho_max_abs": 0.611454079484935,
+    "u_n": 188,
+    "u_rmse": 0.2586135666057935,
+    "u_max_abs": 0.6550598465029989,
+    "p_n": 188,
+    "p_rmse": 0.6694676206318112,
+    "p_max_abs": 0.8453355029874279
+  },
+  "contact": {
+    "n_contact_frames": 21,
+    "mean_violation_over_Rsep": 0.6454557112997102,
+    "covered_frames": 0,
+    "coverage": 0.0
+  },
+  "note": "evaluation uses the saved prediction first, then the 500 mm internal observations; the observation zeta is recomputed with predicted R_c/R_b, not with R_raw"
+}
