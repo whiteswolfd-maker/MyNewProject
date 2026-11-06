@@ -1,0 +1,355 @@
+{
+  "case_id": "tnt_50mm",
+  "R_0": 0.05,
+  "t_0": 0.0,
+  "t_end": 3.99472082790453e-05,
+  "n_x": 2500,
+  "n_t": 16,
+  "x_end": 2.0,
+  "x_min": 0.0001,
+  "symmetry_factor": 8.0,
+  "symmetry_share": 0.125,
+  "symmetry_factor_note": "full sphere / modelled wedge: 8 for an octant model, 1 for a full sphere. Written by the extractor from the shell grid it actually used",
+  "rho_TNT": 1630.0,
+  "field_map": {
+    "time": "t",
+    "radius": "x",
+    "density": "rho",
+    "velocity": "u",
+    "pressure": "P"
+  },
+  "field_provenance": {
+    "t": "d3plot global timesteps, converted by the deck's time unit",
+    "x": "cell centroid radius; ALE mesh, computed once and state-independent",
+    "rho": "per-material ALE group mass / (alpha_m * cell_volume), using the d3plot per-material mass columns; pure-medium shell density is sum(m_m) / sum(alpha_m V). The mixture-density history column is retained in RawFrame.density but is not substituted for a material density",
+    "u": "node velocity averaged per cell, projected on the radial direction",
+    "P": "negative trace of the solid element stress (strengthless: sigma = -p I)",
+    "e": "RECONSTRUCTED, not an LS-DYNA output: this d3plot carries no solid-element internal energy, so e = (p - p_cold(V))/(omega rho_m) for products and e = p/((gamma-1) rho_m) for air, where rho_m is the per-material mass/(alpha V) density, inverted per CELL and then volume-weighted onto the shells. The inverse always exists; cells where it comes out non-positive are not in a valid state of that EOS (p below the JWL cold curve, i.e. the explosive has not released its chemical energy yet) and get no energy label"
+  },
+  "profile_layout": {
+    "version": 1,
+    "layout": "frames_by_radius"
+  },
+  "material_partition_source": {
+    "method": "ale_volume_fraction",
+    "producer": "cli.extract_profiles",
+    "producer_version": 1,
+    "fields": [
+      "tnt_volume_fraction"
+    ],
+    "input_identifier": "sha256:9e81913756de2b8f8778ad3f5ad5024b7ee8d7ab7b2997c2f7a01394480b104a",
+    "detail": {
+      "volume_fraction_columns": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "pure_product_threshold": 0.95,
+      "pure_air_threshold": 0.05,
+      "mixed_band_excluded": true,
+      "symmetry_factor": 8.0
+    }
+  },
+  "material_partition_is_volume_fraction_based": true,
+  "material_phase_source": "material_phase is fixed from the ALE volume fraction only (0 product >=95%, 1 pure air <=5%, 2 mixed); it is written before any shock-supervision withdrawal and is not changed by shock_has_supervision",
+  "material_partition_source_note": "ALE material volume fraction read from the d3plot history variables, summed over the explosive parts; pure product alpha >= 0.95, pure air alpha <= 0.05, the mixed band is excluded from every label",
+  "state_validity_source": "per cell: (rho, p) must be a state of the declared EOS with e > 0. A shell is invalid if ANY cell contributing to it failed this, by volume, and the fraction is recorded in material.npz as contaminated_shell_fraction. Shell averaging skips nan silently, so contamination is measured separately instead of being averaged away",
+  "pressure_kind": "absolute",
+  "pressure_source": "negative trace of the solid-element stress, p = -(sxx+syy+szz)/3; absolute (the undeformed ambient air reads 101320 Pa at t=0); no artificial-viscosity correction is claimed",
+  "lasso_version": "2.0.3",
+  "validated_lasso_version": "2.0.3",
+  "lasso_history_allocation_fix_log": [],
+  "deck": {
+    "deck": "F:\\tnt\\tnt_files\\dp0\\SYS\\MECH\\input.k",
+    "unit_system": "mm_s_t",
+    "product_part_ids": [
+      2,
+      3,
+      4,
+      7
+    ],
+    "air_part_ids": [
+      1,
+      5,
+      6
+    ],
+    "ale_material_mapping": {
+      "source": "*ALE_MULTI-MATERIAL_GROUP, in card order",
+      "n_groups": 7,
+      "resolved_as": [
+        "part id",
+        "part id",
+        "part id",
+        "part id",
+        "part id",
+        "part id",
+        "part id"
+      ],
+      "product_ale_indices": [
+        2,
+        3,
+        4,
+        7
+      ],
+      "air_ale_indices": [
+        1,
+        5,
+        6
+      ],
+      "other_ale_indices": [],
+      "kind_by_ale_index": {
+        "1": "air",
+        "2": "product",
+        "3": "product",
+        "4": "product",
+        "5": "air",
+        "6": "air",
+        "7": "product"
+      },
+      "note": "the ALE material index is the card order, NOT part_id - 1; the volume-fraction column for ALE material k is column k"
+    },
+    "initial_detonation": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "initial_detonation_time": 0.0,
+    "termination_time": 0.001,
+    "d3plot_interval": 1e-06,
+    "control_ale": {
+      "field_0": -1.0,
+      "field_1": 1.0,
+      "field_2": 1.0,
+      "field_3": -1.0,
+      "field_4": 0.0,
+      "field_5": 0.0,
+      "field_6": 0.0,
+      "field_7": 0.0
+    }
+  },
+  "d3plot_directory": "F:\\tnt\\tnt_files\\dp0\\SYS\\MECH",
+  "n_states_available": 779,
+  "n_states_source": "lasso state-count probe + boundary verification (lasso-python 2.0.3); file count 780 differs by 1",
+  "n_d3plot_files": 780,
+  "state_invalid_cells_per_frame": [
+    218328,
+    5911,
+    6965,
+    6522,
+    6455,
+    6861,
+    6975,
+    7221,
+    7166,
+    7097,
+    6998,
+    6799,
+    6599,
+    6705,
+    7250,
+    7224
+  ],
+  "state_indices": [
+    0,
+    12,
+    14,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    24,
+    26,
+    28,
+    30,
+    35,
+    40
+  ],
+  "stride": 1,
+  "batch_states": 1,
+  "cell_geometry": "computed once (Eulerian mesh: node positions are state-independent)",
+  "labelled_shells": {
+    "product": 10145,
+    "air": 371,
+    "ambient": 29484
+  },
+  "finite_shells": {
+    "product": 9730,
+    "air": 371
+  },
+  "valid_shell_fraction": 0.166775,
+  "air_native_resolution_fallback": {
+    "array": "air_native_resolution_fallback_m",
+    "applicability": "air_native_resolution_fallback_applicable",
+    "source": "first pure-air shell strictly outside the contact; original-mesh cell thickness at that shell. It is air-side, not product-side, and is only usable where the applicability flag is true."
+  },
+  "training_location_mask": {
+    "array": "training_location_valid",
+    "definition": "material/withdrawal/contamination/front-protection position eligibility, BEFORE intersection with rho/u/e/p joint finiteness; it does not include boundary_air_location_valid",
+    "field_rule": "final supervision for each field = training_location_valid & field_valid_<field> & [contact.raw, R_b]",
+    "legacy_valid_note": "material.npz 'valid' remains the old joint four-field finite mask; it is not the training position mask"
+  },
+  "boundary_air_field_access": {
+    "material_code": 2,
+    "training_valid": false,
+    "fields_written": [
+      "rho",
+      "u",
+      "P",
+      "e"
+    ],
+    "field_validity_arrays": [
+      "field_valid_density",
+      "field_valid_velocity",
+      "field_valid_energy",
+      "field_valid_pressure"
+    ],
+    "purpose": "outer pure-air shells are unlabelled for training but keep their shell-averaged fields so R_b detection can verify an ambient state; material==2 alone is never treated as environmental proof",
+    "location_mask": "boundary_air_location_valid"
+  },
+  "labelled_without_state_fraction": 0.0394636744009129,
+  "empty_shell_fraction": 0.0,
+  "contaminated_shell_fraction": 0.259175,
+  "contaminated_shell_fraction_by_frame": [
+    0.16633208986323944,
+    0.032855361323001694,
+    0.03976196014813614,
+    0.04877073079831269,
+    0.05484636542148752,
+    0.06305594532566997,
+    0.06699900869508912,
+    0.07252765149022371,
+    0.07565586212403741,
+    0.07873753530381568,
+    0.08494939967534033,
+    0.08776118875049055,
+    0.09404161242363027,
+    0.10564883437726233,
+    0.12409220972303146,
+    0.12522304543321922
+  ],
+  "resolution_note": "shells finer than the ALE cell spacing near the charge are empty by construction: a shell with no cell centroid in it has no state to average. empty_shell_fraction measures that mismatch; those shells are marked invalid",
+  "alpha_range": [
+    0.0,
+    1.0
+  ],
+  "front_detection": {
+    "contact": "per-frame geometric reconstruction (section 9): a spherically symmetric PLIC cut of the all-cell volume-weighted product fraction. The interface radius in a shell [a, b] with fraction alpha solves (r^3 - a^3)/(b^3 - a^3) = alpha, so the cut reproduces the cell phase volume by construction and the round-off is reported per frame. The position is the outer bound of the mixing band when the band spans more than one shell. It is NOT the alpha = 0.5 shell crossing any more: that crossing is kept separately as contact_shell_crossing_radius_m, purely as an auxiliary cross-check, because the shell average smears the interface over about one shell. When the reconstruction cannot locate the interface it returns no radius at all and the reason is recorded in contact_reconstruction_reason; a bracket is always reported.",
+    "contact_status_counts": {
+      "reconstructed": 16,
+      "on_shared_face": 0,
+      "unresolved": 0
+    },
+    "contact_has_supervision_frames": 16,
+    "contact_sub_cell_frames": 16,
+    "shock": "OUTER EDGE OF THE CONTIGUOUS OVER-PRESSURE RUN attached to the contact, air side only (alpha < 0.5), threshold = ambient x (1 + 1e-2), edge linearly interpolated. NOT 'the outermost over-threshold shell': the far-field pressure is numerical noise around p/p_amb = 1.000 with excursions up to ~1.5%, so the outermost rule locks onto a noise spike tens of millimetres beyond the shock and moves by 5-8 mm between 2500 and 5000 shells. See shock_status_counts and shock_rh_* for why a front when it is",
+    "shock_at_grid_edge": false,
+    "method": "pressure-gradient candidates on contiguous valid air-side shells, then RH verification against the measured two-sided states; the shock speed comes from mass conservation and is therefore NOT independent evidence",
+    "noise_floor_factor": 8.0,
+    "band_gradient_fraction": 0.2,
+    "band_pressure_tolerance": 0.05,
+    "rh_tolerance": 0.25,
+    "product_threshold": 0.5,
+    "tolerance_basis": "the RH tolerances are uniform-normalised residuals, NOT the loose tolerances quoted for states inside a numerically smeared wave; they are re-checked against this project's baseline and resolution",
+    "n_contiguous_air_runs": 1,
+    "shock_status_counts": {
+      "confirmed": 4,
+      "doubtful": 7,
+      "not_detected": 5
+    },
+    "shock_frames_with_supervision": 4,
+    "shock_rh_momentum_range": [
+      0.00028854742683221557,
+      0.237210458848991
+    ],
+    "shock_rh_energy_range": [
+      0.003052929136994535,
+      0.4034606757034786
+    ],
+    "shock_compression_range": [
+      1.0015302721336534,
+      1.3177965486675793
+    ],
+    "shock_h_over_cell_range": [
+      0.06788198234240923,
+      1.4749159698961205
+    ],
+    "shock_cell_thickness_range_m": [
+      0.01525969352813391,
+      0.049872472346862845
+    ]
+  },
+  "front_supervision_eligibility": {
+    "contact": {
+      "status_array_key": "contact_reconstruction_status",
+      "status_counts": {
+        "reconstructed": 16,
+        "on_shared_face": 0,
+        "unresolved": 0
+      },
+      "eligibility_array_key": "contact_has_supervision",
+      "n_frames_eligible": 16,
+      "rule": "eligible only when the geometric reconstruction located the interface inside a mixing band bracketed by the expected phases, or exactly on a shared face, and the band spans no empty shell"
+    },
+    "shock": {
+      "status_array_key": "shock_status",
+      "status_counts": {
+        "confirmed": 4,
+        "doubtful": 7,
+        "not_detected": 5
+      },
+      "eligibility_array_key": "shock_has_supervision",
+      "n_frames_eligible": 4,
+      "rule": "eligible only for confirmed candidates, which is where a reliable radius range exists"
+    },
+    "note": "the two fronts are independent: an ineligible shock never removes a usable contact label, and vice versa"
+  },
+  "contact_initial_offset_m": -3.3246812434356565e-07,
+  "contact_initial_offset_shell_crossing_m": 7.730404758862774e-06,
+  "contact_initial_offset_note": "at t = 0 the contact surface is at R_0 by definition, so both numbers are direct, model-free error readings of the two locators on the same frame. The geometric reconstruction is the one carried in contact_radius; the shell crossing is kept only as the auxiliary cross-check (section 9)",
+  "contact_resolution": {
+    "0": "NOT DETECTED: the geometric reconstruction could not locate the interface, so contact_radius is nan. The bracket is still valid and the reason is in contact_reconstruction_reason",
+    "1": "SUB-CELL: a reconstruction exists but is not eligible as a label \u2014 the mixing band is not bracketed by the expected phases, or it spans an empty shell. contact_empty_shells_in_gap counts the latter",
+    "2": "resolved: the interface was located with both neighbours confirmed",
+    "resolved_frames": 16,
+    "subcell_frames": 0,
+    "not_found_frames": 0,
+    "interpolation_gap_range_m": [
+      0.00011999999999998123,
+      0.00012000000000000899
+    ]
+  },
+  "contact_cell_thickness_m_range": [
+    0.006367690084696931,
+    0.04872802074770657
+  ],
+  "mesh_resolution_note": "The ALE element radial thickness is the resolution floor for every front position and for h = R_s - R_c. Measured on the 50 mm case it is ~0.85 mm inside the charge but 9.7-12.7 mm in the 50-60 mm air, 31 mm at 90-120 mm and 105 mm beyond 3 m. Refining the SHELL grid does not change it: the shell grid only resamples a coarse cell. Two quantities are therefore reported separately: the shell-grid convergence (2500 vs 5000 shells, differences relative to R_0 / R_s / h) and the mesh floor from shock_cell_thickness_m.",
+  "initial_detonation_check": "The contact radius at t = 0 is R_0 by construction, so its measured value is a free calibration of the whole front-location chain. See contact_initial_offset_m; on the 50 mm case the measured value is ~2 mm high, which is about a third of the first air cell's 10 mm radial thickness.",
+  "units": {
+    "source": "mm_s_t",
+    "density_to_si": 999999999999.9999
+  },
+  "detonation_velocity_m_s": 6930.0,
+  "initial_detonation": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "implied_charge_radius_m": 0.04999788524454888,
+  "symmetry_multiplier": 8.0,
+  "charge_radius_relative_deviation": 4.229510902245548e-05,
+  "grid": {
+    "n_shells": 2500,
+    "inner_radius": 0.0001,
+    "outer_radius": 2.0,
+    "min_width": 0.00011999999999998123,
+    "max_width": 0.002839840000000038
+  },
+  "time_origin": "t is the raw LS-DYNA physical time; t_0 is the first extracted state"
+}

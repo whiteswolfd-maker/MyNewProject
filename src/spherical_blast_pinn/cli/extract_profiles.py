@@ -1127,6 +1127,10 @@ def extract_case(
         # 仅由体积分数决定的材料归属，不受 shock_has_supervision/旧撤标影响。
         material_phase=material_phase,
         valid=valid,
+        # **训练位置资格**：材料、旧激波撤标、污染、前沿保护带之后的布尔掩码，
+        # 但**不与 rho/u/e/p 的联合有限性相交**，也不包含外侧边界诊断资格。
+        # 每个字段的有效性由 field_valid_* 单独叠加；下游观测构建必须先看这个掩码。
+        training_location_valid=location_valid,
         # 逐字段有效性（§11.1）。``valid`` 是"四项联合可用"，这三个是"这一项自己
         # 可用"。下游按字段各自取点，不再因为 e 缺失而丢掉同一位置的 rho 与 u。
         field_valid_density=field_valid_density,
@@ -1350,6 +1354,22 @@ def extract_case(
                 "first pure-air shell strictly outside the contact; original-mesh "
                 "cell thickness at that shell. It is air-side, not product-side, "
                 "and is only usable where the applicability flag is true."
+            ),
+        },
+        "training_location_mask": {
+            "array": "training_location_valid",
+            "definition": (
+                "material/withdrawal/contamination/front-protection position eligibility, "
+                "BEFORE intersection with rho/u/e/p joint finiteness; it does not "
+                "include boundary_air_location_valid"
+            ),
+            "field_rule": (
+                "final supervision for each field = training_location_valid & "
+                "field_valid_<field> & [contact.raw, R_b]"
+            ),
+            "legacy_valid_note": (
+                "material.npz 'valid' remains the old joint four-field finite mask; "
+                "it is not the training position mask"
             ),
         },
         "boundary_air_field_access": {

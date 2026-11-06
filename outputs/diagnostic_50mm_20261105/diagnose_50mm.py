@@ -38,7 +38,7 @@ from spherical_blast_pinn.data.kfile_parser import parse_deck
 
 
 ROOT = Path(__file__).resolve().parents[2]
-PROFILE = ROOT / "outputs" / "diagnostic_50mm_20261105" / "profile"
+PROFILE = ROOT / "outputs" / "diagnostic_50mm_20261105" / "profile_v2"
 OUT = ROOT / "outputs" / "diagnostic_50mm_20261105"
 CONFIG_PATH = ROOT / "configs" / "contact_air" / "base.yaml"
 DECK = Path("F:/tnt/tnt_files/dp0/SYS/MECH/input.k")
@@ -274,7 +274,13 @@ def frame_counts(case, material, frame: int) -> dict[str, Any]:
     # ``valid`` mask.  ``phase_air`` is a diagnostic field, not a training
     # eligibility mask.
     material1 = np.asarray(case.material[frame]) == 1
-    train_air = material1 & np.asarray(case.valid[frame], dtype=bool)
+    location = (
+        np.asarray(case.training_location_valid[frame], dtype=bool)
+        if getattr(case, "training_location_valid", None) is not None
+        else np.asarray(case.valid[frame], dtype=bool)
+    )
+    train_air = material1 & location
+    old_valid_air = material1 & np.asarray(case.valid[frame], dtype=bool)
     return {
         "n_phase_air": int(np.count_nonzero(phase_air)),
         "n_material1": int(np.count_nonzero(material1)),
@@ -283,6 +289,8 @@ def frame_counts(case, material, frame: int) -> dict[str, Any]:
         "n_field_valid_air_rho": int(np.count_nonzero(phase_air & fv_d)),
         "n_field_valid_air_u": int(np.count_nonzero(phase_air & fv_u)),
         "n_field_valid_air_p": int(np.count_nonzero(phase_air & fv_p)),
+        "n_training_location_mat1": int(np.count_nonzero(train_air)),
+        "n_old_valid_air": int(np.count_nonzero(old_valid_air)),
         "n_training_valid_air": int(np.count_nonzero(train_air)),
         "n_training_valid_air_rho": int(np.count_nonzero(train_air & fv_d)),
         "n_training_valid_air_u": int(np.count_nonzero(train_air & fv_u)),
@@ -444,9 +452,12 @@ def main() -> int:
             "contact_valid": bool(contact_valid[i]),
             "contact_reconstruction_radius_m": float(material["contact_radius"][i]),
             "contact_band_width_m": float(contact_up[i] - contact_low[i]),
+            "contact_interval_half_width_m": 0.5 * float(contact_up[i] - contact_low[i]),
             "contact_mixing_cell_count": int(material["contact_mixing_cell_count"][i]),
             "contact_reconstruction_status": str(material["contact_reconstruction_status"][i]),
-            "contact_position_uncertainty_m": float(material["contact_position_uncertainty_m"][i]),
+            "extractor_contact_position_uncertainty_m": float(
+                material["contact_position_uncertainty_m"][i]
+            ),
             "contact_reason": contact_reasons[i],
             "shock_radius_m": (
                 float(material["shock_radius"][i])
@@ -497,6 +508,8 @@ def main() -> int:
             "n_phase_air": counts["n_phase_air"],
             "n_material1": counts["n_material1"],
             "n_material1_field_valid_all": counts["n_material1_field_valid_all"],
+            "n_training_location_mat1": counts["n_training_location_mat1"],
+            "n_old_valid_air": counts["n_old_valid_air"],
             "n_field_valid_air_all": counts["n_field_valid_air_all"],
             "n_field_valid_air_rho": counts["n_field_valid_air_rho"],
             "n_field_valid_air_u": counts["n_field_valid_air_u"],
@@ -722,7 +735,7 @@ def main() -> int:
         "blocking": [
             "contact/interface resolution: at t0 the contact bracket upper edge is 111.66 mm while state 19's confirmed shock is 109.24 mm (reliable range 103.0-109.24 mm); the current shell representation has no resolved pure-air layer. Raw cells span 20-50 mm; this is a resolution statement, not proof that no physical layer exists",
             "strict ambient verification: 0 ambient cells in every selected frame",
-            "air-side field validity: the first pure-air shells immediately outside the contact are contaminated/invalid; first valid air is 126.4 mm at t0 while contact_up is 111.6 mm; no selected frame has a material1 point passing old valid",
+            "air-side field validity: the first pure-air shells immediately outside the contact are contaminated/invalid; first valid air is 126.4 mm at t0 while contact_up is 111.6 mm; no selected frame has a material1 point passing training_location_valid",
             "old shock supervision: only 4 of 16 selected frames have confirmed shock supervision; state 20 (19.987 us, immediately after t0) is doubtful and has all air labels withdrawn",
             "R_b: no strict verified candidate and no continuous R_b segment at t0; actual AirObservationStore.size=0 and final field-valid counts are 0/0/0 because the geometric range is empty, not because a material count was substituted",
         ],
@@ -770,7 +783,8 @@ def main() -> int:
         "selected_index", "state_index", "time_us",
         "contact_low_m", "contact_up_m", "contact_valid",
         "contact_reconstruction_radius_m", "contact_band_width_m",
-        "contact_mixing_cell_count", "contact_position_uncertainty_m",
+        "contact_interval_half_width_m", "contact_mixing_cell_count",
+        "extractor_contact_position_uncertainty_m",
         "rb_candidate_strict_m", "rb_verified_strict", "rb_strict_radius_m",
         "rb_strict_verification", "separation_strict_status",
         "shock_radius_m", "shock_status", "shock_has_supervision",
@@ -783,6 +797,7 @@ def main() -> int:
         "air_native_resolution_source", "air_native_resolution_m",
         "air_native_fallback_m", "air_native_fallback_applicable",
         "n_phase_air", "n_material1", "n_material1_field_valid_all",
+        "n_training_location_mat1", "n_old_valid_air",
         "n_field_valid_air_all", "n_field_valid_air_rho",
         "n_field_valid_air_u", "n_field_valid_air_p",
         "n_training_valid_air", "n_training_valid_air_rho",
@@ -822,10 +837,12 @@ def main() -> int:
         "`p_air_IC_ambient` is the undisturbed ambient pressure `p_inf`."
     )
     lines.append(
-        "- `contact_band_width` is `R_c,up-R_c,low`; it is not an ALE cell "
-        "thickness and not a statistical uncertainty.  The cell thickness is "
-        "`contact_cell_thickness_m`/`shock_cell_thickness_m`; the position "
-        "uncertainty is `contact_position_uncertainty_m`."
+        "- `contact_band_width` is `R_c,up-R_c,low`; `contact_interval_half_width` "
+        "is half of it.  Neither is an ALE cell thickness and neither is a "
+        "statistical uncertainty.  The cell thickness is "
+        "`contact_cell_thickness_m`/`shock_cell_thickness_m`; the extractor's "
+        "field named `contact_position_uncertainty_m` is reported as an interval "
+        "half-width, not as a statistical error bar."
     )
     lines.append(
         "- The diagnostic sensitivity uses 0.005 kg/m3 **absolute** density "
@@ -869,7 +886,7 @@ def main() -> int:
     lines.append(
         "| # | state | t (us) | contact low/up (mm) | R_s (mm) | R_s - R_cup (mm) | "
         "R_b cand/verified | R_b failure | sep | native source/value (mm) | "
-        "old-valid rho/u/p | diagnostic field-valid rho/u/p | air withdrawn | first valid air (mm) |"
+        "training-location rho/u/p | diagnostic field-valid rho/u/p | air withdrawn | first valid air (mm) |"
     )
     lines.append("|---|---:|---:|---|---:|---:|---|---|---|---|---:|---:|---:|---:|")
     for item in frames:
@@ -901,8 +918,9 @@ def main() -> int:
         )
     lines.append("")
     lines.append(
-        "The `old-valid` columns are `legacy material==1 & valid & field mask`. "
-        "They are **not** final training counts.  Because the strict R_b is absent, "
+        "The `training-location` columns are `legacy material==1 & "
+        "training_location_valid & field mask`.  They are **not** final training "
+        "counts.  Because the strict R_b is absent, "
         "`build_air_observations` has no [R_c,raw, R_b] geometric interval and the "
         "actual observation store is empty on every frame.  See `raw_review/` for "
         "the staged material/field/protection/geometry counts."
@@ -936,11 +954,13 @@ def main() -> int:
         "the detected shock (t0: 111.66 mm vs 109.24 mm), so there is no "
         "resolved shocked-air layer.  This is a bracket width, not an ALE cell "
         "thickness and not a statistical uncertainty: at state 19 the bracket is "
-        "40.08 mm, the contact cell thickness is 21.57 mm, the shock cell "
-        "thickness is 32.90 mm, and the position uncertainty is +/-20.04 mm. "
+        "40.20 mm, the contact cell thickness is 21.57 mm, the shock cell "
+        "thickness is 32.90 mm, and the contact interval half-width is 20.10 mm. "
+        "The extractor mixing-band half-width is 20.04 mm. Neither is a "
+        "statistical uncertainty. "
         "(b) the first pure-air shells outside the "
         "contact are contaminated/invalid (first valid air 126.4 mm), and no "
-        "selected frame has a material1 point passing the old valid mask; the "
+        "selected frame has a material1 point passing training_location_valid; the "
         "actual final training count is 0 because the geometric R_b interval is "
         "empty, not because a material count was substituted for it.  The raw-cell "
         "review shows a transition spread over several coarse cells; this is a "
@@ -953,7 +973,7 @@ def main() -> int:
         "clock is not proven incompatible: R_cup reaches R_sep at 18.18 us vs "
         "t_sep=18.53 us, and reaches Rc0/Rs0 at 20.22/20.73 us vs t0=19.53 us, "
         "but this agreement is with the broad upper bracket edge, not with the "
-        "reconstruction centre. No version-4 cache was written."
+        "reconstruction centre. No version-5 cache was written."
     )
     lines.append("")
     lines.append("A diagnostic tolerance relaxation is included in `diagnostic.json`; "

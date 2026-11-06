@@ -1,17 +1,17 @@
-selected_index,state_index,time_s,phase_air,legacy_material1,legacy_valid_air,mat1_field_valid_rho,mat1_field_valid_u,mat1_field_valid_p,mat1_field_valid_all,protection_band_mat1,protection_band_mat1_field_valid_all,rb_strict_verified,geom_blocked,geometric_range_points,geometry_block_reason,actual_observation_points,final_loss_valid_rho,final_loss_valid_u,final_loss_valid_p
-0,0,0.0,2084,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
-1,12,1.1992168765573297e-05,1898,2,0,0,0,0,0,2,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
-2,14,1.3991579180583358e-05,1841,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
-3,16,1.5969093510648236e-05,1772,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
-4,17,1.6972689991234802e-05,1732,180,0,0,0,0,0,2,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
-5,18,1.7963820937438868e-05,1695,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
-6,19,1.898620575957466e-05,1657,66,0,0,0,0,0,2,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
-7,20,1.9987059204140678e-05,1620,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
-8,21,2.0964458599337377e-05,1593,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
-9,22,2.196778768848162e-05,1570,123,0,1,1,1,1,2,1,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
-10,24,2.399400000285823e-05,1523,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
-11,26,2.5991839720518328e-05,1475,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
-12,28,2.7963114916929044e-05,1412,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
-13,30,2.9955906938994303e-05,1312,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
-14,35,3.499262311379425e-05,1202,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
-15,40,3.99472082790453e-05,1160,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
+selected_index,state_index,time_s,phase_air,legacy_material1,training_location_mat1,legacy_valid_air,mat1_field_valid_rho,mat1_field_valid_u,mat1_field_valid_p,mat1_field_valid_all,mat1_location_field_valid_rho,mat1_location_field_valid_u,mat1_location_field_valid_p,mat1_location_field_valid_all,protection_band_mat1,protection_band_mat1_field_valid_all,rb_strict_verified,geom_blocked,geometric_range_points,geometry_block_reason,actual_observation_points,final_loss_valid_rho,final_loss_valid_u,final_loss_valid_p
+0,0,0.0,2084,0,0,0,0,0,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
+1,12,1.1992168765573297e-05,1898,2,0,0,0,0,0,0,0,0,0,0,2,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
+2,14,1.3991579180583358e-05,1841,0,0,0,0,0,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
+3,16,1.5969093510648236e-05,1772,0,0,0,0,0,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
+4,17,1.6972689991234802e-05,1732,180,0,0,0,0,0,0,0,0,0,0,2,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
+5,18,1.7963820937438868e-05,1695,0,0,0,0,0,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
+6,19,1.898620575957466e-05,1657,66,0,0,0,0,0,0,0,0,0,0,2,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
+7,20,1.9987059204140678e-05,1620,0,0,0,0,0,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
+8,21,2.0964458599337377e-05,1593,0,0,0,0,0,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
+9,22,2.196778768848162e-05,1570,123,0,0,1,1,1,1,0,0,0,0,2,1,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
+10,24,2.399400000285823e-05,1523,0,0,0,0,0,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
+11,26,2.5991839720518328e-05,1475,0,0,0,0,0,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
+12,28,2.7963114916929044e-05,1412,0,0,0,0,0,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
+13,30,2.9955906938994303e-05,1312,0,0,0,0,0,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
+14,35,3.499262311379425e-05,1202,0,0,0,0,0,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0
+15,40,3.99472082790453e-05,1160,0,0,0,0,0,0,0,0,0,0,0,0,0,False,True,0,"no verified R_b; build_air_observations has no [R_c,raw,R_b] interval",0,0,0,0

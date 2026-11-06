@@ -833,30 +833,26 @@ def test_air_data_sampling_is_frame_first_then_point():
     assert np.count_nonzero(times == 1.0) > 60
 
 
-def test_air_observations_keep_the_old_valid_supervision_mask():
-    """A material==1 point outside the old ``valid`` mask must not enter training.
-
-    ``extract_profiles`` keeps outer boundary-air field validity for R_b
-    diagnosis while ``valid`` remains False.  Training observations must not
-    turn that diagnostic access into supervision.
-    """
-    material = np.array([[0, 1, 1, 1]], dtype=np.int64)
-    valid = np.array([[False, True, False, True]], dtype=bool)
-    arrays = CaseArrays(
+def _observation_arrays(material, *, training_location, valid, field_valid):
+    return CaseArrays(
         case_id="mask",
         charge_radius_m=0.05,
         times=np.array([1.0e-5]),
-        radius=np.array([0.10, 0.11, 0.12, 0.13]),
-        density=np.ones((1, 4)),
-        velocity=np.zeros((1, 4)),
-        pressure=np.ones((1, 4)),
-        material=material,
-        phase_material=material.copy(),
-        valid=valid,
-        valid_density=np.ones((1, 4), dtype=bool),
-        valid_velocity=np.ones((1, 4), dtype=bool),
-        valid_pressure=np.ones((1, 4), dtype=bool),
+        radius=np.array([0.10, 0.11, 0.12, 0.13])[: material.shape[1]],
+        density=np.ones(material.shape),
+        velocity=np.zeros(material.shape),
+        pressure=np.ones(material.shape),
+        material=np.asarray(material, dtype=np.int64),
+        phase_material=np.asarray(material, dtype=np.int64).copy(),
+        training_location_valid=np.asarray(training_location, dtype=bool),
+        valid=np.asarray(valid, dtype=bool),
+        valid_density=np.asarray(field_valid, dtype=bool),
+        valid_velocity=np.asarray(field_valid, dtype=bool),
+        valid_pressure=np.asarray(field_valid, dtype=bool),
     )
+
+
+def _mask_contact_and_boundary():
     contact = ContactIntervalTable(
         case_id="mask",
         times=np.array([1.0e-5]),
@@ -868,10 +864,64 @@ def test_air_observations_keep_the_old_valid_supervision_mask():
     boundary = RightBoundaryTrajectory.from_arrays(
         case_id="mask", times=[1.0e-5], radii=[0.15], valid=[True],
     )
+    return contact, boundary
+
+
+def test_air_observations_use_training_location_not_joint_field_finiteness():
+    """A position inside the protection band cannot enter supervision even if all fields are finite."""
+    material = np.array([[0, 1, 1, 1]])
+    location = np.array([[True, True, False, True]])  # r=0.12 is protected
+    arrays = _observation_arrays(
+        material,
+        training_location=location,
+        valid=np.ones((1, 4), dtype=bool),
+        field_valid=np.ones((1, 4), dtype=bool),
+    )
+    contact, boundary = _mask_contact_and_boundary()
     store = build_air_observations(arrays, contact, boundary)
     assert store.size == 2
     assert store.radius.tolist() == [0.11, 0.13]
     assert 0.12 not in store.radius.tolist()
+
+
+def test_air_observations_keep_rho_and_u_when_pressure_is_invalid():
+    """Per-field masks survive: rho/u are supervised while p is not."""
+    material = np.array([[0, 1, 1]])
+    arrays = CaseArrays(
+        case_id="mask",
+        charge_radius_m=0.05,
+        times=np.array([1.0e-5]),
+        radius=np.array([0.10, 0.11, 0.12]),
+        density=np.ones((1, 3)),
+        velocity=np.ones((1, 3)),
+        pressure=np.ones((1, 3)),
+        material=material,
+        phase_material=material.copy(),
+        training_location_valid=np.ones((1, 3), dtype=bool),
+        # The legacy joint mask is False because p/e are not jointly finite;
+        # this must not remove the independently valid rho/u positions.
+        valid=np.array([[True, False, True]], dtype=bool),
+        valid_density=np.array([[True, True, True]], dtype=bool),
+        valid_velocity=np.array([[True, True, True]], dtype=bool),
+        valid_pressure=np.array([[True, False, True]], dtype=bool),
+    )
+    contact, boundary = _mask_contact_and_boundary()
+    store = build_air_observations(arrays, contact, boundary)
+    assert store.size == 2  # 0.11 and 0.12 are inside [0.10, 0.15]
+    assert store.radius.tolist() == [0.11, 0.12]
+    assert store.valid_density.tolist() == [True, True]
+    assert store.valid_velocity.tolist() == [True, True]
+    assert store.valid_pressure.tolist() == [False, True]
+    _, count_rho = _masked_mse(
+        torch.zeros(2), torch.ones(2), torch.as_tensor(store.valid_density), 1.0
+    )
+    _, count_u = _masked_mse(
+        torch.zeros(2), torch.ones(2), torch.as_tensor(store.valid_velocity), 1.0
+    )
+    _, count_p = _masked_mse(
+        torch.zeros(2), torch.ones(2), torch.as_tensor(store.valid_pressure), 1.0
+    )
+    assert (count_rho, count_u, count_p) == (2, 2, 1)
 
 
 def test_contact_labels_outside_the_solve_window_are_not_sampled():
@@ -1172,7 +1222,7 @@ def _write_real_style_profile(
     np.savez(
         directory / "material.npz",
         alpha_product=alpha, material=material, material_phase=material_phase,
-        valid=training_valid,
+        training_location_valid=training_valid, valid=training_valid,
         field_valid_density=field_valid, field_valid_velocity=field_valid,
         field_valid_energy=field_valid, field_valid_pressure=field_valid,
         boundary_air_location_valid=outside_air,

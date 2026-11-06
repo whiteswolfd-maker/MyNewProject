@@ -48,7 +48,7 @@
   球壳样本数不等于原始 ALE 单元数。`extract_profiles` 保留激波外纯空气的
   场量与逐字段有效性（训练 `valid` 仍为 False），不得用环境常数代替。
   `material_phase`（体积分数 0/1/2）与旧 `material` 监督撤标分开传递；
-  R_b/分离/接触区间使用 `material_phase`，训练观测仍受旧监督限制。
+  R_b/分离/接触区间使用 `material_phase`；训练观测使用旧 `material` 与独立的 `training_location_valid`，逐字段再叠加有效性，不把联合有限性 `valid` 当作位置资格。
   原生分辨率逐帧选择，空气侧 fallback 必须显式标记适用。
 * 当前没有真实 d3plot 缓存；``base.yaml`` 的 ``synthetic: false`` 会拒绝无缓存训练；``smoke.yaml`` 的 ``synthetic: true`` 只是工程夹具。
   真实工况必须先 ``extract_profiles`` 再 ``build-cache``，不能把合成结果写成

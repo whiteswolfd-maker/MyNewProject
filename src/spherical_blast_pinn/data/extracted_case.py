@@ -178,6 +178,10 @@ class ExtractedCase:
     #: ``shock_has_supervision`` and of the legacy ``material`` withdrawal.
     #: ``None`` means the export predates this separation.
     material_phase: np.ndarray | None = None
+    #: Independent **training position** eligibility: material, old shock
+    #: withdrawal, contamination and front protection bands, but NOT the joint
+    #: rho/u/e/p finiteness and NOT the boundary-diagnostic air mask.
+    training_location_valid: np.ndarray | None = None
     source: dict[str, Any] = field(default_factory=dict)
     detector: DetectorSettings = field(default_factory=DetectorSettings)
 
@@ -1066,6 +1070,11 @@ def validate_case_object(case: Any, *, path: Any = "<case>") -> None:
             "material_phase", np.asarray(phase), dtype=np.integer,
             allowed=MATERIAL_CODES,
         )
+    training_location = getattr(case, "training_location_valid", None)
+    if training_location is not None:
+        _check_domain(
+            "training_location_valid", np.asarray(training_location), dtype=np.bool_,
+        )
 
     # 逐字段有效性：每一张都必须是 ``(n_t, n_x)`` 的真布尔量。``None`` 表示"没记录"，
     # 与"都有效"不是一回事，所以是整体缺省而不是就地补一张。
@@ -1375,6 +1384,19 @@ def _load_with_volume_fraction_partition(
             radius=radius, path=companion,
         )
 
+    training_location_valid = None
+    if "training_location_valid" in block.files:
+        location_raw = np.asarray(block["training_location_valid"])
+        if location_raw.dtype != np.bool_:
+            raise DataError(
+                f"{companion}: 'training_location_valid' has dtype "
+                f"{location_raw.dtype}, not bool"
+            )
+        training_location_valid = normalise_to_layout(
+            location_raw, name="'training_location_valid'", layout=layout,
+            times=times, radius=radius, path=companion,
+        )
+
     contact_radius = np.asarray(block["contact_radius"], dtype=np.float64)
     shock_radius = np.asarray(block["shock_radius"], dtype=np.float64)
     # 前沿的有效性判据在这里是"数出来了"，不是"猜出来了"。
@@ -1535,6 +1557,7 @@ def _load_with_volume_fraction_partition(
         material=material,
         valid=valid,
         material_phase=material_phase,
+        training_location_valid=training_location_valid,
         source={
             "directory": str(directory),
             "npz": str(npz_path),
@@ -1543,6 +1566,11 @@ def _load_with_volume_fraction_partition(
             "material_phase_source": (
                 "volume-fraction phase record, independent of shock supervision"
                 if material_phase is not None else None
+            ),
+            "training_location_source": (
+                "extractor training_location_valid: material/withdrawal/contamination/"
+                "front-protection location eligibility, before joint field finiteness"
+                if training_location_valid is not None else None
             ),
             "field_map": mapping.mapping,
             "metadata_raw": dict(metadata),

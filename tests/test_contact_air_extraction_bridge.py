@@ -54,7 +54,7 @@ def _write_profile(directory, *, times, precursor):
         directory / "material.npz",
         material=material,
         material_phase=material,
-        valid=valid,
+        training_location_valid=valid, valid=valid,
         contact_radius=np.full(n_t, 0.1075),
         shock_radius=np.full(n_t, 0.16),
         contact_state=np.full(n_t, 2, dtype=np.int64),

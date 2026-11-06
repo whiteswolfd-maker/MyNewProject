@@ -83,6 +83,12 @@ class CaseArrays:
     #: Material attribution from the ALE volume fraction only.  Unlike
     #: ``material`` it is not withdrawn when old shock supervision fails.
     phase_material: np.ndarray | None = None
+    #: Independent training **location** eligibility from the extractor:
+    #: material/withdrawal/contamination/front-protection restrictions, without
+    #: the joint rho/u/e/p finiteness and without boundary-diagnostic access.
+    #: ``None`` means the export predates this separation; observations then fall
+    #: back to ``valid`` so old fixtures do not silently change semantics.
+    training_location_valid: np.ndarray | None = None
     #: Per-frame original radial resolution (e.g. ALE cell thickness at the
     #: shock).  ``None`` means the extractor did not provide it; shell spacing
     #: must not be substituted for it.
@@ -939,9 +945,15 @@ def build_air_observations(
     times = np.asarray(arrays.times, dtype=np.float64).reshape(-1)
     radius = np.asarray(arrays.radius, dtype=np.float64).reshape(-1)
     mat = np.asarray(arrays.material)
-    valid = np.asarray(arrays.valid, dtype=bool)
-    if valid.shape != mat.shape:
-        raise CaseDataError("valid must have the same shape as material")
+    location = (
+        np.asarray(arrays.training_location_valid, dtype=bool)
+        if arrays.training_location_valid is not None
+        else np.asarray(arrays.valid, dtype=bool)
+    )
+    if location.shape != mat.shape:
+        raise CaseDataError(
+            "training_location_valid must have the same shape as material"
+        )
     obs_t, obs_r, obs_z = [], [], []
     obs_rho, obs_u, obs_p = [], [], []
     obs_vd, obs_vu, obs_vp, obs_dom, obs_frame = [], [], [], [], []
@@ -955,11 +967,12 @@ def build_air_observations(
         raw = float(contact.raw[frame])
         if not (rb > raw):
             continue
-        # Training observations keep the old supervision restrictions:
-        # material==1 is the old supervised air label; ``valid`` additionally
-        # removes the front protection bands and contaminated shells.  R_b and
-        # separation use ``phase_material`` and field validity separately.
-        air = (mat[frame] == 1) & valid[frame]
+        # Training observations use the independent position mask: material,
+        # old withdrawal, contamination and front protection bands, but not the
+        # joint rho/u/e/p finiteness.  Each supervised field applies its own
+        # validity mask below.  R_b and separation use ``phase_material`` and
+        # field validity separately.
+        air = (mat[frame] == 1) & location[frame]
         if not np.any(air):
             continue
         indices = np.flatnonzero(air)
@@ -1573,7 +1586,7 @@ def save_case(case: CaseData, path: Path | str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     metadata = {
         "format": "spherical_blast_pinn.contact_air_case",
-        "version": 4,
+        "version": 5,
         "units": {
             "time": "s", "radius": "m", "density": "kg/m^3",
             "velocity": "m/s", "pressure": "Pa", "specific_energy": "J/kg",
@@ -1585,9 +1598,10 @@ def save_case(case: CaseData, path: Path | str) -> Path:
             "metadata", "rb_times", "rb_radius", "rb_valid",
         ],
         "cache_rebuild_reason": (
-            "version 4: material_phase is carried separately from the legacy supervised "
-            "material labels, per-frame native-resolution source selection, and "
-            "verified ambient-state R_b evidence; older caches must be rebuilt"
+            "version 5: training_location_valid is carried independently of joint "
+            "rho/u/e/p finiteness; material_phase, per-frame native-resolution "
+            "source selection and verified ambient-state R_b evidence remain; "
+            "older caches must be rebuilt"
         ),
     }
     np.savez(
@@ -1624,11 +1638,11 @@ def load_case(path: Path | str, *, role: str | None = None) -> CaseData:
         metadata = json.loads(str(archive["metadata"]))
         if metadata.get("format") != "spherical_blast_pinn.contact_air_case":
             raise CaseDataError(f"{path}: not a contact-air case cache")
-        if metadata.get("version") != 4:
+        if metadata.get("version") != 5:
             raise CaseDataError(
                 f"{path}: cache version {metadata.get('version')!r} is not supported. "
-                "Rebuild it with build-cache: version 4 requires material_phase and "
-                "per-frame native-resolution selection"
+                "Rebuild it with build-cache: version 5 requires training_location_valid, "
+                "material_phase and per-frame native-resolution selection"
             )
         case_meta = metadata["case"]
         precursor = metadata["precursor"]
@@ -1690,7 +1704,7 @@ def load_prediction_case(path: Path | str, *, role: str | None = None) -> Predic
         metadata = json.loads(str(archive["metadata"]))
         if metadata.get("format") != "spherical_blast_pinn.contact_air_case":
             raise CaseDataError(f"{path}: not a contact-air case cache")
-        if metadata.get("version") != 4:
+        if metadata.get("version") != 5:
             raise CaseDataError(
                 f"{path}: cache version {metadata.get('version')!r} is not supported "
                 "for boundary-only prediction; rebuild it with build-cache"
@@ -1791,6 +1805,8 @@ def build_case_from_profile(
         shell_count_available = "shell_count" in archive.files
         phase_from_archive = np.asarray(archive["material_phase"]) \
             if "material_phase" in archive.files else None
+        training_location_from_archive = np.asarray(archive["training_location_valid"]) \
+            if "training_location_valid" in archive.files else None
         eligible = np.asarray(archive["contact_has_supervision"], dtype=bool) \
             if "contact_has_supervision" in archive.files else None
     if eligible is None:
@@ -1839,6 +1855,22 @@ def build_case_from_profile(
             "material.npz has no material_phase; re-run extract_profiles so the "
             "volume-fraction material attribution is carried separately from the "
             "legacy supervised material labels"
+        )
+    training_location = (
+        getattr(case, "training_location_valid", None)
+        if getattr(case, "training_location_valid", None) is not None
+        else training_location_from_archive
+    )
+    if training_location is None:
+        raise CaseDataError(
+            "material.npz has no training_location_valid; re-run extract_profiles "
+            "so training position eligibility (material/protection/contamination) "
+            "is not conflated with joint rho/u/e/p finiteness"
+        )
+    training_location = np.asarray(training_location, dtype=bool)
+    if training_location.shape != np.asarray(phase_material).shape:
+        raise CaseDataError(
+            "training_location_valid must have the same shape as material_phase"
         )
     extraction_source = case.source or {}
     # ``material==2`` is ambiguous in the real extractor (mixing band AND
@@ -1909,6 +1941,10 @@ def build_case_from_profile(
         ),
         "air_coverage_available": air_coverage is not None,
         "material_phase_source": phase_source,
+        "training_location_source": (
+            "extractor training_location_valid: material/withdrawal/contamination/"
+            "front-protection location eligibility, before joint field finiteness"
+        ),
         "shell_count_available": bool(shell_count_available),
         "shell_count_is_original_cell_count": False,
         "raw_cell_ids_available": False,
@@ -1931,6 +1967,7 @@ def build_case_from_profile(
         phase_material=(
             np.asarray(phase_material) if phase_is_explicit else None
         ),
+        training_location_valid=training_location,
         valid=np.asarray(case.valid),
         valid_density=field_validity.get("density"),
         valid_velocity=field_validity.get("velocity"),
@@ -2008,6 +2045,7 @@ def synthetic_case(
         case_id=case_id, charge_radius_m=charge_radius_m, times=times, radius=radius,
         density=density, velocity=velocity, pressure=pressure, material=mat,
         phase_material=mat.copy(),
+        training_location_valid=valid.copy(),
         valid=valid, valid_density=valid, valid_velocity=valid, valid_pressure=valid,
         contact_low=contact_low, contact_up=contact_up, contact_raw=rc,
         contact_valid=np.ones(times.size, dtype=bool),

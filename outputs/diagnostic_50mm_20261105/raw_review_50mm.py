@@ -26,9 +26,11 @@ from spherical_blast_pinn.contact_air.cli import _precursor_config
 from spherical_blast_pinn.contact_air.data import (
     CaseArrays,
     build_air_observations,
+    classify_separation_frames,
     contact_interval_from_band,
     contact_interval_from_material,
     detect_right_boundary_report,
+    select_air_native_resolution,
 )
 from spherical_blast_pinn.contact_air.geometry import (
     ContactIntervalTable,
@@ -42,7 +44,7 @@ from spherical_blast_pinn.physics import material as mat
 
 
 ROOT = Path(__file__).resolve().parents[2]
-PROFILE = ROOT / "outputs" / "diagnostic_50mm_20261105" / "profile"
+PROFILE = ROOT / "outputs" / "diagnostic_50mm_20261105" / "profile_v2"
 OUT = ROOT / "outputs" / "diagnostic_50mm_20261105" / "raw_review"
 CONFIG = ROOT / "configs" / "contact_air" / "base.yaml"
 DECK = Path("F:/tnt/tnt_files/dp0/SYS/MECH/input.k")
@@ -435,9 +437,148 @@ def main() -> int:
     )
     actual_obs = build_air_observations(arrays, contact, boundary_empty)
 
+    # ------------------------------------------------------------------
+    # Diagnostic-only R_b with dynamic evidence.  The fixed constant
+    # tolerances below are NOT an accepted configuration and are not used for
+    # a cache.  They are used to test whether a boundary candidate is supported
+    # by pressure/velocity motion rather than by the t=0 density background.
+    # ------------------------------------------------------------------
+    sens_tol = {
+        "ambient_pressure_pa": 101320.0,
+        "ambient_density_kg_m3": 1.225,
+        "pressure_pa": 0.10132,
+        "density_kg_m3": 0.005,       # 0.408% of 1.225; diagnostic only
+        "velocity_m_s": 1.0e-4,
+        "min_shocked_air_samples": 2,
+        "min_air_coverage": 0.5,
+        "min_air_layer_native_cells": 1.0,
+    }
+    sens_reports = []
+    for i in range(extracted.times.size):
+        sens_reports.append(detect_right_boundary_report(
+            extracted.radius, extracted.pressure[i], extracted.velocity[i],
+            extracted.density[i], extracted.material_phase[i],
+            ambient_pressure=sens_tol["ambient_pressure_pa"],
+            ambient_density=sens_tol["ambient_density_kg_m3"],
+            tol_pressure=sens_tol["pressure_pa"],
+            tol_density=sens_tol["density_kg_m3"],
+            tol_velocity=sens_tol["velocity_m_s"],
+            min_ambient_cells=2,
+            valid_density=extracted.field_validity["density"][i],
+            valid_velocity=extracted.field_validity["velocity"][i],
+            valid_pressure=extracted.field_validity["pressure"][i],
+            contact_radius=float(contact_up[i]) if bool(contact_valid[i]) else None,
+            material_is_phase=True,
+        ))
+    sens_boundary = RightBoundaryTrajectory.from_arrays(
+        case_id=extracted.case_id,
+        times=np.asarray(extracted.times),
+        radii=np.asarray([rep.radius for rep in sens_reports]),
+        valid=np.asarray([rep.identified for rep in sens_reports]),
+    )
+    native, native_sources, native_reasons = select_air_native_resolution(
+        extracted.times.size,
+        primary=material["shock_cell_thickness_m"],
+        primary_source="shock_cell_thickness_m",
+        fallback=material["air_native_resolution_fallback_m"],
+        fallback_applicable=material["air_native_resolution_fallback_applicable"],
+        fallback_source="air_native_resolution_fallback_m",
+    )
+    sens_sep = classify_separation_frames(
+        case_id=extracted.case_id,
+        times=np.asarray(extracted.times),
+        radius=extracted.radius,
+        material=extracted.material_phase,
+        density=extracted.density,
+        velocity=extracted.velocity,
+        pressure=extracted.pressure,
+        contact=contact,
+        boundary=sens_boundary,
+        boundary_reports=sens_reports,
+        valid_density=extracted.field_validity["density"],
+        valid_velocity=extracted.field_validity["velocity"],
+        valid_pressure=extracted.field_validity["pressure"],
+        ambient_pressure=sens_tol["ambient_pressure_pa"],
+        ambient_density=sens_tol["ambient_density_kg_m3"],
+        tol_pressure=sens_tol["pressure_pa"],
+        tol_density=sens_tol["density_kg_m3"],
+        tol_velocity=sens_tol["velocity_m_s"],
+        min_shocked_air_samples=sens_tol["min_shocked_air_samples"],
+        air_native_resolution_m=native,
+        air_native_resolution_source=native_sources,
+        air_native_resolution_reason=native_reasons,
+        air_coverage=material["coverage_air"],
+        min_air_coverage=sens_tol["min_air_coverage"],
+        min_air_layer_native_cells=sens_tol["min_air_layer_native_cells"],
+    )
+    r_grid = np.asarray(extracted.radius, dtype=np.float64)
+    rho0 = np.asarray(extracted.density[0], dtype=np.float64)
+    dynamic_rows: list[dict[str, Any]] = []
+    for i, t in enumerate(extracted.times):
+        rep = sens_reports[i]
+        candidate = float(rep.candidate_radius) if np.isfinite(rep.candidate_radius) else None
+        rho = np.asarray(extracted.density[i], dtype=np.float64)
+        u = np.asarray(extracted.velocity[i], dtype=np.float64)
+        p = np.asarray(extracted.pressure[i], dtype=np.float64)
+        state_ok = (
+            np.isfinite(rho) & np.isfinite(u) & np.isfinite(p)
+            & extracted.field_validity["density"][i]
+            & extracted.field_validity["velocity"][i]
+            & extracted.field_validity["pressure"][i]
+        )
+        dynamic_cell = state_ok & (
+            (np.abs(p - sens_tol["ambient_pressure_pa"]) > sens_tol["pressure_pa"])
+            | (np.abs(u) > sens_tol["velocity_m_s"])
+        )
+        inner = (
+            (np.asarray(extracted.material_phase[i]) == 1)
+            & (r_grid >= float(contact.raw[i]))
+            & (r_grid < candidate if candidate is not None else False)
+        )
+        n_dynamic = int(np.count_nonzero(inner & dynamic_cell))
+        # Baseline is the t=0 profile; it is diagnostic only and never becomes
+        # a network boundary condition.
+        rho_base = float(np.interp(candidate, r_grid, rho0)) if candidate is not None else None
+        rho_c = u_c = p_c = None
+        if candidate is not None:
+            j = int(np.argmin(np.abs(r_grid - candidate)))
+            rho_c = float(rho[j])
+            u_c = float(u[j])
+            p_c = float(p[j])
+        dynamic_rows.append({
+            "state_index": int(material["state_index"][i]),
+            "time_s": float(t),
+            "environment_run_identified": bool(rep.identified),
+            "boundary_candidate_m": candidate,
+            "n_dynamic_cells_inside": n_dynamic,
+            "dynamic_evidence_present": bool(n_dynamic >= 2),
+            "separated_under_this_diagnostic": bool(
+                sens_sep["frames"][i]["status"] == "separated"
+            ),
+            "separation_status": str(sens_sep["frames"][i]["status"]),
+            "baseline_density_at_candidate_kg_m3": rho_base,
+            "boundary_rho_kg_m3": rho_c,
+            "boundary_u_m_s": u_c,
+            "boundary_p_pa": p_c,
+            "rho_minus_baseline_kg_m3": (
+                None if rho_base is None or rho_c is None else rho_c - rho_base
+            ),
+            "rho_minus_fixed_ambient_kg_m3": (
+                None if rho_c is None else rho_c - 1.225
+            ),
+            "u_minus_fixed_ambient_m_s": u_c,
+            "p_minus_fixed_ambient_pa": (
+                None if p_c is None else p_c - 101320.0
+            ),
+        })
+
+    # ------------------------------------------------------------------
+    # Count rows
+    # ------------------------------------------------------------------
     count_rows: list[dict[str, Any]] = []
     for i, t in enumerate(extracted.times):
         mat1 = np.asarray(extracted.material[i]) == 1
+        location = np.asarray(extracted.training_location_valid[i], dtype=bool)
         fv_rho = np.asarray(extracted.field_validity["density"][i], dtype=bool)
         fv_u = np.asarray(extracted.field_validity["velocity"][i], dtype=bool)
         fv_p = np.asarray(extracted.field_validity["pressure"][i], dtype=bool)
@@ -456,6 +597,7 @@ def main() -> int:
             "time_s": float(t),
             "phase_air": int(np.count_nonzero(extracted.material_phase[i] == 1)),
             "legacy_material1": int(np.count_nonzero(mat1)),
+            "training_location_mat1": int(np.count_nonzero(mat1 & location)),
             "legacy_valid_air": int(np.count_nonzero(
                 (extracted.material_phase[i] == 1)
                 & np.asarray(extracted.valid[i], dtype=bool)
@@ -464,6 +606,10 @@ def main() -> int:
             "mat1_field_valid_u": int(np.count_nonzero(mat1 & fv_u)),
             "mat1_field_valid_p": int(np.count_nonzero(mat1 & fv_p)),
             "mat1_field_valid_all": int(np.count_nonzero(mat1 & fv_all)),
+            "mat1_location_field_valid_rho": int(np.count_nonzero(mat1 & location & fv_rho)),
+            "mat1_location_field_valid_u": int(np.count_nonzero(mat1 & location & fv_u)),
+            "mat1_location_field_valid_p": int(np.count_nonzero(mat1 & location & fv_p)),
+            "mat1_location_field_valid_all": int(np.count_nonzero(mat1 & location & fv_all)),
             "protection_band_mat1": int(np.count_nonzero(mat1 & protect)),
             "protection_band_mat1_field_valid_all": int(np.count_nonzero(
                 mat1 & protect & fv_all
@@ -490,6 +636,11 @@ def main() -> int:
         writer = csv.DictWriter(fh, fieldnames=list(count_rows[0]))
         writer.writeheader()
         writer.writerows(count_rows)
+
+    with (OUT / "dynamic_boundary_evidence.csv").open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(dynamic_rows[0]))
+        writer.writeheader()
+        writer.writerows(dynamic_rows)
 
     # ------------------------------------------------------------------
     # 4. Sensitivity t=0 false positive: density background only
@@ -558,7 +709,8 @@ def main() -> int:
             "contact_band_width_m": float(contact_up[6] - contact_low[6]),
             "contact_cell_thickness_m": float(material["contact_cell_thickness_m"][6]),
             "shock_cell_thickness_m": float(material["shock_cell_thickness_m"][6]),
-            "contact_position_uncertainty_m": float(material["contact_position_uncertainty_m"][6]),
+            "contact_interval_half_width_m": 0.5 * float(contact_up[6] - contact_low[6]),
+            "extractor_contact_position_uncertainty_m": float(material["contact_position_uncertainty_m"][6]),
             "contact_mixing_cell_count": int(material["contact_mixing_cell_count"][6]),
             "shock_h_over_cell": float(material["shock_h_over_cell"][6]),
             "shock_reliable_inner_m": float(material["shock_reliable_inner_m"][6]),
@@ -574,7 +726,8 @@ def main() -> int:
             "contact_band_width_m": float(contact_up[7] - contact_low[7]),
             "contact_cell_thickness_m": float(material["contact_cell_thickness_m"][7]),
             "shock_cell_thickness_m": float(material["shock_cell_thickness_m"][7]),
-            "contact_position_uncertainty_m": float(material["contact_position_uncertainty_m"][7]),
+            "contact_interval_half_width_m": 0.5 * float(contact_up[7] - contact_low[7]),
+            "extractor_contact_position_uncertainty_m": float(material["contact_position_uncertainty_m"][7]),
             "contact_mixing_cell_count": int(material["contact_mixing_cell_count"][7]),
             "shock_h_over_cell": float(material["shock_h_over_cell"][7]),
             "shock_reliable_inner_m": float(material["shock_reliable_inner_m"][7]),
@@ -615,6 +768,8 @@ def main() -> int:
         "state0_mass_density_consistency": mass_density_consistency,
         "state19_20_cells": shock_rows,
         "training_observation_counts": count_rows,
+        "dynamic_boundary_evidence": dynamic_rows,
+        "dynamic_boundary_tolerances": sens_tol,
         "actual_observation_store_size": int(actual_obs.size),
         "actual_final_loss_valid_rho": int(np.count_nonzero(
             actual_obs.valid_density & actual_obs.valid_domain
@@ -652,7 +807,7 @@ def main() -> int:
         "The nonzero air mass column follows the cell's own part/ALE index; "
         "alpha_product+alpha_air=1 for every selected pure-air cell.",
         "",
-        "## State-0 pure-air cells (fixed diagonal direction)",
+        "## State-0 pure-air cells (direction-cone samples, not one ray)",
         "",
         "| cell id | part / ALE | r (mm) | alpha 1/5/6 | m1 raw | m5 raw | m6 raw | sum raw | V (mm3) | rho_mix | m/(aV) | shell avg |",
         "|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -672,6 +827,13 @@ def main() -> int:
         )
     lines += [
         "",
+        "Sampling note: each bin selects the cell with maximum dot product to "
+        "the diagonal direction inside a cone; this is **not** a continuous "
+        "sequence of cells crossed by one ray.  Radial ranges from different "
+        "angular cells can overlap; they are not, by themselves, proof of "
+        "same-ray cell thickness or air-layer unresolvability.  The raw values "
+        "are a cross-check against the shell profile, not a ray-chain test.",
+        "",
         "The pure-air cells have `alpha_air=1.000`, only their own air material "
         "mass column nonzero, and `alpha_1+alpha_5+alpha_6=1`.  The mass/density "
         "ratio `m/(alpha V)` is **already below the constant mixture density** at "
@@ -685,9 +847,11 @@ def main() -> int:
         f"per-cell ratio ranges "
         f"{mass_density_consistency['per_cell_ratio_min']:.6f}.."
         f"{mass_density_consistency['per_cell_ratio_max']:.6f}.  This is a local "
-        "mass/density redistribution in the d3plot history, not a unit or column bug.",
+        "mass/density redistribution in the d3plot history, not a unit or column bug. "
+        "The underlying mechanism (initialization, remap, or output convention) "
+        "remains undetermined; it is not attributed here to ALE remap.",
         "",
-        "## State 19/20 raw cells across the transition",
+        "## State 19/20 raw cells (direction-cone samples, not one ray)",
         "",
         "| state | cell id | part | bin (mm) | cell range (mm) | alpha | p (MPa) | u (m/s) | rho_mix | rho_air |",
         "|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|",
@@ -704,12 +868,28 @@ def main() -> int:
         "",
         "## Actual training path",
         "",
-        "`build_air_observations` now requires `material==1` **and** the old `valid` "
-        "mask.  Before the targeted fix it used `material==1` plus field validity "
-        "only; at state 22 that would have admitted one protection-band shell "
-        "(r=126.40 mm, field-valid=True, valid=False) if an R_b had existed.",
-        "The current strict R_b is absent, so the geometric range is empty for every frame.",
+        "`build_air_observations` now uses the independent `training_location_valid` "
+        "mask, then each field's own validity.  Before the split it used "
+        "`material==1` plus field validity only; at state 22 that admitted one "
+        "protection-band shell (r=126.40 mm, field-valid=True, location=False) if "
+        "an R_b had existed.",
+        "After the split, `training_location_valid & material==1` is 0 in every "
+        "selected real frame, so the one protection-band point is excluded before "
+        "the geometric range is even applied.",
+        "Before/after layered counts on the same real frames:",
         "",
+        "- before split (diagnostic `material==1 & field_valid_all`): "
+        "state 22 has 1 point at r=126.40 mm; it is in the protection band and "
+        "would enter an observation if an R_b existed;",
+        "- after split (`material==1 & training_location_valid`): 0 points in "
+        "every frame; the protection point is removed before field validity;",
+        "- legacy joint `valid & material==1`: also 0 in every frame;",
+        "- geometric range: 0 because no strict R_b; final loss counts 0/0/0.",
+        "",
+        f"- material1 & training_location_valid counts: "
+        f"{sorted(set(row['training_location_mat1'] for row in count_rows))}",
+        f"- material1 & training_location & field-valid counts: "
+        f"{sorted(set((row['mat1_location_field_valid_rho'], row['mat1_location_field_valid_u'], row['mat1_location_field_valid_p']) for row in count_rows))}",
         f"- actual `AirObservationStore.size` = {actual_obs.size}",
         f"- final field-valid counts: rho={payload['actual_final_loss_valid_rho']}, "
         f"u={payload['actual_final_loss_valid_u']}, p={payload['actual_final_loss_valid_p']}",
@@ -732,7 +912,36 @@ def main() -> int:
         "regression should then yield no verified R_b.  Tolerance alone is not a "
         "valid calibration.",
         "",
+        "## Diagnostic dynamic-evidence check",
+        "",
+        "This table uses the 0.005 kg/m3 diagnostic tolerance only to locate a "
+        "candidate.  A candidate is not called dynamically supported unless at "
+        "least two inner cells have pressure or velocity deviation.  This is not "
+        "an accepted boundary model and no cache is built from it.",
+        "",
+        "| state | t (us) | env run | candidate (mm) | dynamic cells | dynamic evidence | air layer separated |",
+        "|---:|---:|---|---:|---:|---|---|",
+    ]
+    for row in dynamic_rows:
+        cand = "—" if row["boundary_candidate_m"] is None else f"{row['boundary_candidate_m']*1e3:.2f}"
+        lines.append(
+            f"| {row['state_index']} | {row['time_s']*1e6:.3f} | "
+            f"{row['environment_run_identified']} | {cand} | "
+            f"{row['n_dynamic_cells_inside']} | {row['dynamic_evidence_present']} | "
+            f"{row['separated_under_this_diagnostic']} |"
+        )
+    lines += [
+        "",
+        "A true `environment run` identification is not the same as a resolved "
+        "air layer.  At t=0 the environment run is found but dynamic evidence is "
+        "False: 214.42 mm is **not** a verified explosion outer edge.  The "
+        "`air layer separated` column remains False when contact/shock/air-layer "
+        "evidence is insufficient.",
+        "",
         "## Shock context",
+        "",
+        "state 20 is doubtful and has no reliable range; its finite 88.96 mm and "
+        "h/cell=0.068 are **not** confirmation of an air layer.",
         "",
         f"state 19: {json.dumps(jsonable(context['state19']), ensure_ascii=False)}",
         "",
