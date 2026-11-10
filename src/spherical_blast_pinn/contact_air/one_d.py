@@ -55,6 +55,52 @@ class OneDDataError(RuntimeError):
     """A 1-D source is missing, inconsistent or not in SI after conversion."""
 
 
+#: Absolute/relative tolerance for deciding whether two radial cells share a
+#: boundary.  A positive gap larger than this is a real spatial gap and must
+#: break the run; a negative gap smaller than ``-tolerance`` is an overlap.
+GEOMETRY_TOLERANCE_M = 1.0e-9
+
+
+def cell_gap_m(frame: "RadialFrame", left: int, right: int) -> float:
+    """Signed gap from cell ``left`` right edge to cell ``right`` left edge."""
+    if int(right) != int(left) + 1:
+        return float("inf")
+    return float(frame.r_left[int(right)]) - float(frame.r_right[int(left)])
+
+
+def cells_geometrically_adjacent(
+    frame: "RadialFrame", left: int, right: int, *, tolerance_m: float,
+) -> bool:
+    """True only when consecutive cells share a boundary within tolerance."""
+    if int(right) != int(left) + 1:
+        return False
+    width = 0.5 * (
+        float(frame.r_right[int(left)] - frame.r_left[int(left)])
+        + float(frame.r_right[int(right)] - frame.r_left[int(right)])
+    )
+    tolerance = max(float(tolerance_m), 0.0) + 1.0e-9 * max(width, 1.0e-30)
+    return abs(cell_gap_m(frame, left, right)) <= tolerance
+
+
+def _geometric_runs(
+    frame: "RadialFrame", indices: np.ndarray, *, tolerance_m: float,
+) -> list[np.ndarray]:
+    """Split sorted cell indices at both array gaps and real spatial gaps."""
+    indices = np.asarray(indices, dtype=np.int64)
+    if indices.size == 0:
+        return []
+    runs: list[np.ndarray] = []
+    start = 0
+    for position in range(1, indices.size + 1):
+        if position == indices.size or not cells_geometrically_adjacent(
+            frame, int(indices[position - 1]), int(indices[position]),
+            tolerance_m=tolerance_m,
+        ):
+            runs.append(indices[start:position])
+            start = position
+    return runs
+
+
 def _unit(value: Any, table: Mapping[str, float], *, what: str) -> float:
     if value is None:
         raise OneDDataError(
@@ -119,6 +165,30 @@ class RadialFrame:
                 f"case {self.case_id!r} frame {self.frame_index}: radial positions "
                 "must be strictly increasing"
             )
+        n = int(self.radius.size)
+        for name, value in (
+            ("r_left", self.r_left), ("r_right", self.r_right),
+            ("alpha_product", self.alpha_product), ("density", self.density),
+            ("velocity", self.velocity), ("pressure", self.pressure),
+            ("valid_density", self.valid_density),
+            ("valid_velocity", self.valid_velocity),
+            ("valid_pressure", self.valid_pressure),
+        ):
+            if np.asarray(value).reshape(-1).size != n:
+                raise OneDDataError(
+                    f"case {self.case_id!r} frame {self.frame_index}: {name} has "
+                    f"{np.asarray(value).size} entries, expected {n}"
+                )
+        if self.alpha_air is not None and self.alpha_air.size != n:
+            raise OneDDataError(
+                f"case {self.case_id!r} frame {self.frame_index}: alpha_air has "
+                f"{self.alpha_air.size} entries, expected {n}"
+            )
+        if self.material is not None and self.material.size != n:
+            raise OneDDataError(
+                f"case {self.case_id!r} frame {self.frame_index}: material has "
+                f"{self.material.size} entries, expected {n}"
+            )
         if np.any(self.r_right <= self.r_left):
             raise OneDDataError(
                 f"case {self.case_id!r} frame {self.frame_index}: cell r_right must "
@@ -128,6 +198,15 @@ class RadialFrame:
             raise OneDDataError(
                 f"case {self.case_id!r} frame {self.frame_index}: representative "
                 "radius lies outside its cell bounds"
+            )
+        width = np.maximum(self.r_right - self.r_left, 1.0e-30)
+        tolerance = GEOMETRY_TOLERANCE_M + 1.0e-9 * float(np.max(width))
+        overlap = self.r_left[1:] < (self.r_right[:-1] - tolerance)
+        if np.any(overlap):
+            raise OneDDataError(
+                f"case {self.case_id!r} frame {self.frame_index}: radial cells overlap; "
+                "an overlapping mesh is rejected (a positive gap is allowed and "
+                "handled as a spatial break)"
             )
 
 
@@ -216,15 +295,27 @@ def read_standard_1d(path: Path | str) -> RadialCase:
                 f"{path}: absolute_pressure must be explicitly true; gauge/overpressure "
                 "values must be converted before import"
             )
-        coordinate = str(metadata.get("coordinate", "radial_r")).strip().lower()
+        if "coordinate" not in metadata or not str(metadata.get("coordinate")).strip():
+            raise OneDDataError(
+                f"{path}: coordinate is required (e.g. radial_r); a missing key is "
+                "not silently treated as the radial coordinate"
+            )
+        coordinate = str(metadata["coordinate"]).strip().lower()
         if coordinate not in ("radial_r", "radial", "r"):
             raise OneDDataError(
                 f"{path}: coordinate={coordinate!r} is not the radial coordinate; "
                 "an x-axis model must be mapped to radius explicitly before import"
             )
-        velocity_component = str(
-            metadata.get("velocity_component", "radial_u")
-        ).strip().lower()
+        if (
+            "velocity_component" not in metadata
+            or not str(metadata.get("velocity_component")).strip()
+        ):
+            raise OneDDataError(
+                f"{path}: velocity_component is required (e.g. radial_u); a missing "
+                "key is not silently treated as the radial velocity, and a full "
+                "speed magnitude is never accepted"
+            )
+        velocity_component = str(metadata["velocity_component"]).strip().lower()
         if velocity_component not in ("radial_u", "radial", "u_r"):
             raise OneDDataError(
                 f"{path}: velocity_component={velocity_component!r} is not the "
@@ -237,11 +328,14 @@ def read_standard_1d(path: Path | str) -> RadialCase:
                 f"{position_type!r}"
             )
         node_convention = str(metadata.get("node_to_cell_convention", "")).strip()
-        if position_type == "node" and not node_convention:
+        if position_type == "node" and node_convention not in (
+            "preconverted_cell_representatives",
+        ):
             raise OneDDataError(
-                f"{path}: node positions require an explicit "
-                "node_to_cell_convention (how node coordinates/velocities map to "
-                "cell representatives and boundaries); guessing it is forbidden"
+                f"{path}: node sources must be explicitly preconverted to cell "
+                "representatives and boundaries; the only accepted "
+                "node_to_cell_convention is 'preconverted_cell_representatives'. "
+                "Recording an arbitrary convention string is not a conversion"
             )
         case_id = str(metadata.get("case_id", "")).strip()
         if not case_id:
@@ -348,6 +442,7 @@ def read_standard_1d(path: Path | str) -> RadialCase:
         raise OneDDataError(
             f"{path}: raw frame times must be strictly increasing"
         )
+    raw_source = metadata.get("source") or {}
     return RadialCase(
         case_id=case_id, charge_radius_m=charge_radius, frames=radial_frames,
         units=dict(units), position_type=position_type,
@@ -361,7 +456,10 @@ def read_standard_1d(path: Path | str) -> RadialCase:
             "node_to_cell_convention": (
                 node_convention if position_type == "node" else None
             ),
-            "metadata": metadata.get("source"),
+            "synthetic": bool(
+                isinstance(raw_source, Mapping) and raw_source.get("synthetic", False)
+            ),
+            "metadata": raw_source,
         },
     )
 
@@ -407,6 +505,7 @@ def write_standard_1d(
         "absolute_pressure": True,
         "coordinate": "radial_r",
         "velocity_component": "radial_u",
+        "node_to_cell_convention": node_to_cell_convention,
         "frame_times": times.tolist(),
         "cells_per_frame": [int(np.asarray(frame["radius"]).size) for frame in frames],
         "source": dict(source or {"kind": "synthetic_or_test_fixture"}),
@@ -425,7 +524,8 @@ def contact_interval_from_fractions(
     *,
     pure_product_threshold: float = 0.95,
     pure_air_threshold: float = 0.95,
-) -> tuple[float, float, float, bool, str]:
+    geometry_tolerance_m: float = GEOMETRY_TOLERANCE_M,
+) -> tuple[float, float, bool, str]:
     """Locate the contact mixing segment from the volume fractions.
 
     Only the mixing segment connected to the **outer edge of the central
@@ -433,7 +533,7 @@ def contact_interval_from_fractions(
     between the last pure-product cell and the first mixed cell; ``up`` is the
     actual boundary between the last mixed cell and the first pure-air cell.
     A direct pure-product/pure-air transition uses the shared cell boundary.
-    Neither ``alpha=0.5`` nor the interval midpoint is used as a label.
+    No midpoint is returned or stored: the training object never sees one.
     """
     alpha = np.asarray(frame.alpha_product, dtype=np.float64)
     if not (0.0 < float(pure_air_threshold) <= 1.0) or not (
@@ -447,14 +547,19 @@ def contact_interval_from_fractions(
             "pure_air_threshold and pure_product_threshold leave no mixing band"
         )
     if not np.all(np.isfinite(alpha)):
-        return float("nan"), float("nan"), float("nan"), False, (
+        return float("nan"), float("nan"), False, (
             "product volume fraction has non-finite entries; the mixing band is "
             "not identifiable"
+        )
+    if np.any(alpha < -1.0e-9) or np.any(alpha > 1.0 + 1.0e-9):
+        return float("nan"), float("nan"), False, (
+            "product volume fraction lies outside [0,1]; the material convention "
+            "is invalid"
         )
     pure_product = alpha >= product_threshold
     pure_air = alpha <= air_product_cut
     if not bool(pure_product[0]):
-        return float("nan"), float("nan"), float("nan"), False, (
+        return float("nan"), float("nan"), False, (
             "the innermost cell is not pure product; the central product region "
             "cannot be established"
         )
@@ -468,20 +573,32 @@ def contact_interval_from_fractions(
     ):
         index += 1
     mixed_stop = index  # exclusive
+    # Every step across the central product / mixing / first-air transition must
+    # be a real shared cell boundary, not merely a consecutive array index.
+    for left in range(0, mixed_stop):
+        right = left + 1
+        if right >= alpha.size:
+            break
+        if not cells_geometrically_adjacent(
+            frame, left, right, tolerance_m=geometry_tolerance_m
+        ):
+            return float("nan"), float("nan"), False, (
+                "a spatial gap or overlap interrupts the central product / "
+                "contact-mixing / pure-air path"
+            )
     if mixed_stop > mixed_start:
         if mixed_stop >= alpha.size or not bool(pure_air[mixed_stop]):
-            return float("nan"), float("nan"), float("nan"), False, (
+            return float("nan"), float("nan"), False, (
                 "the contact mixing segment is not bracketed by a pure-air cell "
                 "on its outer side"
             )
         low = float(frame.r_left[mixed_start])
         up = float(frame.r_right[mixed_stop - 1])
         if not (low > 0.0 and up >= low):
-            return float("nan"), float("nan"), float("nan"), False, (
+            return float("nan"), float("nan"), False, (
                 "the mixing-segment boundaries are not positive and ordered"
             )
-        raw = 0.5 * (low + up)
-        return low, up, raw, True, (
+        return low, up, True, (
             "mixing segment connected to the central product region; interval is "
             "bounded by the actual cell boundaries"
         )
@@ -489,14 +606,14 @@ def contact_interval_from_fractions(
     if mixed_start < alpha.size and bool(pure_air[mixed_start]):
         boundary = float(frame.r_left[mixed_start])
         if boundary <= 0.0:
-            return float("nan"), float("nan"), float("nan"), False, (
+            return float("nan"), float("nan"), False, (
                 "the direct material-transition boundary is non-positive"
             )
-        return boundary, boundary, boundary, True, (
+        return boundary, boundary, True, (
             "direct pure-product/pure-air transition; both interval bounds are "
             "the shared actual cell boundary"
         )
-    return float("nan"), float("nan"), float("nan"), False, (
+    return float("nan"), float("nan"), False, (
         "no pure-air cell is adjacent to the central product region"
     )
 
@@ -510,6 +627,12 @@ class ShockDetectionConfig:
     min_pressure_jump_fraction: float = 1.0e-3
     require_ambient_outside: bool = False
     ambient_pressure_tolerance_fraction: float = 0.05
+    #: Absolute tolerance for a shared cell boundary; a larger positive gap is a
+    #: real spatial break and a larger negative gap is an overlap.
+    geometry_tolerance_m: float = GEOMETRY_TOLERANCE_M
+    #: Position difference below this is a repeated/plateau position, not an
+    #: inward motion.  It is not a speed clamp: the speed remains unresolved.
+    position_tolerance_m: float = 1.0e-9
     smoothing: str | None = None
 
     def __post_init__(self) -> None:
@@ -521,6 +644,10 @@ class ShockDetectionConfig:
             raise OneDDataError("transition_cells must be at least one")
         if int(self.min_cells_from_contact) < 0:
             raise OneDDataError("min_cells_from_contact must be non-negative")
+        if self.geometry_tolerance_m < 0.0:
+            raise OneDDataError("geometry_tolerance_m must be non-negative")
+        if self.position_tolerance_m < 0.0:
+            raise OneDDataError("position_tolerance_m must be non-negative")
         if self.smoothing not in (None, "none"):
             raise OneDDataError(
                 "no smoothing implementation is enabled; recording a smoothing "
@@ -544,6 +671,10 @@ class ShockDetectionConfig:
             ambient_pressure_tolerance_fraction=float(
                 payload.get("ambient_pressure_tolerance_fraction", 0.05)
             ),
+            geometry_tolerance_m=float(
+                payload.get("geometry_tolerance_m", GEOMETRY_TOLERANCE_M)
+            ),
+            position_tolerance_m=float(payload.get("position_tolerance_m", 1.0e-9)),
             smoothing=payload.get("smoothing"),
         )
 
@@ -556,6 +687,8 @@ class ShockDetectionConfig:
             "min_pressure_jump_fraction": self.min_pressure_jump_fraction,
             "require_ambient_outside": self.require_ambient_outside,
             "ambient_pressure_tolerance_fraction": self.ambient_pressure_tolerance_fraction,
+            "geometry_tolerance_m": self.geometry_tolerance_m,
+            "position_tolerance_m": self.position_tolerance_m,
             "smoothing": self.smoothing,
             "gradient_definition": "g(r) = -dp/dr on valid contiguous air cells",
             "position_definition": "radius of the -dp/dr peak",
@@ -577,6 +710,9 @@ class ShockDetection:
     run_bounds: tuple[int, int] | None = None
     tracked: bool = False
     outward_speed: float | None = None
+    #: ``outward`` / ``plateau`` / ``inward`` / ``unresolved``.  A plateau keeps
+    #: the position valid but does not provide a usable shock speed.
+    speed_status: str = "unresolved"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -594,6 +730,7 @@ class ShockDetection:
             "run_bounds": None if self.run_bounds is None else list(self.run_bounds),
             "tracked": self.tracked,
             "outward_speed_m_s": self.outward_speed,
+            "speed_status": self.speed_status,
         }
 
 
@@ -665,14 +802,14 @@ def detect_frame_shock(
             ("fewer than three valid air pressure cells outside the contact band",),
             float("nan"), float("nan"), float("nan"),
         )
-    # Split into contiguous index runs; a run cannot cross a missing cell.
-    runs: list[np.ndarray] = []
-    start = 0
-    for position in range(1, candidates.size + 1):
-        if position == candidates.size or candidates[position] != candidates[position - 1] + 1:
-            runs.append(candidates[start:position])
-            start = position
-    best: tuple[float, float, int, np.ndarray, np.ndarray, int, float] | None = None
+    # Split at both array gaps and real spatial gaps.  Consecutive indices alone
+    # do not mean the cells touch; the mesh may contain a void.
+    runs = _geometric_runs(
+        frame, candidates, tolerance_m=float(config.geometry_tolerance_m)
+    )
+    best: tuple[
+        float, float, float, int, np.ndarray, np.ndarray, int, int
+    ] | None = None
     rejected: list[str] = []
     for run in runs:
         if run.size < 3:
@@ -718,9 +855,11 @@ def detect_frame_shock(
                     continue
             candidate_radius = float(r[local])
             if best is None or candidate_radius > best[0]:
+                # Keep this run's prominence with the selected candidate; using
+                # the last loop iteration's value would misreport it.
                 best = (
-                    candidate_radius, float(g[local]), int(local), run, g,
-                    inner_index, outer_index,
+                    candidate_radius, float(g[local]), float(prominence),
+                    int(local), run, g, inner_index, outer_index,
                 )
     if best is None:
         reason = (
@@ -734,7 +873,8 @@ def detect_frame_shock(
             float("nan"), float("nan"),
         )
     (
-        candidate_radius, peak_gradient, local, run, g, inner_index, outer_index,
+        candidate_radius, peak_gradient, prominence, local, run, g,
+        inner_index, outer_index,
     ) = best
     states: dict[str, Any] = {}
     rh: dict[str, Any] = {"status": "skipped"}
@@ -810,27 +950,39 @@ def detect_shock_trajectory(
         if detection.valid:
             radii[index] = detection.radius
             valid[index] = True
-    # Tracking pass: the front must move outward relative to the previous frame.
+    # Tracking pass.  A repeated discrete peak position is a plateau, not an
+    # inward motion: the position stays valid and the speed is unresolved.  A
+    # strictly negative displacement beyond tolerance is a true retrograde
+    # detection and is rejected.  No speed is invented or clamped.
     for index in range(1, n):
         if not valid[index] or not valid[index - 1]:
             continue
-        dt = frames[index].time_raw_s - frames[index - 1].time_raw_s
-        speed = (radii[index] - radii[index - 1]) / dt
-        if not math.isfinite(speed) or speed <= 0.0:
+        dt = float(frames[index].time_raw_s - frames[index - 1].time_raw_s)
+        displacement = float(radii[index] - radii[index - 1])
+        tolerance = float(config.position_tolerance_m) + 1.0e-9 * max(
+            abs(float(radii[index])), abs(float(radii[index - 1])), 1.0e-30
+        )
+        if abs(displacement) <= tolerance:
+            detections[index].tracked = True
+            detections[index].outward_speed = 0.0
+            detections[index].speed_status = "plateau"
+        elif displacement < 0.0:
             detections[index] = ShockDetection(
                 float("nan"), False, "not_detected",
-                (f"the candidate moved inward (speed {speed!r} m/s) relative to the "
-                 "previous detected frame; an outward shock is not confirmed",),
+                (f"the candidate moved inward by {displacement!r} m relative to "
+                 "the previous detected frame; an outward shock is not confirmed",),
                 detections[index].candidate_radius, detections[index].peak_gradient,
                 detections[index].prominence, detections[index].states,
                 detections[index].rh, detections[index].run_bounds,
-                tracked=False, outward_speed=speed,
+                tracked=False, outward_speed=displacement / dt,
+                speed_status="inward",
             )
             radii[index] = np.nan
             valid[index] = False
         else:
             detections[index].tracked = True
-            detections[index].outward_speed = float(speed)
+            detections[index].outward_speed = displacement / dt
+            detections[index].speed_status = "outward"
     return radii, valid, detections
 
 
@@ -868,10 +1020,16 @@ class EventAlignment:
         }
 
 
-def _pure_air_between(
+def pure_air_run_between(
     frame: RadialFrame, *, low: float, high: float, pure_air_threshold: float,
-    minimum: int,
+    minimum: int, geometry_tolerance_m: float = GEOMETRY_TOLERANCE_M,
 ) -> tuple[bool, int]:
+    """Largest geometrically continuous, valid pure-air run in ``(low, high)``.
+
+    The run must be contiguous in the array *and* share real cell boundaries.
+    Counting disconnected valid cells as one interval would treat a mesh void as
+    pure air.
+    """
     air = frame.air_mask(pure_air_threshold)
     usable = (
         air
@@ -880,8 +1038,12 @@ def _pure_air_between(
         & frame.valid_pressure
         & np.isfinite(frame.pressure)
     )
-    count = int(np.count_nonzero(usable))
-    return count >= int(minimum), count
+    indices = np.flatnonzero(usable)
+    runs = _geometric_runs(
+        frame, indices, tolerance_m=float(geometry_tolerance_m)
+    )
+    largest = max((int(run.size) for run in runs), default=0)
+    return largest >= int(minimum), largest
 
 
 def align_event(
@@ -896,6 +1058,7 @@ def align_event(
     pure_air_threshold: float,
     window_s: float | None = None,
     min_pure_air_cells: int = 1,
+    geometry_tolerance_m: float = GEOMETRY_TOLERANCE_M,
 ) -> EventAlignment:
     """Pick the first data-identifiable separation frame and time-align it."""
     n = len(frames)
@@ -907,9 +1070,10 @@ def align_event(
         if window_s is not None and abs(frame.time_raw_s - float(t_separation)) > float(window_s):
             skipped_window += 1
             continue
-        ok, _ = _pure_air_between(
+        ok, _ = pure_air_run_between(
             frame, low=float(contact_up[index]), high=float(shock_radius[index]),
             pure_air_threshold=pure_air_threshold, minimum=min_pure_air_cells,
+            geometry_tolerance_m=geometry_tolerance_m,
         )
         if ok:
             candidates.append(index)
@@ -928,10 +1092,11 @@ def align_event(
     frame = frames[event]
     preceding_confirmed = False
     if event > 0 and bool(contact_valid[event - 1]) and bool(shock_valid[event - 1]):
-        ok, _ = _pure_air_between(
+        ok, _ = pure_air_run_between(
             frames[event - 1], low=float(contact_up[event - 1]),
             high=float(shock_radius[event - 1]),
             pure_air_threshold=pure_air_threshold, minimum=min_pure_air_cells,
+            geometry_tolerance_m=geometry_tolerance_m,
         )
         preceding_confirmed = not ok
     reasons = []
@@ -977,6 +1142,10 @@ __all__ = [
     "contact_interval_from_fractions",
     "detect_frame_shock",
     "detect_shock_trajectory",
+    "GEOMETRY_TOLERANCE_M",
+    "cell_gap_m",
+    "cells_geometrically_adjacent",
+    "pure_air_run_between",
     "read_standard_1d",
     "write_standard_1d",
 ]

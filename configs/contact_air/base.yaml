@@ -1,35 +1,18 @@
-# ContactNet + AirNet scheme, one-dimensional radial TNT air blast.
+# ContactNet + AirNet, one-dimensional radial TNT air blast.
 #
 # Geometry: R_c(t) <= r <= R_s(t).  R_s is the outer transmitted shock
-# identified from the raw pressure gradient, NOT the simulation outer
+# identified from the raw radial pressure gradient, NOT the simulation outer
 # boundary and NOT a measured environmental-side "R_b".
 #
-# The JWL/detonation/air values below are CONFIGURATION PLACEHOLDERS for the
-# precursor, not verified material-card values.  Check them against the actual
-# deck/card and then set material_source/material_source_verified.
+# The JWL/detonation/air values below are CONFIGURATION PLACEHOLDERS, not
+# verified material-card values.  Check them against the actual deck/card and
+# then set material_source/material_source_verified.
 #
 # contact_air.cases is deliberately EMPTY.  Which radii are train/validation/
 # test is an explicit research decision, not a default; no radius is reserved
 # as a fixed blind test.  Define the split in a run configuration.
 contact_air:
   version: 2
-
-  # Raw-data locations on this machine.  These are records used by the
-  # extraction/diagnostic scripts; training reads only a cache or the
-  # documented standard 1-D exchange format.
-  data_sources:
-    tnt_50mm:
-      deck: E:/tnt/tnt_files/dp0/SYS/MECH/input.k
-      d3plot_dir: E:/tnt/tnt_files/dp0/SYS/MECH
-    tnt_80mm:
-      deck: G:/500mmtnt/80mmtnt_files/dp0/SYS-3/MECH/input.k
-      d3plot_dir: G:/500mmtnt/80mmtnt_files/dp0/SYS-3/MECH
-    tnt_100mm:
-      deck: G:/500mmtnt/100mmtnt_files/dp0/SYS-3/MECH/input.k
-      d3plot_dir: G:/500mmtnt/100mmtnt_files/dp0/SYS-3/MECH
-    tnt_500mm:
-      deck: D:/500mmtnt/500mmtnt_files/dp0/SYS-3/MECH/input.k
-      d3plot_dir: D:/500mmtnt/500mmtnt_files/dp0/SYS-3/MECH
 
   precursor:
     material_source: unverified_config_defaults
@@ -68,11 +51,12 @@ contact_air:
     pure_air_threshold: 0.95
     min_pure_air_cells: 1
     event_search_window_s: 1.0e-5
+    geometry_tolerance_m: 1.0e-9
 
   # Shock position: radius of the outermost significant positive -dp/dr peak
-  # on valid contiguous air cells.  No smoothing is applied by default.
-  # Prominence is relative to the median |gradient| inside the same valid run;
-  # an absolute floor can be supplied if the real noise level is known.
+  # on valid, geometrically continuous air cells.  No smoothing is applied.
+  # A repeated peak position is a plateau, not an inward motion; plateau times
+  # do not qualify as an RH boundary because D_s is unresolved.
   shock_detection:
     relative_prominence: 8.0
     absolute_prominence_pa_per_m: 0.0
@@ -81,9 +65,11 @@ contact_air:
     min_pressure_jump_fraction: 1.0e-3
     require_ambient_outside: false
     ambient_pressure_tolerance_fraction: 0.05
+    geometry_tolerance_m: 1.0e-9
+    position_tolerance_m: 1.0e-9
     smoothing: null
 
-  # Recorded reference tolerances for diagnostics.  They are NOT the right
+  # Recorded reference values for diagnostics only.  They are NOT the right
   # boundary condition: the right boundary is the finite-Mach RH post-shock
   # state from the identified D_s.
   tolerances:
@@ -94,7 +80,7 @@ contact_air:
   #   - case_id: tnt_50mm
   #     role: train
   #     charge_radius_m: 0.050
-  #     cache: outputs/contact_air/tnt_50mm.npz
+  #     cache: path/to/tnt_50mm.npz
   #     synthetic: false
   cases: []
 

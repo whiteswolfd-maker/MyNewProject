@@ -1,0 +1,49 @@
+# End-to-end smoke through the real one-dimensional file reader.
+#
+# Prerequisites (must be run first):
+#   python scripts/make_synthetic_standard_1d.py --out outputs/contact_air_smoke/standard_1d.npz
+#   python -m spherical_blast_pinn.contact_air.cli build-cache \
+#     --config configs/contact_air/smoke_cached.yaml --case tnt_50mm \
+#     --radius 0.05 --source outputs/contact_air_smoke/standard_1d.npz \
+#     --out outputs/contact_air_smoke/cache.npz --role train
+#
+# This is a synthetic engineering fixture, not a TNT data split or a research
+# result.
+inherits: base.yaml
+
+contact_air:
+  cases:
+    - case_id: tnt_50mm
+      role: train
+      charge_radius_m: 0.050
+      cache: outputs/contact_air_smoke/cache.npz
+      synthetic: true
+
+  networks:
+    contact:
+      width: 8
+      depth: 1
+    air:
+      width: 8
+      depth: 1
+
+  sampling:
+    n_pde: 16
+    n_ic: 8
+    n_right: 8
+    n_data: 16
+    n_contact: 8
+
+  training:
+    loops: 4
+    log_every: 1
+    checkpoint_every: 2
+    validate_every: 2
+    seed: 7
+
+  output_dir: outputs/contact_air_smoke
+
+  validation:
+    holdout_fraction: 0.3
+    data_points: 32
+    contact_points: 32

@@ -393,7 +393,6 @@ class ContactIntervalTable:
     times: np.ndarray
     low: np.ndarray
     up: np.ndarray
-    raw: np.ndarray
     valid: np.ndarray
     reasons: list[str] = field(default_factory=list)
 
@@ -401,28 +400,21 @@ class ContactIntervalTable:
         self.times = np.asarray(self.times, dtype=np.float64).reshape(-1)
         self.low = np.asarray(self.low, dtype=np.float64).reshape(-1)
         self.up = np.asarray(self.up, dtype=np.float64).reshape(-1)
-        self.raw = np.asarray(self.raw, dtype=np.float64).reshape(-1)
         self.valid = np.asarray(self.valid, dtype=bool).reshape(-1)
         n = self.times.size
-        if any(array.size != n for array in (self.low, self.up, self.raw, self.valid)):
+        if any(array.size != n for array in (self.low, self.up, self.valid)):
             raise GeometryError("contact interval arrays must have the same length")
         if n and (not np.all(np.isfinite(self.times)) or np.any(np.diff(self.times) <= 0.0)):
             raise GeometryError(
                 "contact interval times must be finite and strictly increasing"
             )
-        finite = np.isfinite(self.low) & np.isfinite(self.up) & np.isfinite(self.raw)
+        finite = np.isfinite(self.low) & np.isfinite(self.up)
         bad = self.valid & (~finite | (self.low > self.up) | (self.low <= 0.0))
         if np.any(bad):
             indices = np.flatnonzero(bad)[:3].tolist()
             raise GeometryError(
                 f"case {self.case_id!r}: invalid contact intervals at frames {indices}; "
                 "R_c,low must be positive and <= R_c,up"
-            )
-        outside = self.valid & ((self.raw < self.low) | (self.raw > self.up))
-        if np.any(outside):
-            raise GeometryError(
-                f"case {self.case_id!r}: R_raw lies outside [R_c,low, R_c,up] at "
-                f"{np.flatnonzero(outside)[:3].tolist()}"
             )
         if self.reasons and len(self.reasons) != n:
             raise GeometryError("contact interval reasons must have one entry per frame")
@@ -434,12 +426,11 @@ class ContactIntervalTable:
     def indices(self) -> np.ndarray:
         return np.flatnonzero(self.valid)
 
-    def at(self, index: int) -> tuple[float, float, float, float]:
+    def at(self, index: int) -> tuple[float, float, float]:
         return (
             float(self.times[index]),
             float(self.low[index]),
             float(self.up[index]),
-            float(self.raw[index]),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -453,9 +444,8 @@ class ContactIntervalTable:
             ),
             "definition": (
                 "[R_c,low, R_c,up] is the interval between the actual cell "
-                "boundaries bracketing the contact mixing segment. The midpoint "
-                "R_raw is an observation-mapping convention only and is never a "
-                "single-point label."
+                "boundaries bracketing the contact mixing segment. No midpoint "
+                "is stored; it is never a label or network geometry."
             ),
         }
 
@@ -465,6 +455,8 @@ class InitialGeometry:
     t0: float
     Rc0: float
     Rs0: float
+    #: Diagnostic only: (Rs0_theory-Rc0)/(Rs_data(t0)-Rc0).  It is NOT an
+    #: initial-condition split and must not be revived as one.
     zeta_s0: float
     R_sep: float
     u_c_sep: float

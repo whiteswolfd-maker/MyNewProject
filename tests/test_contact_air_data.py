@@ -22,62 +22,36 @@ from spherical_blast_pinn.contact_air.losses import (
 from spherical_blast_pinn.contact_air.models import ContactFields
 from spherical_blast_pinn.contact_air.one_d import (
     OneDDataError,
-    RadialFrame,
     contact_interval_from_fractions,
     read_standard_1d,
     write_standard_1d,
 )
+from tests.contact_air_fixtures import make_frame as _frame
 from spherical_blast_pinn.contact_air.sampling import CaseBatch
-
-
-def _frame(
-    *, alpha, pressure=None, density=None, velocity=None,
-    valid_pressure=None, case_id="c", time=1.0e-5,
-) -> RadialFrame:
-    alpha = np.asarray(alpha, dtype=float)
-    boundaries = np.linspace(0.0, alpha.size * 0.1, alpha.size + 1)
-    centers = 0.5 * (boundaries[:-1] + boundaries[1:])
-    n = alpha.size
-    p = np.full(n, 101320.0) if pressure is None else np.asarray(pressure, float)
-    rho = np.full(n, 1.225) if density is None else np.asarray(density, float)
-    u = np.zeros(n) if velocity is None else np.asarray(velocity, float)
-    vp = np.isfinite(p) if valid_pressure is None else np.asarray(valid_pressure, bool)
-    return RadialFrame(
-        case_id=case_id, charge_radius_m=0.05, frame_index=0, time_raw_s=time,
-        cell_id=np.arange(n), r_left=boundaries[:-1], r_right=boundaries[1:],
-        radius=centers, alpha_product=alpha, alpha_air=1.0 - alpha,
-        material=np.where(alpha >= 0.95, 0, np.where(alpha <= 0.05, 1, 2)),
-        density=rho, velocity=u, pressure=p,
-        valid_density=np.isfinite(rho), valid_velocity=np.isfinite(u),
-        valid_pressure=vp, position_type="cell_center",
-        units={"length": "m", "time": "s", "density": "kg/m^3",
-               "velocity": "m/s", "pressure": "Pa"},
-    )
 
 
 def test_contact_interval_uses_actual_cell_boundaries_not_alpha_half_or_midpoint():
     frame = _frame(alpha=[1.0, 1.0, 1.0, 0.5, 0.5, 0.0, 0.0])
-    low, up, raw, valid, reason = contact_interval_from_fractions(frame)
+    low, up, valid, reason = contact_interval_from_fractions(frame)
     assert valid
     assert low == pytest.approx(frame.r_left[3])
     assert up == pytest.approx(frame.r_right[4])
     assert low < up
-    assert raw == pytest.approx(0.5 * (low + up))
     assert "actual cell boundaries" in reason
 
 
 def test_direct_pure_pure_transition_uses_the_shared_boundary():
     frame = _frame(alpha=[1.0, 1.0, 0.0, 0.0])
-    low, up, raw, valid, reason = contact_interval_from_fractions(frame)
+    low, up, valid, reason = contact_interval_from_fractions(frame)
     assert valid
-    assert low == up == raw == pytest.approx(frame.r_left[2])
+    assert low == up == pytest.approx(frame.r_left[2])
     assert "direct pure-product" in reason
 
 
 def test_an_isolated_outer_product_fragment_is_not_the_contact():
     # Main product -> mixing -> air, then an isolated product fragment further out.
     frame = _frame(alpha=[1.0, 1.0, 0.5, 0.5, 0.0, 0.0, 1.0, 1.0, 0.0])
-    low, up, _, valid, _ = contact_interval_from_fractions(frame)
+    low, up, valid, _ = contact_interval_from_fractions(frame)
     assert valid
     assert up == pytest.approx(frame.r_right[3])
     assert up < frame.r_left[6]
@@ -85,7 +59,7 @@ def test_an_isolated_outer_product_fragment_is_not_the_contact():
 
 def test_nonfinite_volume_fraction_is_not_a_label():
     frame = _frame(alpha=[1.0, 1.0, float("nan"), 0.0])
-    assert not contact_interval_from_fractions(frame)[3]
+    assert not contact_interval_from_fractions(frame)[2]
 
 
 def test_standard_source_converts_declared_units_to_si(tmp_path):
@@ -132,6 +106,61 @@ def test_a_true_mask_over_nan_is_an_error_not_a_dropped_sample(tmp_path):
     )
     with pytest.raises(OneDDataError, match="non-finite density"):
         read_standard_1d(path)
+
+
+def _base_source_arrays():
+    return {
+        "radius": np.array([5.0, 8.0]), "r_left": np.array([4.0, 6.0]),
+        "r_right": np.array([6.0, 10.0]), "alpha_product": np.array([1.0, 0.0]),
+        "density": np.array([1.0, 1.0]), "velocity": np.array([2.0, 2.0]),
+        "pressure": np.array([0.1, 0.1]),
+    }
+
+
+def _rewrite_metadata(source, target, mutate):
+    import json
+
+    with np.load(source, allow_pickle=False) as archive:
+        payload = {key: np.asarray(archive[key]) for key in archive.files}
+    metadata = json.loads(str(payload["metadata"]))
+    mutate(metadata)
+    payload["metadata"] = np.asarray(json.dumps(metadata))
+    np.savez(target, **payload)
+    return target
+
+
+def test_missing_coordinate_or_velocity_component_is_rejected(tmp_path):
+    frame = _base_source_arrays()
+    source = write_standard_1d(
+        tmp_path / "source.npz", case_id="m", charge_radius_m=0.05,
+        frames=[frame, frame], frame_times=[1.0, 2.0],
+    )
+    for key in ("coordinate", "velocity_component"):
+        broken = _rewrite_metadata(
+            source, tmp_path / f"no_{key}.npz", lambda md, key=key: md.pop(key)
+        )
+        with pytest.raises(OneDDataError, match=key):
+            read_standard_1d(broken)
+
+
+def test_node_source_requires_the_supported_preconversion(tmp_path):
+    frame = _base_source_arrays()
+    unsupported = write_standard_1d(
+        tmp_path / "node_bad.npz", case_id="n", charge_radius_m=0.05,
+        frames=[frame, frame], frame_times=[1.0, 2.0],
+        position_type="node", node_to_cell_convention="midpoints_guess",
+    )
+    with pytest.raises(OneDDataError, match="node_to_cell_convention"):
+        read_standard_1d(unsupported)
+    supported = write_standard_1d(
+        tmp_path / "node_ok.npz", case_id="n", charge_radius_m=0.05,
+        frames=[frame, frame], frame_times=[1.0, 2.0],
+        position_type="node",
+        node_to_cell_convention="preconverted_cell_representatives",
+    )
+    source = read_standard_1d(supported)
+    assert source.position_type == "node"
+    assert source.source["node_to_cell_convention"] == "preconverted_cell_representatives"
 
 
 def test_cache_round_trip_preserves_shock_and_physical_observation_radius(tmp_path):
@@ -220,7 +249,7 @@ def test_data_coordinates_use_the_predicted_contact_and_shock():
     assert bool(inside_a.all()) and bool(inside_b.all())
     assert not torch.allclose(zeta_a, zeta_b)
     # The contact interval midpoint is not used: changing R_c changes zeta.
-    midpoint = float(case.contact.raw[0])
+    midpoint = 0.5 * (float(case.contact.low[0]) + float(case.contact.up[0]))
     zeta_c, _, _ = data_coordinates(
         radius=radius, t=t, contact=contact(midpoint), case=case
     )

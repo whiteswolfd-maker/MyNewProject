@@ -425,7 +425,33 @@ def _jsonable(value: Any) -> Any:
 def command_precheck(args) -> int:
     config = load_config(args.config)
     section = _section(config)
-    specs = _case_specs(section)
+    raw_specs = list(section.get("cases", []) or [])
+    if not raw_specs:
+        if args.case is not None:
+            raise CommandError(
+                f"contact_air.cases is empty; no case {args.case!r} is configured"
+            )
+        payload = {
+            "status": "no_cases_configured",
+            "n_cases": 0,
+            "rows": [],
+            "missing": [
+                "no explicit train/validation/test split is configured",
+                "a standard 1-D source (or a cache built from one) is required "
+                "before any geometry, shock trajectory or contact label exists",
+                "no real 50 mm ALE1D data is present; the binary reader is not "
+                "implemented and must not be guessed",
+            ],
+            "note": (
+                "base.yaml deliberately has cases: []. Define the split in a run "
+                "configuration; no radius is a fixed default."
+            ),
+        }
+        if args.output:
+            _write_json(args.output, payload)
+        print(json.dumps(payload, indent=2, default=_jsonable))
+        return 0
+    specs = [dict(spec) for spec in raw_specs]
     wanted = args.case
     selected = [
         spec for spec in specs

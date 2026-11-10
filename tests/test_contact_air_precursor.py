@@ -59,6 +59,19 @@ def test_a_fixed_epsilon_s_is_rejected():
         PrecursorConfig.from_mapping(payload)
 
 
+def test_epsilon_denominator_factor_changes_the_result():
+    reference = default_precursor(0.05)
+    payload = dict(DEFAULT_PRECURSOR)
+    payload["charge_radius_m"] = 0.05
+    payload["epsilon_denominator_factor"] = 100.0
+    doubled = compute_precursor(PrecursorConfig.from_mapping(payload))
+    assert doubled.epsilon == pytest.approx(2.0 * reference.epsilon, rel=1e-12)
+    assert doubled.t0 != pytest.approx(reference.t0)
+    assert doubled.Rc0 != pytest.approx(reference.Rc0)
+    assert doubled.Rs0 != pytest.approx(reference.Rs0)
+    assert doubled.V_sep == pytest.approx(reference.V_sep, rel=1e-12)
+
+
 def test_explicit_C_must_reproduce_the_CJ_pressure():
     result = default_precursor(0.05)
     payload = dict(DEFAULT_PRECURSOR)

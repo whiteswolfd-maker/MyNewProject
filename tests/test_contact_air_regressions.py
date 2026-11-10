@@ -177,7 +177,57 @@ def test_contact_intervals_are_compared_one_to_one_for_several_points():
     assert count == 4 and float(values) > 0.0
 
 
+def test_contact_initial_condition_constrains_position_only():
+    from spherical_blast_pinn.contact_air.losses import contact_ic_loss
+
+    case = synthetic_case_for(0.05, n_frames=5, n_radial=800)
+    radius = torch.tensor([[case.initial.Rc0]], dtype=torch.float64)
+
+    def fields(speed):
+        return ContactFields(
+            radius=radius, speed=torch.full_like(radius, speed),
+            sigmoid=torch.ones_like(radius), raw=torch.zeros_like(radius),
+            pressure=torch.ones_like(radius),
+            relative_volume=torch.ones_like(radius),
+        )
+
+    assert float(contact_ic_loss(fields(0.0), case).total) == 0.0
+    assert float(contact_ic_loss(fields(1.0e9), case).total) == 0.0
+
+
+def test_air_initial_condition_is_only_the_separated_layer():
+    from spherical_blast_pinn.contact_air.losses import air_ic_loss
+    from spherical_blast_pinn.contact_air.models import AirNet, scales_from_precursor
+
+    case = synthetic_case_for(0.05, n_frames=5, n_radial=800)
+    zeta = torch.linspace(0.05, 0.95, 7, dtype=torch.float64)
+    batch = CaseBatch(
+        case_id=case.case_id,
+        t_pde=torch.zeros(0, dtype=torch.float64), zeta_pde=torch.zeros(0, dtype=torch.float64),
+        t_ic=torch.full_like(zeta, case.t0), zeta_ic=zeta,
+        t_right=torch.zeros(0, dtype=torch.float64),
+        t_data=torch.zeros(0, dtype=torch.float64),
+        radius_data=torch.zeros(0, dtype=torch.float64),
+        rho_data=torch.zeros(0, dtype=torch.float64),
+        u_data=torch.zeros(0, dtype=torch.float64),
+        p_data=torch.zeros(0, dtype=torch.float64),
+        valid_rho=torch.zeros(0, dtype=torch.bool),
+        valid_u=torch.zeros(0, dtype=torch.bool),
+        valid_p=torch.zeros(0, dtype=torch.bool),
+        t_contact=torch.zeros(0, dtype=torch.float64),
+        low_contact=torch.zeros(0, dtype=torch.float64),
+        up_contact=torch.zeros(0, dtype=torch.float64),
+    )
+    assert not hasattr(batch, "zeta_ic_ambient")
+    result = air_ic_loss(
+        AirNet(width=8, depth=1), batch, case,
+        scales_from_precursor(case.precursor, like=torch.zeros(1, 1)),
+    )
+    assert result.counts["ic"] == zeta.numel()
+
+
 # ---------------------------------------------------------------------------
+# 3. shock trajectory break markers# ---------------------------------------------------------------------------
 # 3. shock trajectory break markers
 # ---------------------------------------------------------------------------
 def test_a_nan_radius_frame_remains_a_break_marker():
@@ -214,7 +264,26 @@ def test_a_gap_does_not_create_a_sampling_interval():
     assert start <= case.t0 <= end
 
 
+def test_sampling_refuses_a_trajectory_without_supersonic_times():
+    import dataclasses
+    from spherical_blast_pinn.contact_air.geometry import ShockTrajectory
+    from spherical_blast_pinn.contact_air.sampling import SamplingError, sample_case_batch
+
+    case = synthetic_case_for(0.05, n_frames=7, n_radial=800)
+    constant = ShockTrajectory.from_arrays(
+        case_id=case.case_id, times=case.shock.times,
+        radii=np.full(case.shock.times.size, case.initial.Rs_data_at_t0),
+    )
+    frozen = dataclasses.replace(case, shock=constant)
+    with pytest.raises(SamplingError, match="D_s > c_inf"):
+        sample_case_batch(
+            frozen, n_pde=1, n_ic=0, n_right=4, n_data=0, n_contact=0,
+            generator=torch.Generator().manual_seed(0),
+        )
+
+
 # ---------------------------------------------------------------------------
+# 4. loss scales# ---------------------------------------------------------------------------
 # 4. loss scales
 # ---------------------------------------------------------------------------
 def test_energy_residual_scale_is_energy_density_over_time():
@@ -378,7 +447,46 @@ def test_prediction_refuses_incompatible_network_convention(tmp_path):
         cli._check_prediction_compatibility(prediction, payload, contact, air)
 
 
+def test_right_boundary_sampling_excludes_plateau_and_subsonic_times():
+    import dataclasses
+    from spherical_blast_pinn.contact_air.geometry import ShockTrajectory
+    from spherical_blast_pinn.contact_air.sampling import sample_case_batch
+
+    case = synthetic_case_for(0.05, n_frames=9, n_radial=800)
+    times = np.asarray(case.shock.times)
+    mid = times.size // 2
+    radii = np.empty(times.size)
+    radii[:mid] = np.linspace(
+        case.initial.Rs_data_at_t0, case.initial.Rs_data_at_t0 + 0.01, mid
+    )
+    radii[mid:] = radii[mid - 1]
+    shock = ShockTrajectory.from_arrays(case_id=case.case_id, times=times, radii=radii)
+    frozen = dataclasses.replace(case, shock=shock)
+    c_inf = np.sqrt(case.gamma_air * case.ambient_pressure / case.ambient_density)
+    batch = sample_case_batch(
+        frozen, n_pde=0, n_ic=0, n_right=64, n_data=0, n_contact=0,
+        generator=torch.Generator().manual_seed(3),
+    )
+    assert batch.t_right.numel() > 0
+    speed = np.asarray(frozen.shock.derivative(batch.t_right.numpy()))
+    assert np.all(speed > c_inf)
+
+
+def test_precheck_all_reports_an_empty_split_instead_of_failing(tmp_path):
+    output = tmp_path / "precheck.json"
+    code = cli.main([
+        "precheck", "--config", str(ROOT / "configs" / "contact_air" / "base.yaml"),
+        "--all", "--output", str(output),
+    ])
+    assert code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["status"] == "no_cases_configured"
+    assert payload["rows"] == []
+    assert payload["missing"]
+
+
 # ---------------------------------------------------------------------------
+# 8. data-entry regressions# ---------------------------------------------------------------------------
 # 8. data-entry regressions
 # ---------------------------------------------------------------------------
 def test_air_observations_keep_rho_and_u_when_pressure_is_invalid(tmp_path):

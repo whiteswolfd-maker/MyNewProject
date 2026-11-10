@@ -47,6 +47,17 @@ def test_an_isolated_point_has_a_position_but_no_slope():
         shock.require_covering(1.0e-5)
 
 
+def test_a_two_point_segment_gives_only_the_average_speed():
+    shock = ShockTrajectory.from_arrays(
+        case_id="two", times=[1.0e-5, 2.0e-5], radii=[0.15, 0.17],
+    )
+    assert shock.position(1.5e-5) == pytest.approx(0.16)
+    assert shock.derivative(1.5e-5) == pytest.approx(2000.0)
+    assert shock.derivative(1.0e-5) == pytest.approx(2000.0)
+    with pytest.raises(GeometryError):
+        shock.position(0.5e-5)
+
+
 def test_a_gap_splits_segments_instead_of_bridging_it():
     times = np.linspace(1.0e-5, 3.0e-5, 21)
     radii = 0.15 + 100.0 * (times - 1.0e-5)
@@ -129,22 +140,23 @@ def test_t0_must_be_inside_one_continuous_shock_segment():
         )
 
 
-def test_contact_interval_is_ordered_and_brackets_raw():
+def test_contact_interval_is_ordered_and_has_no_midpoint_field():
     table = ContactIntervalTable(
         case_id="c", times=np.array([1.0e-5, 2.0e-5]),
         low=np.array([0.10, 0.11]), up=np.array([0.12, 0.13]),
-        raw=np.array([0.11, 0.12]), valid=np.array([True, False]),
+        valid=np.array([True, False]),
     )
     assert table.n_valid == 1
+    assert not hasattr(table, "raw")
     with pytest.raises(GeometryError):
         ContactIntervalTable(
             case_id="bad", times=np.array([1.0e-5]),
             low=np.array([0.12]), up=np.array([0.11]),
-            raw=np.array([0.115]), valid=np.array([True]),
+            valid=np.array([True]),
         )
     with pytest.raises(GeometryError):
         ContactIntervalTable(
             case_id="bad2", times=np.array([1.0e-5]),
-            low=np.array([0.10]), up=np.array([0.12]),
-            raw=np.array([0.13]), valid=np.array([True]),
+            low=np.array([0.0]), up=np.array([0.12]),
+            valid=np.array([True]),
         )

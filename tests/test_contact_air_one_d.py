@@ -14,6 +14,7 @@ from spherical_blast_pinn.contact_air.losses import finite_mach_rh_state
 from spherical_blast_pinn.contact_air.one_d import (
     ShockDetectionConfig,
     align_event,
+    contact_interval_from_fractions,
     detect_frame_shock,
 )
 from spherical_blast_pinn.contact_air.testing import (
@@ -23,23 +24,8 @@ from spherical_blast_pinn.contact_air.testing import (
     default_precursor,
 )
 
-from tests.test_contact_air_data import _frame
-
-
-def _nonuniform_air_frame(pressures, *, radius, valid_pressure=None):
-    radius = np.asarray(radius, dtype=float)
-    frame = _frame(alpha=np.zeros(len(radius)))
-    boundaries = np.concatenate([radius[:1] - 0.01, 0.5 * (radius[:-1] + radius[1:]),
-                                 radius[-1:] + 0.01])
-    frame.r_left = boundaries[:-1]
-    frame.r_right = boundaries[1:]
-    frame.radius = np.asarray(radius, dtype=float)
-    frame.pressure = np.asarray(pressures, dtype=float)
-    frame.valid_pressure = (
-        np.ones(len(radius), dtype=bool) if valid_pressure is None
-        else np.asarray(valid_pressure, dtype=bool)
-    )
-    return frame
+from tests.contact_air_fixtures import make_frame as _frame
+from tests.contact_air_fixtures import make_gapped_air_frame, make_nonuniform_air_frame as _nonuniform_air_frame
 
 
 def test_shock_uses_only_the_pressure_gradient_on_a_nonuniform_grid():
@@ -94,6 +80,107 @@ def test_a_candidate_that_moves_inward_relative_to_the_previous_frame_is_rejecte
     assert valid[0], detections[0].reasons
     assert not valid[1]
     assert "moved inward" in detections[1].reasons[0]
+
+
+def test_a_real_spatial_gap_is_not_bridged_by_consecutive_indices():
+    frame = make_gapped_air_frame()
+    detection = detect_frame_shock(
+        frame, contact_up=0.05, ambient_pressure=1.0e5,
+        pure_air_threshold=0.95,
+        config=ShockDetectionConfig(relative_prominence=2.0,
+                                    min_pressure_jump_fraction=1e-3),
+    )
+    # The jump 8e6 -> 1e5 lies across the [0.15, 0.25] void and must not be
+    # used as a gradient.  Neither side contains a peak.
+    assert not detection.valid
+    assert detection.run_bounds is None
+
+
+def test_a_spatial_gap_also_breaks_the_contact_path():
+    frame = make_gapped_air_frame()
+    frame.alpha_product = np.array([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+    frame.alpha_air = 1.0 - frame.alpha_product
+    _, _, valid, reason = contact_interval_from_fractions(frame)
+    assert not valid
+    assert "spatial gap" in reason
+
+
+def test_pure_air_between_does_not_count_across_a_gap():
+    from spherical_blast_pinn.contact_air.one_d import pure_air_run_between
+
+    frame = make_gapped_air_frame()
+    ok, count = pure_air_run_between(
+        frame, low=0.05, high=0.4, pure_air_threshold=0.95, minimum=5,
+    )
+    assert not ok
+    assert count == 4  # the larger side only; the two sides are never joined
+    ok, count = pure_air_run_between(
+        frame, low=0.05, high=0.4, pure_air_threshold=0.95, minimum=4,
+    )
+    assert ok and count == 4
+
+
+def test_overlapping_cells_are_rejected():
+    from spherical_blast_pinn.contact_air.one_d import OneDDataError
+
+    frame = make_gapped_air_frame()
+    frame.r_left[3] = frame.r_right[2] - 0.01
+    with pytest.raises(OneDDataError, match="overlap"):
+        frame.require_monotone()
+
+
+def test_repeated_peak_positions_are_a_plateau_not_inward_motion():
+    from spherical_blast_pinn.contact_air.one_d import detect_shock_trajectory
+
+    radius = [0.10, 0.15, 0.19, 0.21, 0.25, 0.30]
+    frames = [
+        _nonuniform_air_frame(
+            [8.0e6, 8.0e6, 8.0e6, 1.0e5, 1.0e5, 1.0e5], radius=radius
+        )
+        for _ in range(3)
+    ]
+    for index, frame in enumerate(frames):
+        frame.time_raw_s = (index + 1) * 1.0e-5
+    radii, valid, detections = detect_shock_trajectory(
+        frames, contact_low=np.array([0.09, 0.09, 0.09]),
+        contact_up=np.array([0.09, 0.09, 0.09]),
+        contact_valid=np.ones(3, bool), ambient_pressure=1.0e5,
+        pure_air_threshold=0.95,
+        config=ShockDetectionConfig(relative_prominence=2.0,
+                                    min_pressure_jump_fraction=1e-3),
+    )
+    assert valid.all(), [d.reasons for d in detections]
+    assert np.allclose(radii, radii[0])
+    assert detections[1].speed_status == "plateau"
+    assert detections[2].speed_status == "plateau"
+    assert detections[1].outward_speed == 0.0
+    assert "moved inward" not in " ".join(detections[1].reasons)
+
+
+def test_selected_prominence_belongs_to_the_selected_run():
+    frame = _frame(alpha=np.zeros(8))
+    frame.radius = np.array([0.10, 0.12, 0.17, 0.20, 0.30, 0.33, 0.37, 0.40])
+    frame.r_left = np.array([0.09, 0.11, 0.145, 0.185, 0.28, 0.315, 0.35, 0.385])
+    frame.r_right = np.array([0.11, 0.145, 0.185, 0.22, 0.315, 0.35, 0.385, 0.415])
+    frame.pressure = np.array(
+        [8.0e6, 8.0e6, 1.0e5, 1.0e5, 1.0e5, 1.0e5, 1.0e5, 1.0e5]
+    )
+    detection = detect_frame_shock(
+        frame, contact_up=0.05, ambient_pressure=1.0e5,
+        pure_air_threshold=0.95,
+        config=ShockDetectionConfig(
+            relative_prominence=2.0, min_cells_from_contact=0,
+            min_pressure_jump_fraction=1e-3,
+        ),
+    )
+    assert detection.valid, detection.reasons
+    assert detection.run_bounds == (0, 3)
+    lo, hi = detection.run_bounds
+    r = frame.radius[lo:hi + 1]
+    p = frame.pressure[lo:hi + 1]
+    g = -np.gradient(p, r)
+    expected = max(2.0 * float(np.median(np.abs(g))), 0.0)
+    assert detection.prominence == pytest.approx(expected, rel=1e-12)
 
 
 def test_event_alignment_uses_the_first_identifiable_frame_and_keeps_spacing():

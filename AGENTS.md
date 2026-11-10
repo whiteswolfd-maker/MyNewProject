@@ -1,391 +1,119 @@
-# 自由空气中球形 TNT 爆炸的双场 PINN
+# 仓库约定
 
-本仓库有两条明确分开的实现：
+本仓库只有一个当前方案：`src/spherical_blast_pinn/contact_air/`。共享
+`ContactNet(t,R0)->R_c` 与 `AirNet(zeta,t,R0)->(rho,u,p)`，两个持久 Adam 交替
+更新，几何为 `R_c(t) <= r <= R_s(t)`，`R_s` 是压力梯度识别出的外传空气激波。
+前置为 CJ + JWL 等熵释放 + 空气 Hugoniot 匹配。
 
-* **新方案（2026-11-10 一维迁移，当前任务）**：`src/spherical_blast_pinn/contact_air/`。
-  共享 ``ContactNet(t,R0)->R_c`` 与 ``AirNet(zeta,t,R0)->(rho,u,p)``；两个持久
-  Adam 交替更新；几何为 ``R_c(t)<=r<=R_s(t)``，``R_s`` 是压力梯度识别的外传
-  激波；前置为 CJ + JWL 等熵释放 + 空气 Hugoniot 匹配。入口：
-  ``python -m spherical_blast_pinn.cli.contact_air ...``，配置在
-  ``configs/contact_air/``。**旧 ProductNet/FrontNet、旧总损失一次反传、
-  0.5/PLIC 单点接触面标签不得进入这条路径。**
-* **旧路径（历史/追溯）**：``models/``、``training/trainer.py``、
-  ``configs/base.yaml``。其物理选择见下面“不得改变的物理选择”；这些选择
-  **不**适用于 ``contact_air`` 新方案。
+旧 ProductNet/FrontNet、旧联合总损失训练器、旧三维球壳提取、旧平面黎曼启动、
+旧 `R_b` 环境边界、固定 500 mm 测试规则均已删除。不要恢复、不要重建第二套
+入口、不要为兼容旧测试重新提供别名。
 
-`README.md` 是方法、数据状态与已知限制的权威说明。
-
-## 新方案 ContactNet/AirNet（一维，2026-11-10）
-
-* **几何**：``R_c(t) <= r <= R_s(t)``，``zeta=(r-R_c)/(R_s-R_c)``。
-  ``R_s`` 是外传空气激波，不是测得的 ``R_b``，也不是仿真外边界
-  ``R_outer``。``R_s(t)`` 用 SciPy PCHIP 系数在 PyTorch 中求值并给解析
-  ``dR_s/dt``；禁止外推、跨无效帧、复制上一帧。
-* **接触区间**：与主产物区外缘相连的混合段，取实际单元边界
-  ``[R_c,low,R_c,up]``；不使用 ``alpha=0.5`` 或区间中点。外侧孤立产物碎片
-  不当作主接触面。阈值显式配置，尚未由真实数据确认。
-* **激波识别**：只在有效连续空气段上算 ``g=-dp/dr``，用
-  ``scipy.signal.find_peaks`` 找显著正峰；真实径向坐标、非均匀网格；不跨
-  缺失点/混合带/断开区间。记录每帧位置、状态、候选、RH 诊断和失败原因；
-  候选必须相对上一有效帧向外传播。不暗中平滑。
-* **事件对齐**：``t = t0 + (t_data - t_event_data)``。用理论 ``t_sep`` 指导
-  搜索，取首个可辨认分离帧；空气观测、接触标签、激波轨迹共用同一时钟。
-  保存原始/对齐时间、事件帧和偏移；不宣称数据事件绝对时间等于理论 ``t0``。
-* **前置与初场**：保留 CJ、JWL 等熵释律、空气 Hugoniot 匹配。
-  ``epsilon = R_sep/[200 (D_s_sep-u_c_sep)]``，``t0=t_sep+epsilon``，
-  ``Rc0=R_sep+u_c_sep epsilon``，``Rs0=R_sep+D_s_sep epsilon``；固定微秒
-  被拒绝。AirNet 初值只在 ``0<zeta<1`` 用分离态，没有未扰动空气子区。
-* **``R_c=R_s sigmoid(raw)``**；``dR_c/dt = D_s s + R_s s(1-s) raw_t``，必须
-  包含 ``D_s`` 项。``AirNet`` 的 ``t``/``zeta`` 导数在固定 ``zeta,R0`` 下求。
-* **损失**：左边界 ``u=Rc_dot``、``p=p_c(t)``（JWL 闭合）；右边界是有限马赫数
-  RH 波后状态（``M_s=D_s/c_inf>1``，不是静止环境）；空气数据用预测的 ``R_c``
-  与 ``R_s`` 重算 ``zeta``，域外点计数后排除、整批全筛掉硬失败；ContactNet
-  初值只约束位置，保留区间监督，独立初始速度损失已删除。
-* **交替更新**：先 AirNet（ContactNet 几何 detached），再 ContactNet
-  （AirNet 参数冻结但输入导数保留的 functional 求值，几何/相容梯度路径保留）。
-  每次 backward 后检查非目标网络没有梯度、参数未移动；检查点保存两个优化器、
-  阶段状态与 RNG。
-* **数据入口**：``one_d.py`` 的 ``standard_1d_source`` 中间格式（显式单位、
-  节点/单元位置类型、逐字段掩码、绝对压力）。**LS-DYNA 二进制 ALE1D 槽位
-  尚未核实，禁止猜测式读取。** 真实接入需文件样例、字段映射或软件版本。
-* **数据划分**：没有固定半径禁令。训练/验证/测试由 ``contact_air.cases`` 的
-  显式 ``role`` 决定；``base.yaml`` 的 ``cases`` 为空，``smoke.yaml`` 只有一个
-  50 mm 合成程序检查，不是研究结论。真实 50 mm 试跑尚未执行。
+`README.md` 是方法、命令、数据状态和已知差异的权威说明。
 
 ## 不得改变的物理选择
 
-* **唯一初始化方案（2026-10-21 决策，2026-10-25 定稿）**：
+- 时间 `t` 是物理秒；不乘 `R0/100mm`，不做输入归一化。`t0=t_sep+epsilon`。
+- 前置保留 CJ 状态、JWL 等熵释律、空气强冲击/精确 Hugoniot 匹配、
+  `R_sep=R0 V_sep^(1/3)`、`t_sep` 和 `C` 的来源。不要替换成另一套前置能量。
+- 初始薄层：
 
-  ``t_phys = 0`` 时是**均匀静止的 JWL 产物球 + 静止空气**（``R_0`` 是材料界面，
-  不是爆轰波前）。产物用现行 JWL 与 ``E0``，空气用现行理想气体 EOS。它**不是**
-  CJ 表面突破，也不引入 Taylor 内场。
+  ```text
+  epsilon = R_sep / [epsilon_denominator_factor * (D_s_sep - u_c_sep)]
+  t0      = t_sep + epsilon
+  Rc0     = R_sep + u_c_sep * epsilon
+  Rs0     = R_sep + D_s_sep * epsilon
+  ```
 
-  小正时间启动由**局部平面黎曼问题**给出：
+  `epsilon_denominator_factor` 是配置值（本轮 200），真正参与计算。固定
+  `epsilon_s` 输入拒绝。`D_s_sep > u_c_sep`、`epsilon > 0`、初始厚度为正都是
+  硬检查。
+- AirNet 初值只在 `0 < zeta < 1` 使用分离态 `(rho_a_sep,u_a_sep,p_a_sep)`；
+  没有未扰动空气子区，没有旧 `zeta_s0` 分段初场。
+- 右边界是有限马赫数 RH 波后状态；`D_s > c_inf`、`M_s > 1` 才能进入该项。
+  不恢复静止环境 `rho_inf/0/p_inf`。
+- ContactNet 初值只约束位置；独立初始速度损失已删除。
+- 接触区间取与爆心主产物区外缘相连混合段的**实际单元边界**；不使用
+  `alpha=0.5` 单点。不计算、不返回也不缓存区间中点；训练对象只有
+  `[R_c,low, R_c,up]`。
+- ContactNet 压力闭合用与前置一致的相对比容
+  `V=V_sep (R_c/R_sep)^3`；不要与有量纲 `1/rho` 混用。
+- 材料卡数值仍是未核验占位值；`material_source_verified` 未核验前不得当作
+  已验证结果。
 
-  1. 产物侧用实际 JWL 等熵线积分（``de/dV = -p/rho0``、``du/dV = c/V``）；
-  2. 空气侧用理想气体激波的三条 RH 关系；
-  3. 压力/速度匹配得到 ``p_*``、``u_*``，并保留完整自相似稀疏波与星区；
-  4. 把该自相似扇嵌入球面，得到 ``t_phys = epsilon`` 的
-     :class:`~spherical_blast_pinn.physics.two_medium_startup_planar.PlanarStartupField`；
-  5. 版本化保存为 ``handoff.npz`` + ``handoff.json``，可重新加载并逐项核对。
+## 一维数据与几何契约
 
-  实现：``physics/two_medium_initial.py``、``physics/two_medium_riemann.py``、
-  ``physics/two_medium_startup_planar.py``、``physics/two_medium_startup_handoff.py``、
-  ``sampling/planar_startup_initial.py``；决策记录见
-  ``DECISION_2026-10-21_UNIFORM_PRODUCT_SPHERE.md``。
+- 标准中间格式 `spherical_blast_pinn.standard_1d_source`（`.npz` 或目录）。
+- metadata 必须显式提供 `units`、`coordinate`、`velocity_component`、
+  `absolute_pressure=true`、`position_type`、`frame_times`、`cells_per_frame`。
+  `coordinate`/`velocity_component` **没有静默默认**；缺键拒绝。
+- 读取后统一 SI；`u` 是径向速度分量，不是速度模长；`p` 是绝对压力。
+- 逐字段掩码：`valid=True` 但有 NaN 时拒绝；缺失字段不填零/环境常数/前帧值。
+- 单元：`r_right>r_left`，代表位置在单元内，径向位置严格递增。真实空间缺口
+  允许并作为分段；单元重叠拒绝。
+- 节点源必须已经转换为单元代表值：
+  `node_to_cell_convention="preconverted_cell_representatives"`。不支持任意
+  约定字符串，也不做猜测式节点→单元转换。
+- 连续段必须同时满足字段有效、材料连通和**真实单元边界相邻**。不能仅凭数组
+  下标连续跨过空间缺口求梯度或统计纯空气区间。
+- 激波只用 `-dp/dr` 正峰；不跨缺失点/混合带/几何缺口；要求压缩方向、距接触
+  带距离、相邻有效帧外传。位置重复是 plateau，不是向内运动；位置严格回退
+  拒绝。不自动跨失败帧插值，不暗中平滑。
+- 事件对齐：`t_model = t0 + (t_data - t_event_data)`。搜索窗口只作定位指导；
+  原始时间/帧号/偏移必须保存；不缩放帧距、不平移半径。
+- `ShockTrajectory` 用 PCHIP；单点无速度，两点只有区间平均速度；不外推。分段
+  系数用 SciPy 预处理，运行时用 PyTorch 求值和解析导数；不得 detach `t` 后
+  转 NumPy 查询并声称自动微分完整。
 
-  **不做任何网格时间推进**：新链路里没有有限体积/差分/拉格朗日逐步推进，也没有
-  旧的爆轰产物场与拉格朗日双材料前置求解器。
+## 模型与损失契约
 
-* ``delta = (R_s-R_c)/R_0 = 1/200`` 是当前候选值，**不是**已验证常数；
-  ``epsilon = delta R_0/(D_s-u_*)``。不同 ``epsilon`` 对应不同物理时刻，
-  不能相减后称为时间收敛。
-* 新启动场固定 ``reference_field=False``、``training_qualified=False``，
-  不是旧 ``ReferenceField`` 的替代品。``training_qualified`` 只是来源记录，
-  **不再是运行门槛**；程序正确性检查仍硬失败。
-
-## 时间
-
-* 新链路的时间约定**只有一个**：
-
-  ``tau = t_phys - epsilon``，``s = U_* tau / (R_0 hat T_*)``，
-  ``s = 0 ⇔ tau = 0 ⇔ t_phys = epsilon_field``。
-
-  由 :class:`~spherical_blast_pinn.physics.similitude.PlanarStartupScales` 显式
-  表达：``start_time()`` 就是该场自己的 ``epsilon``，``detonation_velocity=None``
-  （新原点不含 ``R_0/D``）。它只能由
-  ``PlanarStartupScales.for_startup_field(field, time_scale=...)`` 构造。
-* 旧方案 B 的 ``SimilitudeScales.start_time() = T_h = R_0/D + epsilon(R_0)``
-  仍保留在**旧对象**里，但新链路不使用、也不得把它传给初值批次
-  （``build_planar_startup_initial_batch`` 会明确拒绝）。
-* ``hat_t = U_* tau/R_0``，``s = hat_t/hat_T_*``；``hat_T_*`` 仍由**训练半径**
-  冻结。外推判据在无量纲 ``s`` 上做，不在秒数上做。
-* 物理时间与网络时间的换算只经由 ``physics.similitude``，而且只平移一次
-  （``physical_time_from_network`` / ``network_time_from_physical`` 配对）。
-* LS-DYNA 的原始时间轴 ``T`` 属于数据侧。新链路要求显式给出
-  ``T_origin``（DYNA 的哪个时刻对应模型 ``t_phys=0``），再按
-  ``t_phys = T - T_origin``、``tau = t_phys - epsilon`` 换算。没有默认原点；
-  原点未知时监督与同时间对比都拒绝。对已确认的中心起爆、``LT + R0/D``
-  约定，``cli.build_supervision`` 从卡片元数据生成并记录 ``LT``、``R0``、``D``；
-  非中心起爆或参数缺失时硬失败，不套用公式。
-
-## 坐标与 PDE
-
-* 网络输入坐标一律是 ``(s, xi)`` 或 ``(s, eta)``；物理半径只在需要 ``1/r``
-  几何源项、EOS 与数据标签的地方出现。
-* 链式法则只实现一次，在 ``physics/moving_frame.py``。时间项系数是
-  ``U_*/(R_0 hat_T_*)``，``R_0`` 随算例变，所以 ``scales`` 是必填参数。
-* 接触面与激波在采样与损失里各取**单侧**状态；不在两帧之间做时间线性混合，
-  不跨材料插值。
-* Torch 与 NumPy 两条 EOS 路径必须给同一个数，包括声速；声速平方用**未裁剪**
-  的函数判断有效性。
+- 默认网络：ContactNet 5×50，AirNet 10×32；smoke 可显式缩小并标明是工程配置。
+- `R_c = R_s sigmoid(raw)`；
+  `R_c_dot = D_s s + R_s s(1-s) raw_t`；`L=R_s-R_c` 必须为正，不 clamp 厚度。
+- 空气 PDE 三条残差在 `mapping.py` 只实现一次；两网络复用。能量尺度是单位体积
+  总能量 `s_E=s_p/(gamma-1)+0.5 s_rho s_u^2`，`s_fE=s_E/T_star`。
+- 数据坐标在损失时用**当前预测的** `R_c` 与 `R_s` 重算：
+  `zeta=(r-R_c)/(R_s-R_c)`。域外点计数后排除，不 clamp；整批全筛掉硬失败。
+- 预测/目标/掩码先规范形状再按掩码选择，禁止 `[N,1]` 与 `[N]` 广播成 `[N,N]`。
+- 接触标签在自己的 `t_contact` 上重新计算 ContactNet；不借用 PDE 时刻预测。
+- 两阶段交替：空气阶段只更新 AirNet；接触阶段只更新 ContactNet。接触阶段用
+  参数冻结、输入导数保留的 functional AirNet，不用 `no_grad`/整体 detach 包住
+  物理残差。
+- 每次反传检查：目标网络有非零有限梯度、非目标网络无梯度、参数未移动。
+- 两个优化器持久存在；不要每轮重建。
 
 ## 硬失败，不是警告
 
-下面每一条都会让运行停下来。改成警告就等于把"方程已满足"写成"残差恰为零"：
+- `t, R0, R_s, D_s` 形状不一致或非有限；`R_c`/`R_c_dot` 非有限。
+- `L = R_s - R_c <= 0`；几何退化。
+- `D_s <= c_inf` / `M_s <= 1` 的采样进入 RH 边界损失。
+- `D_s_sep <= u_c_sep`、`epsilon <= 0`、初始厚度非正。
+- 理论 `R_c0 >= R_s_data(t0)`（硬几何无法容纳初始位置）。
+- 数据/接触/PDE 采样在零个有效点上求值；总损失或梯度非有限。
+- 检查点数据/配置/验证划分/网络结构不匹配；旧缓存/旧检查点版本。
+- 一维源缺少必填 metadata、单位未知、掩码覆盖 NaN、节点约定未支持、
+  单元重叠、时间非严格递增。
 
-* ``R_s <= R_c``、前沿或前沿速度非有限、配置点半径到达轴心（``R_c <= 0``）；
-* 零个产物配置点，或大部分请求的产物点被丢弃；
-* 产物 PDE 残差在**零个点**上求值（``mean`` 会把 ``nan`` 吞掉）；
-* 检查点的 case 集合、调度、尺度、采样配置或窗口与当前运行不同；
-* 检查点里没有采样器或全局 RNG 状态（续训时）；
-* 监督数据的 DYNA→模型时间原点未知，或与字段/半径不匹配；
-* 总损失或梯度非有限（更新之前拦下，参数不变）。
+## 采样与命令
 
-**``R_c < R_0`` 不在这一列**：它是监控量，不是非法移动域。
+- `train --cases all` 或显式 `case_id` 集合；只选配置中 `role: train` 的算例。
+  无固定 50/80/100；`role: test` 不得进入训练。
+- `build-cache --source <标准一维文件或目录> --case ... --radius ... --role ... --out ...`。
+- `predict/evaluate --case ...`；预测只读 metadata 与 shock 轨迹，评估才读参考
+  内部场。500 mm 与其他半径同一接口。
+- 空气质量数据先抽帧再抽帧内点；右边界只在 `D_s > c_inf` 时刻采样。
+- 预测是“给定测得的 `R_s` 轨迹条件下的预测”，不是无需轨迹的自主跨半径激波
+  预测。
 
-## 正式命令的当前状态
-
-* 可运行：``startup``（写 handoff）、``validate_startup_planar``、
-  ``check_startup_chain``（装配 + 一次反向）、``train``（单/多半径，Adam +
-  可选 L-BFGS）、``predict``、``compare``，以及数据侧
-  ``audit_dyna`` / ``extract_profiles`` / ``validate_eos``。
-  ``audit_data`` 与 ``validate_eos`` 的**数据闭合**部分只审计旧
-  ``ExtractedCase`` 剖面，需要配置里显式写 ``data.cases``；训练入口不读
-  ``data.cases``，只读 ``startup.cases``。
-* **训练装配**：``cli._common.build_context`` 读 ``startup.cases``，为每个半径
-  加载或构造 handoff、``PlanarStartupScales`` 与 ``RadiusSampler``，然后建立
-  **一个共享的** ``CoupledModel``（ProductNet + AirNet + 前沿参数）与**一个**
-  Adam。网络无量纲，物理输出换算逐次使用 ``batch.scales``；支持范围是同材料、
-  同环境、同 ``delta``、同启动方法与时间尺度，只有 ``R_0``/``epsilon`` 不同。
-  材料/环境以 handoff 保存的完整 JWL、空气 ``gamma``、环境密度/压力与初始
-  产物/空气热力学状态为准；YAML 中显式写出的对应物理值必须一致，冲突在优化
-  之前报错并列出双方数值。自动构造初场时，``jwl``、``E0`` 与 ``air`` 参数
-  实际进入初值；不支持的非默认值（如 ``jwl.V0 != 1``）在装配阶段拒绝。
-  ``check_shared_compatibility`` 直接比较完整 EOS、环境态与初始热力学状态，
-  第一份 case 也与共享模型核对；无量纲前沿恰好相同不能代替材料一致性。
-  参考尺度 ``rho_*/U_*/e_*`` 是数值归一化量，不强制等于实际初态。
-  **这是旧路径的装配，不是新方案。** 旧实现是“一个联合损失、一次
-  ``backward``、一次 Adam 更新”；新方案的交替两网训练在
-  ``contact_air/trainer.py``，入口见上节。不要把旧 ``train`` 命令当成
-  ContactNet/AirNet 的默认训练路径。
-* **诊断模式**（``--diagnostic``）：只限制运行身份与步数（默认上限 100），
-  检查点与清单记录 ``diagnostic``；它不再承担"科研资格"门槛。正式装配不会因
-  ``training_qualified=False`` 被拒绝。
-* **数据监督**：``data.startup_supervision.SupervisionDataset`` 带显式
-  ``T_origin``、SI 单位、逐字段有效性、两条前沿各自的有效性与位置不确定性、
-  synthetic/real 标记。``t_phys = T_DYNA - T_origin``、``tau = t_phys - epsilon``。
-  原点未知的数据可以加载审查，但监督/同时间对比被拒绝；**没有默认
-  ``T_origin=0``**。当前已确认的 50/80/100/500 mm 中心起爆卡片用
-  ``T_origin = LT + R0/D``，由 ``data/dyna_supervision.py`` 从提取元数据生成；
-  非零起爆点或缺参数不能套用。数据源一律用原始 d3plot：
-  50 mm ``E:/tnt/tnt_files/dp0/SYS/MECH``，80 mm
-  ``G:/500mmtnt/80mmtnt_files/dp0/SYS-3/MECH``，100 mm
-  ``G:/500mmtnt/100mmtnt_files/dp0/SYS-3/MECH``，500 mm
-  ``D:/500mmtnt/500mmtnt_files/dp0/SYS-3/MECH``。不要再读取或写入
-  ``F:/2/extracted_geom`` 下的派生提取。旧的 ``100mm_d`` 来自错误的
-  ``F:/2/runs/100mm_full``，该运行与对应提取已删除；在按实际 100 mm deck 完成
-  单位/历史变量布局校验并重新提取之前，没有可用的 100 mm 提取。
-  ``extracted_vf``/GitHub 旧导出缺逐字段有效性，转换会拒绝。旧导出只有
-  ``contact_state``/``shock_state`` 三态码而没有
-  ``contact_has_supervision``/``shock_has_supervision`` 时，``dyna_supervision``
-  也拒绝转换——"定位到了"不等于"够格当标签"。
-  **当前全量提取未完成**：``F:/2/extracted_all_20261028`` 下没有可用的
-  ``raw_line.npz``/``metadata.json``，所以 ``base.yaml`` 没有挂接监督数据，
-  正式训练入口当前只能跑纯物理损失。100 mm 原始 history 的 product
-  density/mass 在 alpha=1、体积不变的单元上下降约 1000 倍，来源未定论；不得
-  乘 1000 修补，也不得把 80/100/500 mm 的晚期产物密度当作已验证监督。
-* **检查点（v5）**：顶层 ``model`` + ``cases`` + ``training``。``model`` 只有
-  一份共享参数、优化器与指纹；每个 case 绑定启动场身份、完整 scales、无量纲
-  前沿初值、完整材料/环境/初始状态记录、采样配置/窗口、采样器 RNG、连续帧组
-  开发划分（经数据身份）、RAR 配置/点池/触发进度与数据内容身份；``training``
-  绑定全局步号、阶段与窗口、日程、平衡器、全局 RNG、历史、选模记录（含共享
-  权重）、运行来源与诊断身份。多半径恢复要求**完全相同的 case_id 集合**。
-  ``--resume`` 恢复完整训练状态；``--init-from`` 只加载参数（不恢复 RAR/窗口/
-  RNG）。恢复先核对再修改，失败回滚。保存、恢复与冻结预测共用
-  ``physics/material_state.py`` 的同一份材料判据；模型结构与材料记录也互相
-  核对。v2/v3/v4 与旧 reference-field 格式按版本明确拒绝。
-* **未训练半径预测**：``predict --radius`` 在半径不在训练集合时走
-  ``load_frozen_model``：核对完整材料/环境/初始热力学状态、delta/方法/时间尺度与
-  无量纲前沿初值，
-  使用新半径自己的 handoff 与 ``epsilon``，不读优化器、不恢复 RNG、不更新参数；
-  ``cache_key`` 允许与训练算例不同。``--case-id`` 则是训练算例的严格复现。
-* **RAR**：配置在 ``training.rar``（``enabled``、``interval``、每介质候选/选点
-  数、点池容量、替换比例）。每个 case、每个材料域有独立的候选评分、点池和
-  随机状态。候选点只在当前时间窗口与合法材料域内生成；评分复用生产 PDE 残差
-  的无量纲尺度，**不调用优化器、不写 ``.grad``、不切换模型模式**。点池有容量、
-  去重和触发间隔；只用配置比例的 PDE 点由池替换，基础分层采样保留。RAR 关闭
-  时采样路径与原来一致。非有限残差明确失败。
-* **开发集**：真实/合成监督都按原始时间顺序形成连续帧组，整组划分训练/开发，
-  记录实际组号、帧号和比例。训练采样只用训练帧；固定检查集另建开发帧批次，
-  只进入 ``data_loss`` 与既有选模偏序，不进梯度、RAR 或训练配点。
-* **阶段机/平衡器**仍保留；L-BFGS 对联合目标做一次更新，不逐 case 覆盖。
-* 旧提取格式的场量对照工具已删除；通用规则（逐字段有效性、材料侧插值、
-  缺失不为零）迁到 ``evaluation/field_compare.py``，新 ``compare`` 使用它。
-
-## 已退出的旧方案（只作历史）
-
-2026-09-22 至 2026-10-21 之间使用的“方案 B”是：中心起爆、有限爆速传播形成
-非均匀爆后产物场，波前到达装药表面后接空气，再用短时球对称拉格朗日双材料
-前置求解到 ``T_h = R_0/D + epsilon``。对应的 ``physics/detonation.py``、
-``physics/precursor.py``（含 ``ReferenceField`` 与验收缓存）、
-``physics/two_medium_startup.py``、``cli/reference_field.py``、
-``cli/validate_startup.py``、``cli/diagnose_startup.py`` 及其专属测试已删除。
-旧缓存文件（``reference_field.npz``）不再被任何代码读取，也不得当成新启动场。
-
-旧数据契约 ``data/contract.py`` 与其专属测试也已删除：训练入口只通过
-``SupervisionDataset.require_supervision_ready()`` 判定监督资格。旧
-``ExtractedCase`` 不再暴露方案 B 的 ``T_h``/``pinn_times``/``frame_split``；
-它只保留原始 DYNA 时间轴，模型时间原点由 ``data/dyna_supervision.py`` 生成。
-
-## 剖面提取
-
-* 材料分区一律来自 d3plot 的 **ALE 材料体积分数**（`cli.extract_profiles`）。密度
-  最陡下降那条启发式路径已经废弃，只在没有配套文件的旧导出上还会走，并且会被闸门
-  判成 `incompatible`。
-* **分类必须用全部单元的体积加权体积分数**（`shell_average.mixture_fraction_profile`），
-  不是只对纯产物单元求平均的那个。后者在没有产物的壳层上是 `nan` 而不是 0，既过不了
-  `>= 0.95` 也过不了 `<= 0.05`，空气会整个消失；而且它在产物侧恒等于 ~1，永远不穿过
-  0.5，接触面根本定不出来。
-* **标签必须蕴含状态。** "标成空气、场量却是空"不是少几个点的问题：采样器会把 `nan`
-  标签逐个丢掉，数据损失里的空气组于是静默消失。提取器写盘前检查这一点，兼容性检查
-  再独立验一遍，门槛是"零个"，不是"比例很低"。
-* 比内能随剖面一起写出（`e`）。它是**重建量，不是 DYNA 输出量**：这套 d3plot 里实体
-  单元根本没有比内能结果，所以只能按各材料的 EOS 反解。**反解是除法，不是求根**，
-  `omega > 0`、`rho > 0` 时永远有有限实数值——不存在"没有实数解"那一档。会出现的
-  是反解出**负**值，那说明该单元的 `p` 落在 JWL 冷压曲线之下（化学能还没放出来，
-  未起爆或正被爆轰波扫过），本来就不该套产物 EOS。把 `nan` 说成"解不出来"会让人去查
-  求解器，而问题在判据的语义上；实测 40 个状态 × 122 万单元里反解为非有限值的是
-  **0 个**。
-* **"标了材料"不等于"有状态"。** 没有状态的单元其比内能留空，且逐帧计数写入元数据；
-  下游只能把缺口算成"反解为负"，不能算成"没有解"。壳层平均会**静默跳过** `nan`，
-  所以污染必须按**体积**单独算一遍（`contaminated_shell_fraction`），任何非零比例
-  让整个壳层作废——否则同一个壳层里剩下的单元会被平均成一个看着很正常的数。
-* **没有激波就没有空气域。** `R_s` 定不出来时 `R_c < r < R_s` 没有边界，空气侧无法与
-  环境态区分，而环境态按规范**无标签**。此时整个空气侧撤标，不能把两米以内的均匀
-  大气当成空气监督送进训练。
-* 前沿与场量用**同一套网格**。曾经前沿另用一套均匀分箱定位，近场分箱比场量壳层粗
-  四倍——"加密了场量网格"于是不等于"前沿也加密了"。
-* **激波标签用"压力梯度候选 + RH 核查"**（`data/shock_detect.py`，§10），不是任何
-  形式的阈值判据。三类判据都试过并被否掉：
-  * "最外侧超压点"：测到的是远场数值噪声（`p/p_amb` 在 1.000 上下摆动、幅度可达
-    1.5%），50 mm 第 10 状态落在 94–101 mm 的噪声尖峰上，而真实超压区外缘在 58 mm；
-  * "与接触面相连的连续超压区外缘"：稳健一些，但**那只是外缘，没有核验**；
-  * 固定阈值：放松一点噪声就成了激波，收紧一点弱激波就漏掉。
-
-  现在的做法是：在**连续有效的空气侧**数据上找 `-dp/dr` 正峰（用真实 `dr`，
-  噪声底取中位数梯度的倍数与 `1e-3 × p / dr` 的较大者），跃迁带取**峰值梯度的一个
-  比例**以上的连续区间——不用"高于噪声底"，因为衰减的爆炸波在波后一直有梯度，
-  那样圈出来的"带"会把已经衰减掉的状态当成波后，RH 残差被撑到 30% 以上而否掉真激波。
-  两侧状态取**紧邻跃迁带外的平台**。然后由**质量守恒**从实测两侧状态解 `Ds`，
-  再核查动量与能量 RH、压缩方向、`Ds - u2 > 0`、熵不减。
-
-  **质量守恒已经用来求 `Ds`，所以它不构成独立证据。** 两侧状态一律取实测数据，
-  **不得先由 RH 造出波后状态再验证 RH**。弱激波的密度跳变埋在窗口自身散布里时，
-  `Ds` 病态，标记为证据不足而不是给一个数。
-* **检测状态与监督资格分开记**（`confirmed` / `doubtful` / `not_detected`）。跃迁带
-  跨不过一个原始单元、或两侧状态不足以定 `Ds`，都只能记存疑，**不给监督资格**；
-  没有监督资格就没有可靠位置范围，空气侧整体撤标。实测 50 mm：状态 778 被确认
-  （`Ds = 594.5 m/s`、压缩比 1.87、动量残差 0.081），其余被诚实拒绝。
-* **壳层网格的宽度不是分辨率。** 前沿位置和 `h = R_s - R_c` 的分辨率下限是**ALE 单元
-  自己的径向厚度**，实测装药外第一个空气单元：50 mm 算例 8.9–14.1 mm，**80 mm 算例
-  208–361 mm，100 mm 算例 260–452 mm，500 mm 算例 1303–2258 mm**。把壳层从 2500 加到
-  5000 只是把同一个粗糙单元重采样得更细，"两套网格一致"因此只证明提取对分箱不敏感，
-  **不证明网格够用**。
-* **接触面也要判"分辨得出吗"，判据是穿越区间里的空壳层个数。** 0.5 穿越如果跨着一段
-  没有数据的壳层插出来，报出的半径就是"两个壳层中间某处"：80/100/500 mm 三个算例的
-  接触面因此被插到 131.97 / 164.96 / 824.80 mm，而装药半径是 80 / 100 / 500 mm——
-  偏高 65%。**不要用"跨距 vs 单元厚度"比大小**：单个巨型单元内部处处是空的，跨距
-  （104 mm）反而小于单元厚度（128 mm），比大小会把这一档整个漏掉。三种状态记在
-  `material.npz` 的 `contact_state` 与 `shock_status` 里。
-* **d3plot 文件数不等于状态数**（实测 780 文件 / 779 状态）。用 `_resolve_state_count`
-  的探针拿权威值，**并用边界复核它**（`n-1` 必须读出恰好一个时间戳、`n` 必须读不出）。
-  解析失败一律**停下**；回退到文件数会静默错位，而错位的时间戳不会报错，只会把每条
-  曲线平移。探针依赖 LASSO 的报错措辞，复核不依赖。
-* 读取状态要**分批**（`--batch-states`）。`buffered_reading=True` 不是"只留一帧"，
-  LASSO 仍为每个被选中的状态分配数组。
-* 材料映射**解析 `*ALE_MULTI-MATERIAL_GROUP` 的出现顺序**，不拿 part id 当列号。
-  四个算例上两者恰好相等（psid = 1..7 且列也按 1..7 排），但那是卡片刚好这么写的：
-  500 mm 的 part 名全是 `Solid Body N`，靠名字猜不可能。字段名因此是
-  `product_ale_indices` / `air_ale_indices`，不是 `*_material_ids`。
-* **history 列宽由 ALE 组数解析，不是固定 16 列。** 紧凑布局是
-  `[密度, n 个体积分数, 材料号, n 个分材料质量]`。50 mm 的 n=7（16 列），
-  100 mm 的 n=2（6 列）。`resolve_d3plot_layout` 用实际列宽 + deck 的组数；
-  列宽不够时硬失败。纯介质密度由 `m_m/(alpha_m V)` 计算，混合物密度列只作
-  原始读数保留。
-* **球壳统计用单元与壳层的重叠体积**（`data/shell_average.py`，§8），不是"质心落在
-  壳层里就整格算进去"。后者在壳层比单元细时是阶梯，而且**壳层之间的体积与质量不守恒**。
-  重叠按**圆台重构**（`dV/dr ~ r^2`，对固定立体角精确；实测完全在内侧的单元重叠分数
-  之和精确为 1）。`rho`、`p` 体积加权，**`u`、`e` 质量加权**。
-  **重叠体积不增加分辨率**：它只把同一个单元在壳层之间重新分配。
-  覆盖率的分母是**被建模的那一块**（八分之一球要除以 8），否则覆盖率会恰好小 8 倍。
-  聚合走**稀疏矩阵乘**：2040 万条配对逐场量 `bincount` 是 2.83 s/帧，改成
-  `A @ (w * v)` 后 1.26 s/帧；`A` 在欧拉网格上整个算例只建一次。
-* **lasso-python 2.0.3 读不动 80 / 100 / 500 mm 的单元 history 变量**（50 mm 正常）。
-  那三个算例的头块 `neiph = 22` 且 `has_element_strain` /
-  `has_solid_shell_plastic_strain_tensor` 都是真，LASSO 把这两项各减 6 得到 10 列的
-  容器，却往里面写 16 列，直接抛 `ValueError: could not broadcast ...`。
-  `raw_reader._install_solid_history_allocation_fix` 把容器按数据的宽度加宽（**只增不
-  减、不动数值**）。**取错列不可能同时满足 `_charge_radius_from_volume`**——它由体积分数
-  与单元体积反推装药半径，四个算例分别给出 49.9979 / 79.9943 / 99.9929 / 499.9610 mm
-  （相对偏差 ≤ 8e-5）。升级 LASSO 之后要重新验这条。
-
-## 数据闸门
-
-* `audit_dyna` 写的 `data_compatibility.json` 是**旧提取剖面**的审计记录；
-  新训练入口不读它，也不读 `data.cases`。新链路的闸门是启动场 handoff 校验
-  与 `SupervisionDataset.require_supervision_ready()`；旧报告里的
-  `compatible/incompatible` 不能替代这两项。
-* `data.allow_unverified_cases` 已从配置中移除——它从未接到新链路上，保留它
-  只会让"我越过了闸门"和"根本没有这道闸门"同时成立。
-* 没有审查证据**不等于**通过。报告里没有的算例是 `unknown`。
-* 没有从材料体积分数来的分区，就是没有；那一项独立判定，别的项审得再好也不放行。
-* 旧提取剖面只有三态码、没有 `contact_has_supervision` /
-  `shock_has_supervision` 时，`dyna_supervision` 拒绝转换。
-
-## 检查与选模型
-
-* 每 `training.check_every` 步在一套**固定**检查点上跑物理验收（`evaluation/checks.py`）。
-  它一次采样、全程复用、独立种子、取开发帧、不进梯度。保存检查点**不等于**
-  完成验收。
-* 选模型的偏序在 `evaluation/checks.py:SELECTION_CRITERIA` 里逐字写死：先非物理
-  状态计数，再物理/界面残差超出 §16 容差多少，最后才比开发集误差。**不按加权
-  训练总损失选模型。**
-* 数据在训练半径内按**连续帧组**留出约配置比例作开发检查
-  （`SupervisionDataset.assign_frame_split`）。同一帧的相邻网格点高度相关，
-  随机拆开会让"开发集误差"只是训练误差的另一种写法。开发帧只进入固定
-  `data_loss` 与既有选模偏序，不进入训练梯度或 RAR。
-* 守恒诊断（产物质量漂移、固定控制体能量平衡）只报告，不进梯度。
-
-## 契约
-
-* 半径只在还原物理量时乘上去。损耗、采样、模型一律通过
-  `losses.terms`/`sampling.batch` 携带的 `charge_radius` 取它，不读模块默认值。
-* 网络输入坐标一律是 `(s, xi)` 或 `(s, eta)`，物理半径只在需要 `1/r` 几何源项、
-  EOS 与数据标签的地方出现。
-* 链式法则只实现一次，在 `physics/moving_frame.py`。任何地方若要把网络输出换
-  成物理导数，必须走那里；重复叠加链式项是本仓库最容易犯的错误。
-* 抽样帧一律返回**真实帧号**，不是 `usable_frames` 里的位置。两者都是合法整数，
-  混用不会报错，只会安静地读错帧。
-* Torch 与 NumPy 两条 EOS 路径必须给同一个数，包括声速。声速平方用**未裁剪**的
-  那个函数判断有效性。
-* `tests/test_moving_frame_and_pde.py` 用解析光滑函数把显式链式法则与自动求导
-  对齐到机器精度；`tests/test_review_regressions.py` 逐条钉住审查清单里的每一个
-  可复现差异。改动移动坐标、时间轴或损失分组前后都要跑它们。
-
-## 规范
-
-```bash
-pytest -q
-```
-
-测试通过不等于完整爆炸预测通过。哪些项"已执行"、哪些"仅实现"、哪些"参考数据
-不足以判断"，必须逐项说明，不能只报一个通过率。
-
-## 规范
+## 检查
 
 ```bash
 python -m pytest -q
 ```
 
-干净环境安装与运行：
+必须使用本仓库解释器并核对 `spherical_blast_pinn.__file__`。旧的 541 数字与
+其他环境的输出不能作为本工作树的证据。另需在新进程执行 README 的
+标准 `.npz → build-cache → train → resume → predict → evaluate` 全链路。
 
-```bash
-python -m venv .venv
-.venv/Scripts/python -m pip install .          # 或 pip install -r requirements.txt
-.venv/Scripts/python -c "import spherical_blast_pinn, sys; print(spherical_blast_pinn.__file__)"
-.venv/Scripts/python -m spherical_blast_pinn.cli.startup --output-dir outputs/planar_startup
-```
-
-测试通过不等于完整爆炸预测通过。哪些项"已执行"、哪些"仅实现"、哪些"参考数据
-不足以判断"，必须逐项说明，不能只报一个通过率。
+测试通过不等于真实 50 mm 数据验证；当前尚无真实一维 ALE1D 数据，二进制读取
+未实现。

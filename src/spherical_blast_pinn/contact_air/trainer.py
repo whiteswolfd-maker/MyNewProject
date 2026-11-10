@@ -656,7 +656,6 @@ class AlternatingTrainer:
         add("contact_times", case.contact.times)
         add("contact_low", case.contact.low)
         add("contact_up", case.contact.up)
-        add("contact_raw", case.contact.raw)
         add("contact_valid", case.contact.valid)
         add("obs_time", case.observations.time)
         add("obs_radius", case.observations.radius)

@@ -83,6 +83,9 @@ class ContactLabelConfig:
     pure_air_threshold: float = 0.95
     min_pure_air_cells: int = 1
     event_search_window_s: float | None = 10.0e-6
+    #: Absolute tolerance for shared cell boundaries; larger positive gaps are
+    #: spatial breaks, larger negative gaps are overlaps.
+    geometry_tolerance_m: float = 1.0e-9
 
     def __post_init__(self) -> None:
         if not (0.0 < self.pure_product_threshold <= 1.0):
@@ -97,6 +100,8 @@ class ContactLabelConfig:
             raise CaseDataError("min_pure_air_cells must be non-negative")
         if self.event_search_window_s is not None and self.event_search_window_s < 0.0:
             raise CaseDataError("event_search_window_s must be non-negative or null")
+        if self.geometry_tolerance_m < 0.0:
+            raise CaseDataError("geometry_tolerance_m must be non-negative")
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> "ContactLabelConfig":
@@ -107,6 +112,7 @@ class ContactLabelConfig:
             pure_air_threshold=float(payload.get("pure_air_threshold", 0.95)),
             min_pure_air_cells=int(payload.get("min_pure_air_cells", 1)),
             event_search_window_s=None if window is None else float(window),
+            geometry_tolerance_m=float(payload.get("geometry_tolerance_m", 1.0e-9)),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -115,6 +121,7 @@ class ContactLabelConfig:
             "pure_air_threshold": self.pure_air_threshold,
             "min_pure_air_cells": self.min_pure_air_cells,
             "event_search_window_s": self.event_search_window_s,
+            "geometry_tolerance_m": self.geometry_tolerance_m,
             "label_semantics": (
                 "mixing segment connected to the central product region, bounded "
                 "by actual cell boundaries; midpoint is not a label"
@@ -358,6 +365,7 @@ class CaseData:
             "R_s_data_at_t0_m": self.initial.Rs_data_at_t0,
             "R_s_theory_minus_data_m": self.initial.Rs0 - self.initial.Rs_data_at_t0,
             "zeta_s0": self.initial.zeta_s0,
+            "zeta_s0_role": "diagnostic_only; not an initial-condition split",
             "event_frame_shock_states": detection.get("states"),
             "event_frame_rh_diagnostic": detection.get("rh_diagnostic"),
             "forced_equal": False,
@@ -400,7 +408,7 @@ class CaseData:
             case_id=self.contact.case_id,
             times=self.contact.times[contact_mask],
             low=self.contact.low[contact_mask], up=self.contact.up[contact_mask],
-            raw=self.contact.raw[contact_mask], valid=self.contact.valid[contact_mask],
+            valid=self.contact.valid[contact_mask],
             reasons=[reason for reason, keep in zip(self.contact.reasons, contact_mask) if keep]
             if self.contact.reasons else [],
         )
@@ -590,18 +598,18 @@ def _contact_tables(
     n = len(frames)
     low = np.full(n, np.nan)
     up = np.full(n, np.nan)
-    raw = np.full(n, np.nan)
     valid = np.zeros(n, dtype=bool)
     reasons: list[str] = []
     for index, frame in enumerate(frames):
-        lo, hi, rr, ok, reason = contact_interval_from_fractions(
+        lo, hi, ok, reason = contact_interval_from_fractions(
             frame, pure_product_threshold=config.pure_product_threshold,
             pure_air_threshold=config.pure_air_threshold,
+            geometry_tolerance_m=config.geometry_tolerance_m,
         )
-        low[index], up[index], raw[index] = lo, hi, rr
+        low[index], up[index] = lo, hi
         valid[index] = ok
         reasons.append(reason)
-    return low, up, raw, valid, reasons
+    return low, up, valid, reasons
 
 
 def build_air_observations(
@@ -746,13 +754,14 @@ def _separation_report(
         if contact_ok and shock_ok:
             rs = float(shock.position(float(times_model[index])))
             up = float(contact.up[index])
-            air = frame.air_mask(contact_config.pure_air_threshold)
-            usable = (
-                air & (frame.radius > up) & (frame.radius < rs)
-                & frame.valid_pressure & np.isfinite(frame.pressure)
+            from .one_d import pure_air_run_between
+
+            pure_air, n_pure = pure_air_run_between(
+                frame, low=up, high=rs,
+                pure_air_threshold=contact_config.pure_air_threshold,
+                minimum=contact_config.min_pure_air_cells,
+                geometry_tolerance_m=contact_config.geometry_tolerance_m,
             )
-            n_pure = int(np.count_nonzero(usable))
-            pure_air = n_pure >= int(contact_config.min_pure_air_cells)
         if not contact_ok:
             reasons.append("contact interval is not locatable")
         if not shock_ok:
@@ -804,7 +813,7 @@ def build_case(
     raw_times = np.asarray([frame.time_raw_s for frame in frames], dtype=np.float64)
     if raw_times.size < 2 or np.any(np.diff(raw_times) <= 0.0):
         raise CaseDataError("raw frame times must be finite and strictly increasing")
-    low, up, raw, contact_valid, reasons = _contact_tables(frames, contact_config)
+    low, up, contact_valid, reasons = _contact_tables(frames, contact_config)
     shock_radii, shock_valid, detections = detect_shock_trajectory(
         frames, contact_low=low, contact_up=up, contact_valid=contact_valid,
         ambient_pressure=float(precursor.air_pressure),
@@ -819,6 +828,7 @@ def build_case(
             pure_air_threshold=contact_config.pure_air_threshold,
             window_s=contact_config.event_search_window_s,
             min_pure_air_cells=contact_config.min_pure_air_cells,
+            geometry_tolerance_m=contact_config.geometry_tolerance_m,
         )
     except OneDDataError as exc:
         raise CaseDataError(str(exc)) from exc
@@ -826,7 +836,7 @@ def build_case(
     times_model = raw_times + offset
     contact = ContactIntervalTable(
         case_id=source.case_id, times=times_model,
-        low=low, up=up, raw=raw, valid=contact_valid, reasons=reasons,
+        low=low, up=up, valid=contact_valid, reasons=reasons,
     )
     shock = ShockTrajectory.from_arrays(
         case_id=source.case_id, times=times_model,
@@ -855,12 +865,37 @@ def build_case(
             f"case {source.case_id!r}: no training interval after t0; "
             f"t0={precursor.t0!r}, t_end={end!r}"
         )
+    # The right boundary is a finite-Mach RH state.  If no time in the single
+    # t0 segment has D_s > c_inf, no RH sample can ever be drawn; report that
+    # now instead of failing later inside sampling.
+    c_inf_check = math.sqrt(
+        float(precursor.gamma_air)
+        * float(precursor.air_pressure)
+        / float(precursor.air_density)
+    )
+    check_times = np.linspace(float(precursor.t0), end, 513)
+    check_speed = np.asarray(shock.derivative(check_times), dtype=np.float64)
+    supersonic = np.isfinite(check_speed) & (check_speed > c_inf_check)
+    if not bool(np.any(supersonic)):
+        raise CaseDataError(
+            f"case {source.case_id!r}: no time in the t0 segment "
+            f"[{precursor.t0!r}, {end!r}] s has D_s > c_inf={c_inf_check:.6g} m/s; "
+            "the shock cannot be used as a finite-Mach RH boundary, so the smoke "
+            "run cannot be assembled. Plateau/zero-speed positions are recorded "
+            "but are not silently promoted to a usable shock speed."
+        )
     source_payload = {
         "data_entry": source.source,
         "raw_position_type": source.position_type,
         "contact_thresholds": contact_config.as_dict(),
         "shock_detection": shock_config.as_dict(),
         "event_alignment": alignment.as_dict(),
+        "shock_speed_availability": {
+            "c_inf_m_s": float(c_inf_check),
+            "n_supersonic_check_times": int(np.count_nonzero(supersonic)),
+            "n_check_times": int(check_times.size),
+            "basis": "R_s derivative sampled uniformly in the single t0 segment",
+        },
         "radial_coordinate_convention": (
             "representative position as declared by the source "
             "(cell centre or node); no shell averaging"
@@ -933,7 +968,6 @@ def save_case(case: CaseData, path: Path | str) -> Path:
         contact_times=case.contact.times,
         contact_low=case.contact.low,
         contact_up=case.contact.up,
-        contact_raw=case.contact.raw,
         contact_valid=case.contact.valid,
         shock_times=case.shock.times,
         shock_radius=case.shock.radii,
@@ -963,7 +997,7 @@ def load_case(path: Path | str, *, role: str | None = None) -> CaseData:
         contact = ContactIntervalTable(
             case_id=case_meta["case_id"], times=np.asarray(archive["contact_times"]),
             low=np.asarray(archive["contact_low"]), up=np.asarray(archive["contact_up"]),
-            raw=np.asarray(archive["contact_raw"]), valid=np.asarray(archive["contact_valid"]),
+            valid=np.asarray(archive["contact_valid"]),
         )
         shock = ShockTrajectory.from_arrays(
             case_id=case_meta["case_id"], times=np.asarray(archive["shock_times"]),
