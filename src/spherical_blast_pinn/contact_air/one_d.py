@@ -60,6 +60,12 @@ class OneDDataError(RuntimeError):
 #: break the run; a negative gap smaller than ``-tolerance`` is an overlap.
 GEOMETRY_TOLERANCE_M = 1.0e-9
 
+#: The current two-medium model supports product + air only.  When an explicit
+#: ``alpha_air`` is supplied, ``alpha_product + alpha_air`` must equal 1 within
+#: this tolerance.  Voids and third materials are not supported, and the reader
+#: never renormalizes or fills fractions.
+VOLUME_FRACTION_TOLERANCE = 1.0e-4
+
 
 def cell_gap_m(frame: "RadialFrame", left: int, right: int) -> float:
     """Signed gap from cell ``left`` right edge to cell ``right`` left edge."""
@@ -142,10 +148,123 @@ class RadialFrame:
     units: dict[str, str]
     source: dict[str, Any] = field(default_factory=dict)
 
-    def air_mask(self, pure_air_threshold: float) -> np.ndarray:
-        """Air occupancy from volume fractions only (no field finiteness)."""
+    def _first_index(self, mask: np.ndarray) -> int:
+        indices = np.flatnonzero(np.asarray(mask, dtype=bool))
+        return int(indices[0]) if indices.size else -1
+
+    def validate_material(self) -> None:
+        """Validate the supported two-medium volume-fraction convention.
+
+        The model has product and air only.  If ``alpha_air`` is explicit, the
+        two fractions must sum to one within ``VOLUME_FRACTION_TOLERANCE``.
+        Voids, third materials and inconsistent fractions are rejected, never
+        renormalized or filled.  If ``alpha_air`` is absent, the remaining
+        fraction is implicitly air (recorded as such by the reader).
+        """
+        alpha_p = np.asarray(self.alpha_product, dtype=np.float64)
+        if alpha_p.ndim != 1:
+            raise OneDDataError(
+                f"case {self.case_id!r} frame {self.frame_index}: alpha_product "
+                "must be a 1-D per-cell array"
+            )
+        if not np.all(np.isfinite(alpha_p)):
+            index = self._first_index(~np.isfinite(alpha_p))
+            raise OneDDataError(
+                f"case {self.case_id!r} frame {self.frame_index}: alpha_product"
+                f"[{index}] is not finite"
+            )
+        bad_p = (alpha_p < -1.0e-9) | (alpha_p > 1.0 + 1.0e-9)
+        if np.any(bad_p):
+            index = self._first_index(bad_p)
+            raise OneDDataError(
+                f"case {self.case_id!r} frame {self.frame_index}: alpha_product"
+                f"[{index}]={alpha_p[index]!r} is outside [0,1]"
+            )
+        if self.alpha_air is None:
+            return
+        alpha_a = np.asarray(self.alpha_air, dtype=np.float64)
+        if alpha_a.ndim != 1 or alpha_a.size != alpha_p.size:
+            raise OneDDataError(
+                f"case {self.case_id!r} frame {self.frame_index}: alpha_air must be "
+                f"a 1-D array of length {alpha_p.size}, got shape {alpha_a.shape}"
+            )
+        if not np.all(np.isfinite(alpha_a)):
+            index = self._first_index(~np.isfinite(alpha_a))
+            raise OneDDataError(
+                f"case {self.case_id!r} frame {self.frame_index}: alpha_air"
+                f"[{index}] is not finite"
+            )
+        bad_a = (alpha_a < -1.0e-9) | (alpha_a > 1.0 + 1.0e-9)
+        if np.any(bad_a):
+            index = self._first_index(bad_a)
+            raise OneDDataError(
+                f"case {self.case_id!r} frame {self.frame_index}: alpha_air"
+                f"[{index}]={alpha_a[index]!r} is outside [0,1]"
+            )
+        total = alpha_p + alpha_a
+        bad_sum = np.abs(total - 1.0) > VOLUME_FRACTION_TOLERANCE
+        if np.any(bad_sum):
+            index = self._first_index(bad_sum)
+            raise OneDDataError(
+                f"case {self.case_id!r} frame {self.frame_index}: cell {index} has "
+                f"alpha_product={alpha_p[index]!r} and alpha_air={alpha_a[index]!r}; "
+                f"their sum {total[index]!r} is not 1 within "
+                f"{VOLUME_FRACTION_TOLERANCE:g}. The current model supports product + "
+                "air only (no void/third material); fractions are not renormalized "
+                "or filled"
+            )
+
+    def material_masks(
+        self, pure_product_threshold: float, pure_air_threshold: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return ``(pure_product, pure_air, mixed)`` from one convention.
+
+        When ``alpha_air`` is explicit it is authoritative for air: a small
+        ``alpha_product`` alone does not prove a pure-air cell.  All consumers
+        (contact interval, shock detection, event search, observations) use this
+        method so the material semantics cannot diverge.
+        """
+        if not (0.0 < float(pure_product_threshold) <= 1.0):
+            raise OneDDataError("pure_product_threshold must lie in (0, 1]")
+        if not (0.0 < float(pure_air_threshold) <= 1.0):
+            raise OneDDataError("pure_air_threshold must lie in (0, 1]")
+        if (1.0 - float(pure_air_threshold)) >= float(pure_product_threshold):
+            raise OneDDataError(
+                "pure_air_threshold and pure_product_threshold leave no mixing band"
+            )
+        self.validate_material()
+        alpha_p = np.asarray(self.alpha_product, dtype=np.float64)
+        product = alpha_p >= float(pure_product_threshold)
         if self.alpha_air is not None:
-            return np.asarray(self.alpha_air, dtype=np.float64) >= float(pure_air_threshold)
+            air = np.asarray(self.alpha_air, dtype=np.float64) >= float(
+                pure_air_threshold
+            )
+        else:
+            air = alpha_p <= (1.0 - float(pure_air_threshold))
+        both = product & air
+        if np.any(both):
+            index = self._first_index(both)
+            raise OneDDataError(
+                f"case {self.case_id!r} frame {self.frame_index}: cell {index} is "
+                "simultaneously classified as pure product and pure air; the "
+                "volume-fraction data are inconsistent"
+            )
+        mixed = (~product) & (~air)
+        return product, air, mixed
+
+    def air_mask(self, pure_air_threshold: float) -> np.ndarray:
+        """Air occupancy from the unified two-medium material convention.
+
+        When ``alpha_air`` is explicit it is authoritative; a small
+        ``alpha_product`` alone never proves air.
+        """
+        if not (0.0 < float(pure_air_threshold) <= 1.0):
+            raise OneDDataError("pure_air_threshold must lie in (0, 1]")
+        self.validate_material()
+        if self.alpha_air is not None:
+            return np.asarray(self.alpha_air, dtype=np.float64) >= float(
+                pure_air_threshold
+            )
         return np.asarray(self.alpha_product, dtype=np.float64) <= (
             1.0 - float(pure_air_threshold)
         )
@@ -156,58 +275,121 @@ class RadialFrame:
                 f"case {self.case_id!r} frame {self.frame_index}: fewer than two "
                 "radial cells cannot define a profile"
             )
-        if not np.all(np.isfinite(self.radius)):
-            raise OneDDataError(
-                f"case {self.case_id!r} frame {self.frame_index}: non-finite radius"
-            )
-        if np.any(np.diff(self.radius) <= 0.0):
-            raise OneDDataError(
-                f"case {self.case_id!r} frame {self.frame_index}: radial positions "
-                "must be strictly increasing"
-            )
         n = int(self.radius.size)
-        for name, value in (
-            ("r_left", self.r_left), ("r_right", self.r_right),
+        checked = (
+            ("cell_id", self.cell_id), ("r_left", self.r_left),
+            ("r_right", self.r_right), ("radius", self.radius),
             ("alpha_product", self.alpha_product), ("density", self.density),
             ("velocity", self.velocity), ("pressure", self.pressure),
             ("valid_density", self.valid_density),
             ("valid_velocity", self.valid_velocity),
             ("valid_pressure", self.valid_pressure),
-        ):
-            if np.asarray(value).reshape(-1).size != n:
+        )
+        for name, value in checked:
+            array = np.asarray(value)
+            if array.ndim != 1:
+                raise OneDDataError(
+                    f"case {self.case_id!r} frame {self.frame_index}: {name} must "
+                    f"be a 1-D per-cell array, got shape {array.shape}"
+                )
+            if array.size != n:
                 raise OneDDataError(
                     f"case {self.case_id!r} frame {self.frame_index}: {name} has "
-                    f"{np.asarray(value).size} entries, expected {n}"
+                    f"{array.size} entries, expected {n}"
                 )
-        if self.alpha_air is not None and self.alpha_air.size != n:
+        if self.alpha_air is not None:
+            array = np.asarray(self.alpha_air)
+            if array.ndim != 1 or array.size != n:
+                raise OneDDataError(
+                    f"case {self.case_id!r} frame {self.frame_index}: alpha_air must "
+                    f"be a 1-D array of length {n}, got shape {array.shape}"
+                )
+        if self.material is not None:
+            array = np.asarray(self.material)
+            if array.ndim != 1 or array.size != n:
+                raise OneDDataError(
+                    f"case {self.case_id!r} frame {self.frame_index}: material must "
+                    f"be a 1-D array of length {n}, got shape {array.shape}"
+                )
+            if not np.issubdtype(array.dtype, np.integer):
+                raise OneDDataError(
+                    f"case {self.case_id!r} frame {self.frame_index}: material must "
+                    f"be integer, got dtype {array.dtype}"
+                )
+
+        cell_id = np.asarray(self.cell_id)
+        if not np.issubdtype(cell_id.dtype, np.integer):
             raise OneDDataError(
-                f"case {self.case_id!r} frame {self.frame_index}: alpha_air has "
-                f"{self.alpha_air.size} entries, expected {n}"
+                f"case {self.case_id!r} frame {self.frame_index}: cell_id must be "
+                f"integer, got dtype {cell_id.dtype}"
             )
-        if self.material is not None and self.material.size != n:
+        if np.unique(cell_id).size != cell_id.size:
+            values, counts = np.unique(cell_id, return_counts=True)
+            duplicate = values[counts > 1][0]
+            first = int(np.flatnonzero(cell_id == duplicate)[0])
             raise OneDDataError(
-                f"case {self.case_id!r} frame {self.frame_index}: material has "
-                f"{self.material.size} entries, expected {n}"
+                f"case {self.case_id!r} frame {self.frame_index}: duplicate cell_id "
+                f"{duplicate!r} at array index {first}"
+            )
+
+        for name, array in (
+            ("r_left", np.asarray(self.r_left, dtype=np.float64)),
+            ("r_right", np.asarray(self.r_right, dtype=np.float64)),
+            ("radius", np.asarray(self.radius, dtype=np.float64)),
+        ):
+            if not np.all(np.isfinite(array)):
+                index = self._first_index(~np.isfinite(array))
+                raise OneDDataError(
+                    f"case {self.case_id!r} frame {self.frame_index}: {name}"
+                    f"[{index}]={array[index]!r} is not finite"
+                )
+        if np.any(self.r_left < 0.0):
+            index = self._first_index(np.asarray(self.r_left) < 0.0)
+            raise OneDDataError(
+                f"case {self.case_id!r} frame {self.frame_index}: r_left[{index}]"
+                f"={self.r_left[index]!r} is negative; radial coordinates must be "
+                "non-negative"
+            )
+        if np.any(self.r_right <= 0.0):
+            index = self._first_index(np.asarray(self.r_right) <= 0.0)
+            raise OneDDataError(
+                f"case {self.case_id!r} frame {self.frame_index}: r_right[{index}]"
+                f"={self.r_right[index]!r} is not positive"
+            )
+        if np.any(np.diff(self.radius) <= 0.0):
+            index = int(np.flatnonzero(np.diff(self.radius) <= 0.0)[0]) + 1
+            raise OneDDataError(
+                f"case {self.case_id!r} frame {self.frame_index}: radial positions "
+                f"must be strictly increasing; radius[{index}]="
+                f"{self.radius[index]!r} does not exceed the previous cell"
             )
         if np.any(self.r_right <= self.r_left):
+            index = self._first_index(np.asarray(self.r_right) <= np.asarray(self.r_left))
             raise OneDDataError(
-                f"case {self.case_id!r} frame {self.frame_index}: cell r_right must "
-                "exceed r_left"
+                f"case {self.case_id!r} frame {self.frame_index}: cell {index} has "
+                f"r_right={self.r_right[index]!r} <= r_left={self.r_left[index]!r}; "
+                "cell width must be positive"
             )
-        if np.any(self.radius < self.r_left) or np.any(self.radius > self.r_right):
+        inside = (self.radius < self.r_left) | (self.radius > self.r_right)
+        if np.any(inside):
+            index = self._first_index(inside)
             raise OneDDataError(
                 f"case {self.case_id!r} frame {self.frame_index}: representative "
-                "radius lies outside its cell bounds"
+                f"radius[{index}]={self.radius[index]!r} lies outside "
+                f"[{self.r_left[index]!r}, {self.r_right[index]!r}]"
             )
         width = np.maximum(self.r_right - self.r_left, 1.0e-30)
         tolerance = GEOMETRY_TOLERANCE_M + 1.0e-9 * float(np.max(width))
         overlap = self.r_left[1:] < (self.r_right[:-1] - tolerance)
         if np.any(overlap):
+            index = int(np.flatnonzero(overlap)[0]) + 1
             raise OneDDataError(
-                f"case {self.case_id!r} frame {self.frame_index}: radial cells overlap; "
-                "an overlapping mesh is rejected (a positive gap is allowed and "
-                "handled as a spatial break)"
+                f"case {self.case_id!r} frame {self.frame_index}: cell {index} "
+                f"r_left={self.r_left[index]!r} overlaps the previous r_right="
+                f"{self.r_right[index - 1]!r}; an overlapping mesh is rejected "
+                "(a positive gap is allowed and handled as a spatial break)"
             )
+        self.validate_material()
 
 
 @dataclass
@@ -220,24 +402,116 @@ class RadialCase:
     source: dict[str, Any] = field(default_factory=dict)
 
 
-def _frame_arrays(archive, metadata: Mapping[str, Any]) -> list[dict[str, np.ndarray]]:
-    offsets = np.asarray(archive["frame_offsets"], dtype=np.int64)
-    n_frames = int(offsets.size - 1)
-    if n_frames < 1:
-        raise OneDDataError("frame_offsets must contain at least two entries")
-    if int(offsets[0]) != 0 or int(offsets[-1]) != len(np.asarray(archive["radius"])):
-        raise OneDDataError("frame_offsets do not span the concatenated arrays")
-    if tuple(np.diff(offsets).tolist()) != tuple(
-        int(v) for v in np.asarray(metadata.get("cells_per_frame", []))
+def _frame_arrays(
+    archive, metadata: Mapping[str, Any], *, path: Path,
+) -> list[dict[str, np.ndarray]]:
+    """Validate offsets and per-cell arrays before slicing.
+
+    No ``astype(int)`` or silent truncation is used: the offsets must already
+    be an integer dtype, and every per-cell array must have exactly the
+    concatenated length declared by the offsets.
+    """
+    if "frame_offsets" not in archive.files:
+        raise OneDDataError(f"{path}: standard 1-D source has no frame_offsets")
+    raw_offsets = np.asarray(archive["frame_offsets"])
+    if raw_offsets.ndim != 1:
+        raise OneDDataError(
+            f"{path}: frame_offsets must be a 1-D array, got shape "
+            f"{raw_offsets.shape}"
+        )
+    if not np.issubdtype(raw_offsets.dtype, np.integer):
+        raise OneDDataError(
+            f"{path}: frame_offsets must have an integer dtype, got "
+            f"{raw_offsets.dtype}; values are not coerced"
+        )
+    offsets = np.asarray(raw_offsets, dtype=np.int64)
+    if offsets.size < 2:
+        raise OneDDataError(
+            f"{path}: frame_offsets must contain at least two entries "
+            f"(start and one frame end), got {offsets.size}"
+        )
+    if int(offsets[0]) != 0:
+        raise OneDDataError(
+            f"{path}: frame_offsets[0]={int(offsets[0])} must be 0"
+        )
+    differences = np.diff(offsets)
+    bad_order = differences <= 0
+    if np.any(bad_order):
+        index = int(np.flatnonzero(bad_order)[0])
+        raise OneDDataError(
+            f"{path}: frame_offsets must be strictly increasing; "
+            f"offset[{index}]={int(offsets[index])}, "
+            f"offset[{index + 1}]={int(offsets[index + 1])}"
+        )
+
+    per_cell_names = [
+        name for name in archive.files
+        if name not in ("metadata", "frame_offsets")
+    ]
+    if "radius" not in per_cell_names:
+        raise OneDDataError(f"{path}: per-cell array 'radius' is missing")
+    total_cells = None
+    for name in per_cell_names:
+        array = np.asarray(archive[name])
+        if array.ndim != 1:
+            raise OneDDataError(
+                f"{path}: per-cell array {name!r} must be 1-D, got shape "
+                f"{array.shape}"
+            )
+        if total_cells is None:
+            total_cells = int(array.size)
+        elif int(array.size) != total_cells:
+            raise OneDDataError(
+                f"{path}: per-cell array {name!r} has {array.size} entries, "
+                f"expected {total_cells} (the same concatenated length as radius)"
+            )
+    assert total_cells is not None
+    if int(offsets[-1]) != total_cells:
+        raise OneDDataError(
+            f"{path}: frame_offsets[-1]={int(offsets[-1])} does not equal the "
+            f"concatenated per-cell length {total_cells}"
+        )
+
+    cells_per_frame = metadata.get("cells_per_frame")
+    if isinstance(cells_per_frame, (str, bytes)) or not isinstance(
+        cells_per_frame, Sequence
     ):
         raise OneDDataError(
-            "metadata.cells_per_frame does not match frame_offsets"
+            f"{path}: metadata.cells_per_frame must be a sequence of integers"
         )
+    n_frames = int(offsets.size - 1)
+    if len(cells_per_frame) != n_frames:
+        raise OneDDataError(
+            f"{path}: metadata.cells_per_frame has {len(cells_per_frame)} "
+            f"entries but frame_offsets defines {n_frames} frames"
+        )
+    for index, value in enumerate(cells_per_frame):
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise OneDDataError(
+                f"{path}: metadata.cells_per_frame[{index}]={value!r} is not an "
+                "integer; values are not coerced"
+            )
+        expected = int(differences[index])
+        if int(value) != expected:
+            raise OneDDataError(
+                f"{path}: metadata.cells_per_frame[{index}]={int(value)} does not "
+                f"match frame_offsets[{index + 1}]-frame_offsets[{index}]="
+                f"{expected}"
+            )
+
     frames = []
     for index in range(n_frames):
         start, stop = int(offsets[index]), int(offsets[index + 1])
-        frames.append({name: np.asarray(archive[name])[start:stop] for name in archive.files
-                       if name not in ("metadata", "frame_offsets")})
+        frame_arrays = {}
+        for name in per_cell_names:
+            array = np.asarray(archive[name])
+            frame_arrays[name] = array[start:stop].copy()
+            if frame_arrays[name].size != stop - start:
+                raise OneDDataError(
+                    f"{path}: frame {index} array {name!r} has "
+                    f"{frame_arrays[name].size} entries, expected {stop - start}"
+                )
+        frames.append(frame_arrays)
     return frames
 
 
@@ -343,15 +617,48 @@ def read_standard_1d(path: Path | str) -> RadialCase:
         charge_radius = float(metadata.get("charge_radius_m", float("nan")))
         if not (math.isfinite(charge_radius) and charge_radius > 0.0):
             raise OneDDataError(f"{path}: charge_radius_m must be finite and positive")
-        frames_meta = _frame_arrays(archive, metadata)
-        times = np.asarray(metadata.get("frame_times", []), dtype=np.float64)
-        if times.size != len(frames_meta):
+        frames_meta = _frame_arrays(archive, metadata, path=path)
+        raw_times = metadata.get("frame_times")
+        if isinstance(raw_times, (str, bytes)) or not isinstance(raw_times, Sequence):
             raise OneDDataError(
-                f"{path}: frame_times has {times.size} entries but there are "
+                f"{path}: metadata.frame_times must be a sequence"
+            )
+        if len(raw_times) != len(frames_meta):
+            raise OneDDataError(
+                f"{path}: frame_times has {len(raw_times)} entries but there are "
                 f"{len(frames_meta)} frames"
             )
+        times = np.empty(len(raw_times), dtype=np.float64)
+        for index, value in enumerate(raw_times):
+            try:
+                converted = float(value)
+            except (TypeError, ValueError) as exc:
+                raise OneDDataError(
+                    f"{path}: frame_times[{index}]={value!r} is not a number"
+                ) from exc
+            if not math.isfinite(converted):
+                raise OneDDataError(
+                    f"{path}: frame_times[{index}]={value!r} is not finite"
+                )
+            times[index] = converted
+        bad_time = np.diff(times) <= 0.0
+        if np.any(bad_time):
+            index = int(np.flatnonzero(bad_time)[0])
+            raise OneDDataError(
+                f"{path}: frame_times must be strictly increasing; "
+                f"frame_times[{index}]={times[index]!r}, "
+                f"frame_times[{index + 1}]={times[index + 1]!r}"
+            )
     radial_frames: list[RadialFrame] = []
-    any_alpha_air = True
+    alpha_air_presence = ["alpha_air" in arrays for arrays in frames_meta]
+    if any(alpha_air_presence) and not all(alpha_air_presence):
+        raise OneDDataError(
+            f"{path}: alpha_air is present in some frames but not others; the "
+            "material convention must be identical for every frame"
+        )
+    all_alpha_air = bool(all(alpha_air_presence))
+    generated_cell_id_frames: list[int] = []
+    cell_id_sources: list[str] = []
     for index, (arrays, time) in enumerate(zip(frames_meta, times)):
         for required in ("radius", "r_left", "r_right", "alpha_product",
                          "density", "velocity", "pressure"):
@@ -359,28 +666,59 @@ def read_standard_1d(path: Path | str) -> RadialCase:
                 raise OneDDataError(
                     f"{path}: frame {index} has no {required!r} array"
                 )
-        radius = np.asarray(arrays["radius"], dtype=np.float64) * length_factor
-        r_left = np.asarray(arrays["r_left"], dtype=np.float64) * length_factor
-        r_right = np.asarray(arrays["r_right"], dtype=np.float64) * length_factor
-        alpha_product = np.asarray(arrays["alpha_product"], dtype=np.float64)
-        alpha_air = (
-            np.asarray(arrays["alpha_air"], dtype=np.float64)
-            if "alpha_air" in arrays else None
-        )
-        if alpha_air is None:
-            any_alpha_air = False
-        material = (
-            np.asarray(arrays["material"]).astype(np.int64)
-            if "material" in arrays else None
-        )
-        density = np.asarray(arrays["density"], dtype=np.float64) * density_factor
-        velocity = np.asarray(arrays["velocity"], dtype=np.float64) * velocity_factor
-        pressure = np.asarray(arrays["pressure"], dtype=np.float64) * pressure_factor
-        cell_id = (
-            np.asarray(arrays["cell_id"]).astype(np.int64)
-            if "cell_id" in arrays
-            else np.arange(radius.size, dtype=np.int64)
-        )
+
+        def float_array(name: str, factor: float = 1.0) -> np.ndarray:
+            try:
+                values = np.asarray(arrays[name], dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise OneDDataError(
+                    f"{path}: frame {index} field {name!r} is not numeric"
+                ) from exc
+            if values.ndim != 1:
+                raise OneDDataError(
+                    f"{path}: frame {index} field {name!r} must be 1-D, got "
+                    f"shape {values.shape}"
+                )
+            return values * float(factor)
+
+        radius = float_array("radius", length_factor)
+        r_left = float_array("r_left", length_factor)
+        r_right = float_array("r_right", length_factor)
+        alpha_product = float_array("alpha_product")
+        alpha_air = float_array("alpha_air") if all_alpha_air else None
+        density = float_array("density", density_factor)
+        velocity = float_array("velocity", velocity_factor)
+        pressure = float_array("pressure", pressure_factor)
+        if "material" in arrays:
+            raw_material = np.asarray(arrays["material"])
+            if raw_material.ndim != 1 or not np.issubdtype(
+                raw_material.dtype, np.integer
+            ):
+                raise OneDDataError(
+                    f"{path}: frame {index} field 'material' must be a 1-D integer "
+                    f"array, got shape {raw_material.shape} / dtype "
+                    f"{raw_material.dtype}"
+                )
+            material = raw_material.astype(np.int64, copy=False)
+        else:
+            material = None
+        if "cell_id" in arrays:
+            raw_cell_id = np.asarray(arrays["cell_id"])
+            if raw_cell_id.ndim != 1 or not np.issubdtype(
+                raw_cell_id.dtype, np.integer
+            ):
+                raise OneDDataError(
+                    f"{path}: frame {index} field 'cell_id' must be a 1-D integer "
+                    f"array, got shape {raw_cell_id.shape} / dtype "
+                    f"{raw_cell_id.dtype}"
+                )
+            cell_id = raw_cell_id.astype(np.int64, copy=False)
+            cell_id_source = "provided"
+        else:
+            cell_id = np.arange(radius.size, dtype=np.int64)
+            cell_id_source = "generated"
+            generated_cell_id_frames.append(index)
+        cell_id_sources.append(cell_id_source)
 
         def mask(name: str, values: np.ndarray, label: str) -> np.ndarray:
             if name in arrays:
@@ -429,6 +767,11 @@ def read_standard_1d(path: Path | str) -> RadialCase:
                 "reader_version": READER_VERSION,
                 "path": str(path),
                 "raw_source": metadata.get("source"),
+                "cell_id_source": cell_id_source,
+                "alpha_air_source": (
+                    "provided" if all_alpha_air
+                    else "implicit_1_minus_alpha_product"
+                ),
             },
         )
         frame.require_monotone()
@@ -438,9 +781,16 @@ def read_standard_1d(path: Path | str) -> RadialCase:
             f"{path}: at least two frames are required to build a shock trajectory"
         )
     raw_times = np.asarray([frame.time_raw_s for frame in radial_frames])
-    if np.any(np.diff(raw_times) <= 0.0):
+    if not np.all(np.isfinite(raw_times)):
+        index = int(np.flatnonzero(~np.isfinite(raw_times))[0])
         raise OneDDataError(
-            f"{path}: raw frame times must be strictly increasing"
+            f"{path}: frame {index} converted time is not finite"
+        )
+    if np.any(np.diff(raw_times) <= 0.0):
+        index = int(np.flatnonzero(np.diff(raw_times) <= 0.0)[0])
+        raise OneDDataError(
+            f"{path}: converted frame times must be strictly increasing; "
+            f"frames {index} and {index + 1} are not"
         )
     raw_source = metadata.get("source") or {}
     return RadialCase(
@@ -450,7 +800,18 @@ def read_standard_1d(path: Path | str) -> RadialCase:
             "format": STANDARD_FORMAT,
             "version": STANDARD_VERSION,
             "reader_version": READER_VERSION,
-            "alpha_air_available": any_alpha_air,
+            "alpha_air_available": all_alpha_air,
+            "alpha_air_source": (
+                "provided" if all_alpha_air
+                else "implicit_1_minus_alpha_product"
+            ),
+            "cell_id_sources": cell_id_sources,
+            "generated_cell_id_frames": generated_cell_id_frames,
+            "volume_fraction_tolerance": VOLUME_FRACTION_TOLERANCE,
+            "two_medium_scope": (
+                "product + air only; with explicit alpha_air their sum must be 1 "
+                "within volume_fraction_tolerance; void/third material unsupported"
+            ),
             "coordinate": coordinate,
             "velocity_component": velocity_component,
             "node_to_cell_convention": (
@@ -535,49 +896,28 @@ def contact_interval_from_fractions(
     A direct pure-product/pure-air transition uses the shared cell boundary.
     No midpoint is returned or stored: the training object never sees one.
     """
-    alpha = np.asarray(frame.alpha_product, dtype=np.float64)
-    if not (0.0 < float(pure_air_threshold) <= 1.0) or not (
-        0.0 < float(pure_product_threshold) <= 1.0
-    ):
-        raise OneDDataError("volume-fraction thresholds must lie in (0, 1]")
-    product_threshold = float(pure_product_threshold)
-    air_product_cut = 1.0 - float(pure_air_threshold)
-    if air_product_cut >= product_threshold:
-        raise OneDDataError(
-            "pure_air_threshold and pure_product_threshold leave no mixing band"
-        )
-    if not np.all(np.isfinite(alpha)):
-        return float("nan"), float("nan"), False, (
-            "product volume fraction has non-finite entries; the mixing band is "
-            "not identifiable"
-        )
-    if np.any(alpha < -1.0e-9) or np.any(alpha > 1.0 + 1.0e-9):
-        return float("nan"), float("nan"), False, (
-            "product volume fraction lies outside [0,1]; the material convention "
-            "is invalid"
-        )
-    pure_product = alpha >= product_threshold
-    pure_air = alpha <= air_product_cut
-    if not bool(pure_product[0]):
+    n = int(frame.radius.size)
+    product, pure_air, mixed = frame.material_masks(
+        pure_product_threshold, pure_air_threshold
+    )
+    if not bool(product[0]):
         return float("nan"), float("nan"), False, (
             "the innermost cell is not pure product; the central product region "
             "cannot be established"
         )
     index = 0
-    while index < alpha.size and bool(pure_product[index]):
+    while index < n and bool(product[index]):
         index += 1
     last_product = index - 1
     mixed_start = index
-    while index < alpha.size and not bool(pure_product[index]) and not bool(
-        pure_air[index]
-    ):
+    while index < n and bool(mixed[index]):
         index += 1
     mixed_stop = index  # exclusive
     # Every step across the central product / mixing / first-air transition must
     # be a real shared cell boundary, not merely a consecutive array index.
     for left in range(0, mixed_stop):
         right = left + 1
-        if right >= alpha.size:
+        if right >= n:
             break
         if not cells_geometrically_adjacent(
             frame, left, right, tolerance_m=geometry_tolerance_m
@@ -587,7 +927,7 @@ def contact_interval_from_fractions(
                 "contact-mixing / pure-air path"
             )
     if mixed_stop > mixed_start:
-        if mixed_stop >= alpha.size or not bool(pure_air[mixed_stop]):
+        if mixed_stop >= n or not bool(pure_air[mixed_stop]):
             return float("nan"), float("nan"), False, (
                 "the contact mixing segment is not bracketed by a pure-air cell "
                 "on its outer side"
@@ -603,7 +943,7 @@ def contact_interval_from_fractions(
             "bounded by the actual cell boundaries"
         )
     # No mixing cell: a direct pure-product/pure-air interface.
-    if mixed_start < alpha.size and bool(pure_air[mixed_start]):
+    if mixed_start < n and bool(pure_air[mixed_start]):
         boundary = float(frame.r_left[mixed_start])
         if boundary <= 0.0:
             return float("nan"), float("nan"), False, (

@@ -47,12 +47,16 @@ AirNet:     (zeta, t, R0) -> (rho, u, p),  e = p / ((gamma_a-1) rho)
 
 ```text
 case_id, charge_radius_m, 原始帧号, 原始时间 t_data
-cell_id, r_left, r_right, 代表位置 radius
+cell_id（显式提供或由读取器生成）, r_left, r_right, 代表位置 radius
 alpha_product, alpha_air（可选）, material（可选）
 rho [kg/m^3], u [m/s 径向分量], p [Pa 绝对压力]
 valid_density, valid_velocity, valid_pressure（逐字段）
 position_type = cell / cell_center / node
 ```
+
+`frame_offsets` 必须是一维整数数组，首值为 0、严格递增、末值等于逐单元数组
+总长度；`cells_per_frame` 必须与它逐帧一致。所有逐单元数组（含 `cell_id`）
+必须等长，不允许截断切片后静默接受。
 
 metadata 必须显式给出：
 
@@ -68,12 +72,21 @@ frame_times, cells_per_frame
 读取后统一换算到 SI。长度支持 m/mm/cm，时间 s/ms/us，密度 kg/m³、g/cm³、
 t/mm³，速度 m/s、mm/us、km/s、cm/us，压力 Pa/kPa/MPa/GPa/bar/kbar。
 
-校验：
+校验（全部在读取阶段给出字段、帧或索引）：
 
-- 单元边界有限、`r_right > r_left`、代表位置在单元内；
-- 径向位置严格递增；
-- 真实空间缺口允许并作为分段；单元重叠拒绝；
-- 体积分数有限且在 `[0,1]`；
+- `frame_times` 必须全部有限且严格递增；
+- `r_left/r_right/radius` 必须有限；径向坐标非负、单元宽度为正、代表位置在
+  单元内、单元不重叠；真实正缺口允许并作为分段；
+- `cell_id` 必须为整数且每帧唯一；缺省生成的 ID 在帧和 case 的
+  `source["cell_id_source"]` / `source["generated_cell_id_frames"]` 中明确记录，
+  不伪称原始 ID；
+- 体积分数有限且在 `[0,1]`。当前两介质模型只支持 product + air：显式给出
+  `alpha_air` 时，`alpha_product + alpha_air` 必须在 `1 ± 1e-4` 内；空腔/第三
+  介质不支持，读取器不会归一化、填充或修正。未提供 `alpha_air` 时，剩余分数
+  按 `1 - alpha_product` 解释为空气，并在 source 中记录；
+- 显式 `alpha_air` 是空气判定的依据；仅凭 `alpha_product` 接近零不会把单元
+  定为纯空气。接触区间、空气掩码、激波检测、事件检测和观测筛选共用
+  `RadialFrame.material_masks` / `air_mask` 的同一套语义；
 - 某字段 `valid=True` 但数值为 NaN 时拒绝；缺失字段不填零、不填环境常数；
 - 节点源必须已按支持约定转换为单元代表值：
   `node_to_cell_convention = "preconverted_cell_representatives"`；任意字符串

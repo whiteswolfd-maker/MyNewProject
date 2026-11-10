@@ -47,10 +47,22 @@
 - metadata 必须显式提供 `units`、`coordinate`、`velocity_component`、
   `absolute_pressure=true`、`position_type`、`frame_times`、`cells_per_frame`。
   `coordinate`/`velocity_component` **没有静默默认**；缺键拒绝。
+- `frame_times` 必须全部有限且严格递增；`frame_offsets` 必须是一维整数数组，
+  首值 0、严格递增、末值等于总单元数，并与 `cells_per_frame` 一致。所有逐单元
+  数组（含 `cell_id`）必须等长；不允许截断切片后静默接受。
+- `cell_id` 必须为整数且每帧唯一。缺省生成 ID 时在 frame/case 的
+  `source["cell_id_source"]`、`source["generated_cell_id_frames"]` 中记录为
+  generated，不能伪称原始 ID。
 - 读取后统一 SI；`u` 是径向速度分量，不是速度模长；`p` 是绝对压力。
 - 逐字段掩码：`valid=True` 但有 NaN 时拒绝；缺失字段不填零/环境常数/前帧值。
-- 单元：`r_right>r_left`，代表位置在单元内，径向位置严格递增。真实空间缺口
-  允许并作为分段；单元重叠拒绝。
+- 两介质材料语义：product + air only。显式 `alpha_air` 时
+  `alpha_product + alpha_air = 1 ± 1e-4`；空腔/第三介质不支持，禁止归一化、
+  填充或修正。未提供 `alpha_air` 时，剩余分数按 `1-alpha_product` 解释为空气并
+  记录来源。显式 `alpha_air` 是空气判定依据，不能仅凭 `alpha_product≈0` 认定
+  纯空气。接触区间、空气掩码、激波检测、事件检测、观测筛选必须共用
+  `RadialFrame.material_masks` / `air_mask`。
+- 单元：`r_left/r_right/radius` 有限、径向坐标非负、`r_right>r_left`、代表位置
+  在单元内、径向位置严格递增、单元不重叠。真实正缺口允许并作为分段。
 - 节点源必须已经转换为单元代表值：
   `node_to_cell_convention="preconverted_cell_representatives"`。不支持任意
   约定字符串，也不做猜测式节点→单元转换。

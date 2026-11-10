@@ -57,9 +57,10 @@ def test_an_isolated_outer_product_fragment_is_not_the_contact():
     assert up < frame.r_left[6]
 
 
-def test_nonfinite_volume_fraction_is_not_a_label():
+def test_nonfinite_volume_fraction_is_rejected_not_classified():
     frame = _frame(alpha=[1.0, 1.0, float("nan"), 0.0])
-    assert not contact_interval_from_fractions(frame)[2]
+    with pytest.raises(OneDDataError, match="alpha_product\[2\] is not finite"):
+        contact_interval_from_fractions(frame)
 
 
 def test_standard_source_converts_declared_units_to_si(tmp_path):
