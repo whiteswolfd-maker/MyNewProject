@@ -1,9 +1,0 @@
-# 完整配置：提示词 §13 的 20000 次更新基线预算。训练需要显式发起。
-#
-# 算例清单来自 `base.yaml` 的 `startup.cases`。当前仓库没有可用的
-# `SupervisionDataset`（真实 d3plot 全量提取尚未完成），所以这条配置跑的是
-# 物理损失链路，不包含数据监督项；挂接数据前不要把结果当作完整训练。
-inherits: ../base.yaml
-
-training:
-  output_dir: outputs/full
