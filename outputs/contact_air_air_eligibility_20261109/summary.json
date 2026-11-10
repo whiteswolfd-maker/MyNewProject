@@ -1,0 +1,508 @@
+{
+  "project_root": "E:\\2-codex-coupled-handoff-pinn\\2-codex-coupled-handoff-pinn\\2-codex-coupled-handoff-pinn1",
+  "python": {
+    "executable": "E:/Anaconda3/envs/pytorch/python.exe",
+    "version": "3.12.12",
+    "torch": "2.9.1+cu130",
+    "numpy": "1.26.4",
+    "scipy": "1.16.3",
+    "lasso_python": "2.0.3",
+    "kmp_duplicate_lib_ok_required": true
+  },
+  "deskbook_checkout": {
+    "path": "C:/Users/26715/Desktop/deskbook/deskbook",
+    "status": "stale git checkout (2026-10-27); lacks contact_air; not used this round"
+  },
+  "data_sources": {
+    "tnt_50mm": {
+      "d3plot_dir": "E:/tnt/tnt_files/dp0/SYS/MECH",
+      "d3plot_files": 780,
+      "n_states": 779,
+      "input_k": true,
+      "implied_radius_m": 0.04999788524454888,
+      "relative_deviation": 4.229510902245548e-05
+    },
+    "tnt_80mm": {
+      "d3plot_dir": "G:/500mmtnt/80mmtnt_files/dp0/SYS-3/MECH",
+      "d3plot_files": 783,
+      "n_states": 782,
+      "input_k": true,
+      "implied_radius_m": 0.07999434187843253,
+      "relative_deviation": 7.072651959337539e-05
+    },
+    "tnt_100mm": {
+      "d3plot_dir": "G:/500mmtnt/100mmtnt_files/dp0/SYS-3/MECH",
+      "d3plot_files": 783,
+      "n_states": 782,
+      "input_k": true,
+      "implied_radius_m": 0.0999929273325749,
+      "relative_deviation": 7.072667425112034e-05
+    },
+    "tnt_500mm": {
+      "d3plot_dir": "D:/500mmtnt/500mmtnt_files/dp0/SYS-3/MECH",
+      "d3plot_files": 783,
+      "n_states": 782,
+      "input_k": true,
+      "implied_radius_m": 0.4999610094555265,
+      "relative_deviation": 7.798108894696565e-05
+    }
+  },
+  "migration_features": {
+    "contact_air_entry": true,
+    "material_phase": true,
+    "training_location_valid": true,
+    "per_field_validity": true,
+    "two_networks_two_persistent_adam_alternating": true
+  },
+  "extraction_metadata": {
+    "state_indices": [
+      0,
+      19,
+      20,
+      22
+    ],
+    "state_invalid_cells_by_phase_per_frame": {
+      "product": [
+        218328,
+        0,
+        0,
+        0
+      ],
+      "air": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "mixed": [
+        0,
+        6975,
+        7221,
+        7097
+      ],
+      "note": "pure-product (alpha>=0.95), pure-air (alpha<=0.05) and mixed cells are disjoint by the volume-fraction masks. An invalid product cell therefore cannot contribute weight to the air average, and vice versa; mixed cells contribute to neither pure-medium average."
+    },
+    "air_supervision_counts": {
+      "air_phase_shells": 6931,
+      "air_location_valid_shells": 6736,
+      "air_contact_band_protected_shells": 1076,
+      "air_missing_contribution_shells": 0,
+      "air_phase_rejected_shells": 195,
+      "air_phase_rejected_contact_band": 195,
+      "air_phase_rejected_empty_or_zero_air_volume": 0,
+      "air_phase_missing_contribution": 0,
+      "product_contaminated_shells": 416,
+      "frames_without_confirmed_shock": 2
+    },
+    "air_supervision_counts_by_frame": {
+      "air_phase_shells": [
+        2084,
+        1657,
+        1620,
+        1570
+      ],
+      "air_location_valid_shells": [
+        2082,
+        1582,
+        1559,
+        1513
+      ],
+      "air_contact_band_protected_shells": [
+        5,
+        338,
+        352,
+        381
+      ],
+      "air_missing_contribution_shells": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "air_phase_rejected_shells": [
+        2,
+        75,
+        61,
+        57
+      ],
+      "air_phase_rejected_contact_band": [
+        2,
+        75,
+        61,
+        57
+      ],
+      "air_phase_rejected_empty_or_zero_air_volume": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "air_phase_missing_contribution": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "product_contaminated_shells": [
+        416,
+        0,
+        0,
+        0
+      ]
+    },
+    "shock_status_counts": {
+      "confirmed": 2,
+      "doubtful": 1,
+      "not_detected": 1
+    }
+  },
+  "per_frame_air_eligibility": [
+    {
+      "state_index": 0,
+      "time_s": 0.0,
+      "air_phase_shells": 2084,
+      "air_location_valid": 2082,
+      "contact_band_rejected": 2,
+      "air_missing_contribution": 0,
+      "old_all_medium_contaminated_air_shells": 0,
+      "new_air_contaminated_shells": 0,
+      "old_training_location_valid_air": 0,
+      "shock_has_supervision": false
+    },
+    {
+      "state_index": 19,
+      "time_s": 1.898620575957466e-05,
+      "air_phase_shells": 1657,
+      "air_location_valid": 1582,
+      "contact_band_rejected": 75,
+      "air_missing_contribution": 0,
+      "old_all_medium_contaminated_air_shells": 209,
+      "new_air_contaminated_shells": 0,
+      "old_training_location_valid_air": 0,
+      "shock_has_supervision": true
+    },
+    {
+      "state_index": 20,
+      "time_s": 1.9987059204140678e-05,
+      "air_phase_shells": 1620,
+      "air_location_valid": 1559,
+      "contact_band_rejected": 61,
+      "air_missing_contribution": 0,
+      "old_all_medium_contaminated_air_shells": 172,
+      "new_air_contaminated_shells": 0,
+      "old_training_location_valid_air": 0,
+      "shock_has_supervision": false
+    },
+    {
+      "state_index": 22,
+      "time_s": 2.196778768848162e-05,
+      "air_phase_shells": 1570,
+      "air_location_valid": 1513,
+      "contact_band_rejected": 57,
+      "air_missing_contribution": 0,
+      "old_all_medium_contaminated_air_shells": 122,
+      "new_air_contaminated_shells": 0,
+      "old_training_location_valid_air": 0,
+      "shock_has_supervision": true
+    }
+  ],
+  "blocker": {
+    "production_rb_identified": false,
+    "build_cache_error": "t0=1.953133291397989e-05 s is outside every continuous R_b segment",
+    "cause": "density_kg_m3=1e-9 and velocity_m_s=1e-6 are below the measured far-field background",
+    "diagnostic_thresholds_only": true
+  },
+  "rb_diagnostics": {
+    "rb_current_thresholds": {
+      "criterion": {
+        "ambient_pressure_pa": 101320.0,
+        "ambient_density_kg_m3": 1.225,
+        "pressure_tolerance_pa": 0.10132,
+        "density_tolerance_kg_m3": 1e-09,
+        "velocity_tolerance_m_s": 1e-06,
+        "min_ambient_cells": 2,
+        "min_air_coverage": 0.5
+      },
+      "state0_static_check": {
+        "n_disturbed_shell_samples": 1,
+        "all_three_identified": 0,
+        "criterion_resolves_all_fields": 0,
+        "passed": 1
+      },
+      "frames": [
+        {
+          "state_index": 0,
+          "rb_candidate_m": null,
+          "pressure_candidate_m": 0.05032000000000001,
+          "velocity_candidate_m": 0.05032000000000001,
+          "density_candidate_m": null,
+          "binding_field": null,
+          "disturbed_shell_samples": 1,
+          "disturbed_continuous": 1,
+          "candidate_at_outer_edge_within_native_cell": 0,
+          "air_rb_available": 0,
+          "air_eligible_shell_samples": 2082,
+          "air_disturbed_shell_samples": 2082,
+          "air_ambient_shell_samples": 0,
+          "grid_identified": 50,
+          "grid_total": 125,
+          "grid_candidate_min_m": 0.430170278622901,
+          "grid_candidate_max_m": 1.3658696871737397
+        },
+        {
+          "state_index": 19,
+          "rb_candidate_m": null,
+          "pressure_candidate_m": 0.28961897524419744,
+          "velocity_candidate_m": null,
+          "density_candidate_m": null,
+          "binding_field": null,
+          "disturbed_shell_samples": 640,
+          "disturbed_continuous": 1,
+          "candidate_at_outer_edge_within_native_cell": 1,
+          "air_rb_available": 0,
+          "air_eligible_shell_samples": 1582,
+          "air_disturbed_shell_samples": 1582,
+          "air_ambient_shell_samples": 0,
+          "grid_identified": 75,
+          "grid_total": 125,
+          "grid_candidate_min_m": 0.20806564457966514,
+          "grid_candidate_max_m": 1.3658696871737397
+        },
+        {
+          "state_index": 20,
+          "rb_candidate_m": null,
+          "pressure_candidate_m": 0.29519201947157936,
+          "velocity_candidate_m": null,
+          "density_candidate_m": null,
+          "binding_field": null,
+          "disturbed_shell_samples": 624,
+          "disturbed_continuous": 1,
+          "candidate_at_outer_edge_within_native_cell": 1,
+          "air_rb_available": 0,
+          "air_eligible_shell_samples": 1559,
+          "air_disturbed_shell_samples": 1559,
+          "air_ambient_shell_samples": 0,
+          "grid_identified": 75,
+          "grid_total": 125,
+          "grid_candidate_min_m": 0.2160555126341088,
+          "grid_candidate_max_m": 1.3658696871737397
+        },
+        {
+          "state_index": 22,
+          "rb_candidate_m": null,
+          "pressure_candidate_m": 0.3025141502642135,
+          "velocity_candidate_m": null,
+          "density_candidate_m": null,
+          "binding_field": null,
+          "disturbed_shell_samples": 587,
+          "disturbed_continuous": 1,
+          "candidate_at_outer_edge_within_native_cell": 1,
+          "air_rb_available": 0,
+          "air_eligible_shell_samples": 1513,
+          "air_disturbed_shell_samples": 1513,
+          "air_ambient_shell_samples": 0,
+          "grid_identified": 75,
+          "grid_total": 125,
+          "grid_candidate_min_m": 0.22453534385908885,
+          "grid_candidate_max_m": 1.3658696871737397
+        }
+      ]
+    },
+    "rb_background_thresholds": {
+      "criterion": {
+        "ambient_pressure_pa": 101320.0,
+        "ambient_density_kg_m3": 1.225,
+        "pressure_tolerance_pa": 0.10132,
+        "density_tolerance_kg_m3": 0.0001225,
+        "velocity_tolerance_m_s": 1e-05,
+        "min_ambient_cells": 2,
+        "min_air_coverage": 0.5
+      },
+      "state0_static_check": {
+        "n_disturbed_shell_samples": 1835,
+        "all_three_identified": 1,
+        "criterion_resolves_all_fields": 1,
+        "passed": 0
+      },
+      "frames": [
+        {
+          "state_index": 0,
+          "rb_candidate_m": 1.3658696871737397,
+          "pressure_candidate_m": 0.05032000000000001,
+          "velocity_candidate_m": 0.05032000000000001,
+          "density_candidate_m": 1.3658696871737397,
+          "binding_field": "density",
+          "disturbed_shell_samples": 1835,
+          "disturbed_continuous": 1,
+          "candidate_at_outer_edge_within_native_cell": 0,
+          "air_rb_available": 1,
+          "air_eligible_shell_samples": 1836,
+          "air_disturbed_shell_samples": 1835,
+          "air_ambient_shell_samples": 1,
+          "grid_identified": 50,
+          "grid_total": 125,
+          "grid_candidate_min_m": 0.430170278622901,
+          "grid_candidate_max_m": 1.3658696871737397
+        },
+        {
+          "state_index": 19,
+          "rb_candidate_m": 1.3658696871737397,
+          "pressure_candidate_m": 0.28961897524419744,
+          "velocity_candidate_m": 1.0056312320896745,
+          "density_candidate_m": 1.3658696871737397,
+          "binding_field": "density",
+          "disturbed_shell_samples": 1335,
+          "disturbed_continuous": 1,
+          "candidate_at_outer_edge_within_native_cell": 1,
+          "air_rb_available": 1,
+          "air_eligible_shell_samples": 1336,
+          "air_disturbed_shell_samples": 1335,
+          "air_ambient_shell_samples": 1,
+          "grid_identified": 75,
+          "grid_total": 125,
+          "grid_candidate_min_m": 0.20806564457966514,
+          "grid_candidate_max_m": 1.3658696871737397
+        },
+        {
+          "state_index": 20,
+          "rb_candidate_m": 1.3658696871737397,
+          "pressure_candidate_m": 0.29519201947157936,
+          "velocity_candidate_m": 1.0075662734347506,
+          "density_candidate_m": 1.3658696871737397,
+          "binding_field": "density",
+          "disturbed_shell_samples": 1312,
+          "disturbed_continuous": 1,
+          "candidate_at_outer_edge_within_native_cell": 1,
+          "air_rb_available": 1,
+          "air_eligible_shell_samples": 1313,
+          "air_disturbed_shell_samples": 1312,
+          "air_ambient_shell_samples": 1,
+          "grid_identified": 75,
+          "grid_total": 125,
+          "grid_candidate_min_m": 0.2160555126341088,
+          "grid_candidate_max_m": 1.3658696871737397
+        },
+        {
+          "state_index": 22,
+          "rb_candidate_m": 1.3658696871737397,
+          "pressure_candidate_m": 0.3025141502642135,
+          "velocity_candidate_m": 1.2489981808807058,
+          "density_candidate_m": 1.3658696871737397,
+          "binding_field": "density",
+          "disturbed_shell_samples": 1266,
+          "disturbed_continuous": 1,
+          "candidate_at_outer_edge_within_native_cell": 1,
+          "air_rb_available": 1,
+          "air_eligible_shell_samples": 1267,
+          "air_disturbed_shell_samples": 1266,
+          "air_ambient_shell_samples": 1,
+          "grid_identified": 75,
+          "grid_total": 125,
+          "grid_candidate_min_m": 0.22453534385908885,
+          "grid_candidate_max_m": 1.3658696871737397
+        }
+      ]
+    },
+    "rb_background_1pct": {
+      "criterion": {
+        "ambient_pressure_pa": 101320.0,
+        "ambient_density_kg_m3": 1.225,
+        "pressure_tolerance_pa": 0.10132,
+        "density_tolerance_kg_m3": 0.01225,
+        "velocity_tolerance_m_s": 0.002,
+        "min_ambient_cells": 2,
+        "min_air_coverage": 0.5
+      },
+      "state0_static_check": {
+        "n_disturbed_shell_samples": 0,
+        "all_three_identified": 0,
+        "criterion_resolves_all_fields": 1,
+        "passed": 1
+      },
+      "frames": [
+        {
+          "state_index": 0,
+          "rb_candidate_m": null,
+          "pressure_candidate_m": 0.05032000000000001,
+          "velocity_candidate_m": 0.05032000000000001,
+          "density_candidate_m": 0.05032000000000001,
+          "binding_field": null,
+          "disturbed_shell_samples": 0,
+          "disturbed_continuous": 1,
+          "candidate_at_outer_edge_within_native_cell": 0,
+          "air_rb_available": 0,
+          "air_eligible_shell_samples": 2082,
+          "air_disturbed_shell_samples": 0,
+          "air_ambient_shell_samples": 2082,
+          "grid_identified": 50,
+          "grid_total": 125,
+          "grid_candidate_min_m": 0.430170278622901,
+          "grid_candidate_max_m": 1.3658696871737397
+        },
+        {
+          "state_index": 19,
+          "rb_candidate_m": 0.28961897524419744,
+          "pressure_candidate_m": 0.28961897524419744,
+          "velocity_candidate_m": 0.26122716662930534,
+          "density_candidate_m": 0.1531601639071259,
+          "binding_field": "pressure",
+          "disturbed_shell_samples": 622,
+          "disturbed_continuous": 0,
+          "candidate_at_outer_edge_within_native_cell": 1,
+          "air_rb_available": 1,
+          "air_eligible_shell_samples": 640,
+          "air_disturbed_shell_samples": 622,
+          "air_ambient_shell_samples": 18,
+          "grid_identified": 75,
+          "grid_total": 125,
+          "grid_candidate_min_m": 0.20806564457966514,
+          "grid_candidate_max_m": 1.3658696871737397
+        },
+        {
+          "state_index": 20,
+          "rb_candidate_m": 0.29519201947157936,
+          "pressure_candidate_m": 0.29519201947157936,
+          "velocity_candidate_m": 0.2765286725380324,
+          "density_candidate_m": 0.1593441342514016,
+          "binding_field": "pressure",
+          "disturbed_shell_samples": 622,
+          "disturbed_continuous": 0,
+          "candidate_at_outer_edge_within_native_cell": 1,
+          "air_rb_available": 1,
+          "air_eligible_shell_samples": 624,
+          "air_disturbed_shell_samples": 622,
+          "air_ambient_shell_samples": 2,
+          "grid_identified": 75,
+          "grid_total": 125,
+          "grid_candidate_min_m": 0.2160555126341088,
+          "grid_candidate_max_m": 1.3658696871737397
+        },
+        {
+          "state_index": 22,
+          "rb_candidate_m": 0.3025141502642135,
+          "pressure_candidate_m": 0.3025141502642135,
+          "velocity_candidate_m": 0.2919943570856706,
+          "density_candidate_m": 0.16884118052842348,
+          "binding_field": "pressure",
+          "disturbed_shell_samples": 584,
+          "disturbed_continuous": 0,
+          "candidate_at_outer_edge_within_native_cell": 1,
+          "air_rb_available": 1,
+          "air_eligible_shell_samples": 587,
+          "air_disturbed_shell_samples": 584,
+          "air_ambient_shell_samples": 3,
+          "grid_identified": 75,
+          "grid_total": 125,
+          "grid_candidate_min_m": 0.22453534385908885,
+          "grid_candidate_max_m": 1.3658696871737397
+        }
+      ]
+    }
+  },
+  "cache_version": 6,
+  "tests": {
+    "passed": 560,
+    "skipped": 2,
+    "command": "python -m pytest -q -rs"
+  }
+}

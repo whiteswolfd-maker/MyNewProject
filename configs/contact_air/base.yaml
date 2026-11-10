@@ -1,22 +1,43 @@
-# ContactNet + AirNet scheme (2026-11-04).
+# ContactNet + AirNet scheme, one-dimensional radial TNT air blast.
 #
-# This file is the default entry for the new scheme.  It does not inherit the
-# legacy product/air/front configuration.  The JWL/detonation/air values here
-# are CONFIGURATION PLACEHOLDERS for the precursor, not verified material-card
-# values and not results from the Yue thesis table.  Check them against the
-# actual deck/card and then set material_source/material_source_verified.
-# Real d3plot caches are not committed; `cache: null` with `synthetic: false`
-# refuses training until build-cache has produced a cache.
+# Geometry: R_c(t) <= r <= R_s(t).  R_s is the outer transmitted shock
+# identified from the raw pressure gradient, NOT the simulation outer
+# boundary and NOT a measured environmental-side "R_b".
+#
+# The JWL/detonation/air values below are CONFIGURATION PLACEHOLDERS for the
+# precursor, not verified material-card values.  Check them against the actual
+# deck/card and then set material_source/material_source_verified.
+#
+# contact_air.cases is deliberately EMPTY.  Which radii are train/validation/
+# test is an explicit research decision, not a default; no radius is reserved
+# as a fixed blind test.  Define the split in a run configuration.
 contact_air:
-  version: 1
+  version: 2
+
+  # Raw-data locations on this machine.  These are records used by the
+  # extraction/diagnostic scripts; training reads only a cache or the
+  # documented standard 1-D exchange format.
+  data_sources:
+    tnt_50mm:
+      deck: E:/tnt/tnt_files/dp0/SYS/MECH/input.k
+      d3plot_dir: E:/tnt/tnt_files/dp0/SYS/MECH
+    tnt_80mm:
+      deck: G:/500mmtnt/80mmtnt_files/dp0/SYS-3/MECH/input.k
+      d3plot_dir: G:/500mmtnt/80mmtnt_files/dp0/SYS-3/MECH
+    tnt_100mm:
+      deck: G:/500mmtnt/100mmtnt_files/dp0/SYS-3/MECH/input.k
+      d3plot_dir: G:/500mmtnt/100mmtnt_files/dp0/SYS-3/MECH
+    tnt_500mm:
+      deck: D:/500mmtnt/500mmtnt_files/dp0/SYS-3/MECH/input.k
+      d3plot_dir: D:/500mmtnt/500mmtnt_files/dp0/SYS-3/MECH
 
   precursor:
-    # These are configuration inputs, not a verified material card.  Set
-    # material_source to the actual deck/card and material_source_verified: true
-    # only after checking the values against it.
     material_source: unverified_config_defaults
     material_source_verified: false
-    epsilon_s: 1.0e-6
+    # epsilon = R_sep / [factor * (D_s_sep - u_c_sep)].  The factor is an
+    # explicit configuration value; 200 is this round's choice, not a
+    # validated constant.  A fixed epsilon_s is rejected.
+    epsilon_denominator_factor: 200.0
     shock_model: strong          # "strong" or "exact"; exact is a documented cross-check
     v_max: 100.0
     integration_limit: 200
@@ -38,40 +59,44 @@ contact_air:
       pressure: 101320.0
       gamma: 1.4
 
+  # Contact interval = the mixing segment connected to the outer edge of the
+  # central product region, bounded by ACTUAL cell boundaries.  These
+  # thresholds are configuration values, not values confirmed against real
+  # data; the midpoint of the interval is never used as a label.
+  contact_interval:
+    pure_product_threshold: 0.95
+    pure_air_threshold: 0.95
+    min_pure_air_cells: 1
+    event_search_window_s: 1.0e-5
+
+  # Shock position: radius of the outermost significant positive -dp/dr peak
+  # on valid contiguous air cells.  No smoothing is applied by default.
+  # Prominence is relative to the median |gradient| inside the same valid run;
+  # an absolute floor can be supplied if the real noise level is known.
+  shock_detection:
+    relative_prominence: 8.0
+    absolute_prominence_pa_per_m: 0.0
+    transition_cells: 1
+    min_cells_from_contact: 1
+    min_pressure_jump_fraction: 1.0e-3
+    require_ambient_outside: false
+    ambient_pressure_tolerance_fraction: 0.05
+    smoothing: null
+
+  # Recorded reference tolerances for diagnostics.  They are NOT the right
+  # boundary condition: the right boundary is the finite-Mach RH post-shock
+  # state from the identified D_s.
   tolerances:
     ambient_pressure_pa: 101320.0
     ambient_density_kg_m3: 1.225
-    pressure_pa: 0.10132          # 1e-6 relative; calibrate on training data
-    density_kg_m3: 1.0e-9
-    velocity_m_s: 1.0e-6
-    min_ambient_cells: 2
-    min_shocked_air_samples: 2   # fewer non-ambient shell samples -> unresolvable
-    min_air_coverage: 0.5        # shell-average contribution floor for layer evidence
-    min_air_layer_native_cells: 1.0  # layer thickness / native ALE cell thickness
 
-  cases:
-    # Real runs: set cache to a .npz produced by build-cache.  No synthetic
-    # fallback is allowed in the base configuration.
-    - case_id: tnt_50mm
-      role: train
-      charge_radius_m: 0.050
-      cache: null
-      synthetic: false
-    - case_id: tnt_80mm
-      role: train
-      charge_radius_m: 0.080
-      cache: null
-      synthetic: false
-    - case_id: tnt_100mm
-      role: train
-      charge_radius_m: 0.100
-      cache: null
-      synthetic: false
-    - case_id: tnt_500mm
-      role: test
-      charge_radius_m: 0.500
-      cache: null
-      synthetic: false
+  # Explicit split only.  Example shape (do not treat as a research default):
+  #   - case_id: tnt_50mm
+  #     role: train
+  #     charge_radius_m: 0.050
+  #     cache: outputs/contact_air/tnt_50mm.npz
+  #     synthetic: false
+  cases: []
 
   networks:
     dtype: float64
@@ -84,8 +109,7 @@ contact_air:
 
   sampling:
     n_pde: 512
-    n_ic_shock: 128
-    n_ic_ambient: 128
+    n_ic: 128
     n_right: 128
     n_data: 128
     n_contact: 128
@@ -97,7 +121,7 @@ contact_air:
     log_every: 50
     checkpoint_every: 100
     validate_every: 100
-    seed: 20261105
+    seed: 20261110
     gradient_clip: 0.0
 
   output_dir: outputs/contact_air
