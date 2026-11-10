@@ -182,6 +182,26 @@ class ExtractedCase:
     #: withdrawal, contamination and front protection bands, but NOT the joint
     #: rho/u/e/p finiteness and NOT the boundary-diagnostic air mask.
     training_location_valid: np.ndarray | None = None
+    #: contact_air (R_c~R_b) air eligibility.  ``material_phase`` only, outside
+    #: the contact mixing band, without the legacy ``no confirmed shock ->
+    #: withdraw the whole air side`` rule.  ``None`` means the export predates
+    #: this separation.
+    air_training_location_valid: np.ndarray | None = None
+    #: Sequence of ``(N_t, N_r)`` boolean masks for the air fields, plus the
+    #: shells where an air cell that actually contributes to the air average has
+    #: no valid EOS state.  The latter invalidates pressure/energy only; density
+    #: and velocity are direct measurements and remain usable.
+    air_field_validity: dict[str, np.ndarray] | None = None
+    air_missing_contribution: np.ndarray | None = None
+    #: Per-medium contribution-weighted contamination, units of occupied volume.
+    air_contaminated_shell_fraction: np.ndarray | None = None
+    product_contaminated_shell_fraction: np.ndarray | None = None
+    air_occupied_volume_m3: np.ndarray | None = None
+    product_occupied_volume_m3: np.ndarray | None = None
+    air_contact_band_protected: np.ndarray | None = None
+    #: Per-frame legacy shock supervision flag.  Recorded for diagnostics; the
+    #: contact_air air eligibility does not use it.
+    shock_has_supervision: np.ndarray | None = None
     source: dict[str, Any] = field(default_factory=dict)
     detector: DetectorSettings = field(default_factory=DetectorSettings)
 
@@ -1075,11 +1095,36 @@ def validate_case_object(case: Any, *, path: Any = "<case>") -> None:
         _check_domain(
             "training_location_valid", np.asarray(training_location), dtype=np.bool_,
         )
+    for name in (
+        "air_training_location_valid", "air_missing_contribution",
+        "air_contact_band_protected",
+    ):
+        value = getattr(case, name, None)
+        if value is not None:
+            _check_domain(name, np.asarray(value), dtype=np.bool_)
+    for name in (
+        "air_contaminated_shell_fraction", "product_contaminated_shell_fraction",
+        "air_occupied_volume_m3", "product_occupied_volume_m3",
+    ):
+        value = getattr(case, name, None)
+        if value is not None:
+            _check_domain(name, np.asarray(value), dtype=np.floating)
+    for name, mask in (getattr(case, "air_field_validity", None) or {}).items():
+        _check_domain(f"air_field_validity[{name!r}]", np.asarray(mask), dtype=np.bool_)
 
     # 逐字段有效性：每一张都必须是 ``(n_t, n_x)`` 的真布尔量。``None`` 表示"没记录"，
     # 与"都有效"不是一回事，所以是整体缺省而不是就地补一张。
     for name, mask in (getattr(case, "field_validity", None) or {}).items():
         _check_domain(f"field_validity[{name!r}]", np.asarray(mask), dtype=np.bool_)
+
+    shock_flag = getattr(case, "shock_has_supervision", None)
+    if shock_flag is not None:
+        array = np.asarray(shock_flag)
+        if array.shape != (times.size,) or array.dtype != np.bool_:
+            raise DataError(
+                f"{path}: shock_has_supervision has shape {array.shape} and dtype "
+                f"{array.dtype}; it must be {times.size} booleans"
+            )
 
     # 前沿资格里**带出来的数组**同样要核。它们在对象上，不在文件里，所以读取时的
     # 那一次校验管不到；不核的话，一张被改坏的资格表会静默改变"哪些帧算标签"。
@@ -1397,6 +1442,49 @@ def _load_with_volume_fraction_partition(
             times=times, radius=radius, path=companion,
         )
 
+    def _bool_companion(key: str):
+        if key not in block.files:
+            return None
+        raw = np.asarray(block[key])
+        if raw.dtype != np.bool_:
+            raise DataError(
+                f"{companion}: {key!r} has dtype {raw.dtype}, not bool"
+            )
+        return normalise_to_layout(
+            raw, name=f"{key!r}", layout=layout, times=times, radius=radius,
+            path=companion,
+        )
+
+    def _float_companion(key: str):
+        if key not in block.files:
+            return None
+        raw = np.asarray(block[key])
+        if not np.issubdtype(raw.dtype, np.floating):
+            raise DataError(
+                f"{companion}: {key!r} has dtype {raw.dtype}, not a floating type"
+            )
+        return normalise_to_layout(
+            raw, name=f"{key!r}", layout=layout, times=times, radius=radius,
+            path=companion,
+        )
+
+    air_training_location_valid = _bool_companion("air_training_location_valid")
+    air_contact_band_protected = _bool_companion("air_contact_band_protected")
+    air_missing_contribution = _bool_companion("air_missing_contribution")
+    air_field_validity = {}
+    for field in ("density", "velocity", "energy", "pressure"):
+        mask = _bool_companion(f"air_field_valid_{field}")
+        if mask is not None:
+            air_field_validity[field] = mask
+    air_contaminated_shell_fraction = _float_companion(
+        "air_contaminated_shell_fraction"
+    )
+    product_contaminated_shell_fraction = _float_companion(
+        "product_contaminated_shell_fraction"
+    )
+    air_occupied_volume_m3 = _float_companion("air_occupied_volume_m3")
+    product_occupied_volume_m3 = _float_companion("product_occupied_volume_m3")
+
     contact_radius = np.asarray(block["contact_radius"], dtype=np.float64)
     shock_radius = np.asarray(block["shock_radius"], dtype=np.float64)
     # 前沿的有效性判据在这里是"数出来了"，不是"猜出来了"。
@@ -1558,6 +1646,17 @@ def _load_with_volume_fraction_partition(
         valid=valid,
         material_phase=material_phase,
         training_location_valid=training_location_valid,
+        air_training_location_valid=air_training_location_valid,
+        air_field_validity=(air_field_validity or None),
+        air_missing_contribution=air_missing_contribution,
+        air_contaminated_shell_fraction=air_contaminated_shell_fraction,
+        product_contaminated_shell_fraction=product_contaminated_shell_fraction,
+        air_occupied_volume_m3=air_occupied_volume_m3,
+        product_occupied_volume_m3=product_occupied_volume_m3,
+        air_contact_band_protected=air_contact_band_protected,
+        shock_has_supervision=(
+            None if shock_eligibility is None else np.asarray(shock_eligibility, dtype=bool)
+        ),
         source={
             "directory": str(directory),
             "npz": str(npz_path),
@@ -1571,6 +1670,12 @@ def _load_with_volume_fraction_partition(
                 "extractor training_location_valid: material/withdrawal/contamination/"
                 "front-protection location eligibility, before joint field finiteness"
                 if training_location_valid is not None else None
+            ),
+            "air_training_location_source": (
+                "extractor air_training_location_valid: material_phase==1, outside "
+                "the contact mixing band, no legacy no-shock withdrawal; per-field "
+                "air masks are in air_field_validity"
+                if air_training_location_valid is not None else None
             ),
             "field_map": mapping.mapping,
             "metadata_raw": dict(metadata),

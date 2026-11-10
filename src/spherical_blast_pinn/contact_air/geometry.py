@@ -1,23 +1,25 @@
-"""Right-boundary trajectories, contact intervals and initial geometry.
+"""Shock trajectory, contact intervals and initial geometry.
 
-The right boundary ``R_b`` is a measured environmental-side trajectory.  It is
-not the shock ``R_s`` and it is not extrapolated: every query must fall inside
-a continuous, strictly increasing valid segment.  A single valid frame gives a
-position at that frame only and **no** derivative.
+The moving air domain is ``R_c(t) <= r <= R_s(t)``.  ``R_s`` is the **outer
+transmitted shock** identified from the pressure gradient in each raw radial
+profile; it is not an "environmental boundary" and it is not the simulation
+outer boundary ``R_outer``.  Every query must lie inside a continuous,
+strictly increasing segment of detected shock positions: no extrapolation, no
+gap filling, and no copying of the previous frame.
 
-The contact interval ``[R_c,low, R_c,up]`` is the auditable bracket produced by
-the extractor: the inner pure-product neighbour and the outer pure-air
-neighbour around a mixed segment.  Its midpoint ``R_raw`` is an engineering
-convention used only for observation mapping, never as a single-point contact
-label.
+``ShockTrajectory`` stores SciPy PCHIP coefficients as fixed external data and
+also evaluates both the position and its analytic derivative in PyTorch.  The
+torch path is required because ``R_s(t)`` enters ``R_c`` and ``L_dot``; wrapping
+a NumPy lookup of a detached ``t`` would silently drop ``dR_s/dt``.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Sequence
 
 import numpy as np
+import torch
 from scipy.interpolate import PchipInterpolator
 
 
@@ -25,23 +27,104 @@ class GeometryError(RuntimeError):
     """A geometry trajectory is missing, discontinuous or out of order."""
 
 
+def _pchip_coefficients(
+    times: np.ndarray, radii: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(breakpoints, c)`` with ``c`` in SciPy PPoly convention.
+
+    ``S(dx) = c[0] dx^3 + c[1] dx^2 + c[2] dx + c[3]`` on each interval,
+    where ``dx = t - x[i]``.  The coefficients are frozen data; they are not
+    trained and they are not a denoiser.
+    """
+    interpolator = PchipInterpolator(times, radii)
+    return np.asarray(interpolator.x, dtype=np.float64), np.asarray(
+        interpolator.c, dtype=np.float64
+    )
+
+
+@dataclass(frozen=True)
+class PchipSegment:
+    start: float
+    end: float
+    x: np.ndarray
+    c: np.ndarray
+
+    @classmethod
+    def build(cls, times: np.ndarray, radii: np.ndarray) -> "PchipSegment":
+        x, c = _pchip_coefficients(times, radii)
+        return cls(start=float(x[0]), end=float(x[-1]), x=x, c=c)
+
+    def position_numpy(self, values: np.ndarray) -> np.ndarray:
+        out = np.empty(values.shape, dtype=np.float64)
+        for index, value in enumerate(values):
+            if not (self.start <= float(value) <= self.end):
+                raise GeometryError(f"t={float(value)!r} is outside the shock segment")
+            i = int(np.searchsorted(self.x, float(value), side="right")) - 1
+            i = min(max(i, 0), self.x.size - 2)
+            dx = float(value) - float(self.x[i])
+            cc = self.c[:, i]
+            out[index] = ((cc[0] * dx + cc[1]) * dx + cc[2]) * dx + cc[3]
+        return out
+
+    def derivative_numpy(self, values: np.ndarray) -> np.ndarray:
+        out = np.empty(values.shape, dtype=np.float64)
+        for index, value in enumerate(values):
+            if not (self.start <= float(value) <= self.end):
+                raise GeometryError(f"t={float(value)!r} is outside the shock segment")
+            i = int(np.searchsorted(self.x, float(value), side="right")) - 1
+            i = min(max(i, 0), self.x.size - 2)
+            dx = float(value) - float(self.x[i])
+            cc = self.c[:, i]
+            out[index] = (3.0 * cc[0] * dx + 2.0 * cc[1]) * dx + cc[2]
+        return out
+
+    def evaluate_torch(
+        self, t: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Position and analytic derivative as functions of ``t``.
+
+        ``t`` may require grad: the polynomial and its derivative are expressed
+        directly in ``t`` (not by detaching and querying NumPy).  The interval
+        index is selected on detached values only, which is the standard
+        piecewise-polynomial convention.
+        """
+        flat = t.reshape(-1)
+        inside = (flat >= self.start) & (flat <= self.end)
+        if not bool(inside.all()):
+            bad = flat.detach()[~inside]
+            raise GeometryError(
+                "shock trajectory is not defined at "
+                f"t={bad[:3].tolist()}; extrapolation and gap filling are forbidden"
+            )
+        x = torch.as_tensor(self.x, dtype=flat.dtype, device=flat.device)
+        c = torch.as_tensor(self.c, dtype=flat.dtype, device=flat.device)
+        index = torch.searchsorted(x, flat.detach(), right=True) - 1
+        index = torch.clamp(index, 0, x.numel() - 2)
+        dx = flat - x[index]
+        cc = c[:, index]
+        position = ((cc[0] * dx + cc[1]) * dx + cc[2]) * dx + cc[3]
+        derivative = (3.0 * cc[0] * dx + 2.0 * cc[1]) * dx + cc[2]
+        return position, derivative
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "start_s": self.start,
+            "end_s": self.end,
+            "n_breakpoints": int(self.x.size),
+            "interpolation": "PCHIP (shape preserving); coefficients fixed",
+        }
+
+
 @dataclass
-class RightBoundaryTrajectory:
+class ShockTrajectory:
     case_id: str
     times: np.ndarray
     radii: np.ndarray
     valid: np.ndarray
-    segments: list[tuple[float, float, PchipInterpolator]] = field(default_factory=list)
+    segments: list[PchipSegment] = field(default_factory=list)
     isolated: list[tuple[float, float]] = field(default_factory=list)
     rejected: list[str] = field(default_factory=list)
-    #: Frames that were supplied with ``valid=True`` but whose radius is not a
-    #: usable positive finite number.  They remain in the time axis as break
-    #: markers; nothing is deleted and the two sides are never joined.
     invalid_frames: list[dict[str, Any]] = field(default_factory=list)
-    #: Continuous runs in which consecutive radii are equal.  A plateau is a
-    #: measured shape, not an error: it is retained and reported.  A strictly
-    #: decreasing radius is a different thing (a retrograde trajectory) and the
-    #: whole segment is rejected instead.
     plateaus: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -50,14 +133,12 @@ class RightBoundaryTrajectory:
         valid = np.asarray(self.valid, dtype=bool).reshape(-1)
         if times.size != radii.size or times.size != valid.size:
             raise GeometryError("times, radii and valid masks must have the same length")
-        # Do not sort or drop rows.  The frame index is part of the data
-        # contract, and silently reordering it would make a gap invisible.
         if not np.all(np.isfinite(times)):
-            raise GeometryError("right-boundary times must all be finite")
+            raise GeometryError("shock times must all be finite")
         if times.size and np.any(np.diff(times) <= 0.0):
             raise GeometryError(
-                "right-boundary times must be strictly increasing; duplicate or "
-                "retrograde timestamps are not repaired"
+                "shock times must be strictly increasing; duplicate or retrograde "
+                "timestamps are not repaired"
             )
         requested_valid = valid.copy()
         usable = requested_valid & np.isfinite(radii) & (radii > 0.0)
@@ -88,9 +169,9 @@ class RightBoundaryTrajectory:
                     dr = np.diff(_r)
                     if np.any(dr < 0.0):
                         self.rejected.append(
-                            f"segment {float(_t[0]):.6g}..{float(_t[-1]):.6g}: R_b "
-                            "decreases at one or more frames; a retrograde trajectory "
-                            "is not repaired and no PCHIP is built"
+                            f"segment {float(_t[0]):.6g}..{float(_t[-1]):.6g}: R_s "
+                            "decreases at one or more frames; a retrograde shock "
+                            "trajectory is not repaired and no PCHIP is built"
                         )
                     else:
                         plateau_count = int(np.count_nonzero(dr == 0.0))
@@ -100,20 +181,18 @@ class RightBoundaryTrajectory:
                                 "end_s": float(_t[-1]),
                                 "n_equal_intervals": plateau_count,
                             })
-                        self.segments.append(
-                            (float(_t[0]), float(_t[-1]), PchipInterpolator(_t, _r))
-                        )
+                        self.segments.append(PchipSegment.build(_t, _r))
                 elif _t.size == 1:
                     self.isolated.append((float(_t[0]), float(_r[0])))
                 start = None
-        self.segments.sort(key=lambda item: item[0])
+        self.segments.sort(key=lambda item: item.start)
         self.isolated.sort(key=lambda item: item[0])
 
     @classmethod
     def from_arrays(
         cls, *, case_id: str, times: Sequence[float], radii: Sequence[float],
         valid: Sequence[bool] | None = None,
-    ) -> "RightBoundaryTrajectory":
+    ) -> "ShockTrajectory":
         return cls(
             case_id=str(case_id),
             times=np.asarray(times, dtype=np.float64),
@@ -130,40 +209,38 @@ class RightBoundaryTrajectory:
         """Outer bounds of the valid samples, **not** a coverage interval."""
         if not self.segments:
             return None
-        return self.segments[0][0], self.segments[-1][1]
+        return self.segments[0].start, self.segments[-1].end
 
     @property
     def domain_min(self) -> float:
-        """First valid sample time; do not use as a solve-interval start."""
         domain = self.domain
         if domain is None:
-            raise GeometryError(f"case {self.case_id!r}: no continuous R_b segment")
+            raise GeometryError(f"case {self.case_id!r}: no continuous R_s segment")
         return domain[0]
 
     @property
     def domain_max(self) -> float:
-        """Last valid sample time; do not use as a solve-interval end."""
         domain = self.domain
         if domain is None:
-            raise GeometryError(f"case {self.case_id!r}: no continuous R_b segment")
+            raise GeometryError(f"case {self.case_id!r}: no continuous R_s segment")
         return domain[1]
 
-    def _segment_at(self, t: float):
-        for start, end, interpolator in self.segments:
-            if start <= t <= end:
-                return interpolator
+    def _segment_at(self, t: float) -> PchipSegment | None:
+        for segment in self.segments:
+            if segment.start <= t <= segment.end:
+                return segment
         return None
 
     def _segment_span_at(self, t: float) -> tuple[float, float] | None:
-        for start, end, _ in self.segments:
-            if start <= t <= end:
-                return float(start), float(end)
+        for segment in self.segments:
+            if segment.start <= t <= segment.end:
+                return float(segment.start), float(segment.end)
         return None
 
     @property
     def continuous_intervals(self) -> list[tuple[float, float]]:
-        """Measured ``R_b`` runs.  There is no interval across a gap."""
-        return [(float(start), float(end)) for start, end, _ in self.segments]
+        """Measured ``R_s`` runs.  There is no interval across a gap."""
+        return [(float(segment.start), float(segment.end)) for segment in self.segments]
 
     def has_slope(self, t: float) -> bool:
         return self._segment_at(float(t)) is not None
@@ -172,28 +249,21 @@ class RightBoundaryTrajectory:
         return self.has_slope(t)
 
     def continuous_interval_containing(self, t: float) -> tuple[float, float]:
-        """Return the one continuous segment that contains ``t``.
-
-        The outer ``domain`` is deliberately *not* used for this: the earliest
-        and latest valid frames can enclose a gap, and a solve interval must
-        not be chosen by those two endpoints alone.
-        """
         span = self._segment_span_at(float(t))
         if span is None:
             if any(math.isclose(time, float(t), rel_tol=0.0, abs_tol=0.0)
                    for time, _ in self.isolated):
                 raise GeometryError(
-                    f"case {self.case_id!r}: t={t!r} s is an isolated R_b frame; "
+                    f"case {self.case_id!r}: t={t!r} s is an isolated R_s frame; "
                     "it has no slope and cannot define a solve interval"
                 )
             raise GeometryError(
                 f"case {self.case_id!r}: t={t!r} s is outside every continuous "
-                "R_b segment; gap filling and extrapolation are forbidden"
+                "R_s segment; gap filling and extrapolation are forbidden"
             )
         return span
 
     def require_interval(self, start: float, end: float) -> tuple[float, float]:
-        """Require ``[start, end]`` to lie inside one continuous segment."""
         start = float(start)
         end = float(end)
         if not (math.isfinite(start) and math.isfinite(end)):
@@ -206,29 +276,27 @@ class RightBoundaryTrajectory:
         if end < span[0] or end > span[1]:
             raise GeometryError(
                 f"case {self.case_id!r}: solve interval [{start!r}, {end!r}] crosses "
-                f"the continuous R_b segment {span!r}; a single connected segment is "
-                "required"
+                f"the continuous R_s segment {span!r}; a single connected segment is required"
             )
-        # Every t between the two endpoints is inside the same PCHIP segment.
         return span
 
     def position(self, t: float | np.ndarray) -> np.ndarray | float:
         values = np.asarray(t, dtype=np.float64)
         flat = values.reshape(-1)
         out = np.full(flat.shape, np.nan, dtype=np.float64)
-        for i, value in enumerate(flat):
-            interpolator = self._segment_at(float(value))
-            if interpolator is not None:
-                out[i] = float(interpolator(float(value)))
+        for index, value in enumerate(flat):
+            segment = self._segment_at(float(value))
+            if segment is not None:
+                out[index] = float(segment.position_numpy(np.asarray([float(value)]))[0])
                 continue
             exact = [radius for time, radius in self.isolated
                      if math.isclose(time, float(value), rel_tol=0.0, abs_tol=0.0)]
             if exact:
-                out[i] = float(exact[0])
+                out[index] = float(exact[0])
         if np.any(~np.isfinite(out)):
             missing = flat[~np.isfinite(out)]
             raise GeometryError(
-                f"case {self.case_id!r}: R_b is not defined at t={missing[:3].tolist()} s; "
+                f"case {self.case_id!r}: R_s is not defined at t={missing[:3].tolist()} s; "
                 "extrapolation and gap filling are forbidden"
             )
         return out[0] if values.ndim == 0 else out.reshape(values.shape)
@@ -237,18 +305,52 @@ class RightBoundaryTrajectory:
         values = np.asarray(t, dtype=np.float64)
         flat = values.reshape(-1)
         out = np.full(flat.shape, np.nan, dtype=np.float64)
-        for i, value in enumerate(flat):
-            interpolator = self._segment_at(float(value))
-            if interpolator is None:
+        for index, value in enumerate(flat):
+            segment = self._segment_at(float(value))
+            if segment is None:
                 raise GeometryError(
-                    f"case {self.case_id!r}: dR_b/dt is not defined at t={float(value)!r} s; "
+                    f"case {self.case_id!r}: dR_s/dt is not defined at t={float(value)!r} s; "
                     "an isolated point cannot provide a slope"
                 )
-            out[i] = float(interpolator.derivative()(float(value)))
+            out[index] = float(segment.derivative_numpy(np.asarray([float(value)]))[0])
         return out[0] if values.ndim == 0 else out.reshape(values.shape)
 
     def position_and_derivative(self, t: float | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         return self.position(t), self.derivative(t)
+
+    def position_and_derivative_torch(
+        self, t: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Torch PCHIP value and analytic derivative for every valid ``t``.
+
+        No SciPy/NumPy lookup of a detached tensor is used: the polynomial is
+        evaluated in torch, so a ``t`` that requires grad still has the correct
+        derivative.  The returned derivative is the derivative of the PCHIP
+        interpolant, not a second application of autograd.
+        """
+        flat = t.reshape(-1)
+        position = torch.full_like(flat, float("nan"))
+        derivative = torch.full_like(flat, float("nan"))
+        covered = torch.zeros(flat.shape, dtype=torch.bool, device=flat.device)
+        for segment in self.segments:
+            inside = (flat.detach() >= segment.start) & (flat.detach() <= segment.end)
+            if not bool(inside.any()):
+                continue
+            selected = flat[inside]
+            values, slopes = segment.evaluate_torch(selected)
+            position = position.masked_scatter(inside, values)
+            derivative = derivative.masked_scatter(inside, slopes)
+            covered = covered | inside
+        if not bool(covered.all()):
+            missing = flat.detach()[~covered]
+            raise GeometryError(
+                f"case {self.case_id!r}: R_s(t) is not defined at "
+                f"t={missing[:3].tolist()} s; extrapolation and gap filling are forbidden"
+            )
+        return position, derivative
+
+    def values_torch(self, t: torch.Tensor) -> torch.Tensor:
+        return self.position_and_derivative_torch(t)[0]
 
     def require_covering(self, t: float) -> None:
         if self._segment_at(float(t)) is not None:
@@ -256,26 +358,25 @@ class RightBoundaryTrajectory:
         if any(math.isclose(time, float(t), rel_tol=0.0, abs_tol=0.0)
                for time, _ in self.isolated):
             raise GeometryError(
-                f"case {self.case_id!r}: R_b({t!r}) is an isolated frame; position is "
-                "known but dR_b/dt is not, so the initial geometry is incomplete"
+                f"case {self.case_id!r}: R_s({t!r}) is an isolated frame; position is "
+                "known but dR_s/dt is not, so the initial geometry is incomplete"
             )
         raise GeometryError(
-            f"case {self.case_id!r}: t0={t!r} s is outside every continuous R_b segment; "
+            f"case {self.case_id!r}: t0={t!r} s is outside every continuous R_s segment; "
             "the initial condition cannot be built without gap filling or extrapolation"
         )
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "case_id": self.case_id,
+            "quantity": "R_s (outer transmitted shock), not R_outer and not R_b",
             "n_samples": int(self.times.size),
             "n_valid": int(np.count_nonzero(self.valid)),
-            "segments": [[float(a), float(b)] for a, b, _ in self.segments],
+            "segments": [segment.as_dict() for segment in self.segments],
             "continuous_intervals": [
                 [float(a), float(b)] for a, b in self.continuous_intervals
             ],
             "isolated": [[float(t), float(r)] for t, r in self.isolated],
-            # Outer bounds only; NOT a statement that every t in between is
-            # covered.  Use continuous_intervals / require_interval.
             "outer_bounds": (
                 None if self.domain is None
                 else [float(self.domain[0]), float(self.domain[1])]
@@ -294,6 +395,7 @@ class ContactIntervalTable:
     up: np.ndarray
     raw: np.ndarray
     valid: np.ndarray
+    reasons: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.times = np.asarray(self.times, dtype=np.float64).reshape(-1)
@@ -316,14 +418,14 @@ class ContactIntervalTable:
                 f"case {self.case_id!r}: invalid contact intervals at frames {indices}; "
                 "R_c,low must be positive and <= R_c,up"
             )
-        # R_raw is an observation-mapping convention, not a label.  Keep it
-        # inside the bracket when possible, but do not move it silently.
         outside = self.valid & ((self.raw < self.low) | (self.raw > self.up))
         if np.any(outside):
             raise GeometryError(
                 f"case {self.case_id!r}: R_raw lies outside [R_c,low, R_c,up] at "
                 f"{np.flatnonzero(outside)[:3].tolist()}"
             )
+        if self.reasons and len(self.reasons) != n:
+            raise GeometryError("contact interval reasons must have one entry per frame")
 
     @property
     def n_valid(self) -> int:
@@ -349,6 +451,12 @@ class ContactIntervalTable:
                 None if not self.times.size
                 else [float(self.times.min()), float(self.times.max())]
             ),
+            "definition": (
+                "[R_c,low, R_c,up] is the interval between the actual cell "
+                "boundaries bracketing the contact mixing segment. The midpoint "
+                "R_raw is an observation-mapping convention only and is never a "
+                "single-point label."
+            ),
         }
 
 
@@ -357,11 +465,11 @@ class InitialGeometry:
     t0: float
     Rc0: float
     Rs0: float
-    Rb0: float
     zeta_s0: float
     R_sep: float
     u_c_sep: float
     D_s_sep: float
+    Rs_data_at_t0: float
 
 
 def build_initial_geometry(
@@ -372,32 +480,36 @@ def build_initial_geometry(
     R_sep: float,
     u_c_sep: float,
     D_s_sep: float,
-    boundary: RightBoundaryTrajectory,
+    shock: ShockTrajectory,
 ) -> InitialGeometry:
-    """Read ``R_b(t0)`` and enforce ``R_c(t0) < R_s(t0) < R_b(t0)``."""
-    boundary.require_covering(float(t0))
-    Rb0 = float(boundary.position(float(t0)))
-    values = {
-        "t0": float(t0),
-        "Rc0": float(Rc0),
-        "Rs0": float(Rs0),
-        "Rb0": float(Rb0),
-    }
-    for name, value in values.items():
+    """Read ``R_s(t0)`` and require ``0 < R_c0 < R_s(t0)``.
+
+    There is no ``R_b`` here: the geometric right boundary of the PINN domain is
+    the identified shock.  The theoretical ``Rs0`` is recorded against the
+    measured ``R_s(t0)``; a difference is reported, not removed.
+    """
+    shock.require_covering(float(t0))
+    Rs_data = float(shock.position(float(t0)))
+    for name, value in (
+        ("t0", float(t0)), ("Rc0", float(Rc0)), ("Rs0", float(Rs0)),
+        ("R_s_data(t0)", Rs_data),
+    ):
         if not math.isfinite(value) or value <= 0.0:
             raise GeometryError(f"initial geometry {name}={value!r} is not finite and positive")
-    if not (Rc0 < Rs0 < Rb0):
+    if Rc0 >= Rs_data:
         raise GeometryError(
-            f"case {boundary.case_id!r}: initial radii must satisfy R_c < R_s < R_b; got "
-            f"{Rc0!r}, {Rs0!r}, {Rb0!r}"
+            f"case {shock.case_id!r}: theoretical R_c(t0)={Rc0!r} is not below the "
+            f"measured shock R_s(t0)={Rs_data!r}; R_c = R_s sigmoid(raw) cannot "
+            "contain the theoretical initial contact position"
         )
-    zeta_s0 = (Rs0 - Rc0) / (Rb0 - Rc0)
-    if not (0.0 < zeta_s0 < 1.0):
-        raise GeometryError(f"initial shock coordinate zeta_s0={zeta_s0!r} is outside (0,1)")
+    zeta_s0 = (Rs0 - Rc0) / (Rs_data - Rc0)
+    if not math.isfinite(zeta_s0):
+        raise GeometryError("initial shock coordinate zeta_s0 is not finite")
     return InitialGeometry(
-        t0=float(t0), Rc0=float(Rc0), Rs0=float(Rs0), Rb0=float(Rb0),
+        t0=float(t0), Rc0=float(Rc0), Rs0=float(Rs0),
         zeta_s0=float(zeta_s0), R_sep=float(R_sep),
         u_c_sep=float(u_c_sep), D_s_sep=float(D_s_sep),
+        Rs_data_at_t0=float(Rs_data),
     )
 
 
@@ -420,7 +532,8 @@ __all__ = [
     "ContactIntervalTable",
     "GeometryError",
     "InitialGeometry",
-    "RightBoundaryTrajectory",
+    "PchipSegment",
+    "ShockTrajectory",
     "build_initial_geometry",
     "split_valid_segments",
 ]

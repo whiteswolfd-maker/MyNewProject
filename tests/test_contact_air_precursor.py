@@ -36,12 +36,27 @@ def test_default_precursor_is_physical_and_all_checks_pass():
     assert all(result.checks.values()), result.checks
 
 
-def test_units_are_converted_once():
+def test_epsilon_is_the_thin_layer_formula_not_a_fixed_microsecond():
     result = default_precursor(0.05)
-    assert result.charge_radius == 0.05
-    assert math.isclose(8.8e-6, 8.8e-6)  # the command-line example stays in seconds
-    assert result.epsilon == 1.0e-6
+    expected = result.R_sep / (
+        DEFAULT_PRECURSOR["epsilon_denominator_factor"]
+        * (result.D_s_sep - result.u_c_sep)
+    )
+    assert result.D_s_sep > result.u_c_sep
+    assert result.epsilon > 0.0
+    assert result.epsilon == pytest.approx(expected, rel=1e-12)
+    assert result.epsilon != pytest.approx(1.0e-6)
     assert result.t0 == pytest.approx(result.t_sep + result.epsilon)
+    assert result.Rc0 == pytest.approx(result.R_sep + result.u_c_sep * result.epsilon)
+    assert result.Rs0 == pytest.approx(result.R_sep + result.D_s_sep * result.epsilon)
+
+
+def test_a_fixed_epsilon_s_is_rejected():
+    payload = dict(DEFAULT_PRECURSOR)
+    payload["charge_radius_m"] = 0.05
+    payload["epsilon_s"] = 1.0e-6
+    with pytest.raises(PrecursorError, match="epsilon_s"):
+        PrecursorConfig.from_mapping(payload)
 
 
 def test_explicit_C_must_reproduce_the_CJ_pressure():

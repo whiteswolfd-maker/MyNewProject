@@ -2,10 +2,10 @@
 
 本仓库有两条明确分开的实现：
 
-* **新方案（2026-11-04，当前任务）**：`src/spherical_blast_pinn/contact_air/`。
+* **新方案（2026-11-10 一维迁移，当前任务）**：`src/spherical_blast_pinn/contact_air/`。
   共享 ``ContactNet(t,R0)->R_c`` 与 ``AirNet(zeta,t,R0)->(rho,u,p)``；两个持久
-  Adam 交替更新；``R_b(t)`` 是测量几何；前置为 CJ + JWL 等熵释放 + 空气
-  Hugoniot 匹配。入口：
+  Adam 交替更新；几何为 ``R_c(t)<=r<=R_s(t)``，``R_s`` 是压力梯度识别的外传
+  激波；前置为 CJ + JWL 等熵释放 + 空气 Hugoniot 匹配。入口：
   ``python -m spherical_blast_pinn.cli.contact_air ...``，配置在
   ``configs/contact_air/``。**旧 ProductNet/FrontNet、旧总损失一次反传、
   0.5/PLIC 单点接触面标签不得进入这条路径。**
@@ -15,44 +15,42 @@
 
 `README.md` 是方法、数据状态与已知限制的权威说明。
 
-## 新方案 ContactNet/AirNet（2026-11-04）
+## 新方案 ContactNet/AirNet（一维，2026-11-10）
 
-* 物理时钟：``t`` 是物理秒，不做时间归一化，不乘 ``R0/100mm``。前置给
-  ``t_sep``、``t0=t_sep+epsilon``，但 ``t_cj=R_cj/D`` 是均匀 CJ 近似，模型时钟与
-  d3plot 时间轴是否同原点**尚未核实**；不按 ``t_sep`` 平移数据，也不伪造事件对齐。
-  这些状态记录在 ``PrecursorResult.clock`` 和 ``precheck`` 输出里。
-* 前置：CJ 密度/压力/质点速度、JWL 等熵释律、强冲击或精确空气 Hugoniot；
-  ``R_sep=R0 V_sep^(1/3)``；``t_sep`` 从 CJ 半径的均匀球膨胀积分得到，
-  ``R0/D`` 只作为表面到达参考时间单独报告。
-* ``R_c=R_b sigmoid(raw)``；``dR_c/dt`` 必须包含 ``dR_b/dt`` 和 sigmoid 的完整
-  乘积导数。``AirNet`` 的 ``t``/``zeta`` 导数在固定 ``zeta,R0`` 下求，不能把
-  detached 的乘积通量拿去求导。
-* 一个 loop：先 AirNet 更新（``L_a``，ContactNet 几何 detached），再 ContactNet
-  更新（``L_c``，AirNet 场/导数 detached，几何保留梯度）。每次 backward 后检查
-  非目标网络没有梯度、参数未移动。
-* 500 mm 只能是 ``role: test``；训练入口拒绝。``predict-500`` 走
-  ``load_prediction_case``，只读 ``metadata``/``rb_times``/``rb_radius``/``rb_valid``；
-  它的时间范围来自包含 ``t0`` 的连续 ``R_b`` 段，不依赖内部监督。先保存预测，
-  再由 ``evaluate-500`` 读参考内部场和区间。
-* 接触面数据损失必须在 ``batch.t_contact`` 上重新计算 ``R_b``/``dR_b/dt``/
-  ``ContactNet``；不能复用 PDE 时刻的预测。预测/标签/掩码先展平、按掩码选点，
-  再做减法，禁止 ``[N,1]`` 与 ``[N]`` 广播成 ``[N,N]``。
-* ``R_b`` 的 NaN/无效帧必须保留为断段标志；时间严格递增；平台保段，回退拒段；
-  求解区间必须落在包含 ``t0`` 的一个连续段内。
-* 能量残差用单位体积总能量 ``E=p/(gamma-1)+rho u^2/2`` 的尺度 ``s_E/T_star``，
-  不是比内能 ``e/T_star``。空气 EOS 的 ``e`` 定义不变。
-* 分离状态分开记录接触区间、受冲击空气层、环境侧右边界三项证据；
-  “能定位混合段”不等于“已分离”。`material==2` 只是候选位置，不能证明环境态；
-  外侧场量有限但非环境时否决，场量缺失时记为无法验证。
-* 受冲击空气层要求连续、非环境、字段有效，并需要原始径向分辨率支持；
-  球壳样本数不等于原始 ALE 单元数。`extract_profiles` 保留激波外纯空气的
-  场量与逐字段有效性（训练 `valid` 仍为 False），不得用环境常数代替。
-  `material_phase`（体积分数 0/1/2）与旧 `material` 监督撤标分开传递；
-  R_b/分离/接触区间使用 `material_phase`；训练观测使用旧 `material` 与独立的 `training_location_valid`，逐字段再叠加有效性，不把联合有限性 `valid` 当作位置资格。
-  原生分辨率逐帧选择，空气侧 fallback 必须显式标记适用。
-* 当前没有真实 d3plot 缓存；``base.yaml`` 的 ``synthetic: false`` 会拒绝无缓存训练；``smoke.yaml`` 的 ``synthetic: true`` 只是工程夹具。
-  真实工况必须先 ``extract_profiles`` 再 ``build-cache``，不能把合成结果写成
-  TNT 精度验证。
+* **几何**：``R_c(t) <= r <= R_s(t)``，``zeta=(r-R_c)/(R_s-R_c)``。
+  ``R_s`` 是外传空气激波，不是测得的 ``R_b``，也不是仿真外边界
+  ``R_outer``。``R_s(t)`` 用 SciPy PCHIP 系数在 PyTorch 中求值并给解析
+  ``dR_s/dt``；禁止外推、跨无效帧、复制上一帧。
+* **接触区间**：与主产物区外缘相连的混合段，取实际单元边界
+  ``[R_c,low,R_c,up]``；不使用 ``alpha=0.5`` 或区间中点。外侧孤立产物碎片
+  不当作主接触面。阈值显式配置，尚未由真实数据确认。
+* **激波识别**：只在有效连续空气段上算 ``g=-dp/dr``，用
+  ``scipy.signal.find_peaks`` 找显著正峰；真实径向坐标、非均匀网格；不跨
+  缺失点/混合带/断开区间。记录每帧位置、状态、候选、RH 诊断和失败原因；
+  候选必须相对上一有效帧向外传播。不暗中平滑。
+* **事件对齐**：``t = t0 + (t_data - t_event_data)``。用理论 ``t_sep`` 指导
+  搜索，取首个可辨认分离帧；空气观测、接触标签、激波轨迹共用同一时钟。
+  保存原始/对齐时间、事件帧和偏移；不宣称数据事件绝对时间等于理论 ``t0``。
+* **前置与初场**：保留 CJ、JWL 等熵释律、空气 Hugoniot 匹配。
+  ``epsilon = R_sep/[200 (D_s_sep-u_c_sep)]``，``t0=t_sep+epsilon``，
+  ``Rc0=R_sep+u_c_sep epsilon``，``Rs0=R_sep+D_s_sep epsilon``；固定微秒
+  被拒绝。AirNet 初值只在 ``0<zeta<1`` 用分离态，没有未扰动空气子区。
+* **``R_c=R_s sigmoid(raw)``**；``dR_c/dt = D_s s + R_s s(1-s) raw_t``，必须
+  包含 ``D_s`` 项。``AirNet`` 的 ``t``/``zeta`` 导数在固定 ``zeta,R0`` 下求。
+* **损失**：左边界 ``u=Rc_dot``、``p=p_c(t)``（JWL 闭合）；右边界是有限马赫数
+  RH 波后状态（``M_s=D_s/c_inf>1``，不是静止环境）；空气数据用预测的 ``R_c``
+  与 ``R_s`` 重算 ``zeta``，域外点计数后排除、整批全筛掉硬失败；ContactNet
+  初值只约束位置，保留区间监督，独立初始速度损失已删除。
+* **交替更新**：先 AirNet（ContactNet 几何 detached），再 ContactNet
+  （AirNet 参数冻结但输入导数保留的 functional 求值，几何/相容梯度路径保留）。
+  每次 backward 后检查非目标网络没有梯度、参数未移动；检查点保存两个优化器、
+  阶段状态与 RNG。
+* **数据入口**：``one_d.py`` 的 ``standard_1d_source`` 中间格式（显式单位、
+  节点/单元位置类型、逐字段掩码、绝对压力）。**LS-DYNA 二进制 ALE1D 槽位
+  尚未核实，禁止猜测式读取。** 真实接入需文件样例、字段映射或软件版本。
+* **数据划分**：没有固定半径禁令。训练/验证/测试由 ``contact_air.cases`` 的
+  显式 ``role`` 决定；``base.yaml`` 的 ``cases`` 为空，``smoke.yaml`` 只有一个
+  50 mm 合成程序检查，不是研究结论。真实 50 mm 试跑尚未执行。
 
 ## 不得改变的物理选择
 
@@ -171,7 +169,7 @@
   ``T_origin=0``**。当前已确认的 50/80/100/500 mm 中心起爆卡片用
   ``T_origin = LT + R0/D``，由 ``data/dyna_supervision.py`` 从提取元数据生成；
   非零起爆点或缺参数不能套用。数据源一律用原始 d3plot：
-  50 mm ``F:/tnt/tnt_files/dp0/SYS/MECH``，80 mm
+  50 mm ``E:/tnt/tnt_files/dp0/SYS/MECH``，80 mm
   ``G:/500mmtnt/80mmtnt_files/dp0/SYS-3/MECH``，100 mm
   ``G:/500mmtnt/100mmtnt_files/dp0/SYS-3/MECH``，500 mm
   ``D:/500mmtnt/500mmtnt_files/dp0/SYS-3/MECH``。不要再读取或写入

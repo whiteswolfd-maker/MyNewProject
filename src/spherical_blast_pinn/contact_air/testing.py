@@ -8,11 +8,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from .data import CaseData, synthetic_case
+from .data import CaseData, ContactLabelConfig, synthetic_case
+from .one_d import ShockDetectionConfig
 from .precursor import PrecursorConfig, PrecursorResult, compute_precursor
 
 DEFAULT_PRECURSOR: dict[str, Any] = {
-    "epsilon_s": 1.0e-6,
+    "epsilon_denominator_factor": 200.0,
     "shock_model": "strong",
     "jwl": {
         "A": 3.7120e11,
@@ -31,14 +32,16 @@ DEFAULT_PRECURSOR: dict[str, Any] = {
     "air": {"density": 1.225, "pressure": 101320.0, "gamma": 1.4},
 }
 
-DEFAULT_TOLERANCES: dict[str, float] = {
+DEFAULT_TOLERANCES: dict[str, Any] = {
     "ambient_pressure_pa": 101320.0,
     "ambient_density_kg_m3": 1.225,
-    "pressure_pa": 0.10132,
-    "density_kg_m3": 1.0e-9,
-    "velocity_m_s": 1.0e-6,
-    "min_ambient_cells": 2,
 }
+
+DEFAULT_CONTACT = ContactLabelConfig()
+DEFAULT_SHOCK = ShockDetectionConfig(
+    relative_prominence=4.0, min_cells_from_contact=1,
+    min_pressure_jump_fraction=1.0e-2,
+)
 
 
 def default_precursor(charge_radius_m: float = 0.05) -> PrecursorResult:
@@ -49,18 +52,21 @@ def default_precursor(charge_radius_m: float = 0.05) -> PrecursorResult:
 
 def synthetic_case_for(
     charge_radius_m: float = 0.05, *, case_id: str | None = None,
-    role: str = "train", n_frames: int = 21, n_radial: int = 200,
+    role: str = "train", n_frames: int = 21, n_radial: int = 2400,
 ) -> CaseData:
     precursor = default_precursor(charge_radius_m)
     return synthetic_case(
         case_id=case_id or f"synthetic_{charge_radius_m:.3f}",
         charge_radius_m=charge_radius_m, precursor=precursor, role=role,
         n_frames=n_frames, n_radial=n_radial, tolerances=DEFAULT_TOLERANCES,
+        contact_config=DEFAULT_CONTACT, shock_config=DEFAULT_SHOCK,
     )
 
 
 __all__ = [
+    "DEFAULT_CONTACT",
     "DEFAULT_PRECURSOR",
+    "DEFAULT_SHOCK",
     "DEFAULT_TOLERANCES",
     "default_precursor",
     "synthetic_case_for",

@@ -93,7 +93,10 @@ class PrecursorConfig:
     detonation: DetonationState
     jwl: JWLParameters
     air: AirState
-    epsilon_s: float = 1.0e-6
+    #: epsilon = R_sep / [factor * (D_s_sep - u_c_sep)].  The factor is an
+    #: explicit configuration value; 200 is the current round's choice, not a
+    #: validated constant.  A fixed microsecond is no longer accepted.
+    epsilon_denominator_factor: float = 200.0
     shock_model: str = "strong"
     v_max: float = 100.0
     integration_limit: int = 200
@@ -106,8 +109,11 @@ class PrecursorConfig:
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.charge_radius_m)) or self.charge_radius_m <= 0.0:
             raise PrecursorError("charge_radius_m must be finite and positive")
-        if not math.isfinite(float(self.epsilon_s)) or self.epsilon_s <= 0.0:
-            raise PrecursorError("epsilon_s must be finite and positive")
+        if (
+            not math.isfinite(float(self.epsilon_denominator_factor))
+            or self.epsilon_denominator_factor <= 0.0
+        ):
+            raise PrecursorError("epsilon_denominator_factor must be finite and positive")
         if self.shock_model not in ("strong", "exact"):
             raise PrecursorError("shock_model must be 'strong' or 'exact'")
         if self.v_max <= 1.0:
@@ -125,6 +131,12 @@ class PrecursorConfig:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "PrecursorConfig":
+        if "epsilon_s" in payload:
+            raise PrecursorError(
+                "fixed epsilon_s is not accepted: this round uses "
+                "epsilon_s = R_sep / (epsilon_denominator_factor * "
+                "(D_s_sep - u_c_sep)); remove epsilon_s from the configuration"
+            )
         return cls(
             charge_radius_m=float(payload["charge_radius_m"]),
             detonation=DetonationState(
@@ -138,7 +150,9 @@ class PrecursorConfig:
                 pressure=float(payload["air"]["pressure"]),
                 gamma=float(payload["air"]["gamma"]),
             ),
-            epsilon_s=float(payload.get("epsilon_s", 1.0e-6)),
+            epsilon_denominator_factor=float(
+                payload.get("epsilon_denominator_factor", 200.0)
+            ),
             shock_model=str(payload.get("shock_model", "strong")),
             v_max=float(payload.get("v_max", 100.0)),
             integration_limit=int(payload.get("integration_limit", 200)),
@@ -175,6 +189,7 @@ class PrecursorResult:
     t_cj: float
     t_surface_ref: float
     t_sep: float
+    epsilon_s: float
     t0: float
     Rc0: float
     Rs0: float
@@ -190,7 +205,7 @@ class PrecursorResult:
 
     @property
     def epsilon(self) -> float:
-        return float(self.config.epsilon_s)
+        return float(self.epsilon_s)
 
     @property
     def air_density(self) -> float:
@@ -228,6 +243,10 @@ class PrecursorResult:
         return {
             "charge_radius_m": self.charge_radius,
             "epsilon_s": self.epsilon,
+            "epsilon_denominator_factor": self.config.epsilon_denominator_factor,
+            "epsilon_formula": (
+                "R_sep / (epsilon_denominator_factor * (D_s_sep - u_c_sep))"
+            ),
             "shock_model": self.shock_model,
             "air_density": self.air_density,
             "air_pressure": self.air_pressure,
@@ -453,9 +472,20 @@ def compute_precursor(config: PrecursorConfig) -> PrecursorResult:
         limit=config.integration_limit,
     )
     t_sep = t_cj + dt
-    t0 = t_sep + config.epsilon_s
-    Rc0 = R_sep + u_c_sep * config.epsilon_s
-    Rs0 = R_sep + D_s * config.epsilon_s
+    thickness_speed = float(D_s) - float(u_c_sep)
+    if not math.isfinite(thickness_speed) or thickness_speed <= 0.0:
+        raise PrecursorError(
+            f"D_s_sep - u_c_sep = {thickness_speed!r} m/s is not positive; the "
+            "initial thin-layer scale is undefined"
+        )
+    epsilon = float(R_sep) / (
+        float(config.epsilon_denominator_factor) * thickness_speed
+    )
+    if not math.isfinite(epsilon) or epsilon <= 0.0:
+        raise PrecursorError(f"epsilon = {epsilon!r} s is not finite and positive")
+    t0 = t_sep + epsilon
+    Rc0 = R_sep + u_c_sep * epsilon
+    Rs0 = R_sep + D_s * epsilon
     V_c0 = V_sep * (Rc0 / R_sep) ** 3
     p_c_t0 = _p(V_c0, jwl, C)
     initial_pressure_compatibility = {
@@ -493,12 +523,15 @@ def compute_precursor(config: PrecursorConfig) -> PrecursorResult:
             "not used as t_cj and not used as the model origin"
         ),
         "t_sep_definition_s": float(t_sep),
-        "t0_definition": "t0 = t_sep + epsilon_s",
+        "t0_definition": (
+            "t0 = t_sep + epsilon; epsilon = R_sep / "
+            "(epsilon_denominator_factor * (D_s_sep - u_c_sep))"
+        ),
         "d3plot_clock_relation": (
-            "frame times are used as recorded by the extraction (physical seconds); "
-            "no t_sep or R0/D shift is applied and no event is aligned to a "
-            "theoretical time. R_b(t0) must exist on that same axis; the shared "
-            "origin of the model clock and the d3plot clock is not verified here"
+            "the raw frame clock is data-side. The one-dimensional data contract "
+            "aligns the first identifiable separation frame to model t0 via "
+            "t = t0 + (t_data - t_event_data) and records the offset; this module "
+            "does not apply that shift and does not claim the absolute clocks agree"
         ),
         "d3plot_clock_verified": False,
         "material_source": config.material_source,
@@ -516,6 +549,8 @@ def compute_precursor(config: PrecursorConfig) -> PrecursorResult:
         ),
         "sound_speed_positive": bool(c_cj > 0.0),
         "t0_after_t_sep": bool(t0 > t_sep),
+        "thin_layer_speed_positive": bool(D_s > u_c_sep),
+        "epsilon_positive": bool(epsilon > 0.0),
         "Rc0_below_Rs0": bool(Rc0 < Rs0),
         "R_sep_above_R0": bool(R_sep > R0),
     }
@@ -559,7 +594,8 @@ def compute_precursor(config: PrecursorConfig) -> PrecursorResult:
                  "R0/D is only a separate surface-arrival reference",
         "Rc0_Rs0": "first-order displacement approximation, not a numerical evolution",
         "missing": [
-            "R_b(t0) is a data-side quantity and is not supplied by this module",
+            "R_s(t_event) and the contact interval are data-side quantities and are "
+            "not supplied by this module",
             "the material card's C/JWL provenance must be checked against the deck",
         ],
     }
@@ -602,6 +638,7 @@ def compute_precursor(config: PrecursorConfig) -> PrecursorResult:
         t_cj=t_cj,
         t_surface_ref=t_surface_ref,
         t_sep=t_sep,
+        epsilon_s=epsilon,
         t0=t0,
         Rc0=Rc0,
         Rs0=Rs0,
@@ -620,7 +657,7 @@ def compare_shock_models(config: PrecursorConfig) -> dict[str, Any]:
         detonation=config.detonation,
         jwl=config.jwl,
         air=config.air,
-        epsilon_s=config.epsilon_s,
+        epsilon_denominator_factor=config.epsilon_denominator_factor,
         shock_model="strong",
         v_max=config.v_max,
         integration_limit=config.integration_limit,
@@ -633,7 +670,7 @@ def compare_shock_models(config: PrecursorConfig) -> dict[str, Any]:
         detonation=config.detonation,
         jwl=config.jwl,
         air=config.air,
-        epsilon_s=config.epsilon_s,
+        epsilon_denominator_factor=config.epsilon_denominator_factor,
         shock_model="exact",
         v_max=config.v_max,
         integration_limit=config.integration_limit,

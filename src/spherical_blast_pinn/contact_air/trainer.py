@@ -5,29 +5,30 @@ One loop has two independent updates:
 1. AirNet update with ``L_a``: ContactNet geometry is evaluated once and
    detached; AirNet fields and their ``t``/``zeta`` derivatives stay live.
 2. ContactNet update with ``L_c``: AirNet fields and derivatives are evaluated
-   once, detached, and the ContactNet geometry is recomputed with gradients.
+   **functionally** with frozen parameter values, while the ContactNet
+   geometry and the predicted contact position stay differentiable.  The
+   physical residual is not wrapped in ``no_grad``/``detach``.
 
 Two Adam optimizers exist for the whole run.  After each backward pass the
-trainer verifies that the non-target network has **no** gradient at all and
-that its parameters did not move; a zero gradient hidden inside a larger
-optimizer is not accepted as isolation.
+trainer verifies that the non-target network has **no** gradient and that its
+parameters did not move.
 """
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import math
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
 
 from .data import CaseData
 from .losses import (
+    LossError,
     TermResult,
     air_data_loss,
     air_ic_loss,
@@ -36,6 +37,7 @@ from .losses import (
     contact_data_loss,
     contact_ic_loss,
     contact_violation_rmse,
+    data_coordinates,
     interface_loss,
     masked_rmse,
     pde_loss,
@@ -105,8 +107,7 @@ def _summarise(results: Sequence[TermResult], like: torch.Tensor) -> TermResult:
 @dataclass
 class TrainConfig:
     n_pde: int = 512
-    n_ic_shock: int = 128
-    n_ic_ambient: int = 128
+    n_ic: int = 128
     n_right: int = 128
     n_data: int = 128
     n_contact: int = 128
@@ -123,7 +124,7 @@ class TrainConfig:
     validation_contact_points: int = 256
 
     def __post_init__(self) -> None:
-        for name in ("n_pde", "n_ic_shock", "n_ic_ambient", "n_right", "n_data", "n_contact"):
+        for name in ("n_pde", "n_ic", "n_right", "n_data", "n_contact"):
             if int(getattr(self, name)) < 0:
                 raise TrainingError(f"{name} must be non-negative")
         if self.loops < 0:
@@ -174,14 +175,18 @@ class AlternatingTrainer:
         if not cases:
             raise TrainingError("at least one training case is required")
         for case in cases:
+            # Generic leakage guard driven by the explicit role.  There is no
+            # fixed-radius rule: whichever case is configured as test is
+            # excluded, and a training case cannot share frames with a
+            # validation subset of the same case.
             if case.role == "test":
                 raise TrainingError(
-                    f"case {case.case_id!r} is a test case; it must never enter training"
+                    f"case {case.case_id!r} is role=test; it must never enter training"
                 )
-            if abs(float(case.charge_radius_m) * 1000.0 - 500.0) <= 1.0e-9:
+            if case.role == "validation":
                 raise TrainingError(
-                    f"case {case.case_id!r}: R0=500 mm is the final-validation radius; "
-                    "it must not enter training even if the role label is wrong"
+                    f"case {case.case_id!r} is role=validation; only train cases "
+                    "belong in the training list"
                 )
         ids = [case.case_id for case in cases]
         if len(set(ids)) != len(ids):
@@ -190,26 +195,20 @@ class AlternatingTrainer:
         validation_cases: list[CaseData] = []
         fraction = float(config.validation_holdout_fraction)
         if fraction == 0.0:
-            # No independent validation frames by explicit choice.  The trainer
-            # reports "not evaluable" rather than pretending the training frames
-            # are a validation set.
             train_cases = list(cases)
         else:
             for case in cases:
-                # Split only frames inside the actual solve window [t0, t_end]
-                # and inside a continuous R_b segment.  A contact label after a
-                # gap must not drag the validation interval across that gap.
                 frames = np.asarray([
                     index for index in case.contact.indices()
                     if case.t0 <= float(case.contact.times[index]) <= case.t_end
-                    and case.boundary.has_slope(float(case.contact.times[index]))
+                    and case.shock.has_slope(float(case.contact.times[index]))
                 ], dtype=np.int64)
                 if frames.size < 2:
                     raise TrainingError(
                         f"case {case.case_id!r} has {frames.size} usable contact "
                         "frame(s); an independent validation split needs at least "
                         "two. Set validation.holdout_fraction: 0 explicitly to "
-                        "train without validation, or improve the extraction."
+                        "train without validation."
                     )
                 n_validation = max(1, int(round(fraction * frames.size)))
                 n_validation = min(n_validation, frames.size - 1)
@@ -243,14 +242,16 @@ class AlternatingTrainer:
         np.random.seed(int(config.seed) % 2**32)
         random.seed(int(config.seed))
         self.loop = 0
+        self.stage_state = "alternating"
         self.history = TrainingHistory()
         self._validation = self._build_validation()
+        like = torch.zeros(1, 1, dtype=torch.float64)
         self._closures = {
-            case.case_id: closure_from_precursor(case.precursor, like=torch.zeros(1, 1, dtype=torch.float64))
+            case.case_id: closure_from_precursor(case.precursor, like=like)
             for case in self.cases
         }
         self._scales = {
-            case.case_id: scales_from_precursor(case.precursor, like=torch.zeros(1, 1, dtype=torch.float64))
+            case.case_id: scales_from_precursor(case.precursor, like=like)
             for case in self.cases
         }
 
@@ -260,8 +261,7 @@ class AlternatingTrainer:
         n = len(self.cases)
         counts = {
             "pde": split_counts(cfg.n_pde, n),
-            "ic_shock": split_counts(cfg.n_ic_shock, n),
-            "ic_amb": split_counts(cfg.n_ic_ambient, n),
+            "ic": split_counts(cfg.n_ic, n),
             "right": split_counts(cfg.n_right, n),
             "data": split_counts(cfg.n_data, n),
             "contact": split_counts(cfg.n_contact, n),
@@ -272,11 +272,8 @@ class AlternatingTrainer:
                 case,
                 sample_case_batch(
                     case,
-                    n_pde=counts["pde"][index],
-                    n_ic_shock=counts["ic_shock"][index],
-                    n_ic_ambient=counts["ic_amb"][index],
-                    n_right=counts["right"][index],
-                    n_data=counts["data"][index],
+                    n_pde=counts["pde"][index], n_ic=counts["ic"][index],
+                    n_right=counts["right"][index], n_data=counts["data"][index],
                     n_contact=counts["contact"][index],
                     generator=self.generator if generator is None else generator,
                 ),
@@ -284,11 +281,11 @@ class AlternatingTrainer:
         return result
 
     def _build_validation(self) -> list[ValidationSample]:
-        generator = torch.Generator().manual_seed(int(self.config.seed) + 20261104)
+        generator = torch.Generator().manual_seed(int(self.config.seed) + 20261110)
         samples: list[ValidationSample] = []
         for case in self.validation_cases:
             batch = sample_case_batch(
-                case, n_pde=0, n_ic_shock=0, n_ic_ambient=0, n_right=0,
+                case, n_pde=0, n_ic=0, n_right=0,
                 n_data=int(self.config.validation_data_points),
                 n_contact=int(self.config.validation_contact_points),
                 generator=generator,
@@ -299,8 +296,8 @@ class AlternatingTrainer:
     def _contact_inputs(self, case: CaseData, t: torch.Tensor):
         t_flat = t.reshape(-1)
         r0 = _full(case.charge_radius_m, t_flat).reshape(-1, 1)
-        rb, rb_dot = case.boundary_tensors(t_flat)
-        return r0, rb.reshape(-1, 1), rb_dot.reshape(-1, 1)
+        rs, ds = case.shock_tensors(t_flat)
+        return r0, rs.reshape(-1, 1), ds.reshape(-1, 1)
 
     # -- gradient isolation ---------------------------------------------
     def _parameter_snapshot(self, net: torch.nn.Module) -> list[torch.Tensor]:
@@ -358,13 +355,13 @@ class AlternatingTrainer:
         for case, batch in batches:
             closure = self._closures[case.case_id]
             scales = self._scales[case.case_id]
-            r0, rb, rb_dot = self._contact_inputs(case, batch.t_pde)
+            r0, rs, ds = self._contact_inputs(case, batch.t_pde)
             c_fields = self.contact_net(
-                batch.t_pde.reshape(-1, 1), r0, rb, rb_dot, closure, create_graph=False
+                batch.t_pde.reshape(-1, 1), r0, rs, ds, closure, create_graph=False
             )
             c_fields = _detach_contact(c_fields)
             geometry = build_geometry(
-                c_fields.radius, c_fields.speed, rb, rb_dot, batch.zeta_pde.reshape(-1, 1)
+                c_fields.radius, c_fields.speed, rs, ds, batch.zeta_pde.reshape(-1, 1)
             )
             fields, derivatives = air_fields_with_derivatives(
                 self.air_net, batch.zeta_pde, batch.t_pde, r0, scales,
@@ -384,16 +381,21 @@ class AlternatingTrainer:
                 )
             else:
                 interface = TermResult(total=torch.zeros((), dtype=torch.float64))
-            if batch.t_right.numel():
-                tr0, trb, trbd = self._contact_inputs(case, batch.t_right)
-                air1 = self.air_net(
-                    torch.ones_like(batch.t_right).reshape(-1, 1),
-                    batch.t_right.reshape(-1, 1), tr0.reshape(-1, 1), scales,
+            right = right_loss(net=self.air_net, batch=batch, case=case, scales=scales)
+            if batch.t_data.numel():
+                r0d, rsd, dsd = self._contact_inputs(case, batch.t_data)
+                c_data = self.contact_net(
+                    batch.t_data.reshape(-1, 1), r0d, rsd, dsd, closure,
+                    create_graph=False,
                 )
-                right = right_loss(air_at_right=air1, case=case)
+                c_data = _detach_contact(c_data)
             else:
-                right = TermResult(total=torch.zeros((), dtype=torch.float64))
-            data = air_data_loss(self.air_net, batch, case, scales)
+                c_data = None
+            data = (
+                air_data_loss(self.air_net, batch, case, scales, c_data)
+                if c_data is not None else
+                TermResult(total=torch.zeros((), dtype=torch.float64))
+            )
             air_results.append(combine_air(
                 pde=pde, ic=ic, interface=interface, right=right, data=data,
                 lambda_pde=lambda_pde, lambda_data=lambda_data,
@@ -415,43 +417,44 @@ class AlternatingTrainer:
         for case, batch in batches:
             closure = self._closures[case.case_id]
             scales = self._scales[case.case_id]
-            r0, rb, rb_dot = self._contact_inputs(case, batch.t_pde)
+            r0, rs, ds = self._contact_inputs(case, batch.t_pde)
             c_fields = self.contact_net(
-                batch.t_pde.reshape(-1, 1), r0, rb, rb_dot, closure, create_graph=True
+                batch.t_pde.reshape(-1, 1), r0, rs, ds, closure, create_graph=True
             )
             geometry = build_geometry(
-                c_fields.radius, c_fields.speed, rb, rb_dot, batch.zeta_pde.reshape(-1, 1)
+                c_fields.radius, c_fields.speed, rs, ds, batch.zeta_pde.reshape(-1, 1)
             )
+            # Frozen AirNet parameters, live zeta/t derivatives and live geometry.
             a_fields, a_derivs = air_fields_with_derivatives(
                 self.air_net, batch.zeta_pde, batch.t_pde, r0, scales,
-                create_graph=False,
+                create_graph=True, functional=True,
             )
-            a_fields = _detach_fields(a_fields)
-            a_derivs = _detach_derivatives(a_derivs)
             pde = pde_loss(
                 fields=a_fields, derivatives=a_derivs, geometry=geometry, case=case
             )
             t0 = torch.full_like(batch.t_pde, float(case.t0))
-            r00, rb0, rb0d = self._contact_inputs(case, t0)
-            c0 = self.contact_net(t0.reshape(-1, 1), r00, rb0, rb0d, closure, create_graph=True)
+            r00, rs0, ds0 = self._contact_inputs(case, t0)
+            c0 = self.contact_net(
+                t0.reshape(-1, 1), r00, rs0, ds0, closure, create_graph=True
+            )
             ic = contact_ic_loss(c0, case)
             if batch.t_pde.numel():
-                air0 = _detach_fields(self.air_net(
+                air0 = self.air_net.forward_functional(
                     torch.zeros_like(batch.t_pde).reshape(-1, 1),
                     batch.t_pde.reshape(-1, 1), r0.reshape(-1, 1), scales,
-                ))
+                    detach_parameters=True,
+                )
                 interface = interface_loss(
                     air_at_contact=air0, contact=c_fields, case=case
                 )
             else:
                 interface = TermResult(total=torch.zeros((), dtype=torch.float64))
             if batch.t_contact.numel():
-                # The interval labels belong to batch.t_contact.  Re-evaluate
-                # R_b, dR_b/dt and ContactNet at those exact times; reusing the
-                # PDE-time prediction would compare different times.
-                r0c, rbc, rbdc = self._contact_inputs(case, batch.t_contact)
+                # L_c's data term is the contact-interval supervision, evaluated
+                # at the label times.  Air observations belong to L_a only.
+                r0c, rsc, dsc = self._contact_inputs(case, batch.t_contact)
                 c_contact = self.contact_net(
-                    batch.t_contact.reshape(-1, 1), r0c, rbc, rbdc, closure,
+                    batch.t_contact.reshape(-1, 1), r0c, rsc, dsc, closure,
                     create_graph=True,
                 )
                 data = contact_data_loss(c_contact, batch, case)
@@ -487,15 +490,55 @@ class AlternatingTrainer:
             "scales_by_case": {
                 case.case_id: case.scale_dict() for case, _ in batches
             },
-            "clock_by_case": {
-                case.case_id: dict(case.precursor.get("clock", {}))
-                for case, _ in batches
+            "event_alignment_by_case": {
+                case.case_id: dict(case.event_alignment) for case, _ in batches
             },
         }
         self.history.loops.append(record)
         return record
 
     # -- validation ------------------------------------------------------
+    def _air_errors(self, case: CaseData, batch: CaseBatch) -> dict[str, Any]:
+        if batch.t_data.numel() == 0:
+            return {
+                "air_rmse": None, "rho_rmse": None, "u_rmse": None,
+                "p_rmse": None, "n_rho": 0, "n_u": 0, "n_p": 0,
+                "n_outside_domain": 0,
+            }
+        scales = self._scales[case.case_id]
+        with torch.enable_grad():
+            r0d, rsd, dsd = self._contact_inputs(case, batch.t_data)
+            c_data = self.contact_net(
+                batch.t_data.reshape(-1, 1), r0d, rsd, dsd,
+                self._closures[case.case_id], create_graph=False,
+            )
+        c_data = _detach_contact(c_data)
+        zeta, inside, outside = data_coordinates(
+            radius=batch.radius_data, t=batch.t_data, contact=c_data, case=case
+        )
+        inside = inside.reshape(-1)
+        r0 = _full(case.charge_radius_m, batch.t_data)
+        with torch.no_grad():
+            fields = self.air_net(
+                zeta.detach(), batch.t_data.reshape(-1, 1), r0.reshape(-1, 1), scales
+            )
+            rho_err, n_rho = masked_rmse(
+                fields.density, batch.rho_data, batch.valid_rho & inside, case.rho_scale
+            )
+            u_err, n_u = masked_rmse(
+                fields.velocity, batch.u_data, batch.valid_u & inside, case.u_scale
+            )
+            p_err, n_p = masked_rmse(
+                fields.pressure, batch.p_data, batch.valid_p & inside, case.p_scale
+            )
+        components = [value for value in (rho_err, u_err, p_err) if value is not None]
+        return {
+            "air_rmse": sum(components) / len(components) if components else None,
+            "rho_rmse": rho_err, "u_rmse": u_err, "p_rmse": p_err,
+            "n_rho": n_rho, "n_u": n_u, "n_p": n_p,
+            "n_outside_domain": int(outside),
+        }
+
     def evaluate(self) -> dict[str, Any]:
         if not self._validation:
             return {
@@ -506,54 +549,32 @@ class AlternatingTrainer:
                 "cases": [],
             }
         per_case: list[dict[str, Any]] = []
-        with torch.no_grad():
-            for sample in self._validation:
-                case = next(c for c in self.validation_cases if c.case_id == sample.case_id)
-                batch = sample.batch
-                scales = self._scales[case.case_id]
-                rho_err = u_err = p_err = None
-                n_rho = n_u = n_p = 0
-                if batch.t_data.numel():
-                    r0 = _full(case.charge_radius_m, batch.t_data)
-                    fields = self.air_net(
-                        batch.zeta_data.reshape(-1, 1), batch.t_data.reshape(-1, 1),
-                        r0.reshape(-1, 1), scales,
+        for sample in self._validation:
+            case = next(c for c in self.validation_cases if c.case_id == sample.case_id)
+            batch = sample.batch
+            air = self._air_errors(case, batch)
+            violation = None
+            n_contact = 0
+            if batch.t_contact.numel():
+                with torch.enable_grad():
+                    r0, rs, ds = self._contact_inputs(case, batch.t_contact)
+                    c_fields = self.contact_net(
+                        batch.t_contact.reshape(-1, 1), r0, rs, ds,
+                        self._closures[case.case_id], create_graph=False,
                     )
-                    rho_err, n_rho = masked_rmse(
-                        fields.density, batch.rho_data, batch.valid_rho, case.rho_scale
-                    )
-                    u_err, n_u = masked_rmse(
-                        fields.velocity, batch.u_data, batch.valid_u, case.u_scale
-                    )
-                    p_err, n_p = masked_rmse(
-                        fields.pressure, batch.p_data, batch.valid_p, case.p_scale
-                    )
-                components = [value for value in (rho_err, u_err, p_err) if value is not None]
-                air_error = sum(components) / len(components) if components else None
-                violation = None
-                n_contact = 0
-                if batch.t_contact.numel():
-                    r0, rb, rb_dot = self._contact_inputs(case, batch.t_contact)
-                    with torch.enable_grad():
-                        c_fields = self.contact_net(
-                            batch.t_contact.reshape(-1, 1), r0, rb, rb_dot,
-                            self._closures[case.case_id], create_graph=False,
-                        )
-                    c_fields = _detach_contact(c_fields)
-                    violation, n_contact = contact_violation_rmse(c_fields, batch, case)
-                available = [value for value in (air_error, violation) if value is not None]
-                # A case with no evaluable component must not contribute a
-                # free zero to the score.
-                score = sum(available) if available else None
-                per_case.append({
-                    "case_id": case.case_id,
-                    "evaluable": bool(available),
-                    "air_rmse": air_error, "rho_rmse": rho_err,
-                    "u_rmse": u_err, "p_rmse": p_err,
-                    "n_rho": n_rho, "n_u": n_u, "n_p": n_p,
-                    "contact_violation": violation, "n_contact": n_contact,
-                    "score": score,
-                })
+                c_fields = _detach_contact(c_fields)
+                violation, n_contact = contact_violation_rmse(c_fields, batch, case)
+            available = [
+                value for value in (air["air_rmse"], violation) if value is not None
+            ]
+            score = sum(available) if available else None
+            per_case.append({
+                "case_id": case.case_id,
+                "evaluable": bool(available),
+                **air,
+                "contact_violation": violation, "n_contact": n_contact,
+                "score": score,
+            })
         scores = [item["score"] for item in per_case if item["score"] is not None]
         return {
             "score": sum(scores) / len(scores) if scores else None,
@@ -626,12 +647,12 @@ class AlternatingTrainer:
         add("t0", np.asarray([case.t0]))
         add("t_end", np.asarray([case.t_end]))
         add("initial", np.asarray([
-            case.initial.Rc0, case.initial.Rs0, case.initial.Rb0,
-            case.initial.zeta_s0,
+            case.initial.Rc0, case.initial.Rs0, case.initial.zeta_s0,
+            case.initial.Rs_data_at_t0,
         ]))
-        add("boundary_times", case.boundary.times)
-        add("boundary_radii", case.boundary.radii)
-        add("boundary_valid", case.boundary.valid)
+        add("shock_times", case.shock.times)
+        add("shock_radii", case.shock.radii)
+        add("shock_valid", case.shock.valid)
         add("contact_times", case.contact.times)
         add("contact_low", case.contact.low)
         add("contact_up", case.contact.up)
@@ -639,7 +660,6 @@ class AlternatingTrainer:
         add("contact_valid", case.contact.valid)
         add("obs_time", case.observations.time)
         add("obs_radius", case.observations.radius)
-        add("obs_zeta", case.observations.zeta)
         add("obs_density", case.observations.density)
         add("obs_velocity", case.observations.velocity)
         add("obs_pressure", case.observations.pressure)
@@ -647,6 +667,9 @@ class AlternatingTrainer:
         add("obs_valid_velocity", case.observations.valid_velocity)
         add("obs_valid_pressure", case.observations.valid_pressure)
         add("obs_frame", case.observations.frame_index)
+        add("event_alignment", json.dumps(case.event_alignment, sort_keys=True, allow_nan=True))
+        add("contact_config", json.dumps(case.contact_config, sort_keys=True))
+        add("shock_config", json.dumps(case.shock_config, sort_keys=True))
         add("notes", "\n".join(case.notes))
         add("tolerances", json.dumps(case.tolerances, sort_keys=True))
         return digest.hexdigest()
@@ -654,15 +677,17 @@ class AlternatingTrainer:
     @staticmethod
     def _batch_payload(batch: CaseBatch) -> dict[str, Any]:
         names = (
-            "t_pde", "zeta_pde", "t_ic", "zeta_ic_shock", "zeta_ic_ambient",
-            "t_right", "t_data", "zeta_data", "rho_data", "u_data", "p_data",
-            "valid_rho", "valid_u", "valid_p", "t_contact", "low_contact",
-            "up_contact",
+            "t_pde", "zeta_pde", "t_ic", "zeta_ic", "t_right", "t_data",
+            "radius_data", "rho_data", "u_data", "p_data", "valid_rho",
+            "valid_u", "valid_p", "t_contact", "low_contact", "up_contact",
         )
         payload: dict[str, Any] = {"case_id": batch.case_id}
         for name in names:
             value = getattr(batch, name)
-            payload[name] = value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
+            payload[name] = (
+                value.detach().cpu().numpy() if hasattr(value, "detach")
+                else np.asarray(value)
+            )
         return payload
 
     @staticmethod
@@ -674,11 +699,9 @@ class AlternatingTrainer:
         return CaseBatch(
             case_id=str(payload["case_id"]),
             t_pde=array("t_pde", "float64"), zeta_pde=array("zeta_pde", "float64"),
-            t_ic=array("t_ic", "float64"),
-            zeta_ic_shock=array("zeta_ic_shock", "float64"),
-            zeta_ic_ambient=array("zeta_ic_ambient", "float64"),
+            t_ic=array("t_ic", "float64"), zeta_ic=array("zeta_ic", "float64"),
             t_right=array("t_right", "float64"),
-            t_data=array("t_data", "float64"), zeta_data=array("zeta_data", "float64"),
+            t_data=array("t_data", "float64"), radius_data=array("radius_data", "float64"),
             rho_data=array("rho_data", "float64"), u_data=array("u_data", "float64"),
             p_data=array("p_data", "float64"),
             valid_rho=array("valid_rho", "bool"), valid_u=array("valid_u", "bool"),
@@ -735,8 +758,9 @@ class AlternatingTrainer:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "format": "spherical_blast_pinn.contact_air_checkpoint",
-            "version": 3,
+            "version": 4,
             "loop": self.loop,
+            "stage_state": self.stage_state,
             "contact_net": self.contact_net.state_dict(),
             "air_net": self.air_net.state_dict(),
             "opt_contact": self.opt_contact.state_dict(),
@@ -772,11 +796,11 @@ class AlternatingTrainer:
         payload = torch.load(path, map_location="cpu", weights_only=False)
         if payload.get("format") != "spherical_blast_pinn.contact_air_checkpoint":
             raise TrainingError(f"{path}: not a contact-air checkpoint")
-        if payload.get("version") != 3:
+        if payload.get("version") != 4:
             raise TrainingError(
                 f"{path}: checkpoint version {payload.get('version')!r} is not "
-                "supported. Retrain: version 3 adds shared-physics metadata "
-                "required for prediction compatibility checks"
+                "supported. Retrain: version 4 carries the R_s/shock-trajectory "
+                "contract and the two-optimizer stage state"
             )
         expected = [case.case_id for case in self.cases]
         if list(payload.get("case_ids", [])) != expected:
@@ -787,8 +811,9 @@ class AlternatingTrainer:
         signatures = [self._case_signature(case) for case in self.cases]
         if list(payload.get("case_signatures", [])) != signatures:
             raise TrainingError(
-                f"{path}: training data / precursor / boundary / split signature "
-                "does not match the current cases; refusing to resume on different data"
+                f"{path}: training data / precursor / shock trajectory / split "
+                "signature does not match the current cases; refusing to resume on "
+                "different data"
             )
         validation_ids = [case.case_id for case in self.validation_cases]
         if list(payload.get("validation_case_ids", [])) != validation_ids:
@@ -806,8 +831,8 @@ class AlternatingTrainer:
         saved_config = payload.get("config", {})
         for key in (
             "validation_holdout_fraction", "validation_data_points",
-            "validation_contact_points", "n_schedule", "n_pde", "n_ic_shock",
-            "n_ic_ambient", "n_right", "n_data", "n_contact", "seed",
+            "validation_contact_points", "n_schedule", "n_pde", "n_ic",
+            "n_right", "n_data", "n_contact", "seed",
         ):
             saved = saved_config.get(key)
             current = getattr(self.config, key)
@@ -816,8 +841,6 @@ class AlternatingTrainer:
                     f"{path}: checkpoint {key}={saved!r} does not match the current "
                     f"{current!r}; the training/validation split or sampling changed"
                 )
-        # Validate every state dict before mutating anything: a partially
-        # loaded checkpoint is worse than a refused one.
         self._check_state_dict(self.contact_net, payload["contact_net"], "contact_net")
         self._check_state_dict(self.air_net, payload["air_net"], "air_net")
         self._check_optimizer(
@@ -841,10 +864,9 @@ class AlternatingTrainer:
         self.opt_contact.load_state_dict(payload["opt_contact"])
         self.opt_air.load_state_dict(payload["opt_air"])
         self.loop = int(payload["loop"])
+        self.stage_state = str(payload.get("stage_state", "alternating"))
         history = payload.get("history", {})
         saved_best = history.get("best_score", None)
-        # ``0.0`` is a valid best score.  Only ``None`` means "no usable best
-        # score"; using ``saved_best or inf`` would silently turn 0 into inf.
         best_score = float("inf") if saved_best is None else float(saved_best)
         self.history = TrainingHistory(
             loops=list(history.get("loops", [])),
@@ -860,7 +882,7 @@ class AlternatingTrainer:
             np.random.set_state(payload["numpy_rng"])
         if "python_rng" in payload:
             random.setstate(payload["python_rng"])
-        return {"loop": self.loop, "case_ids": expected}
+        return {"loop": self.loop, "case_ids": expected, "stage_state": self.stage_state}
 
 
 __all__ = [
@@ -868,4 +890,5 @@ __all__ = [
     "TrainConfig",
     "TrainingError",
     "TrainingHistory",
+    "LossError",
 ]

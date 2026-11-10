@@ -13,15 +13,15 @@ from spherical_blast_pinn.contact_air.models import AirFields
 DTYPE = torch.float64
 
 
-def test_mapped_and_physical_residuals_agree_for_a_smooth_nonuniform_boundary():
+def test_mapped_and_physical_residuals_agree_for_a_smooth_nonuniform_shock():
     zeta = torch.tensor([[0.1], [0.4], [0.8]], dtype=DTYPE)
     t = torch.tensor([[1.0e-5], [2.0e-5], [3.0e-5]], dtype=DTYPE)
-    # Non-uniform R_b and R_c: both the value and the grid speed vary.
+    # Non-uniform R_s and R_c: both the value and the grid speed vary.
     rc = 0.10 + 1000.0 * (t - 1.0e-5)
     rc_dot = torch.full_like(rc, 1000.0)
-    rb = 0.20 + 1500.0 * (t - 1.0e-5) + 2.0e7 * (t - 1.0e-5) ** 2
-    rb_dot = 1500.0 + 4.0e7 * (t - 1.0e-5)
-    geometry = build_geometry(rc, rc_dot, rb, rb_dot, zeta)
+    rs = 0.20 + 1500.0 * (t - 1.0e-5) + 2.0e7 * (t - 1.0e-5) ** 2
+    ds = 1500.0 + 4.0e7 * (t - 1.0e-5)
+    geometry = build_geometry(rc, rc_dot, rs, ds, zeta)
     r = geometry.radius
 
     rho = 1.2 + 0.3 * r + 0.2 * t
@@ -61,7 +61,7 @@ def test_mapped_and_physical_residuals_agree_for_a_smooth_nonuniform_boundary():
         )
 
 
-def test_contact_speed_uses_the_full_product_rule_with_moving_rb():
+def test_contact_speed_uses_the_full_product_rule_with_moving_shock():
     from spherical_blast_pinn.contact_air.models import ContactNet, closure_from_precursor
     from spherical_blast_pinn.contact_air.testing import default_precursor
 
@@ -71,19 +71,19 @@ def test_contact_speed_uses_the_full_product_rule_with_moving_rb():
     closure = closure_from_precursor(precursor.as_dict(), like=torch.zeros(1, 1, dtype=DTYPE))
     t = torch.tensor([[2.0e-5]], dtype=DTYPE)
 
-    def rb_of(value):
+    def rs_of(value):
         return 0.20 + 1500.0 * (value - 1.0e-5) + 2.0e7 * (value - 1.0e-5) ** 2
 
-    def rb_dot_of(value):
+    def ds_of(value):
         return 1500.0 + 4.0e7 * (value - 1.0e-5)
 
     r0 = torch.full_like(t, 0.05)
     with torch.enable_grad():
-        fields = net(t, r0, rb_of(t), rb_dot_of(t), closure, create_graph=False)
+        fields = net(t, r0, rs_of(t), ds_of(t), closure, create_graph=False)
     h = 1.0e-10
     with torch.enable_grad():
-        plus = net(t + h, r0, rb_of(t + h), rb_dot_of(t + h), closure, create_graph=False)
-        minus = net(t - h, r0, rb_of(t - h), rb_dot_of(t - h), closure, create_graph=False)
+        plus = net(t + h, r0, rs_of(t + h), ds_of(t + h), closure, create_graph=False)
+        minus = net(t - h, r0, rs_of(t - h), ds_of(t - h), closure, create_graph=False)
     finite_difference = (plus.radius - minus.radius) / (2.0 * h)
     assert torch.allclose(fields.speed, finite_difference, rtol=2.0e-5, atol=1.0e-3), (
         float(fields.speed), float(finite_difference)
@@ -129,10 +129,10 @@ def test_air_time_derivatives_are_taken_at_fixed_zeta_and_r0():
 def test_geometry_rejects_non_positive_layer():
     zeta = torch.tensor([[0.5]], dtype=DTYPE)
     rc = torch.tensor([[0.2]], dtype=DTYPE)
-    rb = torch.tensor([[0.1]], dtype=DTYPE)
+    rs = torch.tensor([[0.1]], dtype=DTYPE)
     try:
-        build_geometry(rc, torch.zeros_like(rc), rb, torch.zeros_like(rb), zeta)
+        build_geometry(rc, torch.zeros_like(rc), rs, torch.zeros_like(rs), zeta)
     except Exception as exc:
-        assert "L = R_b - R_c" in str(exc)
+        assert "L = R_s - R_c" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("non-positive layer was accepted")

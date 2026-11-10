@@ -1,14 +1,20 @@
 """Shared ContactNet and AirNet.
 
 ``ContactNet`` maps physical ``(t, R0)`` to ``R_c``.  ``R_c`` is parameterised
-as ``R_b(t) * sigmoid(raw)`` so it stays inside the measured right boundary;
+as ``R_s(t) * sigmoid(raw)`` so it stays inside the identified external shock;
 ``dR_c/dt`` is formed from the full product rule, including the measured
-``dR_b/dt`` and the autograd derivative of ``raw``.  ``AirNet`` maps
+``dR_s/dt = D_s`` and the autograd derivative of ``raw``.  ``AirNet`` maps
 ``(zeta, t, R0)`` to ``(rho, u, p)``; ``e = p/((gamma_a-1) rho)`` is derived.
 
 The two networks share parameters across all training radii.  No time or radius
 normalisation is applied to the network inputs: ``t`` is in seconds, ``R0`` and
 ``zeta`` as defined by the scheme.
+
+``AirNet.forward_functional(..., detach_parameters=True)`` evaluates the same
+network with frozen parameter values.  The contact stage uses it so gradients
+can flow through ``zeta``/``t`` into ``ContactNet`` without populating any
+``AirNet`` parameter gradient; this is parameter isolation, not ``no_grad`` on
+the physical residual.
 """
 from __future__ import annotations
 
@@ -89,7 +95,7 @@ def _mlp(input_dim: int, width: int, depth: int, *, dtype, device) -> nn.Sequent
 
 
 class ContactNet(nn.Module):
-    """``(t, R0) -> R_c`` with ``R_c = R_b sigmoid(raw)``."""
+    """``(t, R0) -> R_c`` with ``R_c = R_s sigmoid(raw)``."""
 
     def __init__(self, *, width: int = 50, depth: int = 5, dtype=torch.float64,
                  device="cpu") -> None:
@@ -102,25 +108,30 @@ class ContactNet(nn.Module):
         self,
         t: torch.Tensor,
         r0: torch.Tensor,
-        rb: torch.Tensor,
-        rb_dot: torch.Tensor,
+        shock_radius: torch.Tensor,
+        shock_speed: torch.Tensor,
         closure: JWLClosure,
         *,
         create_graph: bool = True,
     ) -> ContactFields:
-        if t.shape != r0.shape or t.shape != rb.shape or t.shape != rb_dot.shape:
-            raise ModelError("t, R0, R_b and dR_b/dt must have the same shape")
+        if not (
+            t.shape == r0.shape == shock_radius.shape == shock_speed.shape
+        ):
+            raise ModelError(
+                "t, R0, R_s and dR_s/dt must have the same shape"
+            )
         t_leaf = (t if t.requires_grad else t.detach()).reshape(-1, 1).requires_grad_(True)
         r0_in = r0.reshape(-1, 1)
-        rb_in = rb.reshape(-1, 1)
-        rb_dot_in = rb_dot.reshape(-1, 1)
+        rs_in = shock_radius.reshape(-1, 1)
+        ds_in = shock_speed.reshape(-1, 1)
         raw = self.net(torch.cat([t_leaf, r0_in], dim=-1))
         raw_t = torch.autograd.grad(
             raw.sum(), t_leaf, create_graph=create_graph, retain_graph=create_graph
         )[0]
         s = torch.sigmoid(raw)
-        radius = rb_in * s
-        speed = rb_dot_in * s + rb_in * s * (1.0 - s) * raw_t
+        radius = rs_in * s
+        # Full product rule: R_s(t) sigmoid(raw(t)).
+        speed = ds_in * s + rs_in * s * (1.0 - s) * raw_t
         V = closure.V_sep * (radius / closure.R_sep) ** 3
         pressure = closure.pressure(V)
         if not bool(torch.isfinite(radius).all() and torch.isfinite(speed).all()):
@@ -134,7 +145,7 @@ class ContactNet(nn.Module):
         return {
             "name": "ContactNet",
             "inputs": ["t_s", "R0_m"],
-            "output": "R_c = R_b(t) * sigmoid(raw)",
+            "geometry": "R_c = R_s(t) * sigmoid(raw)",
             "width": self.net[0].out_features,
             "depth": sum(isinstance(m, nn.Linear) for m in self.net) - 1,
             "parameters": sum(p.numel() for p in self.parameters()),
@@ -157,7 +168,6 @@ class AirNet(nn.Module):
             layers.append(nn.Tanh())
             last = int(width)
         self.trunk = nn.Sequential(*layers)
-        # Three outputs share the trunk; each head is 1-wide.
         self.head_rho = nn.Linear(width, 1, dtype=dtype, device=device)
         self.head_u = nn.Linear(width, 1, dtype=dtype, device=device)
         self.head_p = nn.Linear(width, 1, dtype=dtype, device=device)
@@ -173,19 +183,73 @@ class AirNet(nn.Module):
         if zeta.shape != t.shape or zeta.shape != r0.shape:
             raise ModelError("zeta, t and R0 must have the same shape")
         hidden = self.trunk(torch.cat([zeta, t, r0], dim=-1))
+        return self._heads(hidden, scales)
+
+    def _heads(self, hidden: torch.Tensor, scales: Scales) -> AirFields:
         rho_raw = self.head_rho(hidden)
         u_raw = self.head_u(hidden)
         p_raw = self.head_p(hidden)
         density = scales.rho * F.softplus(rho_raw)
         pressure = scales.p * F.softplus(p_raw)
         velocity = scales.u * u_raw
-        energy = pressure / (torch.clamp(scales.gamma - 1.0, min=1.0e-12) * torch.clamp(density, min=1.0e-30))
+        energy = pressure / (
+            torch.clamp(scales.gamma - 1.0, min=1.0e-12)
+            * torch.clamp(density, min=1.0e-30)
+        )
         if not bool(
             torch.isfinite(density).all()
             and torch.isfinite(velocity).all()
             and torch.isfinite(pressure).all()
         ):
             raise ModelError("air fields are not finite")
+        return AirFields(
+            density=density, velocity=velocity, pressure=pressure,
+            specific_energy=energy,
+        )
+
+    def forward_functional(
+        self,
+        zeta: torch.Tensor,
+        t: torch.Tensor,
+        r0: torch.Tensor,
+        scales: Scales,
+        *,
+        detach_parameters: bool = True,
+    ) -> AirFields:
+        """Evaluate with frozen parameters but live inputs.
+
+        Every ``Linear`` uses detached weight/bias when
+        ``detach_parameters=True``.  Gradients with respect to ``zeta``/``t``
+        remain, so a ContactNet-dependent ``zeta`` still receives its gradient.
+        """
+        if zeta.shape != t.shape or zeta.shape != r0.shape:
+            raise ModelError("zeta, t and R0 must have the same shape")
+        hidden = torch.cat([zeta, t, r0], dim=-1)
+        for module in self.trunk:
+            if isinstance(module, nn.Linear):
+                weight = module.weight.detach() if detach_parameters else module.weight
+                bias = module.bias.detach() if detach_parameters else module.bias
+                hidden = F.linear(hidden, weight, bias)
+            elif isinstance(module, nn.Tanh):
+                hidden = F.tanh(hidden)
+            else:  # pragma: no cover - architecture is fixed
+                raise ModelError(f"unsupported trunk module {type(module).__name__}")
+        if detach_parameters:
+            out_rho = F.linear(hidden, self.head_rho.weight.detach(), self.head_rho.bias.detach())
+            out_u = F.linear(hidden, self.head_u.weight.detach(), self.head_u.bias.detach())
+            out_p = F.linear(hidden, self.head_p.weight.detach(), self.head_p.bias.detach())
+        else:
+            out_rho = self.head_rho(hidden)
+            out_u = self.head_u(hidden)
+            out_p = self.head_p(hidden)
+        rho_raw, u_raw, p_raw = out_rho, out_u, out_p
+        density = scales.rho * F.softplus(rho_raw)
+        pressure = scales.p * F.softplus(p_raw)
+        velocity = scales.u * u_raw
+        energy = pressure / (
+            torch.clamp(scales.gamma - 1.0, min=1.0e-12)
+            * torch.clamp(density, min=1.0e-30)
+        )
         return AirFields(
             density=density, velocity=velocity, pressure=pressure,
             specific_energy=energy,
@@ -204,8 +268,10 @@ class AirNet(nn.Module):
 
 def closure_from_precursor(precursor: Mapping[str, Any], *, like: torch.Tensor) -> JWLClosure:
     jwl = precursor["jwl"]
+
     def scalar(value: float) -> torch.Tensor:
         return torch.as_tensor(float(value), dtype=like.dtype, device=like.device)
+
     return JWLClosure(
         A=scalar(jwl["A"]), B=scalar(jwl["B"]), C=scalar(jwl["C"]),
         R1=scalar(jwl["R1"]), R2=scalar(jwl["R2"]), omega=scalar(jwl["omega"]),
@@ -216,6 +282,7 @@ def closure_from_precursor(precursor: Mapping[str, Any], *, like: torch.Tensor) 
 def scales_from_precursor(precursor: Mapping[str, Any], *, like: torch.Tensor) -> Scales:
     def scalar(value: float) -> torch.Tensor:
         return torch.as_tensor(float(value), dtype=like.dtype, device=like.device)
+
     return Scales(
         rho=scalar(precursor["rho_a_sep"]), u=scalar(precursor["u_a_sep"]),
         p=scalar(precursor["p_a_sep"]), e=scalar(precursor["e_a_sep"]),
@@ -231,11 +298,21 @@ def air_fields_with_derivatives(
     scales: Scales,
     *,
     create_graph: bool,
+    functional: bool = False,
 ) -> tuple[AirFields, dict[str, torch.Tensor]]:
-    """Return fields and their first derivatives at fixed ``zeta`` and ``R0``."""
+    """Return fields and their first derivatives at fixed ``zeta`` and ``R0``.
+
+    ``functional=True`` freezes the parameter values while keeping input
+    derivatives live (contact stage).
+    """
     zeta_leaf = zeta.detach().reshape(-1, 1).requires_grad_(True)
     t_leaf = t.detach().reshape(-1, 1).requires_grad_(True)
-    fields = net(zeta_leaf, t_leaf, r0.reshape(-1, 1), scales)
+    if functional:
+        fields = net.forward_functional(
+            zeta_leaf, t_leaf, r0.reshape(-1, 1), scales, detach_parameters=True
+        )
+    else:
+        fields = net(zeta_leaf, t_leaf, r0.reshape(-1, 1), scales)
     derivatives: dict[str, torch.Tensor] = {}
     for name, value in (("rho", fields.density), ("u", fields.velocity), ("p", fields.pressure)):
         derivatives[f"{name}_t"] = torch.autograd.grad(

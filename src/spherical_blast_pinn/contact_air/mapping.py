@@ -1,4 +1,4 @@
-"""Mapped spherical air equations on ``zeta=(r-R_c)/(R_b-R_c)``.
+"""Mapped spherical air equations on ``zeta=(r-R_c)/(R_s-R_c)``.
 
 The three residuals are assembled in one place and used by both training
 stages.  The air stage differentiates the network fields; the contact stage
@@ -23,8 +23,8 @@ class MappingError(RuntimeError):
 class MappedGeometry:
     rc: torch.Tensor
     rc_dot: torch.Tensor
-    rb: torch.Tensor
-    rb_dot: torch.Tensor
+    rs: torch.Tensor
+    ds: torch.Tensor
     zeta: torch.Tensor
     length: torch.Tensor
     length_dot: torch.Tensor
@@ -42,20 +42,21 @@ class Residuals:
 def build_geometry(
     rc: torch.Tensor,
     rc_dot: torch.Tensor,
-    rb: torch.Tensor,
-    rb_dot: torch.Tensor,
+    rs: torch.Tensor,
+    ds: torch.Tensor,
     zeta: torch.Tensor,
 ) -> MappedGeometry:
-    length = rb - rc
-    length_dot = rb_dot - rc_dot
+    """Build the moving domain ``[R_c, R_s]`` from contact and shock data."""
+    length = rs - rc
+    length_dot = ds - rc_dot
     radius = rc + zeta * length
     grid_speed = rc_dot + zeta * length_dot
     if not bool(torch.isfinite(length).all() and (length > 0.0).all()):
-        raise MappingError("the moving air layer must have L = R_b - R_c > 0")
+        raise MappingError("the moving air layer must have L = R_s - R_c > 0")
     if not bool(torch.isfinite(radius).all() and (radius > 0.0).all()):
         raise MappingError("the mapped physical radius must be positive")
     return MappedGeometry(
-        rc=rc, rc_dot=rc_dot, rb=rb, rb_dot=rb_dot, zeta=zeta,
+        rc=rc, rc_dot=rc_dot, rs=rs, ds=ds, zeta=zeta,
         length=length, length_dot=length_dot, radius=radius, grid_speed=grid_speed,
     )
 

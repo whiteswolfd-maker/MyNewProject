@@ -703,6 +703,17 @@ def extract_case(
     shell_count: list[np.ndarray] = []
     shell_empty: list[np.ndarray] = []
     shell_contaminated: list[np.ndarray] = []
+    #: Per-medium contamination contribution.  The old ``shell_contaminated``
+    #: counts **every** cell whose EOS energy inversion failed, whatever its
+    #: phase.  That is the right question for a product label but the wrong one
+    #: for an air field: an unreacted product cell does not contribute any weight
+    #: to the air average, so it cannot make that average partial.  These arrays
+    #: keep the contribution-weighted version for each medium.
+    shell_air_contaminated: list[np.ndarray] = []
+    shell_product_contaminated: list[np.ndarray] = []
+    shell_air_occupied: list[np.ndarray] = []
+    shell_product_occupied: list[np.ndarray] = []
+    shell_mixed_occupied: list[np.ndarray] = []
     contact_radius: list[float] = []
     shock_radius: list[float] = []
     #: 检测状态（§10）：confirmed / doubtful / not_detected。**与监督资格分开。**
@@ -737,6 +748,9 @@ def extract_case(
     contact_reconstruction_reason: list[str] = []
     mixed_fraction: list[float] = []
     unreacted_cells: list[int] = []
+    invalid_product_cells: list[int] = []
+    invalid_air_cells: list[int] = []
+    invalid_mixed_cells: list[int] = []
     state_indices: list[int] = []
     air_native_resolution_fallback: list[float] = []
     air_native_resolution_fallback_applicable: list[bool] = []
@@ -876,7 +890,18 @@ def extract_case(
         # 看起来很正常的数，掩盖掉"这个壳层里有一部分根本不是产物状态"这件事。
         # 所以这里按**体积**单独算一遍被污染的比例，任何非零比例都让整个壳层失效。
         state_valid = getattr(frame, "state_valid", None)
+        n_cells = int(frame.n_cells)
+        alpha_cells = np.asarray(frame.tnt_volume_fraction, dtype=np.float64).reshape(-1)
+        if alpha_cells.size != n_cells:
+            raise ExtractionError(
+                f"{case_id}: tnt_volume_fraction has {alpha_cells.size} entries, "
+                f"expected {n_cells}"
+            )
+        pure_air_cells = alpha_cells <= PURE_AIR_THRESHOLD
+        pure_product_cells = alpha_cells >= PURE_PRODUCT_THRESHOLD
+        mixed_cells = ~(pure_air_cells | pure_product_cells)
         if state_valid is None:
+            invalid_cells = np.zeros(n_cells, dtype=bool)
             contaminated_profile = np.zeros_like(alpha_profile)
             unreacted_cells.append(0)
         else:
@@ -886,7 +911,44 @@ def extract_case(
             )
             contaminated_profile = np.asarray(contaminated_profile, dtype=np.float64)
             unreacted_cells.append(int(np.count_nonzero(invalid_cells)))
+        invalid_product_cells.append(
+            int(np.count_nonzero(pure_product_cells & invalid_cells))
+        )
+        invalid_air_cells.append(
+            int(np.count_nonzero(pure_air_cells & invalid_cells))
+        )
+        invalid_mixed_cells.append(
+            int(np.count_nonzero(mixed_cells & invalid_cells))
+        )
         shell_contaminated.append(contaminated_profile)
+
+        # Keep the old all-medium contamination above (it still defines the old
+        # ``valid`` / ``training_location_valid`` consumers), but measure the
+        # contribution-weighted version for each medium separately.  The air
+        # weight is exactly the weight ``shell_average(..., AIR)`` uses, so
+        # ``air_contaminated_volume`` is the volume of air-field average that
+        # would be silently skipped by a partial average.
+        alpha_air_cells = 1.0 - alpha_cells
+        air_weight = np.where(pure_air_cells, alpha_air_cells, 0.0)
+        product_weight = np.where(pure_product_cells, alpha_cells, 0.0)
+        air_occupied, _, _ = assignment.accumulate(n_cells, n_shells, air_weight)
+        product_occupied, _, _ = assignment.accumulate(n_cells, n_shells, product_weight)
+        mixed_occupied, _, _ = assignment.accumulate(
+            n_cells, n_shells, mixed_cells.astype(np.float64)
+        )
+        air_contaminated_volume, _, _ = assignment.accumulate(
+            n_cells, n_shells, np.where(pure_air_cells & invalid_cells, alpha_air_cells, 0.0)
+        )
+        product_contaminated_volume, _, _ = assignment.accumulate(
+            n_cells, n_shells, np.where(pure_product_cells & invalid_cells, alpha_cells, 0.0)
+        )
+        shell_air_occupied.append(np.asarray(air_occupied, dtype=np.float64))
+        shell_product_occupied.append(np.asarray(product_occupied, dtype=np.float64))
+        shell_mixed_occupied.append(np.asarray(mixed_occupied, dtype=np.float64))
+        shell_air_contaminated.append(np.asarray(air_contaminated_volume, dtype=np.float64))
+        shell_product_contaminated.append(
+            np.asarray(product_contaminated_volume, dtype=np.float64)
+        )
 
         # 主激波标签：**压力梯度候选 + RH 核查**（§10），不再用"最外侧超压点"。
         #
@@ -1039,6 +1101,34 @@ def extract_case(
     # 被"没有状态"的单元污染的壳层整层作废（见上面 contaminated_profile 的说明）。
     contaminated = np.asarray(shell_contaminated, dtype=np.float64)[order]
     contaminated_shells = np.isfinite(contaminated) & (contaminated > 0.0)
+    air_occupied = np.asarray(shell_air_occupied, dtype=np.float64)[order]
+    product_occupied = np.asarray(shell_product_occupied, dtype=np.float64)[order]
+    mixed_occupied = np.asarray(shell_mixed_occupied, dtype=np.float64)[order]
+    air_contaminated_volume = np.asarray(
+        shell_air_contaminated, dtype=np.float64
+    )[order]
+    product_contaminated_volume = np.asarray(
+        shell_product_contaminated, dtype=np.float64
+    )[order]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        air_contaminated_fraction = np.where(
+            air_occupied > 0.0,
+            air_contaminated_volume / np.where(air_occupied > 0.0, air_occupied, 1.0),
+            np.nan,
+        )
+        product_contaminated_fraction = np.where(
+            product_occupied > 0.0,
+            product_contaminated_volume
+            / np.where(product_occupied > 0.0, product_occupied, 1.0),
+            np.nan,
+        )
+    air_contaminated_shells = (
+        np.isfinite(air_contaminated_fraction) & (air_contaminated_fraction > 0.0)
+    )
+    product_contaminated_shells = (
+        np.isfinite(product_contaminated_fraction)
+        & (product_contaminated_fraction > 0.0)
+    )
     valid = valid & ~contaminated_shells
     for i in range(material.shape[0]):
         if np.isfinite(shock_array[i]):
@@ -1049,6 +1139,39 @@ def extract_case(
         for front in (contact_array[i], shock_array[i]):
             if np.isfinite(front):
                 valid[i, np.abs(centres - front) <= band_width] = False
+
+    # ------------------------------------------------------------------
+    # 空气监督资格（contact_air / R_c~R_b 方案专用）
+    #
+    # 旧 ``valid`` 上的"没有 confirmed shock 就全帧空气撤标"服务于旧的
+    # R_c~R_s 监督域。新方案的外边界是 R_b，不是 R_s；一个没被核实的候选
+    # 激波位置不能自动删掉外侧可靠空气。这里因此单独生成一张资格表：
+    #
+    #   * 材料归属只看 ``material_phase``（体积分数），不用旧 ``material``；
+    #   * 只排除接触混合带及其保护带，不排除激波外区域；
+    #   * 空气自身的缺失贡献单独记为 ``air_missing_contribution``，只否决
+    #     依赖它的 p/e 字段，不因为一个不参与空气平均的产物单元否决 rho/u；
+    #   * 覆盖率由下游按配置阈值叠加；激波检测状态只记录，不参与这里。
+    # ------------------------------------------------------------------
+    contact_band_inner = np.asarray(contact_band_lo, dtype=np.float64)[order]
+    contact_band_outer = np.asarray(contact_band_hi, dtype=np.float64)[order]
+    air_location_valid = (
+        (material_phase == 1)
+        & ~empty
+        & (air_occupied > 0.0)
+    )
+    air_contact_band_protected = np.zeros_like(air_location_valid)
+    for i in range(material.shape[0]):
+        inner = float(contact_band_inner[i])
+        outer = float(contact_band_outer[i])
+        if np.isfinite(inner) and np.isfinite(outer) and inner < outer:
+            protect = (centres >= inner - band_width) & (centres <= outer + band_width)
+        elif np.isfinite(contact_array[i]):
+            protect = np.abs(centres - float(contact_array[i])) <= 2.0 * band_width
+        else:
+            protect = np.zeros(n_shells, dtype=bool)
+        air_contact_band_protected[i] = protect
+        air_location_valid[i] &= ~protect
 
     # 剖面：两介质各自填充，界面处各取单侧。
     #
@@ -1096,14 +1219,43 @@ def extract_case(
 
     # 外侧纯空气壳层只用于边界识别：位置标签仍是 material==2 且
     # ``valid=False``（不进训练监督），但逐字段有效性保留，供下游核实环境态。
-    boundary_air_location = air_state_here & ~np.asarray(shell_empty, dtype=bool)[order]
-    boundary_air_location = boundary_air_location & ~contaminated_shells
+    # ``air_missing_contribution`` is the air-contribution-weighted version:
+    # only shells where an air cell that actually carries weight in the air
+    # average has no valid EOS state.  An unreacted product cell in the same
+    # shell contributes zero air weight and is not allowed to veto the air
+    # fields (it does not participate in their average).
+    air_missing_contribution = air_contaminated_shells
+    boundary_air_location = air_location_valid & ~air_contaminated_shells
     field_location_valid = location_valid | boundary_air_location
     # 逐字段有效性。数值上每项 = 位置可用 且 该字段有限。
     field_valid_density = field_location_valid & np.isfinite(rho)
     field_valid_velocity = field_location_valid & np.isfinite(vel)
     field_valid_energy = field_location_valid & np.isfinite(energy)
     field_valid_pressure = field_location_valid & np.isfinite(pressure)
+
+    # Air-only field masks.  They are deliberately independent of the old
+    # ``training_location_valid`` (which withdraws all air when no shock is
+    # confirmed) and of product-cell contamination.  Density and velocity are
+    # direct measurements and survive a failed product-energy inversion;
+    # pressure and energy depend on the same EOS state, so a missing air
+    # contribution invalidates **those two fields only** instead of the whole
+    # shell.
+    air_field_valid_density = (
+        air_location_valid & np.isfinite(rho) & (rho > 0.0)
+    )
+    air_field_valid_velocity = air_location_valid & np.isfinite(vel)
+    air_field_valid_energy = (
+        air_location_valid
+        & ~air_missing_contribution
+        & np.isfinite(energy)
+        & (energy > 0.0)
+    )
+    air_field_valid_pressure = (
+        air_location_valid
+        & ~air_missing_contribution
+        & np.isfinite(pressure)
+        & (pressure > 0.0)
+    )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1137,6 +1289,24 @@ def extract_case(
         field_valid_velocity=field_valid_velocity,
         field_valid_energy=field_valid_energy,
         field_valid_pressure=field_valid_pressure,
+        # contact_air（R_c~R_b）专用空气资格。它不继承旧 ``material`` 的激波撤标，
+        # 只用体积分数相、接触混合带保护、空气自身缺失贡献和覆盖率（下游叠加）。
+        air_training_location_valid=air_location_valid,
+        air_contact_band_protected=air_contact_band_protected,
+        air_missing_contribution=air_missing_contribution,
+        air_field_valid_density=air_field_valid_density,
+        air_field_valid_velocity=air_field_valid_velocity,
+        air_field_valid_energy=air_field_valid_energy,
+        air_field_valid_pressure=air_field_valid_pressure,
+        # 分介质的贡献体积，单位 m^3（与壳层几何同一份额）。它们回答“哪些原始
+        # 单元参与了空气平均、权重多大”，而不是把所有无效单元一律算到空气头上。
+        air_occupied_volume_m3=air_occupied,
+        product_occupied_volume_m3=product_occupied,
+        mixed_occupied_volume_m3=mixed_occupied,
+        air_contaminated_volume_m3=air_contaminated_volume,
+        product_contaminated_volume_m3=product_contaminated_volume,
+        air_contaminated_shell_fraction=air_contaminated_fraction,
+        product_contaminated_shell_fraction=product_contaminated_fraction,
         # 外侧纯空气的“位置可诊断”掩码：material==2/valid=False，但场量可用，
         # 只服务于 R_b/环境边界核实，不进入训练监督。
         boundary_air_location_valid=boundary_air_location,
@@ -1308,11 +1478,15 @@ def extract_case(
             "alpha <= 0.05, the mixed band is excluded from every label"
         ),
         "state_validity_source": (
-            "per cell: (rho, p) must be a state of the declared EOS with e > 0. A shell "
-            "is invalid if ANY cell contributing to it failed this, by volume, and the "
-            "fraction is recorded in material.npz as contaminated_shell_fraction. "
-            "Shell averaging skips nan silently, so contamination is measured "
-            "separately instead of being averaged away"
+            "per cell: (rho, p) must be a state of the declared EOS with e > 0. "
+            "contaminated_shell_fraction is the all-medium volume fraction and keeps "
+            "the legacy consumer behaviour. The contribution-weighted split is written "
+            "as air_contaminated_shell_fraction and product_contaminated_shell_fraction: "
+            "each is the invalid contribution divided by that medium's occupied volume, "
+            "so a cell that carries no weight in a medium's average cannot veto that "
+            "medium's fields. Shell averaging skips nan silently; the missing "
+            "contribution is therefore measured separately and air_missing_contribution "
+            "invalidates pressure/energy, not density/velocity"
         ),
         "pressure_kind": "absolute",
         "pressure_source": (
@@ -1333,6 +1507,23 @@ def extract_case(
         "state_invalid_cells_per_frame": [
             int(v) for v in np.asarray(unreacted_cells, dtype=np.int64)[order]
         ],
+        "state_invalid_cells_by_phase_per_frame": {
+            "product": [
+                int(v) for v in np.asarray(invalid_product_cells, dtype=np.int64)[order]
+            ],
+            "air": [
+                int(v) for v in np.asarray(invalid_air_cells, dtype=np.int64)[order]
+            ],
+            "mixed": [
+                int(v) for v in np.asarray(invalid_mixed_cells, dtype=np.int64)[order]
+            ],
+            "note": (
+                "pure-product (alpha>=0.95), pure-air (alpha<=0.05) and mixed cells "
+                "are disjoint by the volume-fraction masks. An invalid product cell "
+                "therefore cannot contribute weight to the air average, and vice "
+                "versa; mixed cells contribute to neither pure-medium average."
+            ),
+        },
         "state_indices": [int(s) for s in np.asarray(state_indices, dtype=np.int64)[order]],
         "stride": int(stride),
         "batch_states": int(batch_states),
@@ -1371,6 +1562,121 @@ def extract_case(
                 "material.npz 'valid' remains the old joint four-field finite mask; "
                 "it is not the training position mask"
             ),
+        },
+        "air_supervision": {
+            "array": "air_training_location_valid",
+            "definition": (
+                "contact_air / R_c~R_b air eligibility: material_phase==1 (ALE volume "
+                "fraction only), non-empty shell, outside the contact mixing band and "
+                "its protective band. It deliberately does NOT apply the legacy "
+                "'no confirmed shock -> withdraw the whole air side' rule and does NOT "
+                "apply product-cell contamination to the air average."
+            ),
+            "field_arrays": {
+                "density": "air_field_valid_density",
+                "velocity": "air_field_valid_velocity",
+                "energy": "air_field_valid_energy",
+                "pressure": "air_field_valid_pressure",
+            },
+            "field_rule": (
+                "density/velocity = air location & finite (and rho>0); pressure/energy "
+                "also require no missing air contribution, because a non-positive air "
+                "EOS state participates in those averages with a non-positive value"
+            ),
+            "missing_contribution_array": "air_missing_contribution",
+            "contamination_fraction_array": "air_contaminated_shell_fraction",
+            "contamination_scope": (
+                "air_contaminated_shell_fraction is the invalid air contribution divided "
+                "by the air-occupied volume (the same weight shell_average(AIR) uses). "
+                "product_contaminated_shell_fraction is the analogous product quantity. "
+                "The old contaminated_shell_fraction remains the all-medium measure for "
+                "the legacy consumers and is not used to veto air fields here."
+            ),
+            "coverage": (
+                "coverage_air is written per shell; the consumer applies "
+                "min_air_coverage and records shells rejected by that threshold"
+            ),
+            "shock_status_policy": (
+                "shock_status / shock_has_supervision are recorded separately and are "
+                "NOT used to withdraw air eligibility. An unconfirmed candidate shock "
+                "does not delete otherwise reliable outer air."
+            ),
+            "counts": {
+                "air_phase_shells": int(np.count_nonzero(material_phase == 1)),
+                "air_location_valid_shells": int(np.count_nonzero(air_location_valid)),
+                "air_contact_band_protected_shells": int(
+                    np.count_nonzero(air_contact_band_protected)
+                ),
+                "air_missing_contribution_shells": int(
+                    np.count_nonzero(air_missing_contribution)
+                ),
+                "air_phase_rejected_shells": int(
+                    np.count_nonzero((material_phase == 1) & ~air_location_valid)
+                ),
+                "air_phase_rejected_contact_band": int(
+                    np.count_nonzero(
+                        (material_phase == 1) & air_contact_band_protected
+                    )
+                ),
+                "air_phase_rejected_empty_or_zero_air_volume": int(
+                    np.count_nonzero(
+                        (material_phase == 1)
+                        & ~air_contact_band_protected
+                        & ~air_location_valid
+                    )
+                ),
+                "air_phase_missing_contribution": int(
+                    np.count_nonzero(
+                        (material_phase == 1) & air_missing_contribution
+                    )
+                ),
+                "product_contaminated_shells": int(
+                    np.count_nonzero(product_contaminated_shells)
+                ),
+                "frames_without_confirmed_shock": int(
+                    np.count_nonzero(~shock_supervision_array)
+                ),
+            },
+            "counts_by_frame": {
+                "air_phase_shells": [
+                    int(v) for v in np.count_nonzero(material_phase == 1, axis=1)
+                ],
+                "air_location_valid_shells": [
+                    int(v) for v in np.count_nonzero(air_location_valid, axis=1)
+                ],
+                "air_contact_band_protected_shells": [
+                    int(v) for v in np.count_nonzero(air_contact_band_protected, axis=1)
+                ],
+                "air_missing_contribution_shells": [
+                    int(v) for v in np.count_nonzero(air_missing_contribution, axis=1)
+                ],
+                "air_phase_rejected_shells": [
+                    int(v) for v in np.count_nonzero(
+                        (material_phase == 1) & ~air_location_valid, axis=1
+                    )
+                ],
+                "air_phase_rejected_contact_band": [
+                    int(v) for v in np.count_nonzero(
+                        (material_phase == 1) & air_contact_band_protected, axis=1
+                    )
+                ],
+                "air_phase_rejected_empty_or_zero_air_volume": [
+                    int(v) for v in np.count_nonzero(
+                        (material_phase == 1)
+                        & ~air_contact_band_protected
+                        & ~air_location_valid,
+                        axis=1,
+                    )
+                ],
+                "air_phase_missing_contribution": [
+                    int(v) for v in np.count_nonzero(
+                        (material_phase == 1) & air_missing_contribution, axis=1
+                    )
+                ],
+                "product_contaminated_shells": [
+                    int(v) for v in np.count_nonzero(product_contaminated_shells, axis=1)
+                ],
+            },
         },
         "boundary_air_field_access": {
             "material_code": 2,

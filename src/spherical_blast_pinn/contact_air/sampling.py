@@ -1,4 +1,10 @@
-"""Sampling for one alternating ContactNet/AirNet loop."""
+"""Sampling for one alternating ContactNet/AirNet loop.
+
+Air data points are drawn **frame first, then point inside the frame**.  The
+right-boundary sample is restricted to times where the identified shock is
+compressive in the ambient air (``D_s > c_inf``); no sample silently uses a
+subsonic or extrapolated shock.
+"""
 from __future__ import annotations
 
 import math
@@ -25,11 +31,10 @@ class CaseBatch:
     t_pde: Any
     zeta_pde: Any
     t_ic: Any
-    zeta_ic_shock: Any
-    zeta_ic_ambient: Any
+    zeta_ic: Any
     t_right: Any
     t_data: Any
-    zeta_data: Any
+    radius_data: Any
     rho_data: Any
     u_data: Any
     p_data: Any
@@ -45,16 +50,11 @@ class CaseBatch:
         return int(self.t_pde.numel())
 
 
-def _full(value: float, like) -> Any:
-    return torch.full_like(like, float(value))
-
-
 def sample_case_batch(
     case: CaseData,
     *,
     n_pde: int,
-    n_ic_shock: int,
-    n_ic_ambient: int,
+    n_ic: int,
     n_right: int,
     n_data: int,
     n_contact: int,
@@ -68,36 +68,59 @@ def sample_case_batch(
             f"case {case.case_id!r} is a test case and must not be sampled for training"
         )
     t0, t_end = float(case.t0), float(case.t_end)
-    # Hard gate: the solve window is one connected R_b segment.  A CaseData
-    # object already enforces this, but sampling is also used directly in
-    # tests and diagnostics, so it does not rely on that alone.
-    case.boundary.require_interval(t0, t_end)
+    case.shock.require_interval(t0, t_end)
+    if t_end <= t0:
+        raise SamplingError(f"case {case.case_id!r}: t_end must be after t0")
 
     def uniform_t(count: int) -> Any:
         if count <= 0:
             return torch.zeros(0, dtype=torch.float64)
-        return t0 + (t_end - t0) * torch.rand(count, dtype=torch.float64, generator=generator)
+        return t0 + (t_end - t0) * torch.rand(
+            count, dtype=torch.float64, generator=generator
+        )
 
-    def uniform_zeta(count: int, lo: float = zeta_floor, hi: float = None) -> Any:
+    def uniform_zeta(count: int) -> Any:
         if count <= 0:
             return torch.zeros(0, dtype=torch.float64)
-        hi = 1.0 - zeta_floor if hi is None else float(hi)
-        lo_eff = max(float(lo), zeta_floor) if float(lo) == 0.0 else float(lo)
-        hi_eff = min(float(hi), 1.0 - zeta_floor) if float(hi) == 1.0 else float(hi)
-        if not (0.0 < lo_eff < hi_eff < 1.0):
-            raise SamplingError(f"invalid zeta interval ({lo!r}, {hi!r})")
+        if not (0.0 < zeta_floor < 0.5):
+            raise SamplingError("zeta_floor must lie in (0, 0.5)")
+        lo_eff = float(zeta_floor)
+        hi_eff = 1.0 - float(zeta_floor)
         return lo_eff + (hi_eff - lo_eff) * torch.rand(
             count, dtype=torch.float64, generator=generator
         )
 
     t_pde = uniform_t(int(n_pde))
     zeta_pde = uniform_zeta(int(n_pde))
-    t_ic = torch.full((int(n_ic_shock) + int(n_ic_ambient),), t0, dtype=torch.float64)
-    zeta_ic_shock = uniform_zeta(int(n_ic_shock), 0.0, case.initial.zeta_s0)
-    zeta_ic_ambient = uniform_zeta(
-        int(n_ic_ambient), case.initial.zeta_s0, 1.0
+    t_ic = torch.full((int(n_ic),), t0, dtype=torch.float64)
+    zeta_ic = uniform_zeta(int(n_ic))
+
+    # Right boundary: only compression-shock times.  Redraw a bounded number of
+    # times rather than extrapolating or accepting D_s <= c_inf.
+    c_inf = math.sqrt(
+        float(case.gamma_air) * float(case.ambient_pressure)
+        / float(case.ambient_density)
     )
-    t_right = uniform_t(int(n_right))
+    right_parts: list[np.ndarray] = []
+    collected = 0
+    for _ in range(8):
+        if collected >= int(n_right) or int(n_right) <= 0:
+            break
+        candidate = uniform_t(max(int(n_right) - collected, 1)).detach().numpy()
+        speed = np.asarray(case.shock.derivative(candidate), dtype=np.float64)
+        keep = candidate[speed > c_inf]
+        if keep.size:
+            right_parts.append(keep)
+            collected += int(keep.size)
+    if int(n_right) > 0 and not right_parts:
+        raise SamplingError(
+            f"case {case.case_id!r}: no sampled time has D_s > c_inf inside the "
+            "valid shock segment; a finite-Mach shock boundary cannot be enforced"
+        )
+    t_right = (
+        torch.as_tensor(np.concatenate(right_parts)[: int(n_right)], dtype=torch.float64)
+        if right_parts else torch.zeros(0, dtype=torch.float64)
+    )
 
     data = case.observations.sample(
         int(n_data), generator, t_min=t0, t_max=t_end
@@ -108,14 +131,16 @@ def sample_case_batch(
         in_window = (
             (contact_times >= t0)
             & (contact_times <= t_end)
-            & np.asarray([case.boundary.has_slope(float(t)) for t in contact_times])
+            & np.asarray([case.shock.has_slope(float(t)) for t in contact_times])
         )
         contact_indices = contact_indices[in_window]
     if contact_indices.size and int(n_contact) > 0:
         if contact_indices.size <= int(n_contact):
             chosen = contact_indices
         else:
-            order = torch.randperm(contact_indices.size, generator=generator).cpu().numpy()
+            order = torch.randperm(
+                contact_indices.size, generator=generator
+            ).cpu().numpy()
             chosen = contact_indices[order[: int(n_contact)]]
         t_contact = torch.as_tensor(case.contact.times[chosen], dtype=torch.float64)
         low_contact = torch.as_tensor(case.contact.low[chosen], dtype=torch.float64)
@@ -128,10 +153,10 @@ def sample_case_batch(
     return CaseBatch(
         case_id=case.case_id,
         t_pde=t_pde, zeta_pde=zeta_pde,
-        t_ic=t_ic, zeta_ic_shock=zeta_ic_shock, zeta_ic_ambient=zeta_ic_ambient,
+        t_ic=t_ic, zeta_ic=zeta_ic,
         t_right=t_right,
-        t_data=data["t"], zeta_data=data["zeta"], rho_data=data["rho"],
-        u_data=data["u"], p_data=data["p"],
+        t_data=data["t"], radius_data=data["radius"],
+        rho_data=data["rho"], u_data=data["u"], p_data=data["p"],
         valid_rho=data["valid_rho"], valid_u=data["valid_u"], valid_p=data["valid_p"],
         t_contact=t_contact, low_contact=low_contact, up_contact=up_contact,
     )

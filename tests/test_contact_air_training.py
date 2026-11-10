@@ -1,8 +1,7 @@
-"""Alternating updates, gradient isolation, checkpoint and 500 mm isolation."""
+"""Alternating updates, gradient isolation, checkpoint and split roles."""
 from __future__ import annotations
 
 import torch
-
 import pytest
 
 from spherical_blast_pinn.contact_air.models import AirNet, ContactNet
@@ -14,21 +13,21 @@ from spherical_blast_pinn.contact_air.trainer import (
 )
 
 
-def _trainer(tmp_path, *, cases=None):
+def _trainer(tmp_path, *, cases=None, holdout=0.3):
     cases = cases or [
-        synthetic_case_for(0.05, case_id="r050", n_frames=11, n_radial=160),
-        synthetic_case_for(0.08, case_id="r080", n_frames=11, n_radial=180),
+        synthetic_case_for(0.05, case_id="r050", n_frames=11, n_radial=1600),
+        synthetic_case_for(0.08, case_id="r080", n_frames=11, n_radial=1600),
     ]
     config = TrainConfig(
-        n_pde=16, n_ic_shock=8, n_ic_ambient=8, n_right=8, n_data=16, n_contact=8,
+        n_pde=8, n_ic=4, n_right=4, n_data=8, n_contact=6,
         loops=2, learning_rate=1.0e-3, log_every=1, checkpoint_every=0,
-        validate_every=0, seed=11,
+        validate_every=0, seed=11, validation_holdout_fraction=holdout,
+        validation_data_points=8, validation_contact_points=6,
     )
-    trainer = AlternatingTrainer(
+    return AlternatingTrainer(
         cases=cases, contact_net=ContactNet(width=8, depth=1),
         air_net=AirNet(width=8, depth=1), config=config, output_dir=tmp_path,
     )
-    return trainer
 
 
 def test_one_alternating_loop_updates_both_networks_and_keeps_gradients_isolated(tmp_path):
@@ -55,11 +54,16 @@ def test_whole_frames_are_isolated_between_training_and_validation(tmp_path):
         assert train_case.t_end <= validation_case.contact.times.min()
 
 
-def test_test_role_cannot_enter_training(tmp_path):
+def test_role_test_cannot_enter_training_but_radius_alone_does_not_ban_it(tmp_path):
     with pytest.raises(TrainingError, match="test"):
-        _trainer(tmp_path, cases=[synthetic_case_for(0.5, role="test")])
-    with pytest.raises(TrainingError, match="500 mm"):
-        _trainer(tmp_path, cases=[synthetic_case_for(0.5, role="train")])
+        _trainer(tmp_path, cases=[synthetic_case_for(0.05, role="test")])
+    # There is no fixed 500 mm training ban; the explicit role decides.
+    trainer = _trainer(
+        tmp_path, cases=[synthetic_case_for(0.5, case_id="r500", role="train",
+                                            n_frames=7, n_radial=1600)],
+        holdout=0.0,
+    )
+    assert trainer.cases[0].charge_radius_m == pytest.approx(0.5)
 
 
 def test_checkpoint_round_trip_and_resume(tmp_path):
@@ -72,6 +76,7 @@ def test_checkpoint_round_trip_and_resume(tmp_path):
     fresh = _trainer(tmp_path / "fresh")
     info = fresh.load(path)
     assert info["loop"] == 2
+    assert info["stage_state"] == "alternating"
     for left, right in zip(trainer.contact_net.state_dict().values(),
                            fresh.contact_net.state_dict().values()):
         assert torch.equal(left, right)
@@ -88,8 +93,8 @@ def test_checkpoint_round_trip_and_resume(tmp_path):
     assert fresh.loop == 3
 
 
-def test_pde_and_interface_gradients_reach_only_their_target_network(tmp_path):
-    from spherical_blast_pinn.contact_air.losses import interface_loss, pde_loss
+def test_air_stage_pde_gradient_reaches_only_airnet(tmp_path):
+    from spherical_blast_pinn.contact_air.losses import pde_loss
     from spherical_blast_pinn.contact_air.mapping import build_geometry
     from spherical_blast_pinn.contact_air.models import air_fields_with_derivatives
     from spherical_blast_pinn.contact_air.sampling import sample_case_batch
@@ -97,18 +102,17 @@ def test_pde_and_interface_gradients_reach_only_their_target_network(tmp_path):
     trainer = _trainer(tmp_path)
     case = trainer.cases[0]
     batch = sample_case_batch(
-        case, n_pde=8, n_ic_shock=0, n_ic_ambient=0, n_right=0,
-        n_data=0, n_contact=0, generator=trainer.generator,
+        case, n_pde=8, n_ic=0, n_right=0, n_data=0, n_contact=0,
+        generator=trainer.generator,
     )
     closure = trainer._closures[case.case_id]
     scales = trainer._scales[case.case_id]
-
     trainer.contact_net.zero_grad(set_to_none=True)
     trainer.air_net.zero_grad(set_to_none=True)
-    r0, rb, rb_dot = trainer._contact_inputs(case, batch.t_pde)
+    r0, rs, ds = trainer._contact_inputs(case, batch.t_pde)
     with torch.enable_grad():
         c_fields = trainer.contact_net(
-            batch.t_pde.reshape(-1, 1), r0, rb, rb_dot, closure, create_graph=False
+            batch.t_pde.reshape(-1, 1), r0, rs, ds, closure, create_graph=False
         )
     c_fields = type(c_fields)(
         radius=c_fields.radius.detach(), speed=c_fields.speed.detach(),
@@ -117,37 +121,48 @@ def test_pde_and_interface_gradients_reach_only_their_target_network(tmp_path):
         relative_volume=c_fields.relative_volume.detach(),
     )
     geometry = build_geometry(
-        c_fields.radius, c_fields.speed, rb, rb_dot, batch.zeta_pde.reshape(-1, 1)
+        c_fields.radius, c_fields.speed, rs, ds, batch.zeta_pde.reshape(-1, 1)
     )
     fields, derivatives = air_fields_with_derivatives(
         trainer.air_net, batch.zeta_pde, batch.t_pde, r0, scales, create_graph=True
     )
-    pde = pde_loss(fields=fields, derivatives=derivatives, geometry=geometry, case=case)
-    pde.total.backward()
+    pde_loss(fields=fields, derivatives=derivatives, geometry=geometry, case=case).total.backward()
     assert any(p.grad is not None and float(p.grad.abs().sum()) > 0
                for p in trainer.air_net.parameters())
     assert all(p.grad is None for p in trainer.contact_net.parameters())
 
+
+def test_contact_stage_shared_physics_gradient_reaches_contactnet_not_airnet(tmp_path):
+    from spherical_blast_pinn.contact_air.losses import pde_loss
+    from spherical_blast_pinn.contact_air.mapping import build_geometry
+    from spherical_blast_pinn.contact_air.models import air_fields_with_derivatives
+    from spherical_blast_pinn.contact_air.sampling import sample_case_batch
+
+    trainer = _trainer(tmp_path)
+    case = trainer.cases[0]
+    batch = sample_case_batch(
+        case, n_pde=8, n_ic=0, n_right=0, n_data=0, n_contact=0,
+        generator=trainer.generator,
+    )
+    closure = trainer._closures[case.case_id]
+    scales = trainer._scales[case.case_id]
     trainer.contact_net.zero_grad(set_to_none=True)
     trainer.air_net.zero_grad(set_to_none=True)
+    r0, rs, ds = trainer._contact_inputs(case, batch.t_pde)
     with torch.enable_grad():
         c_fields = trainer.contact_net(
-            batch.t_pde.reshape(-1, 1), r0, rb, rb_dot, closure, create_graph=True
+            batch.t_pde.reshape(-1, 1), r0, rs, ds, closure, create_graph=True
         )
-    with torch.no_grad():
-        air0 = trainer.air_net(
-            torch.zeros_like(batch.t_pde).reshape(-1, 1),
-            batch.t_pde.reshape(-1, 1), r0, scales,
+        geometry = build_geometry(
+            c_fields.radius, c_fields.speed, rs, ds, batch.zeta_pde.reshape(-1, 1)
         )
-    interface = interface_loss(
-        air_at_contact=type(air0)(
-            density=air0.density.detach(), velocity=air0.velocity.detach(),
-            pressure=air0.pressure.detach(),
-            specific_energy=air0.specific_energy.detach(),
-        ),
-        contact=c_fields, case=case,
-    )
-    interface.total.backward()
+        a_fields, a_derivs = air_fields_with_derivatives(
+            trainer.air_net, batch.zeta_pde, batch.t_pde, r0, scales,
+            create_graph=True, functional=True,
+        )
+        pde_loss(
+            fields=a_fields, derivatives=a_derivs, geometry=geometry, case=case
+        ).total.backward()
     assert any(p.grad is not None and float(p.grad.abs().sum()) > 0
                for p in trainer.contact_net.parameters())
     assert all(p.grad is None for p in trainer.air_net.parameters())
@@ -169,9 +184,4 @@ def test_data_pde_schedule_moves_from_data_heavy_to_pde_heavy():
 def test_multi_radius_uses_one_shared_pair_of_networks(tmp_path):
     trainer = _trainer(tmp_path)
     assert len(trainer.cases) == 2
-    assert trainer.contact_net is trainer.contact_net
-    assert sum(p.numel() for p in trainer.contact_net.parameters()) == sum(
-        p.numel() for p in trainer.contact_net.parameters()
-    )
-    # The same module evaluates both cases; no per-case model dictionary exists.
     assert not hasattr(trainer, "models_by_case")

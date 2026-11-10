@@ -8,107 +8,85 @@
 
 ---
 
-## 新方案入口：ContactNet + AirNet（2026-11-04 契约）
+## 新方案入口：一维 ContactNet + AirNet（2026-11-10 迁移）
 
-这是本任务要求的新路径，实现在 `src/spherical_blast_pinn/contact_air/`，**不**导入
-旧的 `models/`、`losses/objective.py` 或联合总损失训练器：
+本路径实现在 `src/spherical_blast_pinn/contact_air/`，**不**导入旧的
+`models/`、`losses/objective.py` 或联合总损失训练器。它直接消费一维球对称
+径向 ALE 数据（或明确标注的合成夹具），不再做三维方向采样、球壳分配或跨方向平均：
 
 ```text
-ContactNet: (t, R0) -> R_c = R_b(t) * sigmoid(raw)
+ContactNet: (t, R0) -> R_c = R_s(t) * sigmoid(raw)
 AirNet:     (zeta, t, R0) -> (rho, u, p),  e = p / ((gamma_a-1) rho)
+域:         R_c(t) <= r <= R_s(t),  zeta = (r - R_c)/(R_s - R_c)
 ```
 
-- `R_b(t)`、`dR_b/dt` 来自每个工况自己的连续有效段（PCHIP，禁止外推）；`R_c`
-  的位置区间 `[R_c,low, R_c,up]` 来自提取器，`R_raw` 只用于观测映射。
-- 前置模块：CJ 状态、JWL 等熵释律、空气强冲击/精确 Hugoniot 匹配、
-  `R_sep = R0 V_sep^(1/3)`、`t_sep`、`t0 = t_sep + epsilon`。
-- 两个持久 Adam：先更新 AirNet（`L_a`），再更新 ContactNet（`L_c`）。每次更新后
-  检查非目标网络**没有梯度**且参数未移动；PDE 与 interface 在每个阶段只记一次。
-- 500 mm 只允许 `role: test`，训练入口拒绝；`predict-500` 只读 `R_b`、工况物理量
-  和已训练网络，不读 500 mm 的 `R_raw`、区间或内部场。
+- **`R_s` 是外传空气激波，不是 `R_b`，也不是仿真外边界 `R_outer`。**
+  每帧在有效连续空气剖面上用 `g(r)=-dp/dr` 的显著正峰定位，真实径向坐标、
+  不跨缺失点/混合带/断开区间；不填零、不复制上一帧。每帧保存位置、状态、
+  候选和失败原因。位置回退/非外传候选被拒；`PCHIP` 只做保形插值，不外推。
+- **接触区间来自体积分数**：与爆心主产物区外缘相连的混合段，取实际单元边界
+  `[R_c,low, R_c,up]`。不用 `alpha=0.5`，不用区间中点做单点标签；外侧孤立
+  产物碎片不当作主接触面。阈值在配置中显式给出，尚未由真实 50 mm 数据确认。
+- **事件对齐**：用理论 `t_sep` 指导原始帧搜索，取首个可辨认分离帧
+  `t_event_data`，统一换算 `t = t0 + (t_data - t_event_data)`；空气观测、
+  接触标签、激波轨迹共用这一时钟。原始/对齐时间、事件帧和偏移都保存。
+  这不宣称数据事件在绝对物理时间上等于理论 `t0`。
+- **初始薄层**：`epsilon = R_sep/[200 (D_s_sep-u_c_sep)]`、`t0=t_sep+epsilon`、
+  `Rc0=R_sep+u_c_sep epsilon`、`Rs0=R_sep+D_s_sep epsilon`。固定微秒不再接受；
+  `D_s_sep>u_c_sep`、`epsilon>0`、初始厚度为正都硬检查。
+- **损失**：AirNet 初值只在 `0<zeta<1` 用分离态 `(rho_a_sep,u_a_sep,p_a_sep)`，
+  没有未扰动空气子区；左边界为 `u=Rc_dot`、`p=p_c(t)`（JWL 闭合）；右边界为
+  有限马赫数 RH 波后状态（`M_s=D_s/c_inf>1`），不再是静止环境；空气数据用
+  **预测的** `R_c` 与 `R_s` 重新计算 `zeta`，不使用接触区间中点；域外点计数后
+  排除，整批全被筛掉会硬失败。ContactNet 初值只约束位置，区间监督保留
+  （区间内零罚、区间外距离平方），独立初始速度损失已删除。
+- **两个持久 Adam 交替**：空气阶段只更新 AirNet；接触面阶段只更新 ContactNet。
+  冻结非目标网络不等于 `no_grad`：接触面阶段用“参数冻结、输入导数保留”的
+  functional AirNet 求值，PDE/相容项到 ContactNet 的梯度路径保留；每次反传后
+  检查非目标网络无梯度、参数未移动。检查点保存两个优化器、阶段状态和 RNG。
+- **数据入口**：`one_d.py` 提供文档化的中间交换格式
+  （`spherical_blast_pinn.standard_1d_source`，`.npz` 或目录），显式单位、
+  节点/单元位置类型、逐字段掩码、绝对压力标记。**LS-DYNA 二进制 ALE1D 槽位
+  尚未核实，因此没有实现猜测式二进制读取。** 真实接入仍需文件样例、字段映射
+  或软件版本；拿到 50 mm 数据后的首要目标是程序跑通，不是精度验证。
+- **没有固定半径规则**：不再有“500 mm 必须盲测/禁止训练”。训练/验证/测试由
+  `contact_air.cases` 的显式 `role` 决定；`base.yaml` 的 `cases` 为空，
+  `smoke.yaml` 只提供一个 50 mm 合成程序检查，不是数据划分或研究结论。
 
 命令（Windows Git Bash 示例）：
 
 ```bash
-# 50 mm 前置检查（没有真实 R_b(t0) 时明确报告 IC 未核实）
-PYTHONPATH=src python -m spherical_blast_pinn.cli.contact_air precheck \
-  --config configs/contact_air/base.yaml --case tnt_50mm
+# 前置量表；没有一维数据/cache 时明确报告缺什么
+PYTHONPATH=src python -m spherical_blast_pinn.contact_air.cli precheck   --config configs/contact_air/base.yaml --all
 
-# 先从原始 d3plot 提取剖面（沿用现有提取器）
-PYTHONPATH=src python -m spherical_blast_pinn.cli.extract_profiles \
-  --config configs/base.yaml --case tnt_50mm \
-  --deck <input.k> --d3plot-dir <MECH> --out <profile_dir> \
-  --charge-radius 0.05 --shells 2500 --stride 1
+# 从标准一维中间格式建立缓存（真实二进制适配器尚缺）
+PYTHONPATH=src python -m spherical_blast_pinn.contact_air.cli build-cache   --config configs/contact_air/base.yaml --case tnt_50mm --radius 0.05   --source <standard_1d_source.npz> --out <cache.npz> --role train
 
-# 再从 extract_profiles 输出建立 ContactNet/AirNet 缓存
-PYTHONPATH=src python -m spherical_blast_pinn.cli.contact_air build-cache \
-  --config configs/contact_air/base.yaml --case tnt_50mm \
-  --profile-dir <profile_dir> --out <cache.npz>
+# 50 mm 合成 smoke（程序运行检查，不是数据划分/精度结果）
+PYTHONPATH=src python -m spherical_blast_pinn.contact_air.cli train   --config configs/contact_air/smoke.yaml --cases all   --max-loops 4 --output-dir outputs/contact_air_smoke
 
-# 合成/小批量工程检查（不是真实 TNT 精度结果）
-PYTHONPATH=src python -m spherical_blast_pinn.cli.contact_air train \
-  --config configs/contact_air/smoke.yaml --cases three \
-  --max-loops 4 --output-dir outputs/contact_air_smoke
-
-# 500 mm 给定边界预测与先落盘再评估
-PYTHONPATH=src python -m spherical_blast_pinn.cli.contact_air predict-500 \
-  --config configs/contact_air/base.yaml --checkpoint <last.pt> --output <pred.npz>
-PYTHONPATH=src python -m spherical_blast_pinn.cli.contact_air evaluate-500 \
-  --config configs/contact_air/base.yaml --prediction <pred.npz> --output <eval.json>
+# 给定测得的 R_s 轨迹做预测，再评估
+PYTHONPATH=src python -m spherical_blast_pinn.contact_air.cli predict   --config configs/contact_air/smoke.yaml --case tnt_50mm   --checkpoint <last.pt> --output <pred.npz>
+PYTHONPATH=src python -m spherical_blast_pinn.contact_air.cli evaluate   --config configs/contact_air/smoke.yaml --case tnt_50mm   --prediction <pred.npz> --output <eval.json>
 ```
 
-配置文件：`configs/contact_air/base.yaml`（50/80/100 训练，500 测试）、
-`configs/contact_air/smoke.yaml`（小网络、小采样、纯合成工程检查）。
-**当前没有真实 d3plot 缓存**：`base.yaml` 的 `cache: null` + `synthetic: false`
-会拒绝无缓存训练；真实数据必须先 `extract_profiles` 再 `build-cache`。
-`smoke.yaml` 的 `synthetic: true` 只是工程夹具。
+配置文件：`configs/contact_air/base.yaml`（空白显式划分；一维阈值/激波检测
+配置）与 `configs/contact_air/smoke.yaml`（单 50 mm 合成检查）。
+**当前没有真实一维 50 mm 数据，也没有执行真实 50 mm 试跑**；`base.yaml` 没有
+任何 cache，`synthetic: false` 会拒绝无缓存训练。
 
-### 2026-11-05 修正（新路径）
+### 迁移记录（2026-11-10）
 
-- 接触面数据损失改在 `batch.t_contact` 上重新计算 `R_b`、`dR_b/dt` 和
-  `ContactNet`；PDE/interface 仍用各自 `t_pde` 时刻。
-- 预测/标签/掩码统一展平并按掩码选点后再相减；修复 `[N,1]` 与 `[N]` 广播成
-  `[N,N]` 的交叉比较。训练与验证共用同一误差选择逻辑。
-- `R_b` 的 NaN/无效帧保留为断段标志，不再删除后连接两侧；时间必须严格递增；
-  平台保段、回退拒段；求解/预测区间是包含 `t0` 的单个连续段。
-- 能量残差归一化改为单位体积总能量
-  `s_E = s_p/(gamma-1) + 0.5 s_rho s_u^2`、`s_fE=s_E/(s_R/s_u)`；
-  比内能 `e` 的 EOS 定义不变。
-- `extract_profiles` 额外写出 `material_phase`（只由体积分数决定的 0/1/2），
-  与旧 `material` 监督撤标分开；contact_air 的接触区间、R_b 和分离判断使用
-  `material_phase`；训练空气观测使用旧 `material` 与独立的 `training_location_valid`，再逐字段叠加 `field_valid_*`，不把联合有限性 `valid` 当作位置资格。
-- 分离状态分成三项证据记录（接触区间、受冲击空气层、环境侧右边界），
-  只有三项同时成立才是 `separated`；`material==2` 只是候选位置，不能证明环境态。
-  外侧场量有限但非环境时直接否决；场量缺失时记为无法验证，不进入 `R_b`。
-  受冲击空气层要求连续、非环境、字段有效，并有原始径向分辨率支持；球壳样本数
-  本身不等于原始 ALE 单元数。原生分辨率逐帧选择：激波处厚度为主，空气侧
-  fallback 必须显式标记适用；不使用未标记的接触/产物侧厚度。
-- `extract_profiles` 现在保留激波外纯空气的壳平均场量和逐字段有效性
-  （`valid` 仍为 False，不进入训练监督），供 `R_b` 用真实场量核实环境态；
-  不再用环境常数填充。`material.npz` 同时记录 `coverage_air`、原始单元厚度、
-  `shell_count` 以及“没有原始单元 ID/逐单元径向范围”的差距。
-- `predict-500` 改用 `load_prediction_case`，只读 `metadata`/`rb_*`；预测时间范围
-  来自连续 `R_b` 段，不依赖内部观测是否有效。`evaluate-500` 才读内部参考。
-  预测还会核对缓存与当前配置、检查点与预测案例的共同物理参数和网络约定，
-  但不要求 500 mm 的半径/边界与训练签名相同。
-- 验证不可评估时返回 `score: null`，不参与最佳模型选择；无法形成独立验证帧时
-  训练入口报错，而不是把训练帧当验证集。恢复训练核对数据/前置/边界/模型结构/
-  验证划分，并恢复 RNG、固定验证点和 `best_score`（0.0 是有效值）。
-- 缓存与检查点格式升到 **version 5**（检查点 version 3；旧缓存 version 1/2/3/4 会被拒绝）。
-  本轮把 `training_location_valid`（材料/保护带/污染的位置资格，不含 rho/u/e/p 联合有限性）
-  与 `valid`、`field_valid_*`、`boundary_air_location_valid` 分开传递；训练观测先取
-  `material==1 & training_location_valid`，再逐字段叠加 `field_valid_*` 和几何范围。
-  因此必须重新 `extract_profiles` / `build-cache` / 重新训练。
-- `t_cj=R_cj/D`、材料卡来源、模型时钟与 d3plot 时间轴同原点均标为未核实；
-  `p_c(t0)` 与 `p_a,sep` 的实际相对差由 `initial_compatibility()` 报告，不强行抹平。
-- `extract_profiles` 的 `x` 是球壳几何中点、场量是壳平均；缓存里明确记录
-  “shell midpoint, not cell centroid”。
-
-下面的第 1–9 节描述的是**旧 ProductNet/AirNet/FrontNet 路径**，保留用于追溯；
-它不是 `contact_air` 新路径的实现依据，也不得把旧初场、旧总损失或旧 0.5 接触面
-标签混入新路径。
-
----
+- 旧的 `RightBoundaryTrajectory`/`R_b` 环境边界、三维剖面桥
+  (`build_case_from_profile`)、壳层分离资格、原生球壳分辨率、`predict-500`/
+  `evaluate-500` 和固定半径训练禁令已移出训练主路径；仅服务这些旧方案的
+  `rb_diagnostic.py`、`extract_contact_air_profile.py`、
+  `diagnose_contact_air_rb.py` 及对应测试已删除。旧三维提取工具仍保留给历史
+  数据链路，但不再被 `contact_air` 训练入口引用。
+- 缓存升到 **version 7**（保存 shock trajectory、观测物理半径、原始/对齐时钟）；
+  旧 `R_b`/壳层缓存会被明确拒绝并要求重建。检查点升到 **version 4**。
+- README 第 8 节仍是三维提取/历史数据的状态记录；它不再是本路径的数据来源。
+  一维数据侧的具体缺口见本节。
 
 ## 一、物理方案
 
@@ -266,13 +244,14 @@ L   = (L_50 + L_80 + L_100) / 3
 每次 Adam 更新，三个半径都参与并等权：一次采样、一个联合损失、一次优化器
 更新。
 
-> **路径说明（2026-11-05）。** 这一段描述的是**旧 ProductNet/AirNet/FrontNet
-> 训练器**：`training/trainer.py:355-415` 对 `total_loss_for_cases` 做一次
-> `backward()`、一次 `Adam.step()`。它不是 2026-11-04 新方案。
-> 新方案在 `src/spherical_blast_pinn/contact_air/`：两个持久 Adam 交替更新
-> AirNet 与 ContactNet，AirNet 直接输出 `(rho,u,p)`，模型显式使用 `R_b(t)`，
-> 并对每个阶段做非目标网络梯度隔离。运行入口见文首“新方案入口”；旧训练器
-> 不得被当作新方案的默认路径。
+> **路径说明（2026-11-10）。** 这一段描述的是**旧 ProductNet/AirNet/FrontNet
+> 训练器**：`training/trainer.py` 对联合总损失做一次 `backward()`、一次
+> `Adam.step()`。它不是当前的 contact_air 方案。
+> 当前方案在 `src/spherical_blast_pinn/contact_air/`：直接消费一维径向数据，
+> 两个持久 Adam 交替更新 AirNet 与 ContactNet，AirNet 直接输出 `(rho,u,p)`，
+> 几何显式使用识别出的外传激波 `R_s(t)`，并对每个阶段做非目标网络梯度隔离。
+> 运行入口见文首“新方案入口：一维 ContactNet + AirNet”；旧训练器不得被当作
+> 新方案的默认路径。
 
 **独立检查与选模型。** 每 500 步（`training.check_every`）在一套**固定**的检查
 点上跑一次完整物理验收：一次采样、全程复用、独立的随机种子、取**开发帧**、
@@ -392,9 +371,9 @@ python -m venv .venv
 
 ```bash
 python -m spherical_blast_pinn.cli.extract_profiles --config configs/base.yaml \
-  --case tnt_50mm --deck F:/tnt/tnt_files/dp0/SYS/MECH/input.k \
-  --d3plot-dir F:/tnt/tnt_files/dp0/SYS/MECH \
-  --out F:/2/extracted_all_20261028/50mm \
+  --case tnt_50mm --deck E:/tnt/tnt_files/dp0/SYS/MECH/input.k \
+  --d3plot-dir E:/tnt/tnt_files/dp0/SYS/MECH \
+  --out outputs/extracted_50mm \
   --charge-radius 0.05 --shells 2500 --stride 1 --outer-radius-factor 40
 ```
 
@@ -403,7 +382,7 @@ python -m spherical_blast_pinn.cli.extract_profiles --config configs/base.yaml \
 ```bash
 # 1. DYNA 真实物理初始化审查（必须显式给出 deck；--data 只用于旧提取剖面审计）
 python -m spherical_blast_pinn.cli.audit_dyna --config configs/base.yaml \
-  --deck tnt_50mm=F:/tnt/tnt_files/dp0/SYS/MECH/input.k
+  --deck tnt_50mm=E:/tnt/tnt_files/dp0/SYS/MECH/input.k
 
 # 2. 启动场：均匀产物球 + 局部平面黎曼，写出 handoff.npz/json
 python -m spherical_blast_pinn.cli.startup --charge-radius 0.05 --delta 0.005
@@ -469,6 +448,10 @@ python -m pytest -q
 
 ## 八、数据状态与已知限制
 
+> 本节记录的是**旧三维提取/历史数据**的状态，不再是 `contact_air` 一维训练
+> 路径的数据来源。一维入口的真实格式缺口、合成夹具范围和 smoke 状态见上文
+> “新方案入口：一维 ContactNet + AirNet（2026-11-10 迁移）”。
+
 这一节必须如实读。**数据侧的结论仍然有效**，但它们限制了这个模型能宣称什么。
 新链路的数据监督走 `data/startup_supervision.py` 的显式契约；下面这些旧提取
 结论仍然适用于旧 `ExtractedCase` 与 `audit_*` 命令。
@@ -524,7 +507,7 @@ T_origin = LT + R0 / D
 会被拒绝，不自动套用公式。原点未知的数据仍可加载/审查，但不能进入监督或
 同时间对比。合成样例必须标 `synthetic`，只用于接口验证。
 
-数据源一律用原始 d3plot：50 mm `F:/tnt/tnt_files/dp0/SYS/MECH`，
+数据源一律用原始 d3plot：50 mm `E:/tnt/tnt_files/dp0/SYS/MECH`，
 80 mm `G:/500mmtnt/80mmtnt_files/dp0/SYS-3/MECH`，
 100 mm `G:/500mmtnt/100mmtnt_files/dp0/SYS-3/MECH`，
 500 mm `D:/500mmtnt/500mmtnt_files/dp0/SYS-3/MECH`。
@@ -704,7 +687,8 @@ e = p / ((gamma - 1) rho)                空气（理想气体）
 
 ```
 src/spherical_blast_pinn/
-  contact_air/        新方案：precursor.py / geometry.py / data.py / models.py /
+  contact_air/        新方案：one_d.py（一维入口/激波/事件对齐）/ precursor.py /
+                      geometry.py（ShockTrajectory/PCHIP）/ data.py / models.py /
                       mapping.py / losses.py / sampling.py / trainer.py / cli.py
   physics/
     material.py       材料参数与物理零点（唯一的一份数值来源）

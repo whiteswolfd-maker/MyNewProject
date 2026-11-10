@@ -1,30 +1,31 @@
-"""Command line for the ContactNet/AirNet scheme.
+"""Command line for the one-dimensional ContactNet/AirNet scheme.
 
 Commands (run from the repository root):
 
 .. code-block:: text
 
     python -m spherical_blast_pinn.contact_air.cli precheck \
-        --config configs/contact_air/base.yaml --case tnt_50mm
+        --config configs/contact_air/base.yaml --all
 
     python -m spherical_blast_pinn.contact_air.cli build-cache \
         --config configs/contact_air/base.yaml --case tnt_50mm \
-        --profile-dir <extracted profile directory> --out <cache.npz>
+        --radius 0.05 --source <standard_1d_source.npz> --out <cache.npz>
 
     python -m spherical_blast_pinn.contact_air.cli train \
-        --config configs/contact_air/smoke.yaml --cases three \
+        --config configs/contact_air/smoke.yaml --cases all \
         --max-loops 4 --output-dir outputs/contact_air_smoke
 
-    python -m spherical_blast_pinn.contact_air.cli predict-500 \
-        --config configs/contact_air/base.yaml --checkpoint <last.pt> \
-        --output <prediction.npz>
+    python -m spherical_blast_pinn.contact_air.cli predict \
+        --config configs/contact_air/smoke.yaml --case tnt_50mm \
+        --checkpoint <last.pt> --output <prediction.npz>
 
-    python -m spherical_blast_pinn.contact_air.cli evaluate-500 \
-        --config configs/contact_air/base.yaml --prediction <prediction.npz> \
-        --output <evaluation.json>
+    python -m spherical_blast_pinn.contact_air.cli evaluate \
+        --config configs/contact_air/smoke.yaml --case tnt_50mm \
+        --prediction <prediction.npz> --output <evaluation.json>
 
 No path is baked into the repository; cache and output paths come from the
-configuration or the command line.
+configuration or the command line.  There is no fixed-radius training ban:
+the data split is whatever the configured ``cases`` entries explicitly say.
 """
 from __future__ import annotations
 
@@ -49,21 +50,19 @@ from ..config import Config, load_config
 from .data import (
     CaseData,
     CaseDataError,
+    ContactLabelConfig,
     PredictionCaseData,
-    build_case_from_profile,
+    build_case,
     load_case,
     load_prediction_case,
     save_case,
     synthetic_case,
 )
 from .geometry import GeometryError
-from .losses import LossError
+from .losses import LossError, data_coordinates, masked_rmse
 from .models import AirNet, ContactNet
-from .precursor import (
-    PrecursorConfig,
-    PrecursorError,
-    compute_precursor,
-)
+from .one_d import OneDDataError, ShockDetectionConfig, read_standard_1d
+from .precursor import PrecursorConfig, PrecursorError, compute_precursor
 from .sampling import SamplingError
 from .trainer import AlternatingTrainer, TrainConfig, TrainingError
 
@@ -84,40 +83,68 @@ def _resolve(config: Config, value: Any) -> Path:
     return path if path.is_absolute() else (config.root / path)
 
 
-def _precursor_config(section: Mapping[str, Any], radius: float) -> PrecursorConfig:
+def _precursor_payload(section: Mapping[str, Any]) -> dict[str, Any]:
     payload = copy.deepcopy(dict(section["precursor"]))
+    return payload
+
+
+def _precursor_config(section: Mapping[str, Any], radius: float) -> PrecursorConfig:
+    payload = _precursor_payload(section)
     payload["charge_radius_m"] = float(radius)
     return PrecursorConfig.from_mapping(payload)
+
+
+def _contact_config(section: Mapping[str, Any]) -> ContactLabelConfig:
+    return ContactLabelConfig.from_mapping(section.get("contact_interval"))
+
+
+def _shock_config(section: Mapping[str, Any]) -> ShockDetectionConfig:
+    return ShockDetectionConfig.from_mapping(section.get("shock_detection"))
 
 
 def _case_specs(section: Mapping[str, Any]) -> list[dict[str, Any]]:
     specs = list(section.get("cases", []) or [])
     if not specs:
-        raise CommandError("contact_air.cases is empty")
+        raise CommandError(
+            "contact_air.cases is empty. Define an explicit data split: which "
+            "radii are train/validation/test is a research decision, not a "
+            "default. The smoke configuration is the only pre-filled example."
+        )
     return [dict(spec) for spec in specs]
 
 
 def _select_specs(section: Mapping[str, Any], which: str) -> list[dict[str, Any]]:
     specs = _case_specs(section)
-    role = "train"
-    if which == "three":
-        selected = [spec for spec in specs if str(spec.get("role", "train")) == role]
+    if str(which).strip().lower() in ("all", "train"):
+        selected = [spec for spec in specs if str(spec.get("role", "train")) == "train"]
     else:
+        wanted = {part.strip() for part in str(which).split(",") if part.strip()}
         selected = [
             spec for spec in specs
-            if str(spec.get("role", "train")) == role and which in str(spec.get("case_id", ""))
+            if str(spec.get("case_id")) in wanted
+            and str(spec.get("role", "train")) == "train"
         ]
+        missing = wanted - {str(spec.get("case_id")) for spec in selected}
+        if missing:
+            raise CommandError(
+                f"no train case matches {sorted(missing)}; training only accepts "
+                "cases explicitly configured with role: train"
+            )
     if not selected:
-        raise CommandError(f"no training case matches {which!r}")
+        raise CommandError(
+            f"no training case matches {which!r}; define role: train explicitly"
+        )
     return selected
 
 
+#: Physics constants that must match between training and prediction.  Radius-
+#: dependent derived values (R_sep, t0, Rc0, Rs0) intentionally differ.
 _SHARED_PRECURSOR_SCALARS = (
-    "epsilon_s", "shock_model", "air_density", "air_pressure", "gamma_air",
-    "material_source", "material_source_verified",
+    "epsilon_denominator_factor", "shock_model", "air_density", "air_pressure",
+    "gamma_air", "material_source", "material_source_verified",
 )
-_SHARED_DERIVED_SCALARS = (
-    "V_cj", "V_sep", "p_sep", "u_c_sep", "D_s_sep", "t0", "R_sep", "Rc0", "Rs0",
+_SHARED_DIMENSIONLESS = (
+    "V_cj", "V_sep", "C", "p_sep", "u_c_sep", "D_s_sep",
 )
 
 
@@ -136,7 +163,6 @@ def _value_mismatch(a: Any, b: Any) -> bool:
 def _compare_shared_precursor(
     cached: Mapping[str, Any], expected: Mapping[str, Any], *, label: str,
 ) -> None:
-    """Compare material/air/detonation/precursor inputs by field name."""
     problems: list[str] = []
     for key in _SHARED_PRECURSOR_SCALARS:
         if key not in cached or key not in expected:
@@ -163,21 +189,30 @@ def _compare_shared_precursor(
         )
 
 
+def _compare_dimensionless(cached: Mapping[str, Any], expected: Mapping[str, Any], *, label: str) -> None:
+    problems = [
+        key for key in _SHARED_DIMENSIONLESS
+        if key not in cached or key not in expected
+        or _value_mismatch(cached[key], expected[key])
+    ]
+    if problems:
+        raise CommandError(
+            f"{label}: dimensionless precursor values differ ({problems}); the "
+            "shared physics/card is not the same"
+        )
+
+
 def _compare_cached_precursor(
     cached: Mapping[str, Any], expected: Mapping[str, Any], *, label: str,
 ) -> None:
     _compare_shared_precursor(cached, expected, label=label)
-    problems: list[str] = []
-    for key in _SHARED_DERIVED_SCALARS:
-        if key not in cached or key not in expected:
-            problems.append(f"{key}: missing")
-        elif _value_mismatch(cached[key], expected[key]):
-            problems.append(f"{key}: cache={cached[key]!r}, config={expected[key]!r}")
-    if problems:
-        raise CommandError(
-            f"{label}: cached derived precursor does not match the current "
-            f"configuration ({', '.join(problems[:8])}). Re-run build-cache."
-        )
+    _compare_dimensionless(cached, expected, label=label)
+    for key in ("t0", "R_sep", "Rc0", "Rs0"):
+        if key not in cached or key not in expected or _value_mismatch(cached[key], expected[key]):
+            raise CommandError(
+                f"{label}: cached {key}={cached.get(key)!r} does not match the "
+                f"configured {expected.get(key)!r}; re-run build-cache"
+            )
 
 
 def _cache_metadata(path: Path) -> Mapping[str, Any]:
@@ -188,7 +223,6 @@ def _cache_metadata(path: Path) -> Mapping[str, Any]:
 
 
 def _cache_is_synthetic(path: Path) -> bool:
-    """Inspect only the metadata; no training/internal array is read."""
     try:
         metadata = _cache_metadata(path)
     except (OSError, ValueError, json.JSONDecodeError):
@@ -238,11 +272,6 @@ def _make_case(
     radius = float(spec["charge_radius_m"])
     case_id = str(spec["case_id"])
     role = str(spec.get("role", "train"))
-    if role == "train" and abs(radius * 1000.0 - 500.0) <= 1.0e-9:
-        raise CommandError(
-            f"case {case_id!r}: R0=500 mm is the final-validation radius and "
-            "must not be a training case"
-        )
     cached = spec.get("cache")
     if cached:
         path = _resolve(config, cached)
@@ -262,17 +291,18 @@ def _make_case(
         return case
     if not bool(spec.get("synthetic", False)) or not allow_synthetic:
         raise CommandError(
-            f"case {case_id!r}: no cache is configured and synthetic data is not allowed. "
-            "Run build-cache on an extracted profile directory first."
+            f"case {case_id!r}: no cache is configured and synthetic data is not "
+            "allowed. Run build-cache on a standard 1-D source first."
         )
     precursor = compute_precursor(_precursor_config(section, radius))
-    tolerances = dict(section["tolerances"])
     return synthetic_case(
         case_id=case_id, charge_radius_m=radius, precursor=precursor, role=role,
-        n_frames=int(spec.get("n_frames", 41)),
-        n_radial=int(spec.get("n_radial", 400)),
-        duration_s=float(spec.get("duration_s", 2.0e-5)),
-        tolerances=tolerances,
+        n_frames=int(spec.get("n_frames", 21)),
+        n_radial=int(spec.get("n_radial", 2400)),
+        duration_s=spec.get("duration_s"),
+        tolerances=dict(section.get("tolerances", {})),
+        contact_config=_contact_config(section),
+        shock_config=_shock_config(section),
     )
 
 
@@ -280,22 +310,9 @@ def _make_prediction_case(
     section: Mapping[str, Any], spec: Mapping[str, Any], config: Config, *,
     allow_synthetic: bool,
 ) -> PredictionCaseData:
-    """Boundary-only case for ``predict-500``.
-
-    A cache is read through :func:`load_prediction_case`, not ``load_case``.
-    Internal observations, contact labels and ``R_raw`` are not loaded at all.
-    """
     radius = float(spec["charge_radius_m"])
     case_id = str(spec["case_id"])
     role = str(spec.get("role", "test"))
-    if role != "test":
-        raise CommandError(
-            f"case {case_id!r}: predict-500 requires role=test, got {role!r}"
-        )
-    if abs(radius * 1000.0 - 500.0) > 1.0e-9:
-        raise CommandError(
-            f"case {case_id!r}: predict-500 is for R0=500 mm, config says {radius!r} m"
-        )
     cached = spec.get("cache")
     if cached:
         path = _resolve(config, cached)
@@ -320,10 +337,12 @@ def _make_prediction_case(
     precursor = compute_precursor(_precursor_config(section, radius))
     case = synthetic_case(
         case_id=case_id, charge_radius_m=radius, precursor=precursor, role=role,
-        n_frames=int(spec.get("n_frames", 41)),
-        n_radial=int(spec.get("n_radial", 400)),
-        duration_s=float(spec.get("duration_s", 2.0e-5)),
-        tolerances=dict(section["tolerances"]),
+        n_frames=int(spec.get("n_frames", 21)),
+        n_radial=int(spec.get("n_radial", 2400)),
+        duration_s=spec.get("duration_s"),
+        tolerances=dict(section.get("tolerances", {})),
+        contact_config=_contact_config(section),
+        shock_config=_shock_config(section),
     )
     return case.prediction_view()
 
@@ -354,8 +373,7 @@ def _train_config(section: Mapping[str, Any], loops: int | None) -> TrainConfig:
     sampling = dict(section.get("sampling", {}))
     values = {
         "n_pde": int(sampling.get("n_pde", 512)),
-        "n_ic_shock": int(sampling.get("n_ic_shock", 128)),
-        "n_ic_ambient": int(sampling.get("n_ic_ambient", 128)),
+        "n_ic": int(sampling.get("n_ic", 128)),
         "n_right": int(sampling.get("n_right", 128)),
         "n_data": int(sampling.get("n_data", 128)),
         "n_contact": int(sampling.get("n_contact", 128)),
@@ -408,87 +426,65 @@ def command_precheck(args) -> int:
     config = load_config(args.config)
     section = _section(config)
     specs = _case_specs(section)
-    if getattr(args, "all", False):
-        rows = []
-        for item in specs:
-            if str(item.get("role", "train")) != "train":
-                continue
-            radius = float(item["charge_radius_m"])
-            result = compute_precursor(_precursor_config(section, radius))
-            rows.append({
-                "case_id": item["case_id"],
-                "charge_radius_m": radius,
-                "R_sep": result.R_sep,
-                "V_sep": result.V_sep,
-                "p_sep": result.p_sep,
-                "u_c_sep": result.u_c_sep,
-                "D_s_sep": result.D_s_sep,
-                "t_sep": result.t_sep,
-                "t0": result.t0,
-                "Rc0": result.Rc0,
-                "Rs0": result.Rs0,
-                "p_c_t0": result.p_c_t0,
-                "initial_pressure_compatibility": dict(
-                    result.initial_pressure_compatibility
-                ),
-                "clock": dict(result.clock),
-                "checks": dict(result.checks),
-            })
-        payload = {
-            "status": "precursor_table",
-            "note": "all three training radii; R_b(t0) is a data-side missing item",
-            "rows": rows,
-        }
-        if args.output:
-            _write_json(args.output, payload)
-        print(json.dumps(payload, indent=2, default=_jsonable))
-        return 0
-    wanted = args.case or "tnt_50mm"
-    spec = next((item for item in specs if str(item.get("case_id")) == wanted), None)
-    if spec is None:
+    wanted = args.case
+    selected = [
+        spec for spec in specs
+        if wanted is None or str(spec.get("case_id")) == wanted
+    ]
+    if not selected:
         raise CommandError(f"no case {wanted!r} in contact_air.cases")
-    radius = float(spec["charge_radius_m"])
-    precursor_config = _precursor_config(section, radius)
-    result = compute_precursor(precursor_config)
-    report: dict[str, Any] = {
-        "case_id": wanted,
-        "charge_radius_m": radius,
-        "precursor": result.as_dict(),
-        "precursor_checks": dict(result.checks),
-        "status": "precursor_ready_ic_unverified",
-        "initial_condition_verified": False,
+    rows = []
+    for spec in selected:
+        radius = float(spec["charge_radius_m"])
+        result = compute_precursor(_precursor_config(section, radius))
+        row = {
+            "case_id": spec.get("case_id"),
+            "role": spec.get("role", "train"),
+            "charge_radius_m": radius,
+            "precursor": result.as_dict(),
+            "precursor_checks": dict(result.checks),
+            "initial_condition_verified": False,
+            "status": "precursor_ready_ic_unverified",
+            "missing": [
+                "a standard 1-D source or cache is required for R_s(t_event) and "
+                "the contact labels; the precursor alone does not define them"
+            ],
+        }
+        cached = spec.get("cache")
+        if cached:
+            path = _resolve(config, cached)
+            if path.is_file():
+                case = load_case(path, role=str(spec.get("role", "train")))
+                row.update({
+                    "cache": str(path),
+                    "t0": case.t0,
+                    "t_end": case.t_end,
+                    "R_s_at_t0": case.initial.Rs_data_at_t0,
+                    "initial": case.as_dict()["initial"],
+                    "shock_continuous_intervals": case.shock.continuous_intervals,
+                    "event_alignment": case.event_alignment,
+                    "observations": case.observations.size,
+                    "initial_compatibility": case.initial_compatibility(),
+                    "separation": case.separation,
+                    "status": "ic_geometry_ready_physics_unverified",
+                    "initial_condition_verified": False,
+                    "missing": [],
+                })
+            else:
+                row["missing"] = [f"cache {path} does not exist"]
+        rows.append(row)
+    payload = {
+        "status": "precursor_table",
+        "n_cases": len(rows),
+        "rows": rows,
+        "note": (
+            "role assignments are exactly those in the configuration; no radius "
+            "is reserved as a fixed blind test"
+        ),
     }
-    cached = spec.get("cache")
-    if cached:
-        path = _resolve(config, cached)
-        if path.is_file():
-            case = load_case(path, role=str(spec.get("role", "train")))
-            report.update({
-                "cache": str(path),
-                "t0": case.t0,
-                "t_end": case.t_end,
-                "R_b_at_t0": case.initial.Rb0,
-                "initial": case.as_dict()["initial"],
-                "r_b_continuous_intervals": case.boundary.continuous_intervals,
-                "observations": case.observations.size,
-                "initial_compatibility": case.initial_compatibility(),
-                "separation": case.separation,
-                "status": "ic_geometry_ready_physics_unverified",
-                # A cache proves R_b(t0) exists and R_c<R_s<R_b.  It does not
-                # validate the precursor physics, the material card values, or
-                # the p_c(t0) vs p_a,sep difference.
-                "initial_condition_verified": False,
-            })
-        else:
-            report["missing"] = [f"cache {path} does not exist"]
-    else:
-        report["missing"] = [
-            "R_b(t0) trajectory: no cache is available; the full initial field "
-            "cannot be generated for this case"
-        ]
     if args.output:
-        _write_json(args.output, report)
-    print(json.dumps(report, indent=2, default=_jsonable))
+        _write_json(args.output, payload)
+    print(json.dumps(payload, indent=2, default=_jsonable))
     return 0
 
 
@@ -496,17 +492,39 @@ def command_build_cache(args) -> int:
     config = load_config(args.config)
     section = _section(config)
     spec = next(
-        (item for item in _case_specs(section) if str(item.get("case_id")) == args.case),
+        (item for item in list(section.get("cases", []) or [])
+         if str(item.get("case_id")) == args.case),
         None,
     )
-    if spec is None:
-        raise CommandError(f"no case {args.case!r} in contact_air.cases")
-    radius = float(spec["charge_radius_m"])
-    precursor = compute_precursor(_precursor_config(section, radius))
-    case = build_case_from_profile(
-        args.profile_dir, precursor=precursor,
-        role=str(spec.get("role", "train")), tolerances=dict(section["tolerances"]),
-        source={"profile_dir": str(args.profile_dir), "case_id": args.case},
+    radius = args.radius if args.radius is not None else (
+        float(spec["charge_radius_m"]) if spec is not None else None
+    )
+    if radius is None:
+        raise CommandError(
+            f"case {args.case!r} is not in contact_air.cases; pass --radius to "
+            "build its cache"
+        )
+    role = args.role or (str(spec.get("role", "train")) if spec is not None else "train")
+    try:
+        source = read_standard_1d(args.source)
+    except OneDDataError as exc:
+        raise CommandError(str(exc)) from exc
+    if source.case_id != args.case:
+        raise CommandError(
+            f"source case_id={source.case_id!r} does not match --case {args.case!r}"
+        )
+    if abs(source.charge_radius_m - float(radius)) > 1.0e-12:
+        raise CommandError(
+            f"source charge_radius_m={source.charge_radius_m!r} does not match "
+            f"the configured {radius!r}"
+        )
+    precursor = compute_precursor(_precursor_config(section, float(radius)))
+    case = build_case(
+        source, precursor=precursor, role=role,
+        tolerances=dict(section.get("tolerances", {})),
+        contact_config=_contact_config(section),
+        shock_config=_shock_config(section),
+        source_meta={"case_id": args.case, "source_path": str(args.source)},
     )
     save_case(case, args.out)
     print(json.dumps(case.as_dict(), indent=2, default=_jsonable))
@@ -558,13 +576,12 @@ def _load_checkpoint(path: Path, contact: ContactNet, air: AirNet) -> dict[str, 
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if payload.get("format") != "spherical_blast_pinn.contact_air_checkpoint":
         raise CommandError(f"{path}: not a contact-air checkpoint")
-    if payload.get("version") != 3:
+    if payload.get("version") != 4:
         raise CommandError(
             f"{path}: checkpoint version {payload.get('version')!r} is not supported; "
-            "retrain: version 3 carries the shared-physics metadata required for "
-            "prediction compatibility"
+            "retrain: version 4 carries the R_s trajectory contract and the "
+            "two-optimizer stage state"
         )
-    # Validate both state dicts before touching either model.
     _check_checkpoint_state(contact, payload["contact_net"], "contact_net", Path(path))
     _check_checkpoint_state(air, payload["air_net"], "air_net", Path(path))
     for key, module in (("contact_net", contact), ("air_net", air)):
@@ -585,13 +602,6 @@ def _check_prediction_compatibility(
     case: PredictionCaseData, payload: Mapping[str, Any],
     contact: ContactNet, air: AirNet,
 ) -> None:
-    """Compare only shared physics and model conventions.
-
-    The 500 mm radius and its measured boundary are intentionally *not*
-    compared with the training case signatures: cross-radius prediction is
-    the point.  What must match are the material/JWL/detonation/air inputs and
-    the network parameterisation.
-    """
     metadata = list(payload.get("case_metadata", []) or [])
     references = [
         (str(item.get("case_id", "<unknown>")), item.get("precursor"))
@@ -608,6 +618,10 @@ def _check_prediction_compatibility(
             case.precursor, reference,
             label=f"prediction physics vs training case {case_id!r}",
         )
+        _compare_dimensionless(
+            case.precursor, reference,
+            label=f"prediction dimensionless physics vs training case {case_id!r}",
+        )
     for key, module in (("contact_net", contact), ("air_net", air)):
         saved_describe = payload.get(f"{key}_describe")
         if saved_describe is not None and saved_describe != module.describe():
@@ -616,16 +630,13 @@ def _check_prediction_compatibility(
             )
 
 
-def command_predict_500(args) -> int:
+def command_predict(args) -> int:
     config = load_config(args.config)
     section = _section(config)
     specs = _case_specs(section)
-    wanted = args.case or "tnt_500mm"
-    spec = next((item for item in specs if str(item.get("case_id")) == wanted), None)
+    spec = next((item for item in specs if str(item.get("case_id")) == args.case), None)
     if spec is None:
-        raise CommandError(f"no test case {wanted!r} in contact_air.cases")
-    if str(spec.get("role", "test")) != "test":
-        raise CommandError(f"case {wanted!r} is not role=test")
+        raise CommandError(f"no case {args.case!r} in contact_air.cases")
     case = _make_prediction_case(section, spec, config, allow_synthetic=True)
     contact, air = _networks(section)
     payload = _load_checkpoint(Path(args.checkpoint), contact, air)
@@ -638,14 +649,14 @@ def command_predict_500(args) -> int:
     t_tensor = torch.as_tensor(t_grid.reshape(-1, 1), dtype=torch.float64)
     z_tensor = torch.as_tensor(z_grid.reshape(-1, 1), dtype=torch.float64)
     r0 = torch.full_like(t_tensor, float(case.charge_radius_m))
-    rb, rb_dot = case.boundary_tensors(t_grid.reshape(-1))
-    rb = rb.reshape(-1, 1).to(torch.float64)
-    rb_dot = rb_dot.reshape(-1, 1).to(torch.float64)
+    rs, ds = case.shock_tensors(t_grid.reshape(-1))
+    rs = rs.reshape(-1, 1).to(torch.float64)
+    ds = ds.reshape(-1, 1).to(torch.float64)
     from .models import closure_from_precursor, scales_from_precursor
     closure = closure_from_precursor(case.precursor, like=t_tensor)
     scales = scales_from_precursor(case.precursor, like=t_tensor)
     with torch.enable_grad():
-        c_fields = contact(t_tensor, r0, rb, rb_dot, closure, create_graph=False)
+        c_fields = contact(t_tensor, r0, rs, ds, closure, create_graph=False)
     c_fields = type(c_fields)(
         radius=c_fields.radius.detach(), speed=c_fields.speed.detach(),
         sigmoid=c_fields.sigmoid.detach(), raw=c_fields.raw.detach(),
@@ -654,11 +665,11 @@ def command_predict_500(args) -> int:
     )
     with torch.no_grad():
         air_fields = air(z_tensor, t_tensor, r0, scales)
-    length = rb - c_fields.radius
+    length = rs - c_fields.radius
     radius = c_fields.radius + z_tensor * length
     payload_out = {
         "format": "spherical_blast_pinn.contact_air_prediction",
-        "version": 1,
+        "version": 2,
         "case_id": case.case_id,
         "synthetic": bool(case.source.get("synthetic", False)),
         "checkpoint": str(args.checkpoint),
@@ -668,25 +679,23 @@ def command_predict_500(args) -> int:
         "radius": radius.detach().numpy().reshape(n_t, n_z),
         "contact_radius": c_fields.radius.detach().numpy().reshape(n_t, n_z),
         "contact_speed": c_fields.speed.detach().numpy().reshape(n_t, n_z),
-        "rb": rb.detach().numpy().reshape(n_t, n_z),
-        "rb_dot": rb_dot.detach().numpy().reshape(n_t, n_z),
+        "shock_radius": rs.detach().numpy().reshape(n_t, n_z),
+        "shock_speed": ds.detach().numpy().reshape(n_t, n_z),
         "density": air_fields.density.detach().numpy().reshape(n_t, n_z),
         "velocity": air_fields.velocity.detach().numpy().reshape(n_t, n_z),
         "pressure": air_fields.pressure.detach().numpy().reshape(n_t, n_z),
         "specific_energy": air_fields.specific_energy.detach().numpy().reshape(n_t, n_z),
-        # Stored as JSON text, not a Python object, so the prediction file
-        # remains loadable with allow_pickle=False.
         "prediction_data_scope": np.asarray(json.dumps({
-            "loaded_fields": ["metadata", "rb_times", "rb_radius", "rb_valid"],
-            "not_loaded": ["internal observations", "contact interval", "R_raw"],
-            "time_range_source": "continuous R_b segment containing t0",
+            "loaded_fields": ["metadata", "shock_times", "shock_radius", "shock_valid"],
+            "not_loaded": ["internal observations", "contact interval"],
+            "time_range_source": "continuous R_s segment containing t0",
             "internal_supervision_used_for_time_range": False,
         })),
         "note": (
-            "prediction uses only the measured R_b trajectory, dR_b/dt, the case "
-            "physics and the trained networks; predict-500 uses "
-            "load_prediction_case and does not load internal observations, contact "
-            "interval or R_raw. evaluate-500 is the only command that reads them"
+            "prediction uses the identified external shock trajectory, dR_s/dt, "
+            "the case physics and the trained networks; it is 'prediction given "
+            "the measured shock trajectory', not autonomous cross-radius shock "
+            "prediction"
         ),
     }
     out = Path(args.output)
@@ -696,14 +705,13 @@ def command_predict_500(args) -> int:
     return 0
 
 
-def command_evaluate_500(args) -> int:
+def command_evaluate(args) -> int:
     config = load_config(args.config)
     section = _section(config)
     specs = _case_specs(section)
-    wanted = args.case or "tnt_500mm"
-    spec = next((item for item in specs if str(item.get("case_id")) == wanted), None)
+    spec = next((item for item in specs if str(item.get("case_id")) == args.case), None)
     if spec is None:
-        raise CommandError(f"no test case {wanted!r} in contact_air.cases")
+        raise CommandError(f"no case {args.case!r} in contact_air.cases")
     case = _make_case(section, spec, config, allow_synthetic=True)
     with np.load(args.prediction, allow_pickle=False) as archive:
         prediction_case_id = str(archive["case_id"]) if "case_id" in archive.files else None
@@ -713,7 +721,6 @@ def command_evaluate_500(args) -> int:
         u = np.asarray(archive["velocity"])
         p = np.asarray(archive["pressure"])
         rc = np.asarray(archive["contact_radius"])[:, 0]
-        rb_pred = np.asarray(archive["rb"])[:, 0]
     if prediction_case_id is not None and prediction_case_id != case.case_id:
         raise CommandError(
             f"prediction is for case {prediction_case_id!r}, evaluation case is "
@@ -721,25 +728,27 @@ def command_evaluate_500(args) -> int:
         )
     if times.ndim != 1 or zetas.ndim != 1 or rho.shape != (times.size, zetas.size):
         raise CommandError("prediction arrays have unexpected shapes")
-    case.boundary.require_interval(float(times[0]), float(times[-1]))
+    case.shock.require_interval(float(times[0]), float(times[-1]))
     interp = {
         "rho": RegularGridInterpolator((times, zetas), rho, bounds_error=False, fill_value=np.nan),
         "u": RegularGridInterpolator((times, zetas), u, bounds_error=False, fill_value=np.nan),
         "p": RegularGridInterpolator((times, zetas), p, bounds_error=False, fill_value=np.nan),
     }
     obs = case.observations
-    valid_t = (obs.time >= times[0]) & (obs.time <= times[-1]) & obs.valid_domain
+    valid_t = (obs.time >= times[0]) & (obs.time <= times[-1])
     rc_at_obs = np.interp(obs.time, times, rc)
-    rb_at_obs = np.interp(obs.time, times, rb_pred)
+    rs_at_obs = np.asarray(case.shock.position(obs.time), dtype=np.float64)
     with np.errstate(divide="ignore", invalid="ignore"):
-        zeta_pred = (obs.radius - rc_at_obs) / (rb_at_obs - rc_at_obs)
+        zeta_pred = (obs.radius - rc_at_obs) / (rs_at_obs - rc_at_obs)
     in_domain = valid_t & np.isfinite(zeta_pred) & (zeta_pred >= 0.0) & (zeta_pred <= 1.0)
-    points = np.column_stack([obs.time, zeta_pred])
+    points = np.column_stack([obs.time, np.clip(zeta_pred, 0.0, 1.0)])
     predicted = {
         name: np.asarray(interp[name](points), dtype=np.float64)
         for name in ("rho", "u", "p")
     }
-    metrics: dict[str, Any] = {"n_observations": int(obs.size), "n_in_domain": int(in_domain.sum())}
+    metrics: dict[str, Any] = {
+        "n_observations": int(obs.size), "n_in_domain": int(in_domain.sum()),
+    }
     for name, target, mask, scale in (
         ("rho", obs.density, obs.valid_density, case.rho_scale),
         ("u", obs.velocity, obs.valid_velocity, case.u_scale),
@@ -760,9 +769,7 @@ def command_evaluate_500(args) -> int:
     )
     contact_metrics: dict[str, Any] = {"n_contact_frames": int(valid_contact.sum())}
     if np.any(valid_contact):
-        rc_contact = np.interp(
-            case.contact.times[valid_contact], times, rc
-        )
+        rc_contact = np.interp(case.contact.times[valid_contact], times, rc)
         below = np.maximum(case.contact.low[valid_contact] - rc_contact, 0.0)
         above = np.maximum(rc_contact - case.contact.up[valid_contact], 0.0)
         contact_metrics["mean_violation_over_Rsep"] = float(
@@ -771,7 +778,9 @@ def command_evaluate_500(args) -> int:
         contact_metrics["covered_frames"] = int(np.count_nonzero(
             (below == 0.0) & (above == 0.0)
         ))
-        contact_metrics["coverage"] = float(contact_metrics["covered_frames"] / valid_contact.sum())
+        contact_metrics["coverage"] = float(
+            contact_metrics["covered_frames"] / valid_contact.sum()
+        )
     report = {
         "case_id": case.case_id,
         "synthetic": bool(case.source.get("synthetic", False)),
@@ -780,12 +789,11 @@ def command_evaluate_500(args) -> int:
         "contact": contact_metrics,
         "evaluation_data_scope": {
             "loaded_fields": ["saved prediction", "internal observations", "contact interval"],
-            "note": "this command, not predict-500, is allowed to read internal reference data",
+            "note": "this command, not predict, is allowed to read internal reference data",
         },
         "note": (
-            "evaluation uses the saved prediction first, then the 500 mm internal "
-            "observations; the observation zeta is recomputed with predicted R_c/R_b, "
-            "not with R_raw"
+            "the observation coordinate is recomputed with the predicted R_c and "
+            "the measured shock R_s, not with the contact-interval midpoint"
         ),
     }
     _write_json(args.output, report)
@@ -798,33 +806,35 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     pre = sub.add_parser("precheck")
     pre.add_argument("--config", required=True)
-    pre.add_argument("--case", default="tnt_50mm")
-    pre.add_argument("--all", action="store_true", help="print the 50/80/100 precursor table")
+    pre.add_argument("--case", default=None)
+    pre.add_argument("--all", action="store_true", help="print every configured case")
     pre.add_argument("--output", default=None)
     cache = sub.add_parser("build-cache")
     cache.add_argument("--config", required=True)
     cache.add_argument("--case", required=True)
-    cache.add_argument("--profile-dir", required=True)
+    cache.add_argument("--radius", type=float, default=None)
+    cache.add_argument("--role", choices=("train", "validation", "test"), default=None)
+    cache.add_argument("--source", required=True, help="standard 1-D source (.npz or directory)")
     cache.add_argument("--out", required=True)
     train = sub.add_parser("train")
     train.add_argument("--config", required=True)
-    train.add_argument("--cases", default="three", choices=("50", "80", "100", "three"))
+    train.add_argument("--cases", default="all", help="'all' or comma-separated train case ids")
     train.add_argument("--max-loops", type=int, default=None)
     train.add_argument("--output-dir", default=None)
     train.add_argument("--resume", default=None)
     train.add_argument("--no-synthetic", action="store_true")
-    pred = sub.add_parser("predict-500")
+    pred = sub.add_parser("predict")
     pred.add_argument("--config", required=True)
     pred.add_argument("--checkpoint", required=True)
     pred.add_argument("--output", required=True)
-    pred.add_argument("--case", default="tnt_500mm")
+    pred.add_argument("--case", required=True)
     pred.add_argument("--n-times", type=int, default=64)
     pred.add_argument("--n-zeta", type=int, default=64)
-    ev = sub.add_parser("evaluate-500")
+    ev = sub.add_parser("evaluate")
     ev.add_argument("--config", required=True)
     ev.add_argument("--prediction", required=True)
     ev.add_argument("--output", required=True)
-    ev.add_argument("--case", default="tnt_500mm")
+    ev.add_argument("--case", required=True)
     return parser
 
 
@@ -837,14 +847,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return command_build_cache(args)
         if args.command == "train":
             return command_train(args)
-        if args.command == "predict-500":
-            return command_predict_500(args)
-        if args.command == "evaluate-500":
-            return command_evaluate_500(args)
+        if args.command == "predict":
+            return command_predict(args)
+        if args.command == "evaluate":
+            return command_evaluate(args)
         raise CommandError(f"unknown command {args.command!r}")
     except (
         CommandError, CaseDataError, PrecursorError, TrainingError, LossError,
-        SamplingError, GeometryError, ValueError,
+        SamplingError, GeometryError, OneDDataError, ValueError,
     ) as exc:
         print(f"\n** {exc} **\n", file=sys.stderr)
         return 6
