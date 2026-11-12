@@ -95,6 +95,40 @@ t/mm³，速度 m/s、mm/us、km/s、cm/us，压力 Pa/kPa/MPa/GPa/bar/kbar。
 **LS-DYNA 二进制 ALE1D 槽位尚未核实，因此没有实现猜测式二进制读取。** 真实
 接入需要文件样例、版本和字段映射；在此之前只能使用上述中间格式。
 
+### LS-DYNA ASCII profile 导入
+
+`scripts/import_lsdyna_profiles_1d.py` 把 `*DATABASE_PROFILE` 生成的 `.xy`
+文本剖面转换为上述标准中间格式。它只读取 ASCII profile，不解析
+`d3plot`/`d3dump` 二进制槽位。
+
+- 压力、密度、径向速度分别来自 pressure、density、x-velocity profile；
+- 产物体积分数和空气质量分数必须来自两条**按 ALE 材料组**的体积分数请求：
+  `MMG=1`（TNT/产物）和 `MMG=2`（空气）。`MMG=-10`（多材料组列表）输出的是
+  指定组的体积平均，所有单元恒为 1，不能当作 `alpha_product`；
+- 单元边界取速度剖面中的真实节点坐标 `node[i]`、`node[i+1]`，不假设均匀网格；
+- 节点速度按相邻两节点平均到单元代表位置；长度、时间、密度、速度、压力统一
+  换算为 SI；
+- 体积分数不做归一化、填充，也不由密度/压力反推；`alpha_product +
+  alpha_air` 不在 `1 ± 1e-4` 内直接拒绝；
+- 剖面文件名只把输出时刻写到 3 位有效数字，文件和 `d3hsp` 中没有该
+  `*DATABASE_PROFILE` 写入的精确时刻。导入器把文件名时间写入 `frame_times`，
+  并在 `source["time_source"] = "profile_filename_3sigfig"` 记录这一限制；
+  不得把它宣称为精确求解器时刻；
+- 默认保留 `--dense-until-s` 之前的全部帧（事件对齐用），之后每
+  `--frame-stride` 帧取一帧；实际保留的原始文件键写入 source。
+
+示例：
+
+```bash
+PYTHONPATH=src python scripts/import_lsdyna_profiles_1d.py \
+  --source-dir G:/R50_R100_reference_v2/R50_full_alpha_profiles \
+  --case r50_full --radius-m 0.05 \
+  --alpha-product-pattern 'profile4_volume_fraction_x_time*.xy' \
+  --alpha-air-pattern 'profile5_volume_fraction_x_time*.xy' \
+  --dense-until-s 2.5e-5 --frame-stride 10 \
+  --out outputs/contact_air_r50/standard_1d.npz
+```
+
 ## 3. 接触区间、激波与事件对齐
 
 ### 接触区间

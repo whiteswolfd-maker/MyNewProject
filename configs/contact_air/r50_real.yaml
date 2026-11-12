@@ -1,0 +1,66 @@
+# Real 50 mm spherical ALE1D case.
+#
+# Data provenance:
+#   G:\R50_R100_reference_v2\R50_full_alpha_profiles\
+#   R50_full_reference_alpha_profiles.k
+#
+# The deck is the user's R50_full_reference.k with exactly one output change:
+# the single MMG=-10 volume-fraction *DATABASE_PROFILE request was replaced by
+# two requests, MMG=1 (TNT/product) and MMG=2 (air).  Mesh, materials, JWL/EOS,
+# detonation, ALE advection, boundary conditions, time step and termination
+# time are unchanged.
+#
+# Solver version: the original G:\...\R50_full run used LS-DYNA R14.1.1
+# (Ansys 2024 R2).  The local license file is 2021.1231, so R14 exits with a
+# license-version error.  The alpha-profile rerun therefore uses the licensed
+# v221 R12 solver with the same deck.  All five profiles of the new directory
+# come from that one R12 run, so the dataset is internally consistent, but it
+# is not a bit-for-bit R14 replay.  The original R14 directory is untouched.
+#
+# The standard_1d source is produced by
+#   scripts/import_lsdyna_profiles_1d.py
+# and keeps every frame up to 2.5e-5 s, then every 10th frame.  Profile file
+# names carry the output time with three significant figures only; the importer
+# records that limitation in source["time_source"].
+#
+# Event alignment uses the theoretical t_sep = 1.853e-5 s as search guidance
+# and takes the first valid contact+shock+pure-air frame at or after t_sep.
+# On this run that is the 19.1 us frame: contact up = 108.7 mm and identified
+# shock = 116.35 mm, so the theoretical Rc0 = 109.17 mm is inside the measured
+# shock.  Earlier frames (for example 9.07 us, shock 62.25 mm) are still
+# pre-separation by the precursor definition and are not used as the event.
+#
+# This is a real-data integration/run check.  It is not a claim that the PINN
+# reproduces the ALE1D physics; compare predict/evaluate diagnostics before
+# treating any result as validated.
+inherits: base.yaml
+
+contact_air:
+  precursor:
+    # The configuration values match the material/JWL/EOS/detonation cards in
+    # the deck above.  "verified" here means checked against that deck, not
+    # experimentally validated.
+    material_source: "G:/R50_R100_reference_v2/R50_full/R50_full_reference.k"
+    material_source_verified: true
+
+  cases:
+    - case_id: r50_full
+      role: train
+      charge_radius_m: 0.050
+      cache: outputs/contact_air_r50/cache.npz
+      synthetic: false
+
+  output_dir: outputs/contact_air_r50
+
+  training:
+    # First real-data run: short enough to expose pipeline errors, not a
+    # converged production training.
+    loops: 20
+    log_every: 1
+    checkpoint_every: 10
+    validate_every: 10
+
+  validation:
+    holdout_fraction: 0.3
+    data_points: 256
+    contact_points: 256

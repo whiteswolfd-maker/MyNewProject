@@ -451,6 +451,7 @@ def _frame_arrays(
     if "radius" not in per_cell_names:
         raise OneDDataError(f"{path}: per-cell array 'radius' is missing")
     total_cells = None
+    concatenated: dict[str, np.ndarray] = {}
     for name in per_cell_names:
         array = np.asarray(archive[name])
         if array.ndim != 1:
@@ -465,6 +466,10 @@ def _frame_arrays(
                 f"{path}: per-cell array {name!r} has {array.size} entries, "
                 f"expected {total_cells} (the same concatenated length as radius)"
             )
+        # Load each concatenated array exactly once.  Re-reading it inside the
+        # per-frame loop below turns a large real source into O(frames x size)
+        # I/O; the slices are the same either way.
+        concatenated[name] = array
     assert total_cells is not None
     if int(offsets[-1]) != total_cells:
         raise OneDDataError(
@@ -504,8 +509,7 @@ def _frame_arrays(
         start, stop = int(offsets[index]), int(offsets[index + 1])
         frame_arrays = {}
         for name in per_cell_names:
-            array = np.asarray(archive[name])
-            frame_arrays[name] = array[start:stop].copy()
+            frame_arrays[name] = concatenated[name][start:stop].copy()
             if frame_arrays[name].size != stop - start:
                 raise OneDDataError(
                     f"{path}: frame {index} array {name!r} has "
@@ -1428,7 +1432,17 @@ def align_event(
                 if window_s is not None else ""
             )
         )
-    event = int(min(candidates))
+    # A frame earlier than the theoretical separation time cannot be the
+    # separation event.  Prefer the first candidate at or after ``t_separation``
+    # and fall back to the earliest candidate only when the raw output contains
+    # no candidate at/after it.  The raw frame time itself is never rescaled.
+    after_separation = [
+        index for index in candidates
+        if float(frames[index].time_raw_s) >= float(t_separation)
+    ]
+    event = (
+        int(min(after_separation)) if after_separation else int(min(candidates))
+    )
     frame = frames[event]
     preceding_confirmed = False
     if event > 0 and bool(contact_valid[event - 1]) and bool(shock_valid[event - 1]):
@@ -1440,6 +1454,16 @@ def align_event(
         )
         preceding_confirmed = not ok
     reasons = []
+    if after_separation:
+        reasons.append(
+            "event frame is the first valid candidate at or after the theoretical "
+            "t_sep; the raw frame time is used unchanged"
+        )
+    else:
+        reasons.append(
+            "no valid candidate exists at or after the theoretical t_sep; the "
+            "earliest available candidate is used and the raw frame time is kept"
+        )
     if event == 0:
         reasons.append(
             "the event frame is the first available frame; whether separation "
