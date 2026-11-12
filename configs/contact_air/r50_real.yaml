@@ -53,12 +53,12 @@ contact_air:
   output_dir: outputs/contact_air_r50
 
   training:
-    # First real-data run: short enough to expose pipeline errors, not a
-    # converged production training.
-    loops: 20
-    log_every: 1
-    checkpoint_every: 10
-    validate_every: 10
+    # Real-data training run.  The first 20 loops were the pipeline check; this
+    # longer run resumes from that checkpoint with the same data/split/network.
+    loops: 2000
+    log_every: 50
+    checkpoint_every: 100
+    validate_every: 100
 
   validation:
     holdout_fraction: 0.3

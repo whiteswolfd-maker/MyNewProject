@@ -109,7 +109,15 @@ t/mm³，速度 m/s、mm/us、km/s、cm/us，压力 Pa/kPa/MPa/GPa/bar/kbar。
 - 节点速度按相邻两节点平均到单元代表位置；长度、时间、密度、速度、压力统一
   换算为 SI；
 - 体积分数不做归一化、填充，也不由密度/压力反推；`alpha_product +
-  alpha_air` 不在 `1 ± 1e-4` 内直接拒绝；
+  alpha_air` 不在 `1 ± 1e-4` 内直接拒绝；若输入只有 `MMG=1` 的产物分数（例如
+  R150–R350 的 deck），用 `--alpha-air-pattern` 省略空气文件，读取器按
+  `1-alpha_product` 隐式空气并记录来源；
+- `.xy` 必须以 `endcurve` 结束；没有结束标记视为求解器尚未写完，整帧拒绝，
+  不能把截断文件当完整数据；
+- 所有选中帧的单元数、节点数必须一致；固定 ALE1D 网格还要求首末径向边界
+  一致，否则拒绝。移动网格必须显式传 `--allow-moving-mesh`；
+- profile 文件只按单元集顺序给值，不含 LS-DYNA 单元 ID；导入器不生成 ID，
+  由读取器生成并在 `generated_cell_id_frames` 中记录为 generated；
 - 剖面文件名只把输出时刻写到 3 位有效数字，文件和 `d3hsp` 中没有该
   `*DATABASE_PROFILE` 写入的精确时刻。导入器把文件名时间写入 `frame_times`，
   并在 `source["time_source"] = "profile_filename_3sigfig"` 记录这一限制；
@@ -166,16 +174,19 @@ PYTHONPATH=src python scripts/import_lsdyna_profiles_1d.py \
 ### 事件对齐
 
 用理论 `t_sep` 指导原始帧搜索。当某帧同时具有可信接触区间、外层激波和两者
-之间几何连续的纯空气区间时，取首个可辨认分离帧 `t_event_data`：
+之间几何连续的纯空气区间时，取**不早于 `t_sep`** 的首个可辨认分离帧
+`t_event_data`：
 
 ```text
 t_model = t0 + (t_data - t_event_data)
 ```
 
-空气观测、接触标签和激波轨迹共用同一平移。保存原始时间、原始帧号、对齐时间、
-事件帧和偏移。若事件帧是首个可用帧，或前一帧无法验证，明确记录
+若搜索窗口内没有不早于 `t_sep` 的合格帧，明确报错，**不退回** `t_sep` 之前的
+帧。原始帧时间不平移、不缩放；事件对齐只作用于模型时间 `t_model`，不是取消
+偏移。空气观测、接触标签和激波轨迹共用同一平移。保存原始时间、原始帧号、
+对齐时间、事件帧和偏移。若事件帧是首个可用帧，或前一帧无法验证，明确记录
 `event_in_first_frame` / `preceding_frame_confirmed`，不宣称找到了全数据“首次
-分离”。不缩放帧间时间，不平移半径。
+分离”。不平移半径。
 
 ### ShockTrajectory
 

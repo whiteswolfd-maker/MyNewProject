@@ -1433,16 +1433,23 @@ def align_event(
             )
         )
     # A frame earlier than the theoretical separation time cannot be the
-    # separation event.  Prefer the first candidate at or after ``t_separation``
-    # and fall back to the earliest candidate only when the raw output contains
-    # no candidate at/after it.  The raw frame time itself is never rescaled.
+    # separation event.  The rule is "not earlier than t_sep": if the raw
+    # output contains no valid candidate at/after t_sep, fail explicitly rather
+    # than silently falling back to a pre-separation frame.  The raw frame time
+    # itself is never rescaled.
     after_separation = [
         index for index in candidates
         if float(frames[index].time_raw_s) >= float(t_separation)
     ]
-    event = (
-        int(min(after_separation)) if after_separation else int(min(candidates))
-    )
+    if not after_separation:
+        raise OneDDataError(
+            "no valid contact+shock+pure-air frame exists at or after the "
+            f"theoretical t_sep={float(t_separation)!r} s; all "
+            f"{len(candidates)} candidate(s) are earlier than t_sep.  The event "
+            "rule is 'not earlier than t_sep'; a pre-separation frame is never "
+            "used as a fallback.  Extend the raw data or correct t_sep."
+        )
+    event = int(min(after_separation))
     frame = frames[event]
     preceding_confirmed = False
     if event > 0 and bool(contact_valid[event - 1]) and bool(shock_valid[event - 1]):
@@ -1453,17 +1460,11 @@ def align_event(
             geometry_tolerance_m=geometry_tolerance_m,
         )
         preceding_confirmed = not ok
-    reasons = []
-    if after_separation:
-        reasons.append(
-            "event frame is the first valid candidate at or after the theoretical "
-            "t_sep; the raw frame time is used unchanged"
-        )
-    else:
-        reasons.append(
-            "no valid candidate exists at or after the theoretical t_sep; the "
-            "earliest available candidate is used and the raw frame time is kept"
-        )
+    reasons = [
+        "event frame is the first valid candidate at or after the theoretical "
+        "t_sep; the raw frame time is used unchanged, and the documented event "
+        "offset is applied to model time"
+    ]
     if event == 0:
         reasons.append(
             "the event frame is the first available frame; whether separation "

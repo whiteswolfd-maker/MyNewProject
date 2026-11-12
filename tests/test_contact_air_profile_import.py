@@ -122,6 +122,92 @@ def test_profiles_are_converted_with_actual_boundaries_and_si_units(tmp_path):
     provenance = radial.source["metadata"]
     assert provenance["time_source"] == "profile_filename_3sigfig"
     assert provenance["no_normalization_or_filling"] is True
+    # The profile files carry values in set order, not element IDs.  The
+    # importer must not present invented 1..N IDs as source-provided.
+    assert radial.source["cell_id_sources"] == ["generated"] * 3
+    assert radial.source["generated_cell_id_frames"] == [0, 1, 2]
+
+
+def _truncate_xy(path: Path, keep_rows: int, *, keep_endcurve: bool) -> None:
+    lines = path.read_text(encoding="ascii").splitlines()
+    out: list[str] = []
+    started = False
+    kept = 0
+    for line in lines:
+        text = line.strip()
+        if not started:
+            out.append(line)
+            if text.startswith("#pts"):
+                started = True
+            continue
+        if text.lower() == "endcurve":
+            continue
+        if kept < keep_rows:
+            out.append(line)
+            kept += 1
+    if keep_endcurve:
+        out.append("endcurve")
+    path.write_text("\n".join(out) + "\n", encoding="ascii")
+
+
+def test_a_profile_without_endcurve_is_refused(tmp_path):
+    source = _write_run(tmp_path / "run")
+    for path in source.glob("*_time3.00E-06.xy"):
+        _truncate_xy(path, 1000, keep_endcurve=False)
+    with pytest.raises(OneDDataError, match="no 'endcurve' marker"):
+        _convert(source, tmp_path / "bad.npz")
+
+
+def test_a_globally_truncated_set_is_caught_by_the_expected_cell_count(tmp_path):
+    source = _write_run(tmp_path / "run")
+    for path in source.glob("*.xy"):
+        keep = 4 if path.name.startswith("profile1_") else 3
+        _truncate_xy(path, keep, keep_endcurve=True)
+    with pytest.raises(OneDDataError, match="expected 5 cells"):
+        importer.convert(
+            source_dir=source, case_id="fixture", radius_m=0.05,
+            out=tmp_path / "bad.npz",
+            velocity_pattern="profile1_x-velocity_x_time*.xy",
+            pressure_pattern="profile2_pressure_x_time*.xy",
+            density_pattern="profile3_density_x_time*.xy",
+            alpha_product_pattern="profile4_volume_fraction_x_time*.xy",
+            alpha_air_pattern="profile5_volume_fraction_x_time*.xy",
+            dense_until_s=1.0, frame_stride=1,
+            expected_cells=5,
+        )
+
+
+def test_a_consistently_truncated_frame_is_refused(tmp_path):
+    source = _write_run(tmp_path / "run")
+    key = "3.00E-06"
+    for path in source.glob(f"*_time{key}.xy"):
+        keep = 4 if path.name.startswith("profile1_") else 3
+        _truncate_xy(path, keep, keep_endcurve=True)
+    with pytest.raises(OneDDataError, match="differing cell counts"):
+        _convert(source, tmp_path / "bad.npz")
+
+
+def test_product_only_profile_uses_implicit_air(tmp_path):
+    source = _write_run(tmp_path / "run")
+    for path in source.glob("profile5_volume_fraction_x_time*.xy"):
+        path.unlink()
+    out = tmp_path / "standard_product_only.npz"
+    importer.convert(
+        source_dir=source, case_id="fixture", radius_m=0.05, out=out,
+        velocity_pattern="profile1_x-velocity_x_time*.xy",
+        pressure_pattern="profile2_pressure_x_time*.xy",
+        density_pattern="profile3_density_x_time*.xy",
+        alpha_product_pattern="profile4_volume_fraction_x_time*.xy",
+        alpha_air_pattern=None,
+        dense_until_s=1.0, frame_stride=1,
+    )
+    radial = read_standard_1d(out)
+    assert radial.source["alpha_air_source"] == "implicit_1_minus_alpha_product"
+    assert radial.frames[0].alpha_air is None
+    # The implicit rule makes only alpha_product = 0 cells pure air.
+    assert np.array_equal(
+        radial.frames[0].air_mask(0.95), np.array([False, False, False, True, True])
+    )
 
 
 def test_fractions_that_do_not_sum_to_one_are_refused(tmp_path):

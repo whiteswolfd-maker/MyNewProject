@@ -12,6 +12,7 @@ from spherical_blast_pinn.contact_air.data import (
 )
 from spherical_blast_pinn.contact_air.losses import finite_mach_rh_state
 from spherical_blast_pinn.contact_air.one_d import (
+    OneDDataError,
     ShockDetectionConfig,
     align_event,
     contact_interval_from_fractions,
@@ -203,6 +204,26 @@ def test_event_alignment_uses_the_first_identifiable_frame_and_keeps_spacing():
     model_times = times + alignment.offset_s
     assert np.allclose(np.diff(model_times), np.diff(times))
     assert alignment.preceding_frame_confirmed is True
+
+
+def test_event_alignment_never_falls_back_to_a_pre_separation_frame():
+    times = np.array([1.0e-5, 2.0e-5])
+    frames = [_frame(alpha=np.zeros(5), time=float(t)) for t in times]
+    for frame in frames:
+        frame.radius = np.array([0.12, 0.17, 0.22, 0.27, 0.32])
+    # Both frames are before the theoretical separation time.  They do have a
+    # contact, an identified shock and a pure-air interval, so the old fallback
+    # would have selected frame 0.  The "not earlier than t_sep" rule must make
+    # this an explicit error instead.
+    with pytest.raises(OneDDataError, match="at or after the theoretical t_sep"):
+        align_event(
+            frames,
+            contact_up=np.array([0.10, 0.10]),
+            contact_valid=np.ones(2, bool),
+            shock_radius=np.array([0.20, 0.25]),
+            shock_valid=np.ones(2, bool),
+            t_separation=2.5e-5, t0=3.0e-5, pure_air_threshold=0.95,
+        )
 
 
 def test_event_offset_is_recorded_and_does_not_require_equal_theoretical_time():

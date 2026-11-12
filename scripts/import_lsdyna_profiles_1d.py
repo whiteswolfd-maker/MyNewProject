@@ -72,9 +72,16 @@ _TONNE_PER_MM3_TO_KG_PER_M3 = 1.0e12
 
 
 def _read_xy(path: Path) -> np.ndarray:
-    """Read one Curveplot text block (two numeric columns)."""
+    """Read one complete Curveplot text block (two numeric columns).
+
+    ``endcurve`` is the only completion marker in the LS-DYNA ASCII profile
+    format.  A file that stops before it may still be being written by the
+    solver, so it is rejected rather than silently truncated.  The caller also
+    checks that every frame has the same cell count and radial coverage.
+    """
     rows: list[tuple[float, float]] = []
     started = False
+    saw_endcurve = False
     with path.open("r", encoding="utf-8", errors="strict") as stream:
         for line_number, line in enumerate(stream, start=1):
             text = line.strip()
@@ -85,6 +92,7 @@ def _read_xy(path: Path) -> np.ndarray:
             if not text:
                 continue
             if text.lower() == "endcurve":
+                saw_endcurve = True
                 break
             parts = text.split()
             if len(parts) != 2:
@@ -100,6 +108,11 @@ def _read_xy(path: Path) -> np.ndarray:
                 ) from exc
     if not started:
         raise OneDDataError(f"{path}: no '#pts' header found")
+    if not saw_endcurve:
+        raise OneDDataError(
+            f"{path}: incomplete profile: no 'endcurve' marker.  The solver may "
+            "still be writing this frame; wait for the run to finish and re-import"
+        )
     if len(rows) < 2:
         raise OneDDataError(f"{path}: fewer than two data rows")
     return np.asarray(rows, dtype=np.float64)
@@ -152,13 +165,13 @@ def _select_keys(
 
 
 def _frame_arrays(
-    paths: Mapping[str, Any], key: str,
+    paths: Mapping[str, Any], key: str, *, include_alpha_air: bool,
 ) -> dict[str, np.ndarray]:
     velocity = _read_xy(paths["velocity"][key])
     pressure = _read_xy(paths["pressure"][key])
     density = _read_xy(paths["density"][key])
     alpha_p = _read_xy(paths["alpha_product"][key])
-    alpha_a = _read_xy(paths["alpha_air"][key])
+    alpha_a = _read_xy(paths["alpha_air"][key]) if include_alpha_air else None
 
     if velocity.shape[0] != pressure.shape[0] + 1:
         raise OneDDataError(
@@ -166,9 +179,10 @@ def _frame_arrays(
             f"pressure has {pressure.shape[0]} cell rows; expected one more node"
         )
     n_cells = int(pressure.shape[0])
-    for name, array in (
-        ("density", density), ("alpha_product", alpha_p), ("alpha_air", alpha_a),
-    ):
+    cell_fields = [("density", density), ("alpha_product", alpha_p)]
+    if alpha_a is not None:
+        cell_fields.append(("alpha_air", alpha_a))
+    for name, array in cell_fields:
         if array.shape[0] != n_cells:
             raise OneDDataError(
                 f"frame time {key}: {name} has {array.shape[0]} rows, expected "
@@ -177,9 +191,7 @@ def _frame_arrays(
 
     node_r = velocity[:, 0] * _MM_TO_M
     cell_r = pressure[:, 0] * _MM_TO_M
-    for name, array in (
-        ("density", density), ("alpha_product", alpha_p), ("alpha_air", alpha_a),
-    ):
+    for name, array in cell_fields:
         if not np.allclose(array[:, 0] * _MM_TO_M, cell_r, rtol=0.0, atol=1.0e-12):
             index = int(np.flatnonzero(np.abs(array[:, 0] * _MM_TO_M - cell_r) > 1.0e-12)[0])
             raise OneDDataError(
@@ -216,13 +228,14 @@ def _frame_arrays(
     pressure_pa = pressure[:, 1] * _MPA_TO_PA
     density_si = density[:, 1] * _TONNE_PER_MM3_TO_KG_PER_M3
 
-    return {
-        "cell_id": np.arange(1, n_cells + 1, dtype=np.int64),
+    frame = {
+        # No cell_id here: the profile files do not carry LS-DYNA element IDs.
+        # The reader generates IDs and records them as generated; inventing
+        # 1..N in the importer would falsely claim they came from the deck.
         "r_left": r_left,
         "r_right": r_right,
         "radius": cell_r,
         "alpha_product": alpha_p[:, 1].copy(),
-        "alpha_air": alpha_a[:, 1].copy(),
         "density": density_si,
         "velocity": cell_velocity,
         "pressure": pressure_pa,
@@ -230,13 +243,18 @@ def _frame_arrays(
         "valid_velocity": np.isfinite(cell_velocity),
         "valid_pressure": np.isfinite(pressure_pa),
     }
+    if alpha_a is not None:
+        frame["alpha_air"] = alpha_a[:, 1].copy()
+    return frame
 
 
 def _check_fractions(
-    alpha_p: np.ndarray, alpha_a: np.ndarray, *, key: str,
+    alpha_p: np.ndarray, alpha_a: np.ndarray | None, *, key: str,
 ) -> None:
-    if not np.all(np.isfinite(alpha_p)) or not np.all(np.isfinite(alpha_a)):
-        raise OneDDataError(f"frame time {key}: volume fraction is not finite")
+    if not np.all(np.isfinite(alpha_p)):
+        raise OneDDataError(f"frame time {key}: alpha_product is not finite")
+    if alpha_a is not None and not np.all(np.isfinite(alpha_a)):
+        raise OneDDataError(f"frame time {key}: alpha_air is not finite")
     bad_p = (alpha_p < -1.0e-9) | (alpha_p > 1.0 + 1.0e-9)
     if np.any(bad_p):
         index = int(np.flatnonzero(bad_p)[0])
@@ -244,6 +262,8 @@ def _check_fractions(
             f"frame time {key}: alpha_product[{index}]={alpha_p[index]!r} is "
             "outside [0,1]"
         )
+    if alpha_a is None:
+        return
     bad_a = (alpha_a < -1.0e-9) | (alpha_a > 1.0 + 1.0e-9)
     if np.any(bad_a):
         index = int(np.flatnonzero(bad_a)[0])
@@ -266,17 +286,23 @@ def _check_fractions(
 def convert(
     *, source_dir: Path, case_id: str, radius_m: float, out: Path,
     velocity_pattern: str, pressure_pattern: str, density_pattern: str,
-    alpha_product_pattern: str, alpha_air_pattern: str,
-    dense_until_s: float, frame_stride: int,
+    alpha_product_pattern: str, alpha_air_pattern: str | None,
+    dense_until_s: float, frame_stride: int, allow_moving_mesh: bool = False,
+    expected_cells: int | None = None,
+    expected_outer_radius_m: float | None = None,
 ) -> dict[str, Any]:
     source_dir = Path(source_dir)
+    include_alpha_air = alpha_air_pattern is not None
     paths = {
         "velocity": _profile_frames(source_dir, velocity_pattern, "velocity"),
         "pressure": _profile_frames(source_dir, pressure_pattern, "pressure"),
         "density": _profile_frames(source_dir, density_pattern, "density"),
         "alpha_product": _profile_frames(source_dir, alpha_product_pattern, "alpha_product"),
-        "alpha_air": _profile_frames(source_dir, alpha_air_pattern, "alpha_air"),
     }
+    if include_alpha_air:
+        paths["alpha_air"] = _profile_frames(
+            source_dir, str(alpha_air_pattern), "alpha_air"
+        )
     key_sets = {name: set(frames) for name, frames in paths.items()}
     reference = key_sets["pressure"]
     for name, keys in key_sets.items():
@@ -296,28 +322,81 @@ def convert(
 
     frames: list[dict[str, np.ndarray]] = []
     times: list[float] = []
+    cell_counts: set[int] = set()
+    node_counts: set[int] = set()
+    inner_radii: list[float] = []
+    outer_radii: list[float] = []
     alpha_sum_deviation = 0.0
     alpha_min = math.inf
     alpha_max = -math.inf
     for key in selected:
-        frame = _frame_arrays(paths, key)
-        _check_fractions(frame["alpha_product"], frame["alpha_air"], key=key)
-        total = frame["alpha_product"] + frame["alpha_air"]
-        alpha_sum_deviation = max(
-            alpha_sum_deviation, float(np.max(np.abs(total - 1.0)))
+        frame = _frame_arrays(paths, key, include_alpha_air=include_alpha_air)
+        _check_fractions(
+            frame["alpha_product"], frame.get("alpha_air"), key=key
         )
-        alpha_min = min(
-            alpha_min,
-            float(np.min(frame["alpha_product"])),
-            float(np.min(frame["alpha_air"])),
-        )
-        alpha_max = max(
-            alpha_max,
-            float(np.max(frame["alpha_product"])),
-            float(np.max(frame["alpha_air"])),
-        )
+        cell_counts.add(int(frame["radius"].size))
+        node_counts.add(int(frame["r_left"].size) + 1)
+        inner_radii.append(float(frame["r_left"][0]))
+        outer_radii.append(float(frame["r_right"][-1]))
+        if "alpha_air" in frame:
+            total = frame["alpha_product"] + frame["alpha_air"]
+            alpha_sum_deviation = max(
+                alpha_sum_deviation, float(np.max(np.abs(total - 1.0)))
+            )
+            alpha_min = min(
+                alpha_min,
+                float(np.min(frame["alpha_product"])),
+                float(np.min(frame["alpha_air"])),
+            )
+            alpha_max = max(
+                alpha_max,
+                float(np.max(frame["alpha_product"])),
+                float(np.max(frame["alpha_air"])),
+            )
+        else:
+            alpha_min = min(alpha_min, float(np.min(frame["alpha_product"])))
+            alpha_max = max(alpha_max, float(np.max(frame["alpha_product"])))
         frames.append(frame)
         times.append(float(key))
+
+    if len(cell_counts) != 1:
+        raise OneDDataError(
+            f"{source_dir}: selected frames have differing cell counts "
+            f"{sorted(cell_counts)}; a complete fixed-mesh profile set must have "
+            "one count.  A truncated frame looks like this"
+        )
+    if len(node_counts) != 1:
+        raise OneDDataError(
+            f"{source_dir}: selected frames have differing node counts "
+            f"{sorted(node_counts)}"
+        )
+    if not allow_moving_mesh:
+        inner_span = max(inner_radii) - min(inner_radii)
+        outer_span = max(outer_radii) - min(outer_radii)
+        if inner_span > 1.0e-9 or outer_span > 1.0e-9:
+            raise OneDDataError(
+                f"{source_dir}: the radial coverage changes between frames "
+                f"(inner span {inner_span!r} m, outer span {outer_span!r} m). "
+                "This importer is for the fixed ALE1D mesh; pass "
+                "--allow-moving-mesh only if that is intentional"
+            )
+
+    if expected_cells is not None:
+        actual = int(frames[0]["radius"].size)
+        if actual != int(expected_cells):
+            raise OneDDataError(
+                f"{source_dir}: expected {int(expected_cells)} cells but the "
+                f"profile frames contain {actual}; this is a different mesh or a "
+                "globally truncated profile set"
+            )
+    if expected_outer_radius_m is not None:
+        actual_outer = float(frames[0]["r_right"][-1])
+        if abs(actual_outer - float(expected_outer_radius_m)) > 1.0e-9:
+            raise OneDDataError(
+                f"{source_dir}: expected the outer radial boundary at "
+                f"{float(expected_outer_radius_m)!r} m but the profile reaches "
+                f"{actual_outer!r} m; check the deck's domain or the truncation"
+            )
 
     _strictly_increasing(np.asarray(times, dtype=np.float64), what="frame_times")
 
@@ -344,8 +423,15 @@ def convert(
             "are node[i] and node[i+1]"
         ),
         "alpha_source": (
-            "two separate *DATABASE_PROFILE volume-fraction requests: MMG=1 is "
-            "TNT/product, MMG=2 is air; no renormalisation or filling"
+            "*DATABASE_PROFILE volume fraction: MMG=1 is TNT/product; MMG=2 is "
+            "air when an air profile is supplied.  Without an air profile the "
+            "reader uses implicit alpha_air = 1 - alpha_product.  No "
+            "renormalisation or filling"
+        ),
+        "alpha_air_available": include_alpha_air,
+        "cell_id_note": (
+            "profile files contain values in element-set order, not element IDs; "
+            "the importer does not invent IDs and the reader records generated IDs"
         ),
         "time_source": "profile_filename_3sigfig",
         "time_note": (
@@ -358,6 +444,15 @@ def convert(
         "dense_until_s": float(dense_until_s),
         "frame_stride_after_dense": int(frame_stride),
         "cell_count": int(frames[0]["radius"].size),
+        "expected_cells": expected_cells,
+        "expected_outer_radius_m": expected_outer_radius_m,
+        "mesh_consistency": (
+            "all selected frames checked for equal cell/node counts and "
+            "constant inner/outer radial coverage"
+            if not allow_moving_mesh else
+            "equal cell/node counts checked; radial coverage intentionally "
+            "allowed to move"
+        ),
         "alpha_sum_max_abs_deviation": alpha_sum_deviation,
         "alpha_min_seen": alpha_min,
         "alpha_max_seen": alpha_max,
@@ -403,8 +498,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--alpha-air-pattern",
-        default="profile5_volume_fraction_x_time*.xy",
-        help="volume-fraction profile for ALE group 2 (air)",
+        default=None,
+        help=(
+            "optional volume-fraction profile for ALE group 2 (air).  Omit it "
+            "when the deck only writes MMG=1; the standard source then carries "
+            "alpha_product only and the reader uses implicit 1-alpha_product"
+        ),
     )
     parser.add_argument(
         "--dense-until-s", type=float, default=2.5e-5,
@@ -413,6 +512,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--frame-stride", type=int, default=10,
         help="after --dense-until-s keep every Nth frame",
+    )
+    parser.add_argument(
+        "--allow-moving-mesh", action="store_true",
+        help=(
+            "skip the constant inner/outer radial-coverage check.  The current "
+            "ALE1D decks have a fixed mesh; use this only for a moving mesh"
+        ),
+    )
+    parser.add_argument(
+        "--expected-cells", type=int, default=None,
+        help=(
+            "optional expected cell count from the deck; catches a profile set "
+            "that is globally truncated to the same wrong length"
+        ),
+    )
+    parser.add_argument(
+        "--expected-outer-radius-m", type=float, default=None,
+        help="optional expected outer radial boundary in metres",
     )
     args = parser.parse_args(argv)
     try:
@@ -426,6 +543,9 @@ def main(argv: list[str] | None = None) -> int:
             alpha_air_pattern=args.alpha_air_pattern,
             dense_until_s=float(args.dense_until_s),
             frame_stride=int(args.frame_stride),
+            allow_moving_mesh=bool(args.allow_moving_mesh),
+            expected_cells=args.expected_cells,
+            expected_outer_radius_m=args.expected_outer_radius_m,
         )
     except OneDDataError as exc:
         print(f"error: {exc}", file=sys.stderr)
