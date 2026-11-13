@@ -324,17 +324,30 @@ s_fE = s_E / T_star
 - **A 原始仿真**：20 个算例的文件身份、求解器版本、正常结束、原始时间范围、
   均匀球装药质量 `W=4/3 pi rho R^3`、固定半径压力历程；
 - **B 导入链路**：用独立的最小 `.xy` 解析器和配置中的单位因子，逐值与
-  `standard_1d.npz` 比较；并比较“原始完整时序峰值”和“导入帧峰值”；
+  `standard_1d.npz` 比较，状态按容差判定而不是只要等长就写 `ok`；峰值比较
+  先提取**初次入射脉冲**（到达阈值、严格回零、脉冲内最大值），再分别对原始
+  完整时序和导入帧求同一量，并记录峰值帧是否被抽帧选中；
 - **C 经验关系与相容性**：Henrych（球形自由空气、入射超压，系数状态
-  `provisional`）逐点比较；Kingery-Bulmash 因缺少可核实系数表标记
+  `provisional`）逐点比较；Kingery-Bulmash 因缺少可核实系数表仍标记
   `unavailable`，不猜测、不替换；RH 用实测激波位置差分和两侧实测状态独立
-  检查，接触区间与 JWL/空气压力、接触速度与空气速度并列记录；
+  检查，能量通量必须是 `u(E+p) - D_s E`；接触区间与 JWL/空气压力在 t0 之后
+  的早、中、晚多个有效帧上采样，报告多个纯空气单元及压力随距离的变化；
+  接触速度只称为两条区间边界轨迹的差分斜率，不称为物理速度上下界；
 - **D PINN**：复用 `contact_air_diagnostics_*` 的输出。
 
 审计只写 `outputs/reference_audit/`（manifest、CSV、JSON、图和 `report.md`），
 不改缓存、检查点或训练配置。经验公式的数值样例测试在
 `tests/test_contact_air_reference_audit.py`；Henrych 系数尚未与原书逐项核对，
 报告必须保留这一限制。
+
+本轮审计工具修正记录：旧版 RH 能量通量写成 `(E+p)(u-D_s)`，每侧多减
+`D_s p`，会伪造能量残差；旧版“整段最大值 + 1% 阈值”会把脉冲内振荡误标为
+二次脉冲。`one_d.py` 的缓存期 RH 诊断也从“比内能 + 相对动能”改为激波坐标系
+总焓 `h + (u-D_s)^2/2`，`h = gamma p / ((gamma-1) rho)`。旧报告中的 −54%～−64% 能量残差、`partial_contaminated` 状态和单一
+中间帧的 0.19～0.33 JWL/空气比均已撤回，以本轮重算结果为准。现有缓存中由
+旧公式写入的 `event_frame_rh_diagnostic` 不重写；审计用缓存状态重新计算，
+并把旧值单独保存为 `event_frame_rh_diagnostic_cache_recorded`。Kingery-Bulmash
+仍未完成，不能把 `unavailable` 当作已完成。
 
 ## 7. 命令
 

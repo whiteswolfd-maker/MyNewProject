@@ -217,25 +217,96 @@ def _report(audit: dict, root: Path, out_dir: Path, manifest, metrics_rows,
                 f"{'n/a' if arrival is None else f'{arrival*1e3:.3f}'} | "
                 f"{row.get('status')} | {row.get('flags')} |"
             )
+        lines += [
+            "",
+            "Pulse extraction uses the first incident pulse: arrival is the first "
+            "sample above a noise-aware threshold, the positive phase ends at the "
+            "first strict return of the overpressure to zero, and the peak is the "
+            "maximum inside that pulse. Intra-pulse maxima and later excursions are "
+            "listed as candidates; their origin is not classified.",
+            "",
+            "The RH energy residual uses the moving-shock jump condition "
+            "`u(E+p) - D_s E`; `(E+p)(u-D_s)` subtracts an extra `D_s p` per side.",
+            "",
+        ]
     if preservation_rows:
         lines += [
             "",
-            "### Peak visible after import",
+            "### First-pulse peak visible after import",
             "",
-            "| case | Z | raw peak MPa | imported peak MPa | difference |",
-            "|---|---:|---:|---:|---:|",
+            "| case | Z | raw peak MPa | imported peak MPa | difference | "
+            "raw peak frame selected | peak-frame gap s |",
+            "|---|---:|---:|---:|---:|---|---:|",
         ]
         for row in preservation_rows:
+            selected = row.get("raw_peak_frame_selected")
+            gap = row.get("nearest_selected_gap_s")
             lines.append(
                 f"| {row['case_id']} | {float(row['z_m_kg13']):.2f} | "
                 f"{float(row['raw_peak_mpa']):.4f} | "
                 f"{float(row['imported_peak_mpa']):.4f} | "
-                f"{float(row['peak_difference_mpa']):+.4f} |"
+                f"{float(row['peak_difference_mpa']):+.4f} | "
+                f"{selected} | "
+                f"{'n/a' if gap in (None, '', 'None') else f'{float(gap):.3e}'} |"
             )
-    if compatibility:
-        lines.append(f"- constraint compatibility entries: {len(compatibility)}")
     if consistency:
-        lines.append(f"- consistency entries: {len(consistency)}")
+        lines += [
+            "",
+            "### Rankine-Hugoniot residuals (corrected energy flux)",
+            "",
+            "| case | mass residual | momentum residual | energy residual |",
+            "|---|---:|---:|---:|",
+        ]
+        for entry in consistency:
+            samples = entry.get("samples", [])
+            if not samples:
+                continue
+            def span(key):
+                values = [float(sample[key]) for sample in samples
+                          if sample.get(key) is not None]
+                return "n/a" if not values else f"{min(values):+.3f}..{max(values):+.3f}"
+            lines.append(
+                f"| {entry['case_id']} | {span('mass_residual_normalised')} | "
+                f"{span('momentum_residual_normalised')} | "
+                f"{span('energy_residual_normalised')} |"
+            )
+        lines += [
+            "",
+            "The energy residual uses `u(E+p) - D_s E`; `D_s` comes from a central "
+            "difference of the measured shock positions, so mass, momentum and "
+            "energy are all independent checks here.",
+        ]
+    if compatibility:
+        lines += [
+            "",
+            "### Contact/air sampling at early, middle and late valid frames",
+            "",
+            "| case | frame time s | JWL/air (first pure air) | low edge slope m/s | "
+            "up edge slope m/s | air velocity m/s |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+        for entry in compatibility:
+            for sample in entry.get("contact_samples", []):
+                slopes = sample.get("interval_edge_trajectory_derivative_m_s", {})
+                ratio = sample.get("ratio_jwl_up_over_air_first_pure")
+                low_edge = slopes.get("low_edge")
+                up_edge = slopes.get("up_edge")
+                air_u = sample.get("air_velocity_first_pure_m_s")
+                lines.append(
+                    f"| {entry['case_id']} | {sample['contact_model_time_s']:.4e} | "
+                    f"{'n/a' if ratio is None else format(ratio, '.3f')} | "
+                    f"{'n/a' if low_edge is None else format(low_edge, '.1f')} | "
+                    f"{'n/a' if up_edge is None else format(up_edge, '.1f')} | "
+                    f"{'n/a' if air_u is None else format(air_u, '.1f')} |"
+                )
+        lines += [
+            "",
+            "The edge slopes are finite-difference slopes of the two interval edges; "
+            "they are not a physical speed bound, and no interval midpoint is used. "
+            "The event-frame RH diagnostic is recomputed from the cached states with "
+            "the corrected total-enthalpy formula; the cache-recorded value is kept "
+            "only for traceability.",
+        ]
     lines += [
         "",
         "## Layer D - PINN",
@@ -246,8 +317,9 @@ def _report(audit: dict, root: Path, out_dir: Path, manifest, metrics_rows,
         "## Limitations",
         "",
         "- Henrych coefficients are provisional: no printed copy was checked in this repository.",
-        "- Kingery-Bulmash is unavailable; no arrival-time, duration or impulse reference is claimed.",
+        "- Kingery-Bulmash remains unavailable; no arrival-time, duration or impulse reference is claimed.",
         "- Only the focus cases were taken through the raw-history stage in this pass.",
+        "- Intra-pulse maxima and later excursions are candidates, not classified secondary shocks.",
         "- No mesh or output-frequency sensitivity study was run.",
         "- Empirical agreement is evidence about the data, not proof that the simulation is correct.",
         "",
@@ -359,6 +431,16 @@ def main(argv=None) -> int:
             manifest_payload = json.loads(
                 (out_dir / "manifest.json").read_text(encoding="utf-8")
             )
+        if not consistency and (out_dir / "data_consistency.json").is_file():
+            payload = json.loads(
+                (out_dir / "data_consistency.json").read_text(encoding="utf-8")
+            )
+            consistency = payload.get("rh", [])
+        if not compatibility and (out_dir / "constraint_compatibility.json").is_file():
+            payload = json.loads(
+                (out_dir / "constraint_compatibility.json").read_text(encoding="utf-8")
+            )
+            compatibility = payload.get("cases", [])
         _report(audit, root, out_dir, manifest_payload, metrics_rows,
                 import_rows, preservation_rows, consistency, compatibility)
         print(f"report: {out_dir / 'report.md'}")

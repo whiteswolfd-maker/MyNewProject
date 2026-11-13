@@ -129,9 +129,12 @@
   表示训练算例全部帧可用，验证完全由该半径带提供。
 - `build-cache --source <标准一维文件或目录> --case ... --radius ... --role ... --out ...`。
 - `scripts/audit_reference_data.py --stage <manifest|imports|metrics|consistency|report|all>`
-  是只读数据审计：独立解析原始 `.xy`、核对导入值、提取固定半径峰值并与
-  Henrych 对比、检查 RH 和接触/空气相容性。不得修改缓存、检查点或训练配置；
-  Kingery-Bulmash 在系数表核实前保持不可用，Henrych 系数标记暂定。
+  是只读数据审计：独立解析原始 `.xy`、按容差核对导入值、从**初次入射脉冲**
+  （到达阈值 → 严格回零 → 脉冲内最大值）提取固定半径峰值并与 Henrych 对比、
+  用 `u(E+p) - D_s E` 检查 RH、在 t0 后早/中/晚多个有效帧上检查接触/空气
+  压力与边界轨迹斜率。脉内振荡和后续正 excursion 只标为候选，不称为二次
+  激波。不得修改缓存、检查点或训练配置；Kingery-Bulmash 在系数表核实前保持
+  不可用，Henrych 系数标记暂定。
 - `predict/evaluate --case ...`；预测只读 metadata 与 shock 轨迹，评估才读参考
   内部场。500 mm 与其他半径同一接口。
 - 空气质量数据先抽帧再抽帧内点；右边界只在 `D_s > c_inf` 时刻采样。

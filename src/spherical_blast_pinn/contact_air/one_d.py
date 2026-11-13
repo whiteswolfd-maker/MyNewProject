@@ -1104,15 +1104,27 @@ def _rh_diagnostic(
         p_in + rho_in * (u_in - ds) ** 2 - p_out - rho_out * (u_out - ds) ** 2
     ) / p_ref
     g = 1.4
-    energy = (
-        (u_in - ds) ** 2 / 2.0 + p_in / rho_in / (g - 1.0)
-        - (u_out - ds) ** 2 / 2.0 - p_out / rho_out / (g - 1.0)
-    ) / max(abs((u_in - ds) ** 2), 1.0)
+    # In the shock frame the stationary-shock energy condition is
+    # h + (u-D_s)^2/2 = const with the specific enthalpy h = gamma p /
+    # ((gamma-1) rho).  The internal energy alone is missing the pressure-work
+    # term p/rho and would leave a residual for an exact RH state.
+    v_in = u_in - ds
+    v_out = u_out - ds
+    h_in = g * p_in / ((g - 1.0) * rho_in)
+    h_out = g * p_out / ((g - 1.0) * rho_out)
+    total_in = h_in + 0.5 * v_in ** 2
+    total_out = h_out + 0.5 * v_out ** 2
+    scale = max(abs(total_in), abs(total_out), 1.0)
+    energy = (total_in - total_out) / scale
     return {
         "status": "computed_by_mass_from_measured_states",
         "Ds_from_mass_m_s": float(ds),
         "momentum_residual_normalised": float(momentum),
         "energy_residual_normalised": float(energy),
+        "energy_residual_definition": (
+            "shock-frame total enthalpy h + 0.5 (u - D_s)^2, "
+            "h = gamma p / ((gamma - 1) rho)"
+        ),
         "note": (
             "mass conservation was used to derive D_s, so it is not independent "
             "evidence; the side states are measured, not synthesized from RH"
