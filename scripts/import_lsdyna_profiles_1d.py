@@ -38,12 +38,15 @@ Usage (from the repository root)::
         --case tnt_50mm --radius-m 0.05 \
         --alpha-product-pattern 'profile4_volume_fraction_x_time*.xy' \
         --alpha-air-pattern 'profile5_volume_fraction_x_time*.xy' \
-        --dense-until-s 2.5e-5 --frame-stride 10 \
-        --out outputs/contact_air_r50/standard_1d.npz
+        --out outputs/fullframes/standard/r50_full.npz
+
+Every raw output time is imported.  The former ``--dense-until-s`` and
+``--frame-stride`` options were removed; passing them is now an explicit error.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import re
 import sys
@@ -78,44 +81,53 @@ def _read_xy(path: Path) -> np.ndarray:
     format.  A file that stops before it may still be being written by the
     solver, so it is rejected rather than silently truncated.  The caller also
     checks that every frame has the same cell count and radial coverage.
+
+    The numeric body is parsed in one ``np.fromstring`` call.  The old
+    per-line ``float()`` loop was the dominant cost of a full-frame import;
+    the column and token-count checks below still reject malformed rows.
     """
-    rows: list[tuple[float, float]] = []
-    started = False
-    saw_endcurve = False
     with path.open("r", encoding="utf-8", errors="strict") as stream:
-        for line_number, line in enumerate(stream, start=1):
-            text = line.strip()
-            if not started:
-                if text.startswith("#pts"):
-                    started = True
-                continue
-            if not text:
-                continue
-            if text.lower() == "endcurve":
-                saw_endcurve = True
-                break
-            parts = text.split()
-            if len(parts) != 2:
-                raise OneDDataError(
-                    f"{path}: line {line_number} has {len(parts)} columns; "
-                    "the profile reader expects two numeric columns"
-                )
-            try:
-                rows.append((float(parts[0]), float(parts[1])))
-            except ValueError as exc:
-                raise OneDDataError(
-                    f"{path}: line {line_number} is not two numbers: {text!r}"
-                ) from exc
-    if not started:
+        lines = stream.readlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip().startswith("#pts"):
+            start = index + 1
+            break
+    if start is None:
         raise OneDDataError(f"{path}: no '#pts' header found")
+    body: list[str] = []
+    saw_endcurve = False
+    last_line = 0
+    for line_number in range(start, len(lines)):
+        text = lines[line_number].strip()
+        if not text:
+            continue
+        if text.lower() == "endcurve":
+            saw_endcurve = True
+            break
+        parts = text.split()
+        if len(parts) != 2:
+            raise OneDDataError(
+                f"{path}: line {line_number + 1} has {len(parts)} columns; "
+                "the profile reader expects two numeric columns"
+            )
+        body.append(text)
+        last_line = line_number + 1
     if not saw_endcurve:
         raise OneDDataError(
             f"{path}: incomplete profile: no 'endcurve' marker.  The solver may "
             "still be writing this frame; wait for the run to finish and re-import"
         )
-    if len(rows) < 2:
+    if len(body) < 2:
         raise OneDDataError(f"{path}: fewer than two data rows")
-    return np.asarray(rows, dtype=np.float64)
+    values = np.fromstring(" ".join(body), sep=" ", dtype=np.float64)
+    if values.size != 2 * len(body):
+        raise OneDDataError(
+            f"{path}: numeric body did not parse as two columns per row "
+            f"(got {values.size} values for {len(body)} rows; last body line "
+            f"{last_line})"
+        )
+    return values.reshape(-1, 2)
 
 
 def _profile_frames(source_dir: Path, pattern: str, label: str) -> dict[str, Path]:
@@ -150,39 +162,29 @@ def _strictly_increasing(values: np.ndarray, *, what: str) -> None:
         )
 
 
-def _select_keys(
-    keys: Sequence[str], *, dense_until_s: float, frame_stride: int,
-    event_time_s: float | None = None,
-    event_window_s: float = 5.0e-5,
-) -> list[str]:
-    if frame_stride < 1:
-        raise OneDDataError("frame_stride must be >= 1")
-    if event_window_s < 0.0:
-        raise OneDDataError("event_window_s must be non-negative")
-    ordered = sorted(keys, key=float)
-    dense = [key for key in ordered if float(key) <= float(dense_until_s)]
-    sparse = [key for key in ordered if float(key) > float(dense_until_s)]
-    selected = list(dense) + list(sparse[:: int(frame_stride)])
-    if event_time_s is not None:
-        # A stride coarser than the event window can delete the only frame at
-        # or after t_sep, even though the raw output contains it.  Keep every
-        # frame inside the window and one neighbour on each side, regardless
-        # of the stride; the rest of the timeline is downsampled as requested.
-        t_event = float(event_time_s)
-        low = t_event - float(event_window_s)
-        high = t_event + float(event_window_s)
-        inside = [key for key in ordered if low <= float(key) <= high]
-        before = [key for key in ordered if float(key) < low]
-        after = [key for key in ordered if float(key) > high]
-        keep = set(inside)
-        if before:
-            keep.add(before[-1])
-        if after:
-            keep.add(after[0])
-        selected = sorted(set(selected) | keep, key=float)
-    # The sparse slice can leave the final frame out; keep it only when the
-    # requested stride lands on it.  Selection is recorded, not guessed.
-    return selected
+def _input_fingerprint(paths: Mapping[str, Mapping[str, Path]]) -> dict[str, Any]:
+    """Fast version fingerprint over the profile file names, sizes and mtimes.
+
+    The content is not re-hashed here (the raw set is many gigabytes); the
+    fingerprint is sufficient to distinguish two raw output versions and is
+    recorded next to the full sorted key list.  File contents are still checked
+    by the per-frame parser and the independent audit.
+    """
+    digest = hashlib.sha256()
+    for profile in sorted(paths):
+        for key in sorted(paths[profile], key=float):
+            path = paths[profile][key]
+            stat = path.stat()
+            digest.update(
+                f"{profile}|{key}|{path.name}|{stat.st_size}|"
+                f"{stat.st_mtime_ns}\n".encode("utf-8")
+            )
+    return {
+        "algorithm": "sha256(profile|time_key|filename|size|mtime_ns)",
+        "sha256": digest.hexdigest(),
+        "file_count": int(sum(len(frames) for frames in paths.values())),
+        "basis": "profile file names, sizes and modification times",
+    }
 
 
 def _frame_arrays(
@@ -308,11 +310,9 @@ def convert(
     *, source_dir: Path, case_id: str, radius_m: float, out: Path,
     velocity_pattern: str, pressure_pattern: str, density_pattern: str,
     alpha_product_pattern: str, alpha_air_pattern: str | None,
-    dense_until_s: float, frame_stride: int, allow_moving_mesh: bool = False,
+    allow_moving_mesh: bool = False,
     expected_cells: int | None = None,
     expected_outer_radius_m: float | None = None,
-    event_time_s: float | None = None,
-    event_window_s: float = 5.0e-5,
 ) -> dict[str, Any]:
     source_dir = Path(source_dir)
     include_alpha_air = alpha_air_pattern is not None
@@ -336,13 +336,18 @@ def convert(
                 f"{source_dir}: {name} profile times do not match pressure; "
                 f"missing={missing[:5]}, extra={extra[:5]}"
             )
-    selected = _select_keys(
-        sorted(reference, key=float),
-        dense_until_s=dense_until_s, frame_stride=frame_stride,
-        event_time_s=event_time_s, event_window_s=event_window_s,
-    )
+    # Every raw output time is imported.  There is no stride, dense window or
+    # frame-count cap in the formal data path; selection is the sorted key set
+    # itself.  Physical validity is handled later and is not hidden here.
+    raw_keys = sorted(reference, key=float)
+    selected = list(raw_keys)
     if len(selected) < 2:
-        raise OneDDataError("fewer than two frames selected")
+        raise OneDDataError("fewer than two raw frames are present")
+    if len(selected) != len(reference):
+        raise OneDDataError(
+            f"{source_dir}: internal selection error: imported {len(selected)} "
+            f"of {len(reference)} raw frame times"
+        )
 
     frames: list[dict[str, np.ndarray]] = []
     times: list[float] = []
@@ -385,13 +390,13 @@ def convert(
 
     if len(cell_counts) != 1:
         raise OneDDataError(
-            f"{source_dir}: selected frames have differing cell counts "
+            f"{source_dir}: imported frames have differing cell counts "
             f"{sorted(cell_counts)}; a complete fixed-mesh profile set must have "
             "one count.  A truncated frame looks like this"
         )
     if len(node_counts) != 1:
         raise OneDDataError(
-            f"{source_dir}: selected frames have differing node counts "
+            f"{source_dir}: imported frames have differing node counts "
             f"{sorted(node_counts)}"
         )
     if not allow_moving_mesh:
@@ -461,20 +466,27 @@ def convert(
         "time_note": (
             "the profile writer records the output time only in the file name "
             "with three significant figures; the exact solver time is not "
-            "present in the profile file or d3hsp"
+            "present in the profile file or d3hsp.  All output times are "
+            "imported, but this does not recover unsaved solver steps."
+        ),
+        "frame_selection_policy": "all_frames",
+        "frame_selection_note": (
+            "every profile time present in the source directory is imported; "
+            "no dense window, stride or frame-count cap is applied"
         ),
         "raw_frame_count": len(raw_keys),
+        "imported_frame_count": len(selected),
+        "dropped_frame_count": int(len(raw_keys) - len(selected)),
         "selected_raw_frame_keys": selected,
-        "dense_until_s": float(dense_until_s),
-        "frame_stride_after_dense": int(frame_stride),
-        "event_time_s": None if event_time_s is None else float(event_time_s),
-        "event_window_s": float(event_window_s),
-        "event_window_frames_preserved": event_time_s is not None,
+        "raw_frame_keys": raw_keys,
+        "first_raw_time_s": float(raw_keys[0]),
+        "last_raw_time_s": float(raw_keys[-1]),
+        "raw_input_fingerprint": _input_fingerprint(paths),
         "cell_count": int(frames[0]["radius"].size),
         "expected_cells": expected_cells,
         "expected_outer_radius_m": expected_outer_radius_m,
         "mesh_consistency": (
-            "all selected frames checked for equal cell/node counts and "
+            "all imported frames checked for equal cell/node counts and "
             "constant inner/outer radial coverage"
             if not allow_moving_mesh else
             "equal cell/node counts checked; radial coverage intentionally "
@@ -492,8 +504,10 @@ def convert(
     )
     return {
         "out": str(Path(out).resolve()),
+        "frame_selection_policy": "all_frames",
         "raw_frames": len(raw_keys),
-        "selected_frames": len(selected),
+        "imported_frames": len(selected),
+        "dropped_frames": int(len(raw_keys) - len(selected)),
         "cells": int(frames[0]["radius"].size),
         "first_time_s": times[0],
         "last_time_s": times[-1],
@@ -533,29 +547,32 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
-        "--dense-until-s", type=float, default=5.0e-4,
+        "--dense-until-s", type=float, default=None,
         help=(
-            "keep every profile frame up to this raw time.  The default covers "
-            "the t_sep of the largest available case (R1000: 370.6 us) with "
-            "margin; a smaller value plus a coarse stride can delete every "
-            "frame at or after t_sep"
+            "REMOVED: the importer keeps every raw output time.  Passing this "
+            "option is an explicit error, not a silent no-op"
         ),
     )
     parser.add_argument(
-        "--frame-stride", type=int, default=10,
-        help="after --dense-until-s keep every Nth frame",
+        "--frame-stride", type=int, default=None,
+        help=(
+            "REMOVED: frame downsampling is no longer part of the data path.  "
+            "Passing this option is an explicit error"
+        ),
     )
     parser.add_argument(
         "--event-time-s", type=float, default=None,
         help=(
-            "optional theoretical t_sep.  Every raw frame inside "
-            "[t_sep-window, t_sep+window] plus one neighbour on each side is "
-            "kept regardless of the stride"
+            "REMOVED: all frames are kept, so no event-window frame rescue is "
+            "needed.  Passing this option is an explicit error"
         ),
     )
     parser.add_argument(
-        "--event-window-s", type=float, default=5.0e-5,
-        help="half-width of the event window used with --event-time-s",
+        "--event-window-s", type=float, default=None,
+        help=(
+            "REMOVED with --event-time-s; passing this option is an explicit "
+            "error"
+        ),
     )
     parser.add_argument(
         "--allow-moving-mesh", action="store_true",
@@ -576,6 +593,23 @@ def main(argv: list[str] | None = None) -> int:
         help="optional expected outer radial boundary in metres",
     )
     args = parser.parse_args(argv)
+    removed = [
+        flag for flag, value in (
+            ("--dense-until-s", args.dense_until_s),
+            ("--frame-stride", args.frame_stride),
+            ("--event-time-s", args.event_time_s),
+            ("--event-window-s", args.event_window_s),
+        )
+        if value is not None
+    ]
+    if removed:
+        print(
+            "error: frame downsampling options were removed from this importer: "
+            f"{', '.join(removed)}.  Every raw output frame is now imported; "
+            "remove these options and re-run.",
+            file=sys.stderr,
+        )
+        return 2
     try:
         summary = convert(
             source_dir=Path(args.source_dir), case_id=args.case,
@@ -585,13 +619,9 @@ def main(argv: list[str] | None = None) -> int:
             density_pattern=args.density_pattern,
             alpha_product_pattern=args.alpha_product_pattern,
             alpha_air_pattern=args.alpha_air_pattern,
-            dense_until_s=float(args.dense_until_s),
-            frame_stride=int(args.frame_stride),
             allow_moving_mesh=bool(args.allow_moving_mesh),
             expected_cells=args.expected_cells,
             expected_outer_radius_m=args.expected_outer_radius_m,
-            event_time_s=args.event_time_s,
-            event_window_s=float(args.event_window_s),
         )
     except OneDDataError as exc:
         print(f"error: {exc}", file=sys.stderr)

@@ -64,6 +64,9 @@ def test_standard_source_builds_contact_labels_shock_and_cache(tmp_path):
     assert case.contact.n_valid > 0
     assert case.shock.valid.sum() >= 2
     assert case.observations.size > 0
+    # No hidden frame selection between the standard source and the cache.
+    assert case.shock.times.size == len(source.frames)
+    assert case.contact.times.size == len(source.frames)
     assert case.event_alignment["time_convention"] == "t_model = t0 + (t_raw - t_event_raw)"
     cached = load_case(save_case(case, tmp_path / "case.npz"))
     assert cached.observations.size == case.observations.size

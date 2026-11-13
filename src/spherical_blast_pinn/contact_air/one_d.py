@@ -91,20 +91,33 @@ def cells_geometrically_adjacent(
 def _geometric_runs(
     frame: "RadialFrame", indices: np.ndarray, *, tolerance_m: float,
 ) -> list[np.ndarray]:
-    """Split sorted cell indices at both array gaps and real spatial gaps."""
+    """Split sorted cell indices at both array gaps and real spatial gaps.
+
+    Vectorised form of the scalar ``cells_geometrically_adjacent`` predicate.
+    The all-frame cache build calls this for every frame; the scalar loop was
+    the dominant cost there.  The rule is unchanged: consecutive indices only,
+    and the shared boundary must agree within the same tolerance.
+    """
     indices = np.asarray(indices, dtype=np.int64)
     if indices.size == 0:
         return []
-    runs: list[np.ndarray] = []
-    start = 0
-    for position in range(1, indices.size + 1):
-        if position == indices.size or not cells_geometrically_adjacent(
-            frame, int(indices[position - 1]), int(indices[position]),
-            tolerance_m=tolerance_m,
-        ):
-            runs.append(indices[start:position])
-            start = position
-    return runs
+    if indices.size == 1:
+        return [indices]
+    consecutive = np.diff(indices) == 1
+    left = indices[:-1]
+    right = indices[1:]
+    widths = 0.5 * (
+        (frame.r_right[left] - frame.r_left[left])
+        + (frame.r_right[right] - frame.r_left[right])
+    )
+    tolerance = (
+        np.maximum(float(tolerance_m), 0.0)
+        + 1.0e-9 * np.maximum(widths, 1.0e-30)
+    )
+    gaps = frame.r_left[right] - frame.r_right[left]
+    adjacent = consecutive & (np.abs(gaps) <= tolerance)
+    breaks = np.flatnonzero(~adjacent)
+    return [run for run in np.split(indices, breaks + 1) if run.size]
 
 
 def _unit(value: Any, table: Mapping[str, float], *, what: str) -> float:
@@ -909,23 +922,30 @@ def contact_interval_from_fractions(
             "the innermost cell is not pure product; the central product region "
             "cannot be established"
         )
-    index = 0
-    while index < n and bool(product[index]):
-        index += 1
+    non_product = np.flatnonzero(~product)
+    index = int(non_product[0]) if non_product.size else n
     last_product = index - 1
     mixed_start = index
-    while index < n and bool(mixed[index]):
-        index += 1
-    mixed_stop = index  # exclusive
+    tail = np.flatnonzero(~mixed[mixed_start:])
+    mixed_stop = mixed_start + int(tail[0]) if tail.size else n
     # Every step across the central product / mixing / first-air transition must
     # be a real shared cell boundary, not merely a consecutive array index.
-    for left in range(0, mixed_stop):
+    # Vectorised over the prefix; this is the same predicate as
+    # ``cells_geometrically_adjacent`` and avoids a Python loop per cell.
+    edge_count = min(mixed_stop, n - 1)
+    if edge_count > 0:
+        left = np.arange(edge_count, dtype=np.int64)
         right = left + 1
-        if right >= n:
-            break
-        if not cells_geometrically_adjacent(
-            frame, left, right, tolerance_m=geometry_tolerance_m
-        ):
+        widths = 0.5 * (
+            (frame.r_right[left] - frame.r_left[left])
+            + (frame.r_right[right] - frame.r_left[right])
+        )
+        tolerance = (
+            np.maximum(float(geometry_tolerance_m), 0.0)
+            + 1.0e-9 * np.maximum(widths, 1.0e-30)
+        )
+        gaps = frame.r_left[right] - frame.r_right[left]
+        if np.any(np.abs(gaps) > tolerance):
             return float("nan"), float("nan"), False, (
                 "a spatial gap or overlap interrupts the central product / "
                 "contact-mixing / pure-air path"

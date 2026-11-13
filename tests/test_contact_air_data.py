@@ -174,6 +174,12 @@ def test_cache_round_trip_preserves_shock_and_physical_observation_radius(tmp_pa
     assert loaded.observations.size == case.observations.size
     assert np.allclose(loaded.shock.radii, case.shock.radii, equal_nan=True)
     assert np.allclose(loaded.observations.radius, case.observations.radius)
+    # No hidden frame drop between the standard source and the cache.
+    assert loaded.shock.times.size == case.shock.times.size
+    assert loaded.contact.times.size == case.contact.times.size
+    assert loaded.raw_times_s is not None
+    assert loaded.raw_times_s.size == case.raw_times_s.size
+    assert np.allclose(loaded.raw_times_s, case.raw_times_s)
     assert loaded.event_alignment["offset_s"] == pytest.approx(
         case.event_alignment["offset_s"]
     )

@@ -134,6 +134,7 @@ def case_manifest(case: dict, root: Path, units: dict, ambient: dict,
     intervals = np.diff(time_values)
     standard_meta = {}
     selected = []
+    source = {}
     if standard.is_file():
         with np.load(standard, allow_pickle=True) as archive:
             standard_meta = json.loads(str(archive["metadata"].item()))
@@ -174,9 +175,16 @@ def case_manifest(case: dict, root: Path, units: dict, ambient: dict,
             "path": str(standard),
             "sha256": sha256_file(standard) if standard.is_file() else None,
             "frames": len(selected),
-            "dense_until_s": standard_meta.get("source", {}).get("dense_until_s"),
-            "frame_stride": standard_meta.get("source", {}).get("frame_stride_after_dense"),
-            "time_source": standard_meta.get("source", {}).get("time_source"),
+            "frame_selection_policy": source.get("frame_selection_policy"),
+            "raw_frame_count": source.get("raw_frame_count"),
+            "imported_frame_count": source.get("imported_frame_count"),
+            "dropped_frame_count": source.get("dropped_frame_count"),
+            "imported_equals_raw": (
+                source.get("imported_frame_count") == len(selected)
+                if source.get("imported_frame_count") is not None else None
+            ),
+            "input_fingerprint": source.get("raw_input_fingerprint"),
+            "time_source": source.get("time_source"),
             "selected_keys": selected,
         },
         "cache": {
@@ -205,14 +213,19 @@ def _standard_frames(path: Path):
 
 
 def import_comparison(case: dict, root: Path, units: dict,
-                      sample_indices: int = 4) -> list[dict]:
-    """Compare raw file values with the imported standard arrays."""
+                      sample_indices: int | None = 4) -> list[dict]:
+    """Compare raw file values with the imported standard arrays.
+
+    ``sample_indices=None`` compares every imported frame; the default samples
+    four evenly spaced frames for the multi-case pass.  The R50 acceptance
+    check uses every frame explicitly.
+    """
     raw_dir = Path(case["raw_dir"])
     frames, metadata = _standard_frames(root / case["standard"])
     selection = list(metadata["source"]["selected_raw_frame_keys"])
     if len(selection) != len(frames):
         raise AuditError(f"{case['case_id']}: selected keys and frames differ")
-    if sample_indices >= len(frames):
+    if sample_indices is None or sample_indices >= len(frames):
         indices = list(range(len(frames)))
     else:
         event = 0
@@ -593,8 +606,36 @@ def peak_preservation(case: dict, root: Path, units: dict, ambient: dict,
         )
         imported_metrics = pulse_metrics(imported_t, imported_dp)
         raw_peak = raw_metrics.get("peak_mpa")
-        imported_peak = imported_metrics.get("peak_mpa")
         raw_peak_time = raw_metrics.get("peak_time_s")
+        # Use the first-pulse window determined by the FULL raw series on both
+        # sides.  Re-detecting the pulse on the decimated frames would let a
+        # missing peak frame move the window and hide the loss.
+        window_start = raw_metrics.get("arrival_s")
+        window_end = raw_metrics.get("phase_end_s")
+        if window_start is None:
+            window_start = float(raw_t[0]) if raw_t.size else None
+        if window_end is None:
+            window_end = float(raw_t[-1]) if raw_t.size else None
+        if (window_start is not None and window_end is not None
+                and imported_t.size):
+            common = (
+                (imported_t >= float(window_start) - 1.0e-15)
+                & (imported_t <= float(window_end) + 1.0e-15)
+            )
+            if np.any(common):
+                candidates = np.flatnonzero(common)
+                local = candidates[int(np.argmax(imported_dp[candidates]))]
+                imported_peak = float(imported_dp[local])
+                imported_peak_time = float(imported_t[local])
+                imported_window_n = int(candidates.size)
+            else:
+                imported_peak = None
+                imported_peak_time = None
+                imported_window_n = 0
+        else:
+            imported_peak = None
+            imported_peak_time = None
+            imported_window_n = 0
         selected = (
             abs(float(np.min(np.abs(selected_times - raw_peak_time))))
             <= 1.0e-12
@@ -621,10 +662,13 @@ def peak_preservation(case: dict, root: Path, units: dict, ambient: dict,
             "raw_metrics_status": raw_metrics.get("status"),
             "raw_phase_end_s": raw_metrics.get("phase_end_s"),
             "raw_frames": int(raw_t.size),
+            "common_window_start_s": window_start,
+            "common_window_end_s": window_end,
             "imported_peak_mpa": imported_peak,
-            "imported_peak_time_s": imported_metrics.get("peak_time_s"),
+            "imported_peak_time_s": imported_peak_time,
             "imported_metrics_status": imported_metrics.get("status"),
             "imported_phase_end_s": imported_metrics.get("phase_end_s"),
+            "imported_samples_in_window": imported_window_n,
             "imported_frames": len(frames),
             "imported_cell_offset_max_m": float(
                 np.max(np.abs(imported_offsets))) if imported_offsets.size else None,
@@ -687,27 +731,70 @@ def shock_jump_residuals(pre: dict, post: dict, ds: float,
 
 
 def rh_audit(case: dict, root: Path, ambient: dict) -> dict:
+    from .data import ShockTrajectory
+
     frames, metadata = _standard_frames(root / case["standard"])
     with np.load(root / case["cache"], allow_pickle=True) as archive:
         shock_times = np.asarray(archive["shock_times"], float)
         shock_radius = np.asarray(archive["shock_radius"], float)
+        shock_valid = np.asarray(archive["shock_valid"], bool)
         raw_times = np.asarray(archive["raw_times"], float)
     if shock_times.size != len(frames):
         raise AuditError(
             f"{case['case_id']}: cache shock frames {shock_times.size} do not "
             f"match standard frames {len(frames)}"
         )
+    if raw_times.size != len(frames):
+        raise AuditError(
+            f"{case['case_id']}: cache raw_times {raw_times.size} do not match "
+            f"standard frames {len(frames)}"
+        )
+    trajectory = ShockTrajectory.from_arrays(
+        case_id=str(case["case_id"]), times=shock_times,
+        radii=shock_radius, valid=shock_valid,
+    )
     gamma = float(ambient["gamma"])
-    results = []
+    results: list[dict] = []
+    not_evaluable: list[dict] = []
+
+    def reject(index: int, reason: str) -> None:
+        not_evaluable.append({
+            "frame_index": int(index),
+            "raw_time_s": (
+                float(raw_times[index]) if 0 <= index < raw_times.size else None
+            ),
+            "reason": reason,
+        })
+
     for index in (len(frames) // 3, len(frames) // 2, (2 * len(frames)) // 3):
         if index <= 0 or index >= len(frames) - 1:
+            reject(index, "central-difference stencil needs both neighbours")
+            continue
+        if not all(bool(shock_valid[position])
+                   for position in (index - 1, index, index + 1)):
+            reject(index, "a neighbouring shock frame is not valid")
+            continue
+        t_before, t_mid, t_after = (
+            float(shock_times[index - 1]), float(shock_times[index]),
+            float(shock_times[index + 1]),
+        )
+        if not (t_before < t_mid < t_after):
+            reject(index, "shock time is not strictly increasing across the stencil")
+            continue
+        try:
+            segment = trajectory.continuous_interval_containing(t_mid)
+        except Exception as exc:  # GeometryError or no segment
+            reject(index, f"no continuous shock segment at the stencil: {exc}")
+            continue
+        if not (segment[0] <= t_before and t_after <= segment[1]):
+            reject(index, "the derivative stencil crosses a shock trajectory break")
             continue
         frame = frames[index]
         radius = frame["radius"]
         dr = float(np.median(np.diff(radius)))
         rs = float(shock_radius[index])
         ds = float((shock_radius[index + 1] - shock_radius[index - 1])
-                   / (shock_times[index + 1] - shock_times[index - 1]))
+                   / (t_after - t_before))
         valid = (
             np.asarray(frame["valid_pressure"], bool)
             & np.asarray(frame["valid_density"], bool)
@@ -719,7 +806,11 @@ def rh_audit(case: dict, root: Path, ambient: dict) -> dict:
         air = np.asarray(frame["alpha_product"], float) < 0.05
         outside = np.flatnonzero((radius > rs) & valid & air)
         inside = np.flatnonzero((radius < rs) & valid & air)
-        if outside.size < 4 or inside.size < 10:
+        if outside.size < 4:
+            reject(index, "fewer than four valid pure-air cells outside the shock")
+            continue
+        if inside.size < 10:
+            reject(index, "fewer than ten valid pure-air cells inside the shock")
             continue
         pre_index = outside[:5]
         pre = {
@@ -731,6 +822,7 @@ def rh_audit(case: dict, root: Path, ambient: dict) -> dict:
             target = rs - cells_inside * dr
             inside_local = inside[np.argsort(np.abs(radius[inside] - target))]
             if inside_local.size == 0:
+                reject(index, f"no valid cell {cells_inside} cells inside the shock")
                 continue
             post_index = int(inside_local[0])
             post = {
@@ -739,6 +831,10 @@ def rh_audit(case: dict, root: Path, ambient: dict) -> dict:
                 "p": float(frame["pressure"][post_index]),
             }
             residuals = shock_jump_residuals(pre, post, ds, gamma)
+            if residuals.get("status") != "ok":
+                reject(index, f"non-finite or non-positive state: "
+                              f"{residuals.get('status')}")
+                continue
             results.append({
                 "frame_index": index,
                 "raw_time_s": float(raw_times[index]),
@@ -746,6 +842,11 @@ def rh_audit(case: dict, root: Path, ambient: dict) -> dict:
                 "cells_inside": cells_inside,
                 "dr_m": dr,
                 "pre": pre, "post": post,
+                "normalisation": {
+                    "mass": "rho_pre * |D_s|",
+                    "momentum": "rho_pre * D_s^2",
+                    "energy": "rho_pre * |D_s|^3",
+                },
                 "status": residuals["status"],
                 **{key: value for key, value in residuals.items()
                    if key != "status"},
@@ -754,8 +855,15 @@ def rh_audit(case: dict, root: Path, ambient: dict) -> dict:
         "case_id": case["case_id"],
         "note": "Ds from central difference of measured shock positions; states measured, "
                 "not synthesized from the Rankine-Hugoniot relations; energy flux is "
-                "u(E+p) - D_s E with E = p/(gamma-1) + rho u^2/2",
+                "u(E+p) - D_s E with E = p/(gamma-1) + rho u^2/2.  The normalised "
+                "energy residual is not a percentage of energy lost.",
+        "normalisation": {
+            "mass": "rho_pre * |D_s|",
+            "momentum": "rho_pre * D_s^2",
+            "energy": "rho_pre * |D_s|^3",
+        },
         "samples": results,
+        "not_evaluable": not_evaluable,
     }
 
 

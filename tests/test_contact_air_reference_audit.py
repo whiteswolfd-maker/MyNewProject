@@ -18,13 +18,15 @@ from spherical_blast_pinn.contact_air.blast_reference import (
     kb_positive_impulse,
     scaled_distance,
 )
-from spherical_blast_pinn.contact_air.one_d import _rh_diagnostic
+from spherical_blast_pinn.contact_air.one_d import _rh_diagnostic, write_standard_1d
 from spherical_blast_pinn.contact_air.reference_audit import (
     AuditError,
     fixed_radius_histories,
     frame_keys,
+    peak_preservation,
     pulse_metrics,
     read_xy,
+    rh_audit,
     shock_jump_residuals,
 )
 
@@ -164,6 +166,99 @@ def test_shock_frame_enthalpy_diagnostic_vanishes_for_exact_rankine_hugoniot():
     )
     assert diagnostic["energy_residual_normalised"] == pytest.approx(
         0.0, abs=1.0e-12
+    )
+
+
+def test_peak_preservation_uses_the_raw_first_pulse_window(tmp_path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    times = [f"{i * 1.0e-6:.2E}" for i in range(8)]
+    x_mm = np.array([400.0, 500.0, 600.0])
+    # At r=500 mm: ambient, first pulse at 2-4 us, then a larger later pulse.
+    pressure = [0.10132, 0.10132, 0.50, 0.30, 0.10132, 0.10132, 1.00, 0.10132]
+    for key, value in zip(times, pressure):
+        _write_xy(raw / f"profile2_pressure_x_time{key}.xy", x_mm,
+                  np.array([0.10132, value, 0.10132]))
+    # Imported frames deliberately omit the first-pulse peak (frame 2) but
+    # retain the later, larger pulse (frame 6).  A record-maximum method would
+    # wrongly report the later pulse; the common raw window must not.
+    keep = [0, 1, 3, 4, 5, 6, 7]
+    frames = []
+    for index in keep:
+        frames.append({
+            "r_left": np.array([0.3995, 0.4995, 0.5995]),
+            "r_right": np.array([0.4005, 0.5005, 0.6005]),
+            "radius": x_mm * 1.0e-3,
+            "alpha_product": np.zeros(3),
+            "density": np.full(3, 1.225),
+            "velocity": np.zeros(3),
+            "pressure": np.array([0.10132, pressure[index], 0.10132]) * 1.0e6,
+            "valid_density": np.ones(3, bool),
+            "valid_velocity": np.ones(3, bool),
+            "valid_pressure": np.ones(3, bool),
+        })
+    standard = tmp_path / "standard.npz"
+    write_standard_1d(
+        standard, case_id="fixture", charge_radius_m=0.05,
+        frames=frames, frame_times=[float(times[index]) for index in keep],
+        source={"selected_raw_frame_keys": [times[index] for index in keep],
+                "frame_selection_policy": "all_frames"},
+    )
+    rows = peak_preservation(
+        {"case_id": "fixture", "radius_m": 0.05, "raw_dir": str(raw),
+         "standard": "standard.npz"},
+        tmp_path, UNITS, AMBIENT, CHARGE, [0.5],
+    )
+    row = rows[0]
+    assert row["raw_peak_mpa"] == pytest.approx(0.39868, abs=1.0e-6)
+    assert row["imported_peak_mpa"] == pytest.approx(0.19868, abs=1.0e-6)
+    assert row["common_window_end_s"] == pytest.approx(4.0e-6, abs=1.0e-12)
+    assert row["raw_peak_frame_selected"] is False
+    assert row["peak_difference_mpa"] < 0.0
+
+
+def test_rh_audit_does_not_differentiate_across_an_invalid_shock_frame(tmp_path):
+    n_cells = 30
+    n_frames = 5
+    r_left = np.linspace(0.0, 0.2, n_cells, endpoint=False)
+    r_right = np.linspace(0.0, 0.2, n_cells + 1)[1:]
+    radius = 0.5 * (r_left + r_right)
+    frames = []
+    for _ in range(n_frames):
+        frames.append({
+            "r_left": r_left.copy(),
+            "r_right": r_right.copy(),
+            "radius": radius.copy(),
+            "alpha_product": np.zeros(n_cells),
+            "density": np.full(n_cells, 1.225),
+            "velocity": np.zeros(n_cells),
+            "pressure": np.full(n_cells, 101325.0),
+            "valid_density": np.ones(n_cells, bool),
+            "valid_velocity": np.ones(n_cells, bool),
+            "valid_pressure": np.ones(n_cells, bool),
+        })
+    standard = tmp_path / "standard.npz"
+    write_standard_1d(
+        standard, case_id="fixture", charge_radius_m=0.01,
+        frames=frames, frame_times=[0.0, 1.0e-5, 2.0e-5, 3.0e-5, 4.0e-5],
+    )
+    cache = tmp_path / "cache.npz"
+    np.savez(
+        cache,
+        shock_times=np.array([0.0, 1.0e-5, 2.0e-5, 3.0e-5, 4.0e-5]),
+        shock_radius=np.array([0.05, 0.06, 0.07, 0.08, 0.09]),
+        shock_valid=np.array([True, True, False, True, True]),
+        raw_times=np.array([0.0, 1.0e-5, 2.0e-5, 3.0e-5, 4.0e-5]),
+    )
+    audit = rh_audit(
+        {"case_id": "fixture", "standard": str(standard), "cache": str(cache)},
+        tmp_path, {"gamma": 1.4},
+    )
+    assert audit["samples"] == []
+    assert len(audit["not_evaluable"]) == 3
+    assert all(
+        any(token in entry["reason"] for token in ("valid", "segment", "break"))
+        for entry in audit["not_evaluable"]
     )
 
 

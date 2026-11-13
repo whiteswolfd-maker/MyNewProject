@@ -1,0 +1,185 @@
+# Read-only audit of the ORIGINAL and FULL-FRAME imported data.
+#
+# This is the full-frame counterpart of reference_audit.yaml.  It reads the
+# all-frames standards in outputs/fullframes/standard and the caches in
+# outputs/fullframes/cache.  The old strided standards/caches are not touched.
+# Every case is audited; frame_selection_policy must be all_frames.
+audit:
+  version: 2
+  repo_root: .
+  training_config: "configs/contact_air/split_train_r50_500_fullframes.yaml"
+  output_dir: outputs/reference_audit_fullframes
+  units:
+    length: mm
+    time: s
+    density: tonne/mm^3
+    pressure: MPa
+    velocity: mm/s
+    to_si:
+      length: 0.001
+      density: 1000000000000.0
+      pressure: 1000000.0
+      velocity: 0.001
+  ambient:
+    pressure_mpa: 0.10132
+    density_kg_m3: 1.225
+    gamma: 1.4
+  charge:
+    density_kg_m3: 1630.0
+    mass_source: uniform_sphere_from_material_card
+  references:
+    henrych:
+      status: provisional
+      source: Henrych (1979), The Dynamics of Explosion and Its Use; spherical free-air
+        burst incident overpressure
+      note: coefficients commonly reproduced; not checked against a printed copy in
+        this repository
+    kingery_bulmash:
+      status: unavailable
+      reason: verified coefficient tables are not present; not guessed or replaced
+  measurement_scaled_distances_m_kg13:
+  - 0.5
+  - 0.75
+  - 1.0
+  focus_cases:
+  - r50_full
+  - r100_full
+  - r150_full
+  - r200_full
+  - r250_full
+  - r300_full
+  - r350_full
+  - r400_full
+  - r450_full
+  - r500_full
+  - r550_full
+  - r600_full
+  - r650_full
+  - r700_full
+  - r750_full
+  - r800_full
+  - r850_full
+  - r900_full
+  - r950_full
+  - r1000_full
+  cases:
+  - case_id: r50_full
+    radius_m: 0.05
+    raw_dir: G:/R50_R100_reference_v2/R50_full_alpha_profiles
+    deck: R50_full_reference_alpha_profiles.k
+    standard: outputs/fullframes/standard/r50_full.npz
+    cache: outputs/fullframes/cache/r50_full.npz
+  - case_id: r100_full
+    radius_m: 0.1
+    raw_dir: G:/R50_R100_reference_v2/R100
+    deck: R100_full_reference_vf_fixed.k
+    standard: outputs/fullframes/standard/r100_full.npz
+    cache: outputs/fullframes/cache/r100_full.npz
+  - case_id: r150_full
+    radius_m: 0.15
+    raw_dir: G:/R50_R100_reference_v2/R150
+    deck: R150_full_reference.k
+    standard: outputs/fullframes/standard/r150_full.npz
+    cache: outputs/fullframes/cache/r150_full.npz
+  - case_id: r200_full
+    radius_m: 0.2
+    raw_dir: G:/R50_R100_reference_v2/R200
+    deck: R200_full_reference.k
+    standard: outputs/fullframes/standard/r200_full.npz
+    cache: outputs/fullframes/cache/r200_full.npz
+  - case_id: r250_full
+    radius_m: 0.25
+    raw_dir: G:/R50_R100_reference_v2/R250
+    deck: R250_full_reference.k
+    standard: outputs/fullframes/standard/r250_full.npz
+    cache: outputs/fullframes/cache/r250_full.npz
+  - case_id: r300_full
+    radius_m: 0.3
+    raw_dir: G:/R50_R100_reference_v2/R300
+    deck: R300_full_reference.k
+    standard: outputs/fullframes/standard/r300_full.npz
+    cache: outputs/fullframes/cache/r300_full.npz
+  - case_id: r350_full
+    radius_m: 0.35
+    raw_dir: G:/R50_R100_reference_v2/R350
+    deck: R350_full_reference.k
+    standard: outputs/fullframes/standard/r350_full.npz
+    cache: outputs/fullframes/cache/r350_full.npz
+  - case_id: r400_full
+    radius_m: 0.4
+    raw_dir: G:/R50_R100_reference_v2/R400
+    deck: R400_full_reference.k
+    standard: outputs/fullframes/standard/r400_full.npz
+    cache: outputs/fullframes/cache/r400_full.npz
+  - case_id: r450_full
+    radius_m: 0.45
+    raw_dir: G:/R50_R100_reference_v2/R450
+    deck: R450_full_reference.k
+    standard: outputs/fullframes/standard/r450_full.npz
+    cache: outputs/fullframes/cache/r450_full.npz
+  - case_id: r500_full
+    radius_m: 0.5
+    raw_dir: G:/R50_R100_reference_v2/R500
+    deck: R500_full_reference.k
+    standard: outputs/fullframes/standard/r500_full.npz
+    cache: outputs/fullframes/cache/r500_full.npz
+  - case_id: r550_full
+    radius_m: 0.55
+    raw_dir: G:/R50_R100_reference_v2/R550
+    deck: R550_full_reference.k
+    standard: outputs/fullframes/standard/r550_full.npz
+    cache: outputs/fullframes/cache/r550_full.npz
+  - case_id: r600_full
+    radius_m: 0.6
+    raw_dir: G:/R50_R100_reference_v2/R600
+    deck: R600_full_reference.k
+    standard: outputs/fullframes/standard/r600_full.npz
+    cache: outputs/fullframes/cache/r600_full.npz
+  - case_id: r650_full
+    radius_m: 0.65
+    raw_dir: G:/R50_R100_reference_v2/R650
+    deck: R650_full_reference.k
+    standard: outputs/fullframes/standard/r650_full.npz
+    cache: outputs/fullframes/cache/r650_full.npz
+  - case_id: r700_full
+    radius_m: 0.7
+    raw_dir: D:/R700-1000/R700
+    deck: R700_full_reference.k
+    standard: outputs/fullframes/standard/r700_full.npz
+    cache: outputs/fullframes/cache/r700_full.npz
+  - case_id: r750_full
+    radius_m: 0.75
+    raw_dir: D:/R700-1000/R750
+    deck: R750_full_reference.k
+    standard: outputs/fullframes/standard/r750_full.npz
+    cache: outputs/fullframes/cache/r750_full.npz
+  - case_id: r800_full
+    radius_m: 0.8
+    raw_dir: D:/R700-1000/R800
+    deck: R800_full_reference.k
+    standard: outputs/fullframes/standard/r800_full.npz
+    cache: outputs/fullframes/cache/r800_full.npz
+  - case_id: r850_full
+    radius_m: 0.85
+    raw_dir: D:/R700-1000/R850
+    deck: R850_full_reference.k
+    standard: outputs/fullframes/standard/r850_full.npz
+    cache: outputs/fullframes/cache/r850_full.npz
+  - case_id: r900_full
+    radius_m: 0.9
+    raw_dir: D:/R700-1000/R900
+    deck: R900_full_reference.k
+    standard: outputs/fullframes/standard/r900_full.npz
+    cache: outputs/fullframes/cache/r900_full.npz
+  - case_id: r950_full
+    radius_m: 0.95
+    raw_dir: D:/R700-1000/R950
+    deck: R950_full_reference.k
+    standard: outputs/fullframes/standard/r950_full.npz
+    cache: outputs/fullframes/cache/r950_full.npz
+  - case_id: r1000_full
+    radius_m: 1.0
+    raw_dir: D:/R700-1000/R1000
+    deck: R1000_full_reference.k
+    standard: outputs/fullframes/standard/r1000_full.npz
+    cache: outputs/fullframes/cache/r1000_full.npz

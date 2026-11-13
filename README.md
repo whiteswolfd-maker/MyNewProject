@@ -117,7 +117,7 @@ t/mm³，速度 m/s、mm/us、km/s、cm/us，压力 Pa/kPa/MPa/GPa/bar/kbar。
   `1-alpha_product` 隐式空气并记录来源；
 - `.xy` 必须以 `endcurve` 结束；没有结束标记视为求解器尚未写完，整帧拒绝，
   不能把截断文件当完整数据；
-- 所有选中帧的单元数、节点数必须一致；固定 ALE1D 网格还要求首末径向边界
+- 所有导入帧的单元数、节点数必须一致；固定 ALE1D 网格还要求首末径向边界
   一致，否则拒绝。移动网格必须显式传 `--allow-moving-mesh`；
 - profile 文件只按单元集顺序给值，不含 LS-DYNA 单元 ID；导入器不生成 ID，
   由读取器生成并在 `generated_cell_id_frames` 中记录为 generated；
@@ -125,13 +125,16 @@ t/mm³，速度 m/s、mm/us、km/s、cm/us，压力 Pa/kPa/MPa/GPa/bar/kbar。
   `*DATABASE_PROFILE` 写入的精确时刻。导入器把文件名时间写入 `frame_times`，
   并在 `source["time_source"] = "profile_filename_3sigfig"` 记录这一限制；
   不得把它宣称为精确求解器时刻；
-- 默认保留 `--dense-until-s` 之前的全部帧（当前默认 500 µs，覆盖 R1000 的
-  `t_sep=370.6 µs`），之后每 `--frame-stride` 帧取一帧；实际保留的原始文件
-  键写入 source。
-- 缩放算例的原始输出间隔是 `T/1000`（R200 为 4 µs、R1000 为 20 µs），
-  粗 stride 可能把 `t_sep` 之后唯一的帧删掉。显式传 `--event-time-s`
-  （理论 `t_sep`）时，窗口 `[t_sep-50 µs, t_sep+50 µs]` 内的全部帧以及
-  两侧各一个邻近帧无论如何都会保留，其余时段仍按 stride 降采样。
+- **所有原始输出时刻都导入**：没有 dense 窗口、stride 或帧数上限。source 中
+  记录 `frame_selection_policy="all_frames"`、`raw_frame_count`、
+  `imported_frame_count`、`dropped_frame_count=0`、完整的
+  `raw_frame_keys`、首末原始时间以及 `raw_input_fingerprint`。
+- 旧的 `--dense-until-s`、`--frame-stride`、`--event-time-s`、
+  `--event-window-s` 已从正式数据路径删除；命令行仍传入这些选项会明确报错，
+  不会静默忽略。文件名 3 位有效数字的限制仍在，全帧导入不等于恢复未输出的
+  求解器内部步。
+- 物理有效性（接触区间、激波、事件对齐、域外点）在缓存和采样阶段处理，并
+  逐帧记录原因；不得把它们与“为省资源抽帧”混为一谈。
 
 示例：
 
@@ -141,9 +144,19 @@ PYTHONPATH=src python scripts/import_lsdyna_profiles_1d.py \
   --case r50_full --radius-m 0.05 \
   --alpha-product-pattern 'profile4_volume_fraction_x_time*.xy' \
   --alpha-air-pattern 'profile5_volume_fraction_x_time*.xy' \
-  --dense-until-s 2.5e-5 --frame-stride 10 \
-  --out outputs/contact_air_r50/standard_1d.npz
+  --out outputs/fullframes/standard/r50_full.npz
 ```
+
+全帧数据与缓存的统一准备命令（调用上面的导入器和既有 `build-cache`）：
+
+```bash
+PYTHONPATH=src python scripts/prepare_fullframe_data.py --cases r50_full
+PYTHONPATH=src python scripts/prepare_fullframe_data.py          # all 20
+PYTHONPATH=src python scripts/summarize_fullframe_data.py       # frame inventory
+```
+
+输出在 `outputs/fullframes/standard/` 与 `outputs/fullframes/cache/`，不会覆盖
+旧的 `outputs/contact_air_r*/` 或 `outputs/contact_air_split_*`。
 
 ## 3. 接触区间、激波与事件对齐
 
@@ -325,14 +338,22 @@ s_fE = s_E / T_star
   均匀球装药质量 `W=4/3 pi rho R^3`、固定半径压力历程；
 - **B 导入链路**：用独立的最小 `.xy` 解析器和配置中的单位因子，逐值与
   `standard_1d.npz` 比较，状态按容差判定而不是只要等长就写 `ok`；峰值比较
-  先提取**初次入射脉冲**（到达阈值、严格回零、脉冲内最大值），再分别对原始
-  完整时序和导入帧求同一量，并记录峰值帧是否被抽帧选中；
+  先由**原始完整时序**确定初次入射脉冲窗口，再在同一固定物理半径、相同环境
+  压力和同一窗口内比较原始与导入峰值，并记录峰值帧是否被保留；
 - **C 经验关系与相容性**：Henrych（球形自由空气、入射超压，系数状态
   `provisional`）逐点比较；Kingery-Bulmash 因缺少可核实系数表仍标记
   `unavailable`，不猜测、不替换；RH 用实测激波位置差分和两侧实测状态独立
-  检查，能量通量必须是 `u(E+p) - D_s E`；接触区间与 JWL/空气压力在 t0 之后
-  的早、中、晚多个有效帧上采样，报告多个纯空气单元及压力随距离的变化；
-  接触速度只称为两条区间边界轨迹的差分斜率，不称为物理速度上下界；
+  检查，能量通量必须是 `u(E+p) - D_s E`，且中心差分的前/中/后三帧必须有效、
+  属于同一连续轨迹段；接触区间与 JWL/空气压力在 t0 之后的早、中、晚多个有效
+  帧上采样，报告多个纯空气单元及压力随距离的变化；接触速度只称为两条区间
+  边界轨迹的差分斜率，不称为物理速度上下界；
+- `configs/contact_air/reference_audit_fullframes.yaml` 是同一审计的全帧版本，
+  读取 `outputs/fullframes/standard|` 与 `outputs/fullframes/cache|`，不覆盖
+  旧的 strided 审计输出；`scripts/summarize_fullframe_data.py` 生成 20 例的
+  原始/导入/缓存有效帧清单。
+- R50 全帧验收：原始 968 帧全部导入（`dropped_frames=0`），968 个标准帧逐值
+  与原始文件一致（最大相对差 1.8e-16），固定测点 Z=0.5/0.75/1.0 的峰值在
+  原始首脉冲共同窗口内与原始完全一致（差 0）。
 - **D PINN**：复用 `contact_air_diagnostics_*` 的输出。
 
 审计只写 `outputs/reference_audit/`（manifest、CSV、JSON、图和 `report.md`），

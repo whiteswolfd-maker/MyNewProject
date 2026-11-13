@@ -81,7 +81,11 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
 
 
 def _case_data(audit: dict, case_id: str):
-    config = load_config(_REPO_ROOT / "configs/contact_air/split_train_r50_500_cw3.yaml")
+    training_config = audit.get(
+        "training_config",
+        "configs/contact_air/split_train_r50_500_cw3.yaml",
+    )
+    config = load_config(_REPO_ROOT / str(training_config))
     section = _section(config)
     spec = next(
         (item for item in _case_specs(section) if str(item["case_id"]) == case_id),
@@ -97,10 +101,12 @@ def _plot_histories(history_map: dict, out_dir: Path) -> None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(1, len(history_map), figsize=(4.3 * len(history_map), 4.2),
+    ncols = min(4, max(1, len(history_map)))
+    nrows = max(1, (len(history_map) + ncols - 1) // ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.3 * ncols, 4.2 * nrows),
                              squeeze=False)
     colors = ["#1f77b4", "#d95f02", "#2ca02c", "#9467bd"]
-    for ax, (case_id, histories) in zip(axes[0], history_map.items()):
+    for ax, (case_id, histories) in zip(axes.flat, history_map.items()):
         for color, (label, history) in zip(colors, histories.items()):
             ax.plot(np.asarray(history["t"], float) * 1e6,
                     np.asarray(history["dp_mpa"], float),
@@ -112,9 +118,11 @@ def _plot_histories(history_map: dict, out_dir: Path) -> None:
         ax.set_axisbelow(True)
         for side in ("top", "right"):
             ax.spines[side].set_visible(False)
-    axes[0][0].legend(frameon=False, fontsize=8)
+    for ax in list(axes.flat)[len(history_map):]:
+        ax.set_visible(False)
+    axes.flat[0].legend(frameon=False, fontsize=8)
     fig.suptitle("Fixed-radius incident overpressure histories", fontsize=11)
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
     out_dir.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_dir / "pressure_histories.png", dpi=150)
     plt.close(fig)
@@ -164,8 +172,11 @@ def _report(audit: dict, root: Path, out_dir: Path, manifest, metrics_rows,
         normal = sum(1 for case in manifest["cases"] if case["normal_termination"])
         lines.append(f"- cases inspected: {len(manifest['cases'])}; normal termination: {normal}")
         for case in manifest["cases"]:
+            standard = case.get("standard", {})
             lines.append(
                 f"- {case['case_id']}: raw frames {case['raw_frame_count']}, "
+                f"imported {standard.get('imported_frame_count', 'n/a')}, "
+                f"policy {standard.get('frame_selection_policy', 'n/a')}, "
                 f"raw time {case['raw_time_start_s']:.3e}..{case['raw_time_end_s']:.3e} s, "
                 f"charge mass {case['charge_mass_kg']:.6g} kg (uniform sphere)"
             )
@@ -232,22 +243,25 @@ def _report(audit: dict, root: Path, out_dir: Path, manifest, metrics_rows,
     if preservation_rows:
         lines += [
             "",
-            "### First-pulse peak visible after import",
+            "### First-pulse peak visible after import (common raw window)",
             "",
             "| case | Z | raw peak MPa | imported peak MPa | difference | "
-            "raw peak frame selected | peak-frame gap s |",
-            "|---|---:|---:|---:|---:|---|---:|",
+            "raw peak frame selected | peak-frame gap s | imported samples in window |",
+            "|---|---:|---:|---:|---:|---|---:|---:|",
         ]
         for row in preservation_rows:
             selected = row.get("raw_peak_frame_selected")
             gap = row.get("nearest_selected_gap_s")
+            peak = row.get("imported_peak_mpa")
+            difference = row.get("peak_difference_mpa")
             lines.append(
                 f"| {row['case_id']} | {float(row['z_m_kg13']):.2f} | "
                 f"{float(row['raw_peak_mpa']):.4f} | "
-                f"{float(row['imported_peak_mpa']):.4f} | "
-                f"{float(row['peak_difference_mpa']):+.4f} | "
+                f"{'n/a' if peak in (None, '', 'None') else f'{float(peak):.4f}'} | "
+                f"{'n/a' if difference in (None, '', 'None') else f'{float(difference):+.4f}'} | "
                 f"{selected} | "
-                f"{'n/a' if gap in (None, '', 'None') else f'{float(gap):.3e}'} |"
+                f"{'n/a' if gap in (None, '', 'None') else f'{float(gap):.3e}'} | "
+                f"{row.get('imported_samples_in_window', 'n/a')} |"
             )
     if consistency:
         lines += [
@@ -336,6 +350,10 @@ def main(argv=None) -> int:
                                  "report", "all"))
     parser.add_argument("--cases", default=None,
                         help="comma-separated audit case ids for the raw-history stages")
+    parser.add_argument(
+        "--import-sample-frames", type=int, default=4,
+        help="evenly spaced frames checked in the import stage; <=0 checks all",
+    )
     args = parser.parse_args(argv)
     audit = _load_audit(Path(args.config))
     root = (_REPO_ROOT / audit.get("repo_root", ".")).resolve()
@@ -363,9 +381,16 @@ def main(argv=None) -> int:
         print(f"manifest: {len(cases)} cases")
 
     if args.stage in ("imports", "all"):
+        sample_frames = (
+            None if args.import_sample_frames <= 0
+            else int(args.import_sample_frames)
+        )
         for case_id in focus:
             case = _case_config(audit, case_id)
-            import_rows.extend(import_comparison(case, root, audit["units"]))
+            import_rows.extend(
+                import_comparison(case, root, audit["units"],
+                                  sample_indices=sample_frames)
+            )
         _write_csv(out_dir / "raw_import_comparison.csv", import_rows)
         print(f"imports: {len(import_rows)} rows")
 

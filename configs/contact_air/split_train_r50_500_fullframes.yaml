@@ -1,0 +1,83 @@
+# Full-frame data split: train R50-R500, validation R550-R1000.
+#
+# This configuration uses the all-frames standards/caches under
+# outputs/fullframes.  It must not overwrite the strided baseline caches or
+# checkpoints.  Training is from scratch with the same seed, networks,
+# learning rate, sampling budget, T_ref=0.010 s and contact_data_weight=3 as
+# the old cw3 4000-loop baseline.  n_schedule remains 2000.
+#
+#   train      : R50, R100, ..., R500   (10 cases)
+#   validation : R550, R600, ..., R1000 (10 cases, disjoint radii)
+#
+# The validation band is never sampled for training.  It is scored every
+# validation.validate_every loops and can select best.pt.  Because the split
+# is by radius, validation.holdout_fraction is 0: every frame of every train
+# case is usable for training, and the held-out signal comes from the
+# disjoint radius band instead of from late-time frames of the same cases.
+#
+# All 20 caches come from the real LS-DYNA profiles; none is synthetic.
+inherits: base.yaml
+
+contact_air:
+  precursor:
+    material_source: "G:/R50_R100_reference_v2/R50_full/R50_full_reference.k"
+    material_source_verified: true
+
+  contact_interval:
+    # Caches for R150-R1000 were built with this window (see all_real.yaml).
+    event_search_window_s: 5.0e-5
+
+  cases:
+    - {case_id: r50_full,   role: train,      charge_radius_m: 0.050, cache: outputs/fullframes/cache/r50_full.npz,   synthetic: false}
+    - {case_id: r100_full,  role: train,      charge_radius_m: 0.100, cache: outputs/fullframes/cache/r100_full.npz,  synthetic: false}
+    - {case_id: r150_full,  role: train,      charge_radius_m: 0.150, cache: outputs/fullframes/cache/r150_full.npz,  synthetic: false}
+    - {case_id: r200_full,  role: train,      charge_radius_m: 0.200, cache: outputs/fullframes/cache/r200_full.npz,  synthetic: false}
+    - {case_id: r250_full,  role: train,      charge_radius_m: 0.250, cache: outputs/fullframes/cache/r250_full.npz,  synthetic: false}
+    - {case_id: r300_full,  role: train,      charge_radius_m: 0.300, cache: outputs/fullframes/cache/r300_full.npz,  synthetic: false}
+    - {case_id: r350_full,  role: train,      charge_radius_m: 0.350, cache: outputs/fullframes/cache/r350_full.npz,  synthetic: false}
+    - {case_id: r400_full,  role: train,      charge_radius_m: 0.400, cache: outputs/fullframes/cache/r400_full.npz,  synthetic: false}
+    - {case_id: r450_full,  role: train,      charge_radius_m: 0.450, cache: outputs/fullframes/cache/r450_full.npz,  synthetic: false}
+    - {case_id: r500_full,  role: train,      charge_radius_m: 0.500, cache: outputs/fullframes/cache/r500_full.npz,  synthetic: false}
+    - {case_id: r550_full,  role: validation, charge_radius_m: 0.550, cache: outputs/fullframes/cache/r550_full.npz,  synthetic: false}
+    - {case_id: r600_full,  role: validation, charge_radius_m: 0.600, cache: outputs/fullframes/cache/r600_full.npz,  synthetic: false}
+    - {case_id: r650_full,  role: validation, charge_radius_m: 0.650, cache: outputs/fullframes/cache/r650_full.npz,  synthetic: false}
+    - {case_id: r700_full,  role: validation, charge_radius_m: 0.700, cache: outputs/fullframes/cache/r700_full.npz,  synthetic: false}
+    - {case_id: r750_full,  role: validation, charge_radius_m: 0.750, cache: outputs/fullframes/cache/r750_full.npz,  synthetic: false}
+    - {case_id: r800_full,  role: validation, charge_radius_m: 0.800, cache: outputs/fullframes/cache/r800_full.npz,  synthetic: false}
+    - {case_id: r850_full,  role: validation, charge_radius_m: 0.850, cache: outputs/fullframes/cache/r850_full.npz,  synthetic: false}
+    - {case_id: r900_full,  role: validation, charge_radius_m: 0.900, cache: outputs/fullframes/cache/r900_full.npz,  synthetic: false}
+    - {case_id: r950_full,  role: validation, charge_radius_m: 0.950, cache: outputs/fullframes/cache/r950_full.npz,  synthetic: false}
+    - {case_id: r1000_full, role: validation, charge_radius_m: 1.000, cache: outputs/fullframes/cache/r1000_full.npz, synthetic: false}
+
+  output_dir: outputs/contact_air_split_r50_500_fullframes_cw3_4000
+
+  # Sampling counts are totals split across the 10 training cases, not
+  # per-case budgets.  The base 512/128/128/128/128 would give only ~51 PDE,
+  # ~12 data and ~12 contact points per case; scale the totals with the case
+  # count so each radius keeps a usable signal per loop.
+  sampling:
+    n_pde: 2048
+    n_ic: 512
+    n_right: 512
+    n_data: 512
+    n_contact: 512
+
+  networks:
+    # Fixed reference from the training band: the largest training t_end is
+    # R500 = 10 ms, so tau = t / 0.010 runs from ~0 at t0 to 1 at R500's end
+    # and to 2 for the R1000 validation case.  Shared by every radius; only
+    # the number handed to the MLP changes, all physics stays in seconds.
+    time_reference_s: 0.010
+
+  training:
+    loops: 4000
+    contact_data_weight: 3.0
+    log_every: 50
+    checkpoint_every: 100
+    validate_every: 100
+
+  validation:
+    # Radius-band holdout replaces the internal late-frame holdout.
+    holdout_fraction: 0.0
+    data_points: 256
+    contact_points: 256

@@ -7,6 +7,7 @@
 audit:
   version: 1
   repo_root: "."
+  training_config: "configs/contact_air/split_train_r50_500_cw3.yaml"
   output_dir: outputs/reference_audit
 
   units:

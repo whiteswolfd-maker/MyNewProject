@@ -818,6 +818,7 @@ def command_evaluate(args) -> int:
     }
     metrics: dict[str, Any] = {
         "n_observations": int(obs.size), "n_in_domain": int(in_domain.sum()),
+        "n_out_of_domain": int(obs.size - in_domain.sum()),
     }
     for name, target, mask, scale in (
         ("rho", obs.density, obs.valid_density, case.rho_scale),

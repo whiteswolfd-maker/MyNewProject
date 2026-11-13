@@ -48,6 +48,11 @@
 ## 一维数据与几何契约
 
 - 标准中间格式 `spherical_blast_pinn.standard_1d_source`（`.npz` 或目录）。
+- LS-DYNA 导入必须保留全部原始输出帧：`frame_selection_policy="all_frames"`，
+  `raw_frame_count == imported_frame_count`，`dropped_frame_count=0`，并记录
+  完整 `raw_frame_keys`、首末时间和 `raw_input_fingerprint`。旧的
+  `--dense-until-s`/`--frame-stride`/事件保帧窗口不属于正式数据路径；传入即
+  报错。全帧导入不恢复未输出的求解器内部时间。
 - metadata 必须显式提供 `units`、`coordinate`、`velocity_component`、
   `absolute_pressure=true`、`position_type`、`frame_times`、`cells_per_frame`。
   `coordinate`/`velocity_component` **没有静默默认**；缺键拒绝。
@@ -128,6 +133,8 @@
   训练采样；不能与训练算例重复 `case_id`。`validation.holdout_fraction: 0`
   表示训练算例全部帧可用，验证完全由该半径带提供。
 - `build-cache --source <标准一维文件或目录> --case ... --radius ... --role ... --out ...`。
+- `scripts/prepare_fullframe_data.py --cases ...` 是薄编排器：调用现有导入器和
+  `build-cache`，把全帧标准/缓存写到 `outputs/fullframes/`；不覆盖旧数据。
 - `scripts/audit_reference_data.py --stage <manifest|imports|metrics|consistency|report|all>`
   是只读数据审计：独立解析原始 `.xy`、按容差核对导入值、从**初次入射脉冲**
   （到达阈值 → 严格回零 → 脉冲内最大值）提取固定半径峰值并与 Henrych 对比、
@@ -151,5 +158,5 @@ python -m pytest -q
 其他环境的输出不能作为本工作树的证据。另需在新进程执行 README 的
 标准 `.npz → build-cache → train → resume → predict → evaluate` 全链路。
 
-测试通过不等于真实 50 mm 数据验证；当前尚无真实一维 ALE1D 数据，二进制读取
-未实现。
+测试通过不等于真实数据验证；当前使用 LS-DYNA ASCII `*DATABASE_PROFILE` 输出
+（不是二进制 ALE1D 槽位读取），二进制读取仍未实现。
