@@ -156,11 +156,10 @@ def pde_loss(
     gamma = torch.full_like(fields.density, float(case.gamma_air))
     residuals = assemble_residuals(fields, derivatives, geometry, gamma=gamma)
     scales = residual_scales(case)
-    total = (
-        _mse(residuals.mass, scales["mass_residual"])
-        + _mse(residuals.momentum, scales["momentum_residual"])
-        + _mse(residuals.energy, scales["energy_residual"])
-    )
+    mass_norm = _mse(residuals.mass, scales["mass_residual"])
+    momentum_norm = _mse(residuals.momentum, scales["momentum_residual"])
+    energy_norm = _mse(residuals.energy, scales["energy_residual"])
+    total = mass_norm + momentum_norm + energy_norm
     return TermResult(
         total=total,
         counts={"pde_points": int(fields.density.numel())},
@@ -168,6 +167,11 @@ def pde_loss(
             "pde_mass": float(residuals.mass.detach().pow(2).mean()) if residuals.mass.numel() else 0.0,
             "pde_momentum": float(residuals.momentum.detach().pow(2).mean()) if residuals.momentum.numel() else 0.0,
             "pde_energy": float(residuals.energy.detach().pow(2).mean()) if residuals.energy.numel() else 0.0,
+            # Normalized components of the same total, for logging only.  They
+            # do not change the total, the sampling, or any gradient.
+            "pde_mass_normalised": float(mass_norm.detach()),
+            "pde_momentum_normalised": float(momentum_norm.detach()),
+            "pde_energy_normalised": float(energy_norm.detach()),
         },
     )
 

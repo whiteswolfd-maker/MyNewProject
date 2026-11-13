@@ -664,11 +664,15 @@ class AlternatingTrainer:
             record["contact_data_weight"] = float(self.config.contact_data_weight)
             records.append(record)
             if self.config.log_every > 0 and self.loop % self.config.log_every == 0:
+                parts = record.get("air_parts", {})
                 print(
                     f"loop {self.loop:5d}  air={record['air_loss']:.6e}  "
                     f"contact={record['contact_loss']:.6e}  "
                     f"lambda_data={record['lambda_data']:.3f}  "
-                    f"lr={record['learning_rate']:.3e}"
+                    f"lr={record['learning_rate']:.3e}  "
+                    f"pde_norm m={parts.get('pde_mass_normalised', float('nan')):.3e} "
+                    f"mom={parts.get('pde_momentum_normalised', float('nan')):.3e} "
+                    f"e={parts.get('pde_energy_normalised', float('nan')):.3e}"
                 )
             if self.config.validate_every > 0 and self.loop % self.config.validate_every == 0:
                 verdict = self.evaluate()

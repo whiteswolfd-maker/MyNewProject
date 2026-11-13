@@ -294,6 +294,11 @@ s_fE = s_E / T_star
   `zeta/t` 导数与计算图保留（`AirNet.forward_functional`，detached 参数）。
   不用 `no_grad`/整体 detach 包住物理残差。
 - 每次反传检查目标网络有非零有限梯度、非目标网络无梯度、参数未移动。
+- 每条 loop 日志在原有字段后追加空气阶段三个**归一化** PDE 分项
+  （`pde_mass_normalised` / `pde_momentum_normalised` /
+  `pde_energy_normalised`）；它们只是同一 `pde_loss` 总和的三个分量，用于
+  记录，不改变损失、采样或梯度，且不消耗训练随机数。历史记录保留原有未加权
+  分项。
 - 多半径均衡采样；空气数据先抽帧再抽帧内点；接触标签用自己的时刻；只在有效
   轨迹段采样；先不加激波附近额外权重。
 - 缓存 schema **version 7**；检查点 **version 4**。旧格式明确拒绝并要求重建。

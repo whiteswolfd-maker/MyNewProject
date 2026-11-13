@@ -19,14 +19,14 @@ from spherical_blast_pinn.contact_air.trainer import (
 
 
 def _trainer(tmp_path, *, cases=None, holdout=0.3, external=None,
-             time_reference_s=1.0, contact_data_weight=1.0):
+             time_reference_s=1.0, contact_data_weight=1.0, log_every=1):
     cases = cases or [
         synthetic_case_for(0.05, case_id="r050", n_frames=11, n_radial=1600),
         synthetic_case_for(0.08, case_id="r080", n_frames=11, n_radial=1600),
     ]
     config = TrainConfig(
         n_pde=8, n_ic=4, n_right=4, n_data=8, n_contact=6,
-        loops=2, learning_rate=1.0e-3, log_every=1, checkpoint_every=0,
+        loops=2, learning_rate=1.0e-3, log_every=log_every, checkpoint_every=0,
         validate_every=0, seed=11, validation_holdout_fraction=holdout,
         validation_data_points=8, validation_contact_points=6,
         contact_data_weight=contact_data_weight,
@@ -361,3 +361,24 @@ def test_resume_treats_a_legacy_checkpoint_weight_as_one(tmp_path):
     weighted = _trainer(tmp_path / "weighted", contact_data_weight=3.0)
     with pytest.raises(TrainingError, match="contact_data_weight"):
         weighted.load(path)
+
+
+def test_pde_parts_include_normalised_components(tmp_path):
+    trainer = _trainer(tmp_path)
+    record = trainer.step()
+    parts = record["air_parts"]
+    for key in ("pde_mass_normalised", "pde_momentum_normalised",
+                "pde_energy_normalised"):
+        assert key in parts
+        assert torch.isfinite(torch.tensor(parts[key]))
+
+
+def test_logging_does_not_consume_sampling_randomness(tmp_path):
+    logged = _trainer(tmp_path / "logged", log_every=1)
+    quiet = _trainer(tmp_path / "quiet", log_every=0)
+    first = logged.train(loops=2)["history"]["loops"]
+    second = quiet.train(loops=2)["history"]["loops"]
+    for left, right in zip(first, second):
+        assert left["air_loss"] == pytest.approx(right["air_loss"])
+        assert left["contact_loss"] == pytest.approx(right["contact_loss"])
+        assert left["counts"] == right["counts"]
