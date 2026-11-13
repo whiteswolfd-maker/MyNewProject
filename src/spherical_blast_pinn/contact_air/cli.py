@@ -360,15 +360,18 @@ def _networks(section: Mapping[str, Any]):
     dtype = getattr(torch, dtype_name, torch.float64)
     contact_section = net_section.get("contact", {})
     air_section = net_section.get("air", {})
+    time_reference_s = float(net_section.get("time_reference_s", 1.0))
     contact = ContactNet(
         width=int(contact_section.get("width", 50)),
         depth=int(contact_section.get("depth", 5)),
         dtype=dtype, device="cpu",
+        time_reference_s=time_reference_s,
     )
     air = AirNet(
         width=int(air_section.get("width", 32)),
         depth=int(air_section.get("depth", 10)),
         dtype=dtype, device="cpu",
+        time_reference_s=time_reference_s,
     )
     return contact, air
 
@@ -616,6 +619,21 @@ def command_train(args) -> int:
     return 0
 
 
+def _describe_matches(saved: Mapping[str, Any] | None, current: Mapping[str, Any]) -> bool:
+    """Compare checkpoint model metadata.
+
+    Checkpoints written before the optional time-input scaling existed have no
+    ``time_reference_s`` key; for them the reference was the physical second,
+    so an absent key means 1.0.  A checkpoint that does carry the key is
+    compared exactly, so a 1.0 checkpoint cannot be loaded into a 0.01 model.
+    """
+    if saved is None:
+        return True
+    normalized = dict(saved)
+    normalized.setdefault("time_reference_s", 1.0)
+    return normalized == dict(current)
+
+
 def _check_checkpoint_state(module, state, name: str, path: Path) -> None:
     current = module.state_dict()
     if set(state) != set(current):
@@ -642,8 +660,7 @@ def _load_checkpoint(path: Path, contact: ContactNet, air: AirNet) -> dict[str, 
     _check_checkpoint_state(contact, payload["contact_net"], "contact_net", Path(path))
     _check_checkpoint_state(air, payload["air_net"], "air_net", Path(path))
     for key, module in (("contact_net", contact), ("air_net", air)):
-        saved_describe = payload.get(f"{key}_describe")
-        if saved_describe is not None and saved_describe != module.describe():
+        if not _describe_matches(payload.get(f"{key}_describe"), module.describe()):
             raise CommandError(
                 f"{path}: {key} model convention/architecture metadata does not "
                 "match the configured network"
@@ -680,8 +697,7 @@ def _check_prediction_compatibility(
             label=f"prediction dimensionless physics vs training case {case_id!r}",
         )
     for key, module in (("contact_net", contact), ("air_net", air)):
-        saved_describe = payload.get(f"{key}_describe")
-        if saved_describe is not None and saved_describe != module.describe():
+        if not _describe_matches(payload.get(f"{key}_describe"), module.describe()):
             raise CommandError(
                 f"checkpoint {key} model convention does not match the prediction model"
             )

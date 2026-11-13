@@ -24,8 +24,11 @@ AirNet:     (zeta, t, R0) -> (rho, u, p),  e = p / ((gamma_a-1) rho)
 
 - `R_s` 是**外传空气激波**，由原始径向压力剖面的 `-dp/dr` 识别；不是旧
   `R_b`，也不是仿真外边界 `R_outer`。
-- ContactNet 默认 5 个隐藏层 × 50 神经元；AirNet 默认 10 × 32。时间输入是
-  物理秒，`R0` 是米；不做时间/半径输入归一化。
+- ContactNet 默认 5 个隐藏层 × 50 神经元；AirNet 默认 10 × 32。`R0` 是米。
+  两个网络的时间输入是 `tau = t / networks.time_reference_s`：默认
+  `time_reference_s: 1.0`，即物理秒；可设为一个由训练组确定的固定值（例如
+  训练组最大 `t_end`），所有算例共用。只有送进 MLP 的数字被缩放，激波轨迹、
+  接触速度、PDE、边界条件和自动求导仍按秒计算，速度仍是 m/s。
 - `R_c = R_s sigmoid(raw)` 保证 `0 < R_c < R_s`。完整乘积导数：
   `R_c_dot = D_s s + R_s s (1-s) raw_t`。有限精度下 `L <= 0` 明确报错，不截断
   厚度制造可用几何。

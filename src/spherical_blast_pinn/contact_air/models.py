@@ -98,11 +98,14 @@ class ContactNet(nn.Module):
     """``(t, R0) -> R_c`` with ``R_c = R_s sigmoid(raw)``."""
 
     def __init__(self, *, width: int = 50, depth: int = 5, dtype=torch.float64,
-                 device="cpu") -> None:
+                 device="cpu", time_reference_s: float = 1.0) -> None:
         super().__init__()
+        if not (float(time_reference_s) > 0.0):
+            raise ModelError("time_reference_s must be positive")
         self.net = _mlp(2, width, depth, dtype=dtype, device=device)
         self.dtype = dtype
         self.device = device
+        self.time_reference_s = float(time_reference_s)
 
     def forward(
         self,
@@ -124,7 +127,10 @@ class ContactNet(nn.Module):
         r0_in = r0.reshape(-1, 1)
         rs_in = shock_radius.reshape(-1, 1)
         ds_in = shock_speed.reshape(-1, 1)
-        raw = self.net(torch.cat([t_leaf, r0_in], dim=-1))
+        # The MLP sees a dimensionless time; the division stays in the autograd
+        # graph, so raw_t below is still d(raw)/dt in 1/s and speed stays m/s.
+        t_scaled = t_leaf / self.time_reference_s
+        raw = self.net(torch.cat([t_scaled, r0_in], dim=-1))
         raw_t = torch.autograd.grad(
             raw.sum(), t_leaf, create_graph=create_graph, retain_graph=create_graph
         )[0]
@@ -149,6 +155,7 @@ class ContactNet(nn.Module):
             "width": self.net[0].out_features,
             "depth": sum(isinstance(m, nn.Linear) for m in self.net) - 1,
             "parameters": sum(p.numel() for p in self.parameters()),
+            "time_reference_s": self.time_reference_s,
         }
 
 
@@ -156,8 +163,11 @@ class AirNet(nn.Module):
     """``(zeta, t, R0) -> (rho, u, p)`` with positive density/pressure."""
 
     def __init__(self, *, width: int = 32, depth: int = 10, dtype=torch.float64,
-                 device="cpu") -> None:
+                 device="cpu", time_reference_s: float = 1.0) -> None:
         super().__init__()
+        if not (float(time_reference_s) > 0.0):
+            raise ModelError("time_reference_s must be positive")
+        self.time_reference_s = float(time_reference_s)
         layers: list[nn.Module] = []
         last = 3
         for _ in range(int(depth)):
@@ -182,7 +192,9 @@ class AirNet(nn.Module):
     ) -> AirFields:
         if zeta.shape != t.shape or zeta.shape != r0.shape:
             raise ModelError("zeta, t and R0 must have the same shape")
-        hidden = self.trunk(torch.cat([zeta, t, r0], dim=-1))
+        # Dimensionless time; derivatives are still taken with respect to the
+        # physical t passed in, because the division is part of the graph.
+        hidden = self.trunk(torch.cat([zeta, t / self.time_reference_s, r0], dim=-1))
         return self._heads(hidden, scales)
 
     def _heads(self, hidden: torch.Tensor, scales: Scales) -> AirFields:
@@ -224,7 +236,7 @@ class AirNet(nn.Module):
         """
         if zeta.shape != t.shape or zeta.shape != r0.shape:
             raise ModelError("zeta, t and R0 must have the same shape")
-        hidden = torch.cat([zeta, t, r0], dim=-1)
+        hidden = torch.cat([zeta, t / self.time_reference_s, r0], dim=-1)
         for module in self.trunk:
             if isinstance(module, nn.Linear):
                 weight = module.weight.detach() if detach_parameters else module.weight
@@ -263,6 +275,7 @@ class AirNet(nn.Module):
             "width": self.trunk[0].out_features,
             "depth": sum(isinstance(m, nn.Linear) for m in self.trunk),
             "parameters": sum(p.numel() for p in self.parameters()),
+            "time_reference_s": self.time_reference_s,
         }
 
 

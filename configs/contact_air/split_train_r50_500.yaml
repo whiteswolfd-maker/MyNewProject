@@ -55,6 +55,13 @@ contact_air:
     n_data: 512
     n_contact: 512
 
+  networks:
+    # Fixed reference from the training band: the largest training t_end is
+    # R500 = 10 ms, so tau = t / 0.010 runs from ~0 at t0 to 1 at R500's end
+    # and to 2 for the R1000 validation case.  Shared by every radius; only
+    # the number handed to the MLP changes, all physics stays in seconds.
+    time_reference_s: 0.010
+
   training:
     loops: 2000
     log_every: 50

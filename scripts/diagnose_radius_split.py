@@ -234,20 +234,22 @@ def _plot_case(case, best: dict, last: dict, out_png: Path) -> None:
     t_sep_raw = float(alignment["t_separation_theoretical_s"])
 
     times = best["times"]
-    # Inverse of t_model = t0 + (t_raw - t_event_raw).
+    # The cache stores contact times already event-aligned to model time
+    # (t_model = t0 + (t_raw - t_event_raw)).  Predictions use the same model
+    # time.  Filter and compare in model time; convert to raw time exactly once
+    # for the raw-time panel.
     raw_times = times - t0 + t_event_raw
-    raw_min, raw_max = float(raw_times[0]), float(raw_times[-1])
 
     contact = case.contact
     keep = (
         np.asarray(contact.valid, dtype=bool)
-        & (contact.times >= raw_min)
-        & (contact.times <= raw_max)
+        & (contact.times >= times[0])
+        & (contact.times <= times[-1])
     )
-    contact_raw_us = contact.times[keep] * 1.0e6
+    contact_model_us = contact.times[keep] * 1.0e6
+    contact_raw_us = (contact.times[keep] - t0 + t_event_raw) * 1.0e6
     low_mm = contact.low[keep] * 1.0e3
     up_mm = contact.up[keep] * 1.0e3
-    contact_model_us = (contact.times[keep] - t_event_raw + t0) * 1.0e6
 
     raw_us = raw_times * 1.0e6
     model_us = times * 1.0e6

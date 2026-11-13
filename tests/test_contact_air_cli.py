@@ -75,3 +75,14 @@ def test_base_config_does_not_encode_a_default_radius_split():
 
     section = load_config(ROOT / "configs" / "contact_air" / "base.yaml").section("contact_air")
     assert section["cases"] == []
+
+
+def test_checkpoint_describe_treats_a_missing_time_reference_as_seconds():
+    current_scaled = {"name": "ContactNet", "time_reference_s": 0.01}
+    current_seconds = {"name": "ContactNet", "time_reference_s": 1.0}
+    old_saved = {"name": "ContactNet"}  # written before the scaling existed
+    assert cli._describe_matches(old_saved, current_seconds) is True
+    assert cli._describe_matches(old_saved, current_scaled) is False
+    assert cli._describe_matches({"name": "ContactNet", "time_reference_s": 0.01},
+                                 current_scaled) is True
+    assert cli._describe_matches(None, current_scaled) is True

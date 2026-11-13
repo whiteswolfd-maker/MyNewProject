@@ -86,6 +86,11 @@ contact_air:
 
   networks:
     dtype: float64
+    # Both MLPs receive tau = t / time_reference_s instead of raw seconds.
+    # 1.0 keeps the physical seconds (the previous behaviour).  The reference
+    # is a fixed value shared by every case; shock trajectory, contact speed,
+    # PDE and boundary conditions are still evaluated in seconds.
+    time_reference_s: 1.0
     contact:
       width: 50
       depth: 5
