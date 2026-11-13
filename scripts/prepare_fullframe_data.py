@@ -37,6 +37,9 @@ from import_lsdyna_profiles_1d import (  # noqa: E402
     convert,
 )
 from spherical_blast_pinn.contact_air.cli import command_build_cache  # noqa: E402
+from spherical_blast_pinn.contact_air.one_d import (  # noqa: E402
+    standard_source_digest,
+)
 
 _PROFILE_PATTERNS = {
     "velocity": "profile1_x-velocity_x_time*.xy",
@@ -94,18 +97,47 @@ def _standard_is_current(
 
 
 def _cache_is_current(standard: Path, cache: Path) -> tuple[bool, str]:
-    """Check that a cache covers every frame of the standard and its raw times."""
+    """Check that a cache was built from this exact standard file.
+
+    Frame counts and times are not sufficient: a standard rebuilt from changed
+    raw data can keep the same frames and times while carrying different
+    pressure/density arrays.  The cache therefore records the standard's
+    content digest at build time, and that digest must still match.
+    """
     if not cache.is_file():
         return False, "cache is missing"
+    if not standard.is_file():
+        return False, "standard is missing"
     with np.load(standard, allow_pickle=False) as archive:
         standard_meta = json.loads(str(archive["metadata"]))
     frame_times = np.asarray(standard_meta["frame_times"], dtype=np.float64)
+    standard_digest = standard_source_digest(standard)
     with np.load(cache, allow_pickle=False) as archive:
         if "raw_times" not in archive.files:
             return False, "cache has no raw_times"
         raw_times = np.asarray(archive["raw_times"], dtype=np.float64)
         contact_times = np.asarray(archive["contact_times"], dtype=np.float64)
         shock_times = np.asarray(archive["shock_times"], dtype=np.float64)
+        cache_meta = json.loads(str(archive["metadata"]))
+    recorded = (
+        ((cache_meta.get("case") or {}).get("source") or {})
+        .get("standard_data_digest")
+    )
+    if not isinstance(recorded, dict) or "sha256" not in recorded:
+        return False, (
+            "cache has no standard data fingerprint; it predates fingerprinting "
+            "and cannot be proven current"
+        )
+    if recorded.get("algorithm") != standard_digest["algorithm"]:
+        return False, (
+            f"cache fingerprint algorithm {recorded.get('algorithm')!r} != "
+            f"{standard_digest['algorithm']!r}"
+        )
+    if recorded.get("sha256") != standard_digest["sha256"]:
+        return False, (
+            "cache standard fingerprint differs from the current standard: "
+            f"cache={recorded.get('sha256')} standard={standard_digest['sha256']}"
+        )
     if raw_times.size != frame_times.size:
         return False, (
             f"cache raw_times {raw_times.size} != standard frames {frame_times.size}"
@@ -179,6 +211,7 @@ def main(argv=None) -> int:
             "standard": str(standard),
             "cache": str(cache),
         }
+        standard_rebuilt = False
         if args.cache_only:
             ok, reason = _standard_is_current(raw_dir, standard)
             if not ok:
@@ -210,9 +243,17 @@ def main(argv=None) -> int:
                 )
                 entry["import"] = summary
                 entry["standard_bytes"] = int(standard.stat().st_size)
+                standard_rebuilt = True
+        entry["standard_rebuilt"] = standard_rebuilt
         if not args.import_only:
-            reusable = cache.is_file() and not args.overwrite
+            cache_existed = cache.is_file() and not args.overwrite
+            reusable = cache_existed
             reason = "not present"
+            if reusable and standard_rebuilt:
+                # A cache is derived from the standard.  When this run rewrote
+                # the standard, the old cache must not survive even if the
+                # frame times did not change.
+                reusable, reason = False, "standard was rebuilt in this run"
             if reusable:
                 if not standard.is_file():
                     reusable, reason = False, "standard is missing"
@@ -223,6 +264,8 @@ def main(argv=None) -> int:
                     entry["cache_validation"] = reason
                 else:
                     entry["cache_validation"] = f"rebuild: {reason}"
+            elif cache_existed:
+                entry["cache_validation"] = f"rebuild: {reason}"
             if not reusable:
                 if not standard.is_file():
                     raise SystemExit(

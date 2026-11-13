@@ -18,6 +18,12 @@ import yaml
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+if str(_REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+from spherical_blast_pinn.contact_air.one_d import (  # noqa: E402
+    standard_source_digest,
+)
 
 
 def _load_audit(path: Path) -> dict:
@@ -49,8 +55,11 @@ def main(argv=None) -> int:
             with np.load(standard, allow_pickle=False) as archive:
                 metadata = json.loads(str(archive["metadata"]))
             source = metadata.get("source", {})
+            digest = standard_source_digest(standard)
             row.update({
                 "standard_exists": True,
+                "standard_digest": digest["sha256"],
+                "standard_digest_algorithm": digest["algorithm"],
                 "standard_bytes": standard.stat().st_size,
                 "raw_frames": source.get("raw_frame_count"),
                 "imported_frames": source.get("imported_frame_count",
@@ -74,8 +83,19 @@ def main(argv=None) -> int:
             case_meta = cache_meta["case"]
             status = (case_meta.get("separation", {}) or {}).get(
                 "status_counts", {})
+            recorded = (
+                (case_meta.get("source") or {})
+                .get("standard_data_digest", {})
+            )
             row.update({
                 "cache_exists": True,
+                "cache_standard_digest": recorded.get("sha256"),
+                "cache_digest_matches": bool(
+                    row.get("standard_digest")
+                    and recorded.get("sha256") == row.get("standard_digest")
+                    and recorded.get("algorithm")
+                    == row.get("standard_digest_algorithm")
+                ),
                 "cache_bytes": cache.stat().st_size,
                 "cache_frames": contact_frames,
                 "contact_valid_frames": contact_valid,

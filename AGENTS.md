@@ -48,6 +48,10 @@
 ## 一维数据与几何契约
 
 - 标准中间格式 `spherical_blast_pinn.standard_1d_source`（`.npz` 或目录）。
+- 缓存必须记录生成时标准文件的 `standard_data_digest`
+  （`sha256(npz member name|crc32|size)`，读 ZIP 目录，不重读数组）。复用
+  缓存、`--cache-only`、审计都必须核对它；标准被重建时对应缓存必须重建。
+  没有该指纹的旧缓存不得当作 current。
 - LS-DYNA 导入必须保留全部原始输出帧：`frame_selection_policy="all_frames"`，
   `raw_frame_count == imported_frame_count`，`dropped_frame_count=0`，并记录
   完整 `raw_frame_keys`、首末时间和 `raw_input_fingerprint`。旧的
@@ -145,7 +149,8 @@
   不一致、缓存 raw_times/帧数不一致、逐值 mismatch）必须返回非零退出码；
   KB/Henrych 和 JWL 局部差异只记录，不作为失败。全帧验收用
   `--stage all --import-sample-frames 0`。`prepare_fullframe_data.py` 在跳过
-  现有标准/缓存前会核对全帧键、frame_times、缓存 raw_times 和原始输入指纹。
+  现有标准/缓存前会核对全帧键、frame_times、缓存 raw_times、原始输入指纹和
+  缓存记录的标准数据指纹；本次重建了标准就强制重建缓存。
 - `predict/evaluate --case ...`；预测只读 metadata 与 shock 轨迹，评估才读参考
   内部场。500 mm 与其他半径同一接口。
 - 空气质量数据先抽帧再抽帧内点；右边界只在 `D_s > c_inf` 时刻采样。

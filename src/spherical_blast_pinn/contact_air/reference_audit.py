@@ -18,6 +18,7 @@ from .blast_reference import (
     HENRYCH_SOURCE, HENRYCH_STATUS, KB_REASON, KB_STATUS,
     ReferenceRangeError, charge_mass_kg, henrych_reference, scaled_distance,
 )
+from .one_d import standard_source_digest
 
 
 class AuditError(RuntimeError):
@@ -146,11 +147,13 @@ def case_manifest(case: dict, root: Path, units: dict, ambient: dict,
     standard_meta = {}
     selected = []
     source = {}
+    standard_digest = None
     if standard.is_file():
         with np.load(standard, allow_pickle=True) as archive:
             standard_meta = json.loads(str(archive["metadata"].item()))
         source = standard_meta.get("source", {})
         selected = list(source.get("selected_raw_frame_keys", []))
+        standard_digest = standard_source_digest(standard)
     mass = charge_mass_kg(float(case["radius_m"]), float(charge["density_kg_m3"]))
     sample_files = [
         _profile_path(raw_dir, pressure_pattern, keys[0]),
@@ -206,6 +209,7 @@ def case_manifest(case: dict, root: Path, units: dict, ambient: dict,
             "time_mismatch_count": len(time_mismatches),
             "time_mismatch_examples": time_mismatches[:5],
             "input_fingerprint": source.get("raw_input_fingerprint"),
+            "data_digest": standard_digest,
             "time_source": source.get("time_source"),
             "selected_keys": imported_keys,
         })
@@ -249,6 +253,16 @@ def case_manifest(case: dict, root: Path, units: dict, ambient: dict,
             cache_contact.size == standard_times.size
             and cache_shock.size == standard_times.size
         )
+        recorded_digest = (
+            ((cache_meta.get("case") or {}).get("source") or {})
+            .get("standard_data_digest")
+        )
+        digest_match = bool(
+            standard_digest is not None
+            and isinstance(recorded_digest, dict)
+            and recorded_digest.get("algorithm") == standard_digest["algorithm"]
+            and recorded_digest.get("sha256") == standard_digest["sha256"]
+        )
         cache_info.update({
             "file_identity": file_identity(cache),
             "frame_count": int(cache_contact.size),
@@ -256,6 +270,9 @@ def case_manifest(case: dict, root: Path, units: dict, ambient: dict,
             "raw_times_count": int(cache_raw_times.size),
             "raw_times_match_standard": bool(raw_time_match),
             "frame_counts_match_standard": bool(frame_count_match),
+            "standard_data_digest": recorded_digest,
+            "expected_standard_data_digest": standard_digest,
+            "standard_digest_matches": digest_match,
             "case_t0_s": cache_meta.get("case", {}).get("t0"),
             "case_t_end_s": cache_meta.get("case", {}).get("t_end"),
         })
@@ -263,6 +280,18 @@ def case_manifest(case: dict, root: Path, units: dict, ambient: dict,
             integrity.append("cache raw_times do not match standard frame_times")
         if not frame_count_match:
             integrity.append("cache contact/shock frame counts do not match standard")
+        if standard_digest is not None:
+            if not isinstance(recorded_digest, dict):
+                if require_all_frames:
+                    integrity.append(
+                        "cache has no standard data fingerprint; it cannot be "
+                        "proven to belong to the current standard"
+                    )
+            elif not digest_match:
+                integrity.append(
+                    "cache standard fingerprint does not match the current "
+                    "standard (cache was built from different data)"
+                )
     else:
         integrity.append("cache is missing")
     return {

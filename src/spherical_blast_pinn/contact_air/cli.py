@@ -61,7 +61,12 @@ from .data import (
 from .geometry import GeometryError
 from .losses import LossError, data_coordinates, masked_rmse
 from .models import AirNet, ContactNet
-from .one_d import OneDDataError, ShockDetectionConfig, read_standard_1d
+from .one_d import (
+    OneDDataError,
+    ShockDetectionConfig,
+    standard_source_digest,
+    read_standard_1d,
+)
 from .precursor import PrecursorConfig, PrecursorError, compute_precursor
 from .sampling import SamplingError
 from .trainer import (
@@ -567,7 +572,14 @@ def command_build_cache(args) -> int:
         tolerances=dict(section.get("tolerances", {})),
         contact_config=_contact_config(section),
         shock_config=_shock_config(section),
-        source_meta={"case_id": args.case, "source_path": str(args.source)},
+        source_meta={
+            "case_id": args.case,
+            "source_path": str(args.source),
+            # Recorded at build time so a later process can prove that this
+            # cache belongs to this standard, not merely to frame times that
+            # happen to have the same length.
+            "standard_data_digest": standard_source_digest(args.source),
+        },
     )
     save_case(case, args.out)
     print(json.dumps(case.as_dict(), indent=2, default=_jsonable))

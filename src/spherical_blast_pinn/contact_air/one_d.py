@@ -19,8 +19,10 @@ marked ``synthetic`` and are never TNT validation data.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -31,6 +33,70 @@ from scipy.signal import find_peaks
 STANDARD_FORMAT = "spherical_blast_pinn.standard_1d_source"
 STANDARD_VERSION = 1
 READER_VERSION = "one_d.standard/1"
+
+
+def npz_content_digest(path: Path | str) -> dict[str, Any]:
+    """Fingerprint every stored member of an ``.npz`` archive.
+
+    An ``.npz`` file is a ZIP archive and the central directory records the
+    CRC-32 and size of every member (``metadata``, ``frame_offsets`` and each
+    per-cell array).  Hashing those entries is O(directory) rather than
+    O(bytes), so a multi-gigabyte standard can be checked in milliseconds.
+    Any edited member changes its recorded CRC-32 (barring a 32-bit CRC
+    collision), so stale arrays are detected without re-reading gigabytes.
+    The digest is only for provenance ("was this cache built from this
+    standard?"); it is not a substitute for re-reading and comparing arrays.
+    """
+    path = Path(path)
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = sorted(
+                (info.filename, int(info.CRC), int(info.file_size))
+                for info in archive.infolist()
+            )
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise OneDDataError(f"{path}: cannot read npz members: {exc}") from exc
+    hasher = hashlib.sha256()
+    for name, crc, size in members:
+        hasher.update(f"{name}\t{crc:08x}\t{size}\n".encode("utf-8"))
+    return {
+        "algorithm": "sha256(npz member name|crc32|size)",
+        "sha256": hasher.hexdigest(),
+        "members": len(members),
+        "uncompressed_bytes": int(sum(size for _, _, size in members)),
+    }
+
+
+def standard_source_digest(path: Path | str) -> dict[str, Any]:
+    """Fingerprint a standard source in either supported layout.
+
+    A ``.npz`` source uses the member directory digest above.  A directory
+    source (``metadata.json`` + ``data.npz``) folds the small metadata file and
+    the ``data.npz`` digest into one value.  Callers compare the returned
+    ``algorithm`` and ``sha256``; the other fields are diagnostics.
+    """
+    path = Path(path)
+    if not path.is_dir():
+        return npz_content_digest(path)
+    metadata_path = path / "metadata.json"
+    data_path = path / "data.npz"
+    if not metadata_path.is_file() or not data_path.is_file():
+        raise OneDDataError(
+            f"{path}: a directory source needs metadata.json and data.npz"
+        )
+    data_digest = npz_content_digest(data_path)
+    hasher = hashlib.sha256()
+    hasher.update(metadata_path.read_bytes())
+    hasher.update(b"\0")
+    hasher.update(str(data_digest["sha256"]).encode("ascii"))
+    return {
+        "algorithm": "sha256(metadata.json|sha256(npz member name|crc32|size))",
+        "sha256": hasher.hexdigest(),
+        "members": data_digest["members"],
+        "uncompressed_bytes": int(data_digest["uncompressed_bytes"])
+        + int(metadata_path.stat().st_size),
+    }
+
 
 #: Multipliers to SI.  Unit names are normalised (lower-case, ``µ`` -> ``u``).
 _LENGTH = {"m": 1.0, "meter": 1.0, "metre": 1.0, "mm": 1.0e-3, "cm": 1.0e-2}

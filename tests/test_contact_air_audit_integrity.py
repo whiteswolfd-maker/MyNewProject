@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 import yaml
 
-from spherical_blast_pinn.contact_air.one_d import write_standard_1d
+from spherical_blast_pinn.contact_air.one_d import (
+    npz_content_digest,
+    write_standard_1d,
+)
 from spherical_blast_pinn.contact_air.reference_audit import case_manifest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -128,6 +132,45 @@ def test_manifest_detects_stale_frame_times_and_metadata_counts(tmp_path):
     )
     assert manifest["standard"]["metadata_count_matches_disk"] is False
     assert manifest["standard"]["imported_equals_raw"] is False
+
+
+def test_manifest_rejects_a_cache_built_from_a_different_standard(tmp_path):
+    times = [1.0e-6, 2.0e-6, 3.0e-6]
+    times_text = ["1.00E-06", "2.00E-06", "3.00E-06"]
+    _raw_run(tmp_path / "raw", times_text)
+    standard = tmp_path / "standard.npz"
+    _standard(standard, times)
+    digest = npz_content_digest(standard)
+    values = np.asarray(times, dtype=np.float64)
+    np.savez(
+        tmp_path / "cache.npz",
+        metadata=np.asarray(json.dumps({
+            "format": "spherical_blast_pinn.contact_air_case",
+            "version": 7,
+            "case": {"case_id": "fixture", "source": {
+                "case_id": "fixture",
+                "standard_data_digest": digest,
+            }},
+        })),
+        raw_times=values, contact_times=values, shock_times=values,
+    )
+    manifest = case_manifest(
+        _manifest_case(tmp_path), tmp_path, UNITS, AMBIENT, CHARGE,
+        require_all_frames=True,
+    )
+    assert manifest["cache"]["standard_digest_matches"] is True
+    assert not any("fingerprint" in item
+                   for item in manifest["integrity_failures"])
+
+    # Same frame times, changed pressure: the standard is a different data set.
+    _standard(standard, times, pressure_scale=1.1)
+    manifest = case_manifest(
+        _manifest_case(tmp_path), tmp_path, UNITS, AMBIENT, CHARGE,
+        require_all_frames=True,
+    )
+    assert manifest["cache"]["standard_digest_matches"] is False
+    assert any("fingerprint does not match the current standard" in item
+               for item in manifest["integrity_failures"])
 
 
 def test_audit_exit_code_is_nonzero_for_a_value_mismatch(tmp_path):

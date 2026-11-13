@@ -158,6 +158,14 @@ PYTHONPATH=src python scripts/summarize_fullframe_data.py       # frame inventor
 输出在 `outputs/fullframes/standard/` 与 `outputs/fullframes/cache/`，不会覆盖
 旧的 `outputs/contact_air_r*/` 或 `outputs/contact_air_split_*`。
 
+缓存复用不只看帧数和时间。`build-cache` 在缓存 metadata 的
+`case.source.standard_data_digest` 中记录生成时标准文件的内容指纹
+（`sha256(npz member name|crc32|size)`：读取 `.npz` ZIP 目录，不重读几十 GB
+数组；任一数组或 metadata 改变都会改变指纹）。`prepare_fullframe_data.py`
+在使用已有缓存前核对该指纹，并且**只要本次运行重建了标准文件，就强制重建
+对应缓存**；`--cache-only` 和审计也做同一检查。没有指纹的旧缓存视为
+`rebuild: cache has no standard data fingerprint`，不会被当作 current。
+
 ## 3. 接触区间、激波与事件对齐
 
 ### 接触区间
@@ -367,9 +375,11 @@ PYTHONPATH=src python scripts/audit_reference_data.py \
 `reference_audit_fullframes.yaml` 设置了 `require_all_frames: true`，因此默认也
 会逐帧比较；显式传 `0` 仍建议保留。审计在以下导入完整性问题时返回**非零
 退出码**：漏帧/多余帧、原始键或时间数组不一致、缓存 raw_times 或帧数不匹配、
-逐值比较 `mismatch`/`non_finite`/`size_mismatch`。KB/Henrych 偏差、JWL 与局部
-压力差异只记录，不作为失败条件。manifest 对标准/缓存只记录文件大小和 mtime，
-不再对每例几十 GB 文件重复做 SHA-256。
+缓存标准数据指纹缺失（全帧模式）或与当前标准不匹配、逐值比较
+`mismatch`/`non_finite`/`size_mismatch`。KB/Henrych 偏差、JWL 与局部压力差异
+只记录，不作为失败条件。manifest 对标准/缓存只记录文件大小和 mtime，标准
+内容指纹用 `.npz` 成员 CRC 目录计算，不对每例几十 GB 文件重复做整文件
+SHA-256。
 
 审计只写 `outputs/reference_audit/` 或
 `outputs/reference_audit_fullframes/`（manifest、CSV、JSON、图和 `report.md`），
