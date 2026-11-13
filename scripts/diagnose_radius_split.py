@@ -31,7 +31,7 @@ FIELD_ATTR = {
 
 def _load_prediction(path: Path) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=False) as archive:
-        return {
+        payload = {
             "times": np.asarray(archive["times"], dtype=np.float64),
             "zeta": np.asarray(archive["zeta"], dtype=np.float64),
             "density": np.asarray(archive["density"], dtype=np.float64),
@@ -40,6 +40,13 @@ def _load_prediction(path: Path) -> dict[str, np.ndarray]:
             "contact_radius": np.asarray(archive["contact_radius"], dtype=np.float64),
             "shock_radius": np.asarray(archive["shock_radius"], dtype=np.float64),
         }
+        if "checkpoint_loop" in archive.files:
+            payload["checkpoint_loop"] = int(
+                np.asarray(archive["checkpoint_loop"]).reshape(-1)[0]
+            )
+        else:
+            payload["checkpoint_loop"] = -1
+        return payload
 
 
 def _interpolator(prediction: dict[str, np.ndarray], name: str):

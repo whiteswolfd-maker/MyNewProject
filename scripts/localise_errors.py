@@ -181,48 +181,85 @@ def _plot_density(case, prediction_a, prediction_b, out_png: Path) -> None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    times = prediction_a["times"]
-    zetas = prediction_a["zeta"]
-    targets = [0.25, 0.50, 0.75, 0.98]
-    fractions = np.linspace(times[0], times[-1], len(times))
-    fig, axes = plt.subplots(2, 2, figsize=(10.0, 7.0))
     obs = case.observations
-    unique_times = np.unique(obs.time)
+    times_a = prediction_a["times"]
+    times_b = prediction_b["times"]
+    t_min = max(float(times_a[0]), float(times_b[0]))
+    t_max = min(float(times_a[-1]), float(times_b[-1]))
+    zetas = prediction_a["zeta"]
+    if zetas.shape != prediction_b["zeta"].shape or not np.allclose(
+        zetas, prediction_b["zeta"]
+    ):
+        raise RuntimeError("prediction zeta grids differ; cannot compare profiles")
 
+    valid_density = np.asarray(obs.valid_density, bool) & np.isfinite(obs.density)
+    frame_times, counts = np.unique(obs.time[valid_density], return_counts=True)
+    usable = (frame_times >= t_min) & (frame_times <= t_max) & (counts >= 8)
+    frame_times = frame_times[usable]
+
+    fractions = (0.05, 0.10, 0.20, 0.25, 0.50, 0.75, 0.95, 0.98)
+    fig, axes = plt.subplots(2, 4, figsize=(15.0, 6.8))
     baseline_color = "#1f77b4"
     extended_color = "#d95f02"
-    for ax, fraction in zip(axes.ravel(), targets):
-        target_t = times[0] + fraction * (times[-1] - times[0])
-        index = int(np.argmin(np.abs(times - target_t)))
-        rc_a = prediction_a["contact_radius"][index, 0]
-        rs_a = prediction_a["shock_radius"][index, 0]
-        rc_b = prediction_b["contact_radius"][index, 0]
-        rs_b = prediction_b["shock_radius"][index, 0]
-        radius_a = rc_a + zetas * (rs_a - rc_a)
-        radius_b = rc_b + zetas * (rs_b - rc_b)
-        ax.plot(radius_a, prediction_a["density"][index], color=baseline_color,
-                linewidth=2.0, label="2000 loops")
-        ax.plot(radius_b, prediction_b["density"][index], color=extended_color,
-                linewidth=2.0, label="4000 loops")
-        frame_time = unique_times[int(np.argmin(np.abs(unique_times - times[index])))]
-        frame = obs.time == frame_time
-        use = frame & np.asarray(obs.valid_density, bool) & np.isfinite(obs.density)
+    loop_a = prediction_a.get("checkpoint_loop", -1)
+    loop_b = prediction_b.get("checkpoint_loop", -1)
+    label_a = f"{loop_a} loops" if loop_a and loop_a > 0 else "checkpoint A"
+    label_b = f"{loop_b} loops" if loop_b and loop_b > 0 else "checkpoint B"
+    alignment = case.event_alignment
+    t0 = float(alignment["t0_model_s"])
+    t_event_raw = float(alignment["event_time_raw_s"])
+
+    def at_time(prediction, value: float):
+        times = prediction["times"]
+        upper = int(np.clip(np.searchsorted(times, value) - 1, 0, times.size - 2))
+        weight = (value - times[upper]) / (times[upper + 1] - times[upper])
+        density = (
+            (1.0 - weight) * prediction["density"][upper]
+            + weight * prediction["density"][upper + 1]
+        )
+        rc = float(np.interp(value, times, prediction["contact_radius"][:, 0]))
+        return density, rc
+
+    for ax, fraction in zip(axes.ravel(), fractions):
+        target = t_min + fraction * (t_max - t_min)
+        if frame_times.size:
+            frame_time = float(frame_times[int(np.argmin(np.abs(frame_times - target)))])
+        else:  # pragma: no cover - every case has dense early frames
+            frame_time = target
+        density_a, rc_a = at_time(prediction_a, frame_time)
+        density_b, rc_b = at_time(prediction_b, frame_time)
+        rs = float(np.asarray(case.shock.position(np.array([frame_time])))[0])
+        radius_a = rc_a + zetas * (rs - rc_a)
+        radius_b = rc_b + zetas * (rs - rc_b)
+        ax.plot(radius_a, density_a, color=baseline_color, linewidth=2.0,
+                label=label_a)
+        ax.plot(radius_b, density_b, color=extended_color, linewidth=2.0,
+                label=label_b)
+        use = (obs.time == frame_time) & valid_density
         if np.any(use):
             ax.scatter(obs.radius[use], obs.density[use], s=4, color="#777777",
                        alpha=0.45, linewidth=0, label="reference frame")
-        ax.set_title(f"t_model = {times[index] * 1e6:.1f} µs", fontsize=9)
-        ax.set_xlabel("radius (m)")
-        ax.set_ylabel("density (kg/m³)")
+        raw_time = (frame_time - t0 + t_event_raw) * 1e6
+        ax.set_title(
+            f"t_model={frame_time * 1e6:.1f} µs (raw {raw_time:.1f} µs)",
+            fontsize=8.5,
+        )
+        ax.set_xlabel("radius (m)", fontsize=9)
+        ax.set_ylabel("density (kg/m³)", fontsize=9)
+        ax.tick_params(labelsize=8)
         ax.grid(True, color="#e6e6e6", linewidth=0.7)
         ax.set_axisbelow(True)
         for side in ("top", "right"):
             ax.spines[side].set_visible(False)
     handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False, fontsize=9,
-               bbox_to_anchor=(0.5, -0.01))
-    fig.suptitle(f"{case.case_id}: density profiles ({case.charge_radius_m*1e3:.0f} mm charge)",
-                 fontsize=11)
-    fig.tight_layout(rect=(0, 0.05, 1, 0.95))
+               bbox_to_anchor=(0.5, -0.005))
+    fig.suptitle(
+        f"{case.case_id}: density profiles at the same model time for both "
+        f"checkpoints ({case.charge_radius_m*1e3:.0f} mm charge)",
+        fontsize=11,
+    )
+    fig.tight_layout(rect=(0, 0.04, 1, 0.95))
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=150)
     plt.close(fig)

@@ -15,6 +15,7 @@ from spherical_blast_pinn.contact_air.trainer import (
     AlternatingTrainer,
     TrainConfig,
     TrainingError,
+    seed_everything,
 )
 
 
@@ -374,7 +375,12 @@ def test_pde_parts_include_normalised_components(tmp_path):
 
 
 def test_logging_does_not_consume_sampling_randomness(tmp_path):
+    # Seed before each network is constructed, so the two trainers start from
+    # identical initial weights.  Seeding only inside the trainer is too late
+    # for the parameter initialisation.
+    seed_everything(11)
     logged = _trainer(tmp_path / "logged", log_every=1)
+    seed_everything(11)
     quiet = _trainer(tmp_path / "quiet", log_every=0)
     first = logged.train(loops=2)["history"]["loops"]
     second = quiet.train(loops=2)["history"]["loops"]
