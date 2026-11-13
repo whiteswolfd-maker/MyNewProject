@@ -152,13 +152,34 @@ def _strictly_increasing(values: np.ndarray, *, what: str) -> None:
 
 def _select_keys(
     keys: Sequence[str], *, dense_until_s: float, frame_stride: int,
+    event_time_s: float | None = None,
+    event_window_s: float = 5.0e-5,
 ) -> list[str]:
     if frame_stride < 1:
         raise OneDDataError("frame_stride must be >= 1")
+    if event_window_s < 0.0:
+        raise OneDDataError("event_window_s must be non-negative")
     ordered = sorted(keys, key=float)
     dense = [key for key in ordered if float(key) <= float(dense_until_s)]
     sparse = [key for key in ordered if float(key) > float(dense_until_s)]
     selected = list(dense) + list(sparse[:: int(frame_stride)])
+    if event_time_s is not None:
+        # A stride coarser than the event window can delete the only frame at
+        # or after t_sep, even though the raw output contains it.  Keep every
+        # frame inside the window and one neighbour on each side, regardless
+        # of the stride; the rest of the timeline is downsampled as requested.
+        t_event = float(event_time_s)
+        low = t_event - float(event_window_s)
+        high = t_event + float(event_window_s)
+        inside = [key for key in ordered if low <= float(key) <= high]
+        before = [key for key in ordered if float(key) < low]
+        after = [key for key in ordered if float(key) > high]
+        keep = set(inside)
+        if before:
+            keep.add(before[-1])
+        if after:
+            keep.add(after[0])
+        selected = sorted(set(selected) | keep, key=float)
     # The sparse slice can leave the final frame out; keep it only when the
     # requested stride lands on it.  Selection is recorded, not guessed.
     return selected
@@ -290,6 +311,8 @@ def convert(
     dense_until_s: float, frame_stride: int, allow_moving_mesh: bool = False,
     expected_cells: int | None = None,
     expected_outer_radius_m: float | None = None,
+    event_time_s: float | None = None,
+    event_window_s: float = 5.0e-5,
 ) -> dict[str, Any]:
     source_dir = Path(source_dir)
     include_alpha_air = alpha_air_pattern is not None
@@ -316,6 +339,7 @@ def convert(
     selected = _select_keys(
         sorted(reference, key=float),
         dense_until_s=dense_until_s, frame_stride=frame_stride,
+        event_time_s=event_time_s, event_window_s=event_window_s,
     )
     if len(selected) < 2:
         raise OneDDataError("fewer than two frames selected")
@@ -443,6 +467,9 @@ def convert(
         "selected_raw_frame_keys": selected,
         "dense_until_s": float(dense_until_s),
         "frame_stride_after_dense": int(frame_stride),
+        "event_time_s": None if event_time_s is None else float(event_time_s),
+        "event_window_s": float(event_window_s),
+        "event_window_frames_preserved": event_time_s is not None,
         "cell_count": int(frames[0]["radius"].size),
         "expected_cells": expected_cells,
         "expected_outer_radius_m": expected_outer_radius_m,
@@ -506,12 +533,29 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
-        "--dense-until-s", type=float, default=2.5e-5,
-        help="keep every profile frame up to this raw time (event alignment)",
+        "--dense-until-s", type=float, default=5.0e-4,
+        help=(
+            "keep every profile frame up to this raw time.  The default covers "
+            "the t_sep of the largest available case (R1000: 370.6 us) with "
+            "margin; a smaller value plus a coarse stride can delete every "
+            "frame at or after t_sep"
+        ),
     )
     parser.add_argument(
         "--frame-stride", type=int, default=10,
         help="after --dense-until-s keep every Nth frame",
+    )
+    parser.add_argument(
+        "--event-time-s", type=float, default=None,
+        help=(
+            "optional theoretical t_sep.  Every raw frame inside "
+            "[t_sep-window, t_sep+window] plus one neighbour on each side is "
+            "kept regardless of the stride"
+        ),
+    )
+    parser.add_argument(
+        "--event-window-s", type=float, default=5.0e-5,
+        help="half-width of the event window used with --event-time-s",
     )
     parser.add_argument(
         "--allow-moving-mesh", action="store_true",
@@ -546,6 +590,8 @@ def main(argv: list[str] | None = None) -> int:
             allow_moving_mesh=bool(args.allow_moving_mesh),
             expected_cells=args.expected_cells,
             expected_outer_radius_m=args.expected_outer_radius_m,
+            event_time_s=args.event_time_s,
+            event_window_s=float(args.event_window_s),
         )
     except OneDDataError as exc:
         print(f"error: {exc}", file=sys.stderr)

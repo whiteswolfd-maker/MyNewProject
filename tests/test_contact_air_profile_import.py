@@ -224,3 +224,36 @@ def test_mismatched_profile_time_sets_are_refused(tmp_path):
     (source / "profile5_volume_fraction_x_time3.00E-06.xy").unlink()
     with pytest.raises(OneDDataError, match="do not match pressure"):
         _convert(source, tmp_path / "bad.npz")
+
+
+def test_event_window_frames_survive_a_coarse_stride():
+    # R1000-like cadence: one profile frame every 20 us.  With a 25 us dense
+    # part and stride 10, the plain selection keeps 25, 225, 425 us, so every
+    # frame at or after t_sep=370.63 us inside a 50 us window is lost.
+    times_us = list(range(0, 1001, 20))
+    keys = [f"{t * 1.0e-6:.2E}" for t in times_us]
+
+    plain = [
+        float(key) for key in importer._select_keys(
+            keys, dense_until_s=2.5e-5, frame_stride=10,
+        )
+    ]
+    assert 3.80e-4 not in plain
+    assert 4.00e-4 not in plain
+    assert 4.20e-4 not in plain
+
+    protected = [
+        float(key) for key in importer._select_keys(
+            keys, dense_until_s=2.5e-5, frame_stride=10,
+            event_time_s=3.7063e-4, event_window_s=5.0e-5,
+        )
+    ]
+    def kept(t_us: float) -> bool:
+        return any(abs(value - t_us * 1.0e-6) <= 1.0e-12 for value in protected)
+
+    # Every frame inside [320.63, 420.63] us is kept ...
+    for t_us in (340, 360, 380, 400, 420):
+        assert kept(t_us)
+    # ... together with one neighbour on each side.
+    assert kept(320)
+    assert kept(440)

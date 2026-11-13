@@ -112,6 +112,9 @@
 
 - `train --cases all` 或显式 `case_id` 集合；只选配置中 `role: train` 的算例。
   无固定 50/80/100；`role: test` 不得进入训练。
+- 配置中整例 `role: validation` 的算例参与验证评分与 `best.pt` 选择，不进入
+  训练采样；不能与训练算例重复 `case_id`。`validation.holdout_fraction: 0`
+  表示训练算例全部帧可用，验证完全由该半径带提供。
 - `build-cache --source <标准一维文件或目录> --case ... --radius ... --role ... --out ...`。
 - `predict/evaluate --case ...`；预测只读 metadata 与 shock 轨迹，评估才读参考
   内部场。500 mm 与其他半径同一接口。

@@ -64,7 +64,12 @@ from .models import AirNet, ContactNet
 from .one_d import OneDDataError, ShockDetectionConfig, read_standard_1d
 from .precursor import PrecursorConfig, PrecursorError, compute_precursor
 from .sampling import SamplingError
-from .trainer import AlternatingTrainer, TrainConfig, TrainingError
+from .trainer import (
+    AlternatingTrainer,
+    TrainConfig,
+    TrainingError,
+    seed_everything,
+)
 
 
 class CommandError(RuntimeError):
@@ -563,6 +568,21 @@ def command_train(args) -> int:
     specs = _select_specs(section, args.cases)
     cases = [_make_case(section, spec, config, allow_synthetic=not args.no_synthetic)
              for spec in specs]
+    # Explicit role: validation cases are scored every validate_every loops and
+    # can select best.pt, but they are never sampled for training.
+    validation_specs = [
+        spec for spec in _case_specs(section)
+        if str(spec.get("role", "train")) == "validation"
+    ]
+    validation_cases = [
+        _make_case(section, spec, config, allow_synthetic=not args.no_synthetic)
+        for spec in validation_specs
+    ]
+    # Seed before constructing the networks: torch's default generator draws
+    # the initial weights, so seeding only inside the trainer would leave the
+    # initial parameters different between otherwise identical runs.
+    seed = int(section.get("training", {}).get("seed", 0))
+    seed_everything(seed)
     contact, air = _networks(section)
     train_config = _train_config(section, args.max_loops)
     output_dir = Path(args.output_dir) if args.output_dir else _resolve(
@@ -571,10 +591,21 @@ def command_train(args) -> int:
     trainer = AlternatingTrainer(
         cases=cases, contact_net=contact, air_net=air,
         config=train_config, output_dir=output_dir,
+        external_validation_cases=validation_cases,
     )
     if args.resume:
         info = trainer.load(args.resume)
         print(f"resumed from {args.resume} at loop {info['loop']}")
+    if args.learning_rate is not None:
+        rate = float(args.learning_rate)
+        if rate <= 0.0:
+            raise CommandError("--learning-rate must be positive")
+        # Applied after a resume because load() restores the Adam state,
+        # including the learning rate stored in it.
+        for optimizer in (trainer.opt_contact, trainer.opt_air):
+            for group in optimizer.param_groups:
+                group["lr"] = rate
+        print(f"learning rate overridden to {rate:.3e} for both optimizers")
     result = trainer.train()
     _write_json(output_dir / "train_result.json", result)
     print(json.dumps({
@@ -848,6 +879,14 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--max-loops", type=int, default=None)
     train.add_argument("--output-dir", default=None)
     train.add_argument("--resume", default=None)
+    train.add_argument(
+        "--learning-rate", type=float, default=None,
+        help=(
+            "override the configured learning rate for both optimizers.  "
+            "Applied after --resume restores the Adam state, which otherwise "
+            "brings back the old learning rate"
+        ),
+    )
     train.add_argument("--no-synthetic", action="store_true")
     pred = sub.add_parser("predict")
     pred.add_argument("--config", required=True)

@@ -122,8 +122,13 @@ t/mm³，速度 m/s、mm/us、km/s、cm/us，压力 Pa/kPa/MPa/GPa/bar/kbar。
   `*DATABASE_PROFILE` 写入的精确时刻。导入器把文件名时间写入 `frame_times`，
   并在 `source["time_source"] = "profile_filename_3sigfig"` 记录这一限制；
   不得把它宣称为精确求解器时刻；
-- 默认保留 `--dense-until-s` 之前的全部帧（事件对齐用），之后每
-  `--frame-stride` 帧取一帧；实际保留的原始文件键写入 source。
+- 默认保留 `--dense-until-s` 之前的全部帧（当前默认 500 µs，覆盖 R1000 的
+  `t_sep=370.6 µs`），之后每 `--frame-stride` 帧取一帧；实际保留的原始文件
+  键写入 source。
+- 缩放算例的原始输出间隔是 `T/1000`（R200 为 4 µs、R1000 为 20 µs），
+  粗 stride 可能把 `t_sep` 之后唯一的帧删掉。显式传 `--event-time-s`
+  （理论 `t_sep`）时，窗口 `[t_sep-50 µs, t_sep+50 µs]` 内的全部帧以及
+  两侧各一个邻近帧无论如何都会保留，其余时段仍按 stride 降采样。
 
 示例：
 
@@ -287,7 +292,11 @@ s_fE = s_E / T_star
 - 检查点保存两个网络、两个优化器、阶段状态、RNG、配置、数据身份、固定验证
   样本；恢复先核对再应用。
 - 训练/验证/测试由配置中的显式 `role` 决定；没有固定半径禁令。`role: test`
-  不能进入训练；验证按连续帧组留出。
+  不能进入训练。验证有两个来源：训练算例末尾的连续帧组
+  （`validation.holdout_fraction > 0`），以及配置中整例 `role: validation`
+  的算例（例如一条不重叠的半径带）。后者每 `validate_every` 步评分并可决定
+  `best.pt`，但绝不进入训练采样，且不能与训练算例共用 `case_id`。两者可同时
+  使用；要把验证完全交给半径带，就把 `holdout_fraction` 设为 0。
 
 ## 7. 命令
 

@@ -1,6 +1,11 @@
 """Alternating updates, gradient isolation, checkpoint and split roles."""
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import torch
 import pytest
 
@@ -13,7 +18,7 @@ from spherical_blast_pinn.contact_air.trainer import (
 )
 
 
-def _trainer(tmp_path, *, cases=None, holdout=0.3):
+def _trainer(tmp_path, *, cases=None, holdout=0.3, external=None):
     cases = cases or [
         synthetic_case_for(0.05, case_id="r050", n_frames=11, n_radial=1600),
         synthetic_case_for(0.08, case_id="r080", n_frames=11, n_radial=1600),
@@ -27,6 +32,7 @@ def _trainer(tmp_path, *, cases=None, holdout=0.3):
     return AlternatingTrainer(
         cases=cases, contact_net=ContactNet(width=8, depth=1),
         air_net=AirNet(width=8, depth=1), config=config, output_dir=tmp_path,
+        external_validation_cases=external or (),
     )
 
 
@@ -64,6 +70,39 @@ def test_role_test_cannot_enter_training_but_radius_alone_does_not_ban_it(tmp_pa
         holdout=0.0,
     )
     assert trainer.cases[0].charge_radius_m == pytest.approx(0.5)
+
+
+def test_external_validation_band_is_scored_and_never_trained(tmp_path):
+    train = [synthetic_case_for(0.05, case_id="r050", n_frames=11, n_radial=1600)]
+    external = synthetic_case_for(
+        0.55, case_id="r550", role="validation", n_frames=7, n_radial=1600
+    )
+    trainer = _trainer(tmp_path, cases=train, holdout=0.0, external=[external])
+    assert [case.case_id for case in trainer.cases] == ["r050"]
+    assert [case.case_id for case in trainer.validation_cases] == ["r550"]
+
+    verdict = trainer.evaluate()
+    assert verdict["evaluable"] is True
+    assert verdict["n_cases"] == 1
+    assert verdict["cases"][0]["case_id"] == "r550"
+
+
+def test_external_validation_requires_validation_role_and_disjoint_id(tmp_path):
+    train = [synthetic_case_for(0.05, case_id="r050", n_frames=11, n_radial=1600)]
+    with pytest.raises(TrainingError, match="role: validation"):
+        _trainer(
+            tmp_path, cases=train, holdout=0.0,
+            external=[synthetic_case_for(
+                0.55, case_id="r550", role="train", n_frames=7, n_radial=1600
+            )],
+        )
+    with pytest.raises(TrainingError, match="both"):
+        _trainer(
+            tmp_path, cases=train, holdout=0.0,
+            external=[synthetic_case_for(
+                0.05, case_id="r050", role="validation", n_frames=7, n_radial=1600
+            )],
+        )
 
 
 def test_checkpoint_round_trip_and_resume(tmp_path):
@@ -185,3 +224,47 @@ def test_multi_radius_uses_one_shared_pair_of_networks(tmp_path):
     trainer = _trainer(tmp_path)
     assert len(trainer.cases) == 2
     assert not hasattr(trainer, "models_by_case")
+
+
+_INIT_SCRIPT = """
+import hashlib
+from spherical_blast_pinn.contact_air.cli import _networks
+from spherical_blast_pinn.contact_air.trainer import seed_everything
+
+section = {
+    "networks": {
+        "dtype": "float64",
+        "contact": {"width": 8, "depth": 1},
+        "air": {"width": 8, "depth": 1},
+    },
+    "training": {"seed": 4242},
+}
+seed_everything(4242)
+contact, air = _networks(section)
+digest = hashlib.sha256()
+for parameter in list(contact.parameters()) + list(air.parameters()):
+    digest.update(parameter.detach().numpy().tobytes())
+print(digest.hexdigest())
+"""
+
+
+def test_seeded_initialisation_is_identical_across_independent_processes():
+    root = Path(__file__).resolve().parent.parent
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(root / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    digests = []
+    for _ in range(2):
+        completed = subprocess.run(
+            [sys.executable, "-c", _INIT_SCRIPT],
+            env=env, capture_output=True, text=True, check=True,
+        )
+        digests.append(completed.stdout.strip())
+    assert digests[0]
+    assert digests[0] == digests[1]
+
+
+def test_training_log_records_the_actual_learning_rate(tmp_path):
+    trainer = _trainer(tmp_path)
+    result = trainer.train(loops=1)
+    record = result["history"]["loops"][0]
+    assert record["learning_rate"] == pytest.approx(1.0e-3)

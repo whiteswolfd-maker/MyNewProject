@@ -142,6 +142,19 @@ class TrainConfig:
                 raise TrainingError(f"{name} must be non-negative")
 
 
+def seed_everything(seed: int) -> None:
+    """Seed every RNG used by network initialisation and sampling.
+
+    This must run **before** ContactNet/AirNet are constructed.  Seeding only
+    inside the trainer is too late: the initial weights are already drawn from
+    torch's default generator, so two processes with the same configured seed
+    can start from different parameters and make tuning comparisons noisy.
+    """
+    torch.manual_seed(int(seed))
+    np.random.seed(int(seed) % 2**32)
+    random.seed(int(seed))
+
+
 @dataclass
 class ValidationSample:
     case_id: str
@@ -171,6 +184,7 @@ class AlternatingTrainer:
         air_net: AirNet,
         config: TrainConfig,
         output_dir: Path | str,
+        external_validation_cases: Sequence[CaseData] = (),
     ) -> None:
         if not cases:
             raise TrainingError("at least one training case is required")
@@ -191,6 +205,24 @@ class AlternatingTrainer:
         ids = [case.case_id for case in cases]
         if len(set(ids)) != len(ids):
             raise TrainingError(f"duplicate case_id in training cases: {ids}")
+        external = list(external_validation_cases)
+        for case in external:
+            if case.role != "validation":
+                raise TrainingError(
+                    f"case {case.case_id!r} is role={case.role!r}; an external "
+                    "validation case must be configured with role: validation"
+                )
+        external_ids = [case.case_id for case in external]
+        if len(set(external_ids)) != len(external_ids):
+            raise TrainingError(
+                f"duplicate case_id in external validation cases: {external_ids}"
+            )
+        overlap = set(external_ids) & set(ids)
+        if overlap:
+            raise TrainingError(
+                "a case cannot be both training and external validation: "
+                f"{sorted(overlap)}"
+            )
         train_cases: list[CaseData] = []
         validation_cases: list[CaseData] = []
         fraction = float(config.validation_holdout_fraction)
@@ -224,6 +256,10 @@ class AlternatingTrainer:
                 )
         if not train_cases:
             raise TrainingError("the frame split left no training frames")
+        # External validation cases (for example a disjoint radius band) are
+        # used only for scoring and best-model selection.  They are never
+        # sampled for training and never share an id with a training case.
+        validation_cases.extend(external)
         self.cases = train_cases
         self.validation_cases = validation_cases
         self.contact_net = contact_net
@@ -238,21 +274,20 @@ class AlternatingTrainer:
             self.air_net.parameters(), lr=float(config.learning_rate)
         )
         self.generator = torch.Generator().manual_seed(int(config.seed))
-        torch.manual_seed(int(config.seed))
-        np.random.seed(int(config.seed) % 2**32)
-        random.seed(int(config.seed))
+        seed_everything(config.seed)
         self.loop = 0
         self.stage_state = "alternating"
         self.history = TrainingHistory()
         self._validation = self._build_validation()
         like = torch.zeros(1, 1, dtype=torch.float64)
+        scored_cases = list(self.cases) + list(self.validation_cases)
         self._closures = {
             case.case_id: closure_from_precursor(case.precursor, like=like)
-            for case in self.cases
+            for case in scored_cases
         }
         self._scales = {
             case.case_id: scales_from_precursor(case.precursor, like=like)
-            for case in self.cases
+            for case in scored_cases
         }
 
     # -- batches ---------------------------------------------------------
@@ -596,12 +631,18 @@ class AlternatingTrainer:
         records = []
         while self.loop < target:
             record = self.step()
+            # Record the optimizers' actual learning rate: it is not the config
+            # value after a resume unless --learning-rate overrides it.
+            record["learning_rate"] = float(
+                self.opt_contact.param_groups[0]["lr"]
+            )
             records.append(record)
             if self.config.log_every > 0 and self.loop % self.config.log_every == 0:
                 print(
                     f"loop {self.loop:5d}  air={record['air_loss']:.6e}  "
                     f"contact={record['contact_loss']:.6e}  "
-                    f"lambda_data={record['lambda_data']:.3f}"
+                    f"lambda_data={record['lambda_data']:.3f}  "
+                    f"lr={record['learning_rate']:.3e}"
                 )
             if self.config.validate_every > 0 and self.loop % self.config.validate_every == 0:
                 verdict = self.evaluate()
