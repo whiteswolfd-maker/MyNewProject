@@ -151,12 +151,16 @@ def describe_matches(saved: Mapping[str, Any] | None, current: Mapping[str, Any]
     """Compare checkpoint model metadata against the current network.
 
     Checkpoints written before the optional time-input scaling have no
-    ``time_reference_s`` key; for them the reference was the physical second,
-    so an absent key means 1.0.  A checkpoint that carries the key is compared
-    exactly, so a 0.01 checkpoint cannot resume a 1.0 network (or vice versa).
+    ``time_reference_s`` key inside an otherwise present description; for them
+    the reference was the physical second, so an absent key means 1.0.  A
+    checkpoint that carries the key is compared exactly, so a 0.01 checkpoint
+    cannot resume a 1.0 network (or vice versa).
+
+    A completely missing description block is not treated as legacy metadata:
+    it means the checkpoint cannot be verified at all, so it is rejected.
     """
     if saved is None:
-        return True
+        return False
     normalized = dict(saved)
     normalized.setdefault("time_reference_s", 1.0)
     return normalized == dict(current)
@@ -903,6 +907,14 @@ class AlternatingTrainer:
                     f"{path}: checkpoint {key}={saved!r} does not match the current "
                     f"{current!r}; the training/validation split or sampling changed"
                 )
+        saved_contact_weight = saved_config.get("contact_data_weight", 1.0)
+        if float(saved_contact_weight) != float(self.config.contact_data_weight):
+            raise TrainingError(
+                f"{path}: checkpoint contact_data_weight="
+                f"{saved_contact_weight!r} does not match the current "
+                f"{self.config.contact_data_weight!r}; pass the same "
+                "--contact-data-weight (or configure it) before resuming"
+            )
         # The time scale is a plain attribute, not a state_dict entry, so the
         # shape check alone cannot detect a 0.01 checkpoint resumed into a 1.0
         # network.  Check the model metadata before restoring anything.

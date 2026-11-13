@@ -1,0 +1,19 @@
+# Contact-interval supervision weight 3, saved explicitly.
+#
+# This inherits the radius split and every other training parameter unchanged:
+#   train R50-R500, validation R550-R1000, T_ref = 0.010 s,
+#   lr 1e-4, seed 20261110, 2048/512/512/512/512 sampling.
+#
+# The previous 2000-loop run lives in outputs/contact_air_split_r50_500_cw3.
+# This configuration is for the 4000-loop extension: resume from that run's
+# last.pt.  n_schedule stays 2000 (the value stored in the checkpoint), so the
+# lambda_data schedule is already at its 0.3 floor and the extension keeps the
+# final data/PDE balance.
+inherits: split_train_r50_500.yaml
+
+contact_air:
+  output_dir: outputs/contact_air_split_r50_500_cw3_4000
+
+  training:
+    contact_data_weight: 3.0
+    loops: 4000

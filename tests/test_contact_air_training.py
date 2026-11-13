@@ -326,3 +326,38 @@ def test_contact_data_weight_is_recorded_and_scales_only_the_interval_term(tmp_p
     assert result["history"]["loops"][0]["contact_data_weight"] == pytest.approx(3.0)
     with pytest.raises(TrainingError, match="contact_data_weight"):
         TrainConfig(contact_data_weight=-1.0)
+
+
+def test_resume_rejects_a_checkpoint_without_model_description(tmp_path):
+    trainer = _trainer(tmp_path, time_reference_s=1.0)
+    path = trainer.save(tmp_path / "no_describe.pt")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload.pop("contact_net_describe")
+    payload.pop("air_net_describe")
+    torch.save(payload, path)
+    same = _trainer(tmp_path / "same", time_reference_s=1.0)
+    with pytest.raises(TrainingError, match="model metadata"):
+        same.load(path)
+
+
+def test_resume_rejects_a_different_contact_data_weight(tmp_path):
+    trainer = _trainer(tmp_path, contact_data_weight=3.0)
+    path = trainer.save(tmp_path / "weight3.pt")
+    same = _trainer(tmp_path / "same", contact_data_weight=3.0)
+    assert same.load(path)["loop"] == 0
+    different = _trainer(tmp_path / "different", contact_data_weight=1.0)
+    with pytest.raises(TrainingError, match="contact_data_weight"):
+        different.load(path)
+
+
+def test_resume_treats_a_legacy_checkpoint_weight_as_one(tmp_path):
+    trainer = _trainer(tmp_path, contact_data_weight=1.0)
+    path = trainer.save(tmp_path / "legacy_weight.pt")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["config"].pop("contact_data_weight")
+    torch.save(payload, path)
+    plain = _trainer(tmp_path / "plain", contact_data_weight=1.0)
+    assert plain.load(path)["loop"] == 0
+    weighted = _trainer(tmp_path / "weighted", contact_data_weight=3.0)
+    with pytest.raises(TrainingError, match="contact_data_weight"):
+        weighted.load(path)

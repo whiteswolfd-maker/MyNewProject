@@ -87,4 +87,5 @@ def test_checkpoint_describe_treats_a_missing_time_reference_as_seconds():
     assert describe_matches(old_saved, current_scaled) is False
     assert describe_matches({"name": "ContactNet", "time_reference_s": 0.01},
                             current_scaled) is True
-    assert describe_matches(None, current_scaled) is True
+    # A missing description block cannot be verified, so it is not accepted.
+    assert describe_matches(None, current_scaled) is False
