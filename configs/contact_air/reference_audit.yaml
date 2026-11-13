@@ -1,0 +1,70 @@
+# Read-only audit of the original LS-DYNA output and the import chain.
+#
+# This file is independent of the training configs: it names raw directories,
+# units, ambient conditions, fixed measurement radii and empirical reference
+# sources.  The audit writes its own outputs and never changes caches,
+# checkpoints or training settings.
+audit:
+  version: 1
+  repo_root: "."
+  output_dir: outputs/reference_audit
+
+  units:
+    length: mm
+    time: s
+    density: tonne/mm^3
+    pressure: MPa
+    velocity: mm/s
+    to_si:
+      length: 1.0e-3
+      density: 1.0e+12
+      pressure: 1.0e+6
+      velocity: 1.0e-3
+
+  ambient:
+    pressure_mpa: 0.10132
+    density_kg_m3: 1.225
+    gamma: 1.4
+
+  charge:
+    density_kg_m3: 1630.0
+    # Uniform-sphere cross-check: W = 4/3 pi rho R^3.
+    mass_source: "uniform_sphere_from_material_card"
+
+  references:
+    henrych:
+      status: provisional
+      source: "Henrych (1979), The Dynamics of Explosion and Its Use; spherical free-air burst incident overpressure"
+      note: "coefficients commonly reproduced; not checked against a printed copy in this repository"
+    kingery_bulmash:
+      status: unavailable
+      reason: "verified coefficient tables are not present; not guessed or replaced"
+
+  # Fixed physical radii are chosen by scaled distance.  The recorded shock
+  # reaches Z approximately 1.32 at the end of every case (that is itself a
+  # similarity check), so the common measurable range is kept below it.
+  measurement_scaled_distances_m_kg13: [0.5, 0.75, 1.0]
+  # Audit these first; the rest are listed for later extension.
+  focus_cases: [r50_full, r500_full, r1000_full]
+
+  cases:
+    - {case_id: r50_full,   radius_m: 0.050, raw_dir: "G:/R50_R100_reference_v2/R50_full_alpha_profiles", deck: "R50_full_reference_alpha_profiles.k", standard: "outputs/contact_air_r50/standard_1d.npz",   cache: "outputs/contact_air_r50/cache.npz"}
+    - {case_id: r100_full,  radius_m: 0.100, raw_dir: "G:/R50_R100_reference_v2/R100", deck: "R100_full_reference_vf_fixed.k", standard: "outputs/contact_air_r100/standard_1d.npz",  cache: "outputs/contact_air_r100/cache.npz"}
+    - {case_id: r150_full,  radius_m: 0.150, raw_dir: "G:/R50_R100_reference_v2/R150", deck: "R150_full_reference.k", standard: "outputs/contact_air_r150/standard_1d.npz",  cache: "outputs/contact_air_r150/cache.npz"}
+    - {case_id: r200_full,  radius_m: 0.200, raw_dir: "G:/R50_R100_reference_v2/R200", deck: "R200_full_reference.k", standard: "outputs/contact_air_r200/standard_1d.npz",  cache: "outputs/contact_air_r200/cache.npz"}
+    - {case_id: r250_full,  radius_m: 0.250, raw_dir: "G:/R50_R100_reference_v2/R250", deck: "R250_full_reference.k", standard: "outputs/contact_air_r250/standard_1d.npz",  cache: "outputs/contact_air_r250/cache.npz"}
+    - {case_id: r300_full,  radius_m: 0.300, raw_dir: "G:/R50_R100_reference_v2/R300", deck: "R300_full_reference.k", standard: "outputs/contact_air_r300/standard_1d.npz",  cache: "outputs/contact_air_r300/cache.npz"}
+    - {case_id: r350_full,  radius_m: 0.350, raw_dir: "G:/R50_R100_reference_v2/R350", deck: "R350_full_reference.k", standard: "outputs/contact_air_r350/standard_1d.npz",  cache: "outputs/contact_air_r350/cache.npz"}
+    - {case_id: r400_full,  radius_m: 0.400, raw_dir: "G:/R50_R100_reference_v2/R400", deck: "R400_full_reference.k", standard: "outputs/contact_air_r400/standard_1d.npz",  cache: "outputs/contact_air_r400/cache.npz"}
+    - {case_id: r450_full,  radius_m: 0.450, raw_dir: "G:/R50_R100_reference_v2/R450", deck: "R450_full_reference.k", standard: "outputs/contact_air_r450/standard_1d.npz",  cache: "outputs/contact_air_r450/cache.npz"}
+    - {case_id: r500_full,  radius_m: 0.500, raw_dir: "G:/R50_R100_reference_v2/R500", deck: "R500_full_reference.k", standard: "outputs/contact_air_r500/standard_1d.npz",  cache: "outputs/contact_air_r500/cache.npz"}
+    - {case_id: r550_full,  radius_m: 0.550, raw_dir: "G:/R50_R100_reference_v2/R550", deck: "R550_full_reference.k", standard: "outputs/contact_air_r550/standard_1d.npz",  cache: "outputs/contact_air_r550/cache.npz"}
+    - {case_id: r600_full,  radius_m: 0.600, raw_dir: "G:/R50_R100_reference_v2/R600", deck: "R600_full_reference.k", standard: "outputs/contact_air_r600/standard_1d.npz",  cache: "outputs/contact_air_r600/cache.npz"}
+    - {case_id: r650_full,  radius_m: 0.650, raw_dir: "G:/R50_R100_reference_v2/R650", deck: "R650_full_reference.k", standard: "outputs/contact_air_r650/standard_1d.npz",  cache: "outputs/contact_air_r650/cache.npz"}
+    - {case_id: r700_full,  radius_m: 0.700, raw_dir: "D:/R700-1000/R700", deck: "R700_full_reference.k", standard: "outputs/contact_air_r700/standard_1d.npz",  cache: "outputs/contact_air_r700/cache.npz"}
+    - {case_id: r750_full,  radius_m: 0.750, raw_dir: "D:/R700-1000/R750", deck: "R750_full_reference.k", standard: "outputs/contact_air_r750/standard_1d.npz",  cache: "outputs/contact_air_r750/cache.npz"}
+    - {case_id: r800_full,  radius_m: 0.800, raw_dir: "D:/R700-1000/R800", deck: "R800_full_reference.k", standard: "outputs/contact_air_r800/standard_1d.npz",  cache: "outputs/contact_air_r800/cache.npz"}
+    - {case_id: r850_full,  radius_m: 0.850, raw_dir: "D:/R700-1000/R850", deck: "R850_full_reference.k", standard: "outputs/contact_air_r850/standard_1d.npz",  cache: "outputs/contact_air_r850/cache.npz"}
+    - {case_id: r900_full,  radius_m: 0.900, raw_dir: "D:/R700-1000/R900", deck: "R900_full_reference.k", standard: "outputs/contact_air_r900/standard_1d.npz",  cache: "outputs/contact_air_r900/cache.npz"}
+    - {case_id: r950_full,  radius_m: 0.950, raw_dir: "D:/R700-1000/R950", deck: "R950_full_reference.k", standard: "outputs/contact_air_r950/standard_1d.npz",  cache: "outputs/contact_air_r950/cache.npz"}
+    - {case_id: r1000_full, radius_m: 1.000, raw_dir: "D:/R700-1000/R1000", deck: "R1000_full_reference.k", standard: "outputs/contact_air_r1000/standard_1d.npz", cache: "outputs/contact_air_r1000/cache.npz"}

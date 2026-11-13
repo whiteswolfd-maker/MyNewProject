@@ -128,6 +128,10 @@
   训练采样；不能与训练算例重复 `case_id`。`validation.holdout_fraction: 0`
   表示训练算例全部帧可用，验证完全由该半径带提供。
 - `build-cache --source <标准一维文件或目录> --case ... --radius ... --role ... --out ...`。
+- `scripts/audit_reference_data.py --stage <manifest|imports|metrics|consistency|report|all>`
+  是只读数据审计：独立解析原始 `.xy`、核对导入值、提取固定半径峰值并与
+  Henrych 对比、检查 RH 和接触/空气相容性。不得修改缓存、检查点或训练配置；
+  Kingery-Bulmash 在系数表核实前保持不可用，Henrych 系数标记暂定。
 - `predict/evaluate --case ...`；预测只读 metadata 与 shock 轨迹，评估才读参考
   内部场。500 mm 与其他半径同一接口。
 - 空气质量数据先抽帧再抽帧内点；右边界只在 `D_s > c_inf` 时刻采样。

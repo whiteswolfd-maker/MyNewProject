@@ -315,6 +315,27 @@ s_fE = s_E / T_star
   `best.pt`，但绝不进入训练采样，且不能与训练算例共用 `case_id`。两者可同时
   使用；要把验证完全交给半径带，就把 `holdout_fraction` 设为 0。
 
+### 参考数据与实现审计（只读）
+
+`configs/contact_air/reference_audit.yaml` +
+`scripts/audit_reference_data.py` + `contact_air/reference_audit.py` 提供不依赖
+训练链路的核验：
+
+- **A 原始仿真**：20 个算例的文件身份、求解器版本、正常结束、原始时间范围、
+  均匀球装药质量 `W=4/3 pi rho R^3`、固定半径压力历程；
+- **B 导入链路**：用独立的最小 `.xy` 解析器和配置中的单位因子，逐值与
+  `standard_1d.npz` 比较；并比较“原始完整时序峰值”和“导入帧峰值”；
+- **C 经验关系与相容性**：Henrych（球形自由空气、入射超压，系数状态
+  `provisional`）逐点比较；Kingery-Bulmash 因缺少可核实系数表标记
+  `unavailable`，不猜测、不替换；RH 用实测激波位置差分和两侧实测状态独立
+  检查，接触区间与 JWL/空气压力、接触速度与空气速度并列记录；
+- **D PINN**：复用 `contact_air_diagnostics_*` 的输出。
+
+审计只写 `outputs/reference_audit/`（manifest、CSV、JSON、图和 `report.md`），
+不改缓存、检查点或训练配置。经验公式的数值样例测试在
+`tests/test_contact_air_reference_audit.py`；Henrych 系数尚未与原书逐项核对，
+报告必须保留这一限制。
+
 ## 7. 命令
 
 本机验证使用的解释器是
