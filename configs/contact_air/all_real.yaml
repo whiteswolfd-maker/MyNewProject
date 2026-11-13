@@ -1,0 +1,61 @@
+# All real spherical ALE1D cases available as of 2026-11-13.
+#
+# R50  : G:\R50_R100_reference_v2\R50_full_alpha_profiles\
+#        R50_full_reference_alpha_profiles.k  (product AND air alpha)
+# R100 : G:\R50_R100_reference_v2\R100\R100_full_reference_vf_fixed.k (product only)
+# R150-R650 : G:\R50_R100_reference_v2\R<label>\R<label>_full_reference.k
+# R700-R1000: D:\R700-1000\R<label>\R<label>_full_reference.k
+#
+# Every case is real LS-DYNA ASCII profile output; none is synthetic.
+# The scaled decks keep the R50 material/JWL/EOS/detonation cards fixed and
+# change geometry and time, so one precursor material source is valid.
+#
+# This configuration is a data-preparation / integration configuration.  It is
+# not a research data split: every case is role=train.  Define a held-out split
+# explicitly before treating any score as validation.
+inherits: base.yaml
+
+contact_air:
+  precursor:
+    material_source: "G:/R50_R100_reference_v2/R50_full/R50_full_reference.k"
+    material_source_verified: true
+
+  contact_interval:
+    # The base 1.0e-5 s window is narrower than the raw frame spacing of the
+    # scaled decks above 200 mm: raw cadence is T/1000, i.e. 4 us at R200 and
+    # 20 us at R1000, and filename time carries only three significant
+    # figures.  A 10 us window can then contain no frame at or after t_sep
+    # (R200: t_sep=74.1 us, frames at 65 and 105 us).  5.0e-5 s still selects
+    # only the first valid frame at or after t_sep; it does not relax that
+    # rule, it only makes the search bound wider than the frame spacing.
+    event_search_window_s: 5.0e-5
+
+  cases:
+    - {case_id: r50_full,   role: train, charge_radius_m: 0.050, cache: outputs/contact_air_r50/cache.npz,   synthetic: false}
+    - {case_id: r100_full,  role: train, charge_radius_m: 0.100, cache: outputs/contact_air_r100/cache.npz,  synthetic: false}
+    - {case_id: r150_full,  role: train, charge_radius_m: 0.150, cache: outputs/contact_air_r150/cache.npz,  synthetic: false}
+    - {case_id: r200_full,  role: train, charge_radius_m: 0.200, cache: outputs/contact_air_r200/cache.npz,  synthetic: false}
+    - {case_id: r250_full,  role: train, charge_radius_m: 0.250, cache: outputs/contact_air_r250/cache.npz,  synthetic: false}
+    - {case_id: r300_full,  role: train, charge_radius_m: 0.300, cache: outputs/contact_air_r300/cache.npz,  synthetic: false}
+    - {case_id: r350_full,  role: train, charge_radius_m: 0.350, cache: outputs/contact_air_r350/cache.npz,  synthetic: false}
+    - {case_id: r400_full,  role: train, charge_radius_m: 0.400, cache: outputs/contact_air_r400/cache.npz,  synthetic: false}
+    - {case_id: r450_full,  role: train, charge_radius_m: 0.450, cache: outputs/contact_air_r450/cache.npz,  synthetic: false}
+    - {case_id: r500_full,  role: train, charge_radius_m: 0.500, cache: outputs/contact_air_r500/cache.npz,  synthetic: false}
+    - {case_id: r550_full,  role: train, charge_radius_m: 0.550, cache: outputs/contact_air_r550/cache.npz,  synthetic: false}
+    - {case_id: r600_full,  role: train, charge_radius_m: 0.600, cache: outputs/contact_air_r600/cache.npz,  synthetic: false}
+    - {case_id: r650_full,  role: train, charge_radius_m: 0.650, cache: outputs/contact_air_r650/cache.npz,  synthetic: false}
+    - {case_id: r700_full,  role: train, charge_radius_m: 0.700, cache: outputs/contact_air_r700/cache.npz,  synthetic: false}
+    - {case_id: r750_full,  role: train, charge_radius_m: 0.750, cache: outputs/contact_air_r750/cache.npz,  synthetic: false}
+    - {case_id: r800_full,  role: train, charge_radius_m: 0.800, cache: outputs/contact_air_r800/cache.npz,  synthetic: false}
+    - {case_id: r850_full,  role: train, charge_radius_m: 0.850, cache: outputs/contact_air_r850/cache.npz,  synthetic: false}
+    - {case_id: r900_full,  role: train, charge_radius_m: 0.900, cache: outputs/contact_air_r900/cache.npz,  synthetic: false}
+    - {case_id: r950_full,  role: train, charge_radius_m: 0.950, cache: outputs/contact_air_r950/cache.npz,  synthetic: false}
+    - {case_id: r1000_full, role: train, charge_radius_m: 1.000, cache: outputs/contact_air_r1000/cache.npz, synthetic: false}
+
+  output_dir: outputs/contact_air_all
+
+  training:
+    loops: 2000
+    log_every: 50
+    checkpoint_every: 100
+    validate_every: 100

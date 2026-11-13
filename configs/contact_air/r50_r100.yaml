@@ -1,0 +1,47 @@
+# Real 50 mm + 100 mm spherical ALE1D cases.
+#
+# Both cases come from the user's scaled LS-DYNA decks:
+#   R50  : G:\R50_R100_reference_v2\R50_full_alpha_profiles\
+#          R50_full_reference_alpha_profiles.k
+#   R100 : G:\R50_R100_reference_v2\R100\R100_full_reference_vf_fixed.k
+#
+# R50 carries explicit product AND air volume fractions (MMG=1 and MMG=2).
+# R100 carries product volume fraction only (MMG=1); the importer records the
+# implicit rule alpha_air = 1 - alpha_product.
+#
+# This config is the multi-radius integration check: it proves the trainer
+# accepts more than one charge radius at once.  It is not a claim that the
+# PINN reproduces the ALE1D physics.
+inherits: base.yaml
+
+contact_air:
+  precursor:
+    # Same material/JWL/EOS/detonation cards as the R50 deck; the scaled decks
+    # keep those cards fixed and change only geometry/time.
+    material_source: "G:/R50_R100_reference_v2/R50_full/R50_full_reference.k"
+    material_source_verified: true
+
+  cases:
+    - case_id: r50_full
+      role: train
+      charge_radius_m: 0.050
+      cache: outputs/contact_air_r50/cache.npz
+      synthetic: false
+    - case_id: r100_full
+      role: train
+      charge_radius_m: 0.100
+      cache: outputs/contact_air_r100/cache.npz
+      synthetic: false
+
+  output_dir: outputs/contact_air_r50_r100
+
+  training:
+    loops: 2000
+    log_every: 50
+    checkpoint_every: 100
+    validate_every: 100
+
+  validation:
+    holdout_fraction: 0.3
+    data_points: 256
+    contact_points: 256
