@@ -438,11 +438,11 @@ def combine_air(
 
 def combine_contact(
     *, pde: TermResult, ic: TermResult, interface: TermResult, data: TermResult,
-    lambda_pde: float, lambda_data: float,
+    lambda_pde: float, lambda_data: float, contact_data_weight: float = 1.0,
 ) -> TermResult:
     total = (
         float(lambda_pde) * pde.total
-        + float(lambda_data) * data.total
+        + float(lambda_data) * float(contact_data_weight) * data.total
         + 1.0 * ic.total
         + 1.0 * interface.total
     )

@@ -122,6 +122,7 @@ class TrainConfig:
     validation_holdout_fraction: float = 0.3
     validation_data_points: int = 256
     validation_contact_points: int = 256
+    contact_data_weight: float = 1.0
 
     def __post_init__(self) -> None:
         for name in ("n_pde", "n_ic", "n_right", "n_data", "n_contact"):
@@ -140,6 +141,25 @@ class TrainConfig:
         for name in ("validation_data_points", "validation_contact_points"):
             if int(getattr(self, name)) < 0:
                 raise TrainingError(f"{name} must be non-negative")
+        if not math.isfinite(float(self.contact_data_weight)) or float(
+            self.contact_data_weight
+        ) < 0.0:
+            raise TrainingError("contact_data_weight must be finite and non-negative")
+
+
+def describe_matches(saved: Mapping[str, Any] | None, current: Mapping[str, Any]) -> bool:
+    """Compare checkpoint model metadata against the current network.
+
+    Checkpoints written before the optional time-input scaling have no
+    ``time_reference_s`` key; for them the reference was the physical second,
+    so an absent key means 1.0.  A checkpoint that carries the key is compared
+    exactly, so a 0.01 checkpoint cannot resume a 1.0 network (or vice versa).
+    """
+    if saved is None:
+        return True
+    normalized = dict(saved)
+    normalized.setdefault("time_reference_s", 1.0)
+    return normalized == dict(current)
 
 
 def seed_everything(seed: int) -> None:
@@ -501,6 +521,7 @@ class AlternatingTrainer:
             contact_results.append(combine_contact(
                 pde=pde, ic=ic, interface=interface, data=data,
                 lambda_pde=lambda_pde, lambda_data=lambda_data,
+                contact_data_weight=self.config.contact_data_weight,
             ))
         contact_total = _summarise(contact_results, batches[0][1].t_ic)
         if not bool(torch.isfinite(contact_total.total)):
@@ -636,6 +657,7 @@ class AlternatingTrainer:
             record["learning_rate"] = float(
                 self.opt_contact.param_groups[0]["lr"]
             )
+            record["contact_data_weight"] = float(self.config.contact_data_weight)
             records.append(record)
             if self.config.log_every > 0 and self.loop % self.config.log_every == 0:
                 print(
@@ -880,6 +902,17 @@ class AlternatingTrainer:
                 raise TrainingError(
                     f"{path}: checkpoint {key}={saved!r} does not match the current "
                     f"{current!r}; the training/validation split or sampling changed"
+                )
+        # The time scale is a plain attribute, not a state_dict entry, so the
+        # shape check alone cannot detect a 0.01 checkpoint resumed into a 1.0
+        # network.  Check the model metadata before restoring anything.
+        for key, module in (
+            ("contact_net", self.contact_net), ("air_net", self.air_net),
+        ):
+            if not describe_matches(payload.get(f"{key}_describe"), module.describe()):
+                raise TrainingError(
+                    f"{path}: {key} model metadata (time_reference_s / architecture) "
+                    "does not match the current network; refusing to resume"
                 )
         self._check_state_dict(self.contact_net, payload["contact_net"], "contact_net")
         self._check_state_dict(self.air_net, payload["air_net"], "air_net")

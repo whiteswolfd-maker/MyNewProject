@@ -68,6 +68,7 @@ from .trainer import (
     AlternatingTrainer,
     TrainConfig,
     TrainingError,
+    describe_matches,
     seed_everything,
 )
 
@@ -376,7 +377,10 @@ def _networks(section: Mapping[str, Any]):
     return contact, air
 
 
-def _train_config(section: Mapping[str, Any], loops: int | None) -> TrainConfig:
+def _train_config(
+    section: Mapping[str, Any], loops: int | None,
+    contact_data_weight: float | None = None,
+) -> TrainConfig:
     training = dict(section.get("training", {}))
     sampling = dict(section.get("sampling", {}))
     values = {
@@ -402,9 +406,14 @@ def _train_config(section: Mapping[str, Any], loops: int | None) -> TrainConfig:
         "validation_contact_points": int(
             section.get("validation", {}).get("contact_points", 256)
         ),
+        "contact_data_weight": float(
+            training.get("contact_data_weight", 1.0)
+        ),
     }
     if loops is not None:
         values["loops"] = int(loops)
+    if contact_data_weight is not None:
+        values["contact_data_weight"] = float(contact_data_weight)
     return TrainConfig(**values)
 
 
@@ -587,7 +596,10 @@ def command_train(args) -> int:
     seed = int(section.get("training", {}).get("seed", 0))
     seed_everything(seed)
     contact, air = _networks(section)
-    train_config = _train_config(section, args.max_loops)
+    train_config = _train_config(
+        section, args.max_loops,
+        contact_data_weight=args.contact_data_weight,
+    )
     output_dir = Path(args.output_dir) if args.output_dir else _resolve(
         config, section.get("output_dir", "outputs/contact_air")
     )
@@ -619,21 +631,6 @@ def command_train(args) -> int:
     return 0
 
 
-def _describe_matches(saved: Mapping[str, Any] | None, current: Mapping[str, Any]) -> bool:
-    """Compare checkpoint model metadata.
-
-    Checkpoints written before the optional time-input scaling existed have no
-    ``time_reference_s`` key; for them the reference was the physical second,
-    so an absent key means 1.0.  A checkpoint that does carry the key is
-    compared exactly, so a 1.0 checkpoint cannot be loaded into a 0.01 model.
-    """
-    if saved is None:
-        return True
-    normalized = dict(saved)
-    normalized.setdefault("time_reference_s", 1.0)
-    return normalized == dict(current)
-
-
 def _check_checkpoint_state(module, state, name: str, path: Path) -> None:
     current = module.state_dict()
     if set(state) != set(current):
@@ -660,7 +657,7 @@ def _load_checkpoint(path: Path, contact: ContactNet, air: AirNet) -> dict[str, 
     _check_checkpoint_state(contact, payload["contact_net"], "contact_net", Path(path))
     _check_checkpoint_state(air, payload["air_net"], "air_net", Path(path))
     for key, module in (("contact_net", contact), ("air_net", air)):
-        if not _describe_matches(payload.get(f"{key}_describe"), module.describe()):
+        if not describe_matches(payload.get(f"{key}_describe"), module.describe()):
             raise CommandError(
                 f"{path}: {key} model convention/architecture metadata does not "
                 "match the configured network"
@@ -697,7 +694,7 @@ def _check_prediction_compatibility(
             label=f"prediction dimensionless physics vs training case {case_id!r}",
         )
     for key, module in (("contact_net", contact), ("air_net", air)):
-        if not _describe_matches(payload.get(f"{key}_describe"), module.describe()):
+        if not describe_matches(payload.get(f"{key}_describe"), module.describe()):
             raise CommandError(
                 f"checkpoint {key} model convention does not match the prediction model"
             )
@@ -901,6 +898,13 @@ def build_parser() -> argparse.ArgumentParser:
             "override the configured learning rate for both optimizers.  "
             "Applied after --resume restores the Adam state, which otherwise "
             "brings back the old learning rate"
+        ),
+    )
+    train.add_argument(
+        "--contact-data-weight", type=float, default=None,
+        help=(
+            "multiply the contact-interval supervision term (lambda_data * "
+            "contact_data) by this factor; every other loss weight is unchanged"
         ),
     )
     train.add_argument("--no-synthetic", action="store_true")

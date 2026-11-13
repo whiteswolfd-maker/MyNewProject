@@ -256,12 +256,17 @@ L_a = lambda_PDE L_PDE + lambda_IC L_a_IC
 ### ContactNet
 
 ```text
-L_c = lambda_IC L_c_IC + lambda_data L_c_data
+L_c = lambda_IC L_c_IC + lambda_data * w_c L_c_data
     + lambda_PDE L_PDE + lambda_interface L_interface
 
 L_c_IC   = [(R_c(t0)-Rc0)/s_R]^2
 L_c_data = mean[(ReLU(R_c,low-R_c)/s_R)^2 + (ReLU(R_c-R_c,up)/s_R)^2]
 ```
+
+- `w_c = training.contact_data_weight`（默认 1.0）**只乘接触区间监督项**，
+  不动初值、界面、空气数据和 PDE 权重；命令行 `--contact-data-weight`
+  可覆盖。每条 loop 记录未加权的 `contact_parts`，并记录实际 `w_c`，避免
+  用乘权后的总损失做跨实验比较。
 
 区间内零罚、区间外距离平方；接触标签在自己的 `t_contact` 上重新计算网络。两个
 网络复用同一组映射空气残差，不复制“接触面 PDE”。
@@ -293,7 +298,9 @@ s_fE = s_E / T_star
   轨迹段采样；先不加激波附近额外权重。
 - 缓存 schema **version 7**；检查点 **version 4**。旧格式明确拒绝并要求重建。
 - 检查点保存两个网络、两个优化器、阶段状态、RNG、配置、数据身份、固定验证
-  样本；恢复先核对再应用。
+  样本；恢复先核对再应用。网络元数据中的 `time_reference_s` 也参与核对：
+  旧检查点缺少该字段时按 1.0 处理，与当前网络不一致就拒绝续训（预测路径同样
+  检查）。
 - 训练/验证/测试由配置中的显式 `role` 决定；没有固定半径禁令。`role: test`
   不能进入训练。验证有两个来源：训练算例末尾的连续帧组
   （`validation.holdout_fraction > 0`），以及配置中整例 `role: validation`

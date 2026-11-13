@@ -55,6 +55,8 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--cases", default="r50_full,r250_full,r500_full,r550_full,r750_full,r1000_full",
     )
+    parser.add_argument("--label-a", default="t_ref = 1 s (baseline)")
+    parser.add_argument("--label-b", default="t_ref = 0.01 s")
     parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
 
@@ -85,9 +87,9 @@ def main(argv=None) -> int:
         x_tref, dev_tref = _deviation(case, tref)
         ax.axhline(0.0, color="#555555", linewidth=1.0)
         ax.plot(x_base, dev_base, color=baseline_color, linewidth=2.0,
-                label="t_ref = 1 s (baseline)")
+                label=args.label_a)
         ax.plot(x_tref, dev_tref, color=tref_color, linewidth=2.0,
-                label="t_ref = 0.01 s")
+                label=args.label_b)
         ax.set_title(f"{case_id} ({case.charge_radius_m * 1.0e3:.0f} mm)",
                      fontsize=10)
         ax.grid(True, color="#e6e6e6", linewidth=0.8)

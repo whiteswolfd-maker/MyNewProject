@@ -18,7 +18,8 @@ from spherical_blast_pinn.contact_air.trainer import (
 )
 
 
-def _trainer(tmp_path, *, cases=None, holdout=0.3, external=None):
+def _trainer(tmp_path, *, cases=None, holdout=0.3, external=None,
+             time_reference_s=1.0, contact_data_weight=1.0):
     cases = cases or [
         synthetic_case_for(0.05, case_id="r050", n_frames=11, n_radial=1600),
         synthetic_case_for(0.08, case_id="r080", n_frames=11, n_radial=1600),
@@ -28,10 +29,13 @@ def _trainer(tmp_path, *, cases=None, holdout=0.3, external=None):
         loops=2, learning_rate=1.0e-3, log_every=1, checkpoint_every=0,
         validate_every=0, seed=11, validation_holdout_fraction=holdout,
         validation_data_points=8, validation_contact_points=6,
+        contact_data_weight=contact_data_weight,
     )
     return AlternatingTrainer(
-        cases=cases, contact_net=ContactNet(width=8, depth=1),
-        air_net=AirNet(width=8, depth=1), config=config, output_dir=tmp_path,
+        cases=cases, contact_net=ContactNet(width=8, depth=1,
+                                            time_reference_s=time_reference_s),
+        air_net=AirNet(width=8, depth=1, time_reference_s=time_reference_s),
+        config=config, output_dir=tmp_path,
         external_validation_cases=external or (),
     )
 
@@ -268,3 +272,57 @@ def test_training_log_records_the_actual_learning_rate(tmp_path):
     result = trainer.train(loops=1)
     record = result["history"]["loops"][0]
     assert record["learning_rate"] == pytest.approx(1.0e-3)
+
+
+def test_resume_accepts_the_same_time_reference(tmp_path):
+    trainer = _trainer(tmp_path, time_reference_s=0.01)
+    path = trainer.save(tmp_path / "scaled.pt")
+    same = _trainer(tmp_path / "same", time_reference_s=0.01)
+    assert same.load(path)["loop"] == 0
+
+
+def test_resume_rejects_a_different_time_reference(tmp_path):
+    trainer = _trainer(tmp_path, time_reference_s=0.01)
+    path = trainer.save(tmp_path / "scaled.pt")
+    different = _trainer(tmp_path / "different", time_reference_s=1.0)
+    with pytest.raises(TrainingError, match="time_reference"):
+        different.load(path)
+
+
+def test_resume_treats_a_legacy_checkpoint_as_seconds(tmp_path):
+    trainer = _trainer(tmp_path, time_reference_s=1.0)
+    path = trainer.save(tmp_path / "legacy.pt")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["contact_net_describe"].pop("time_reference_s")
+    payload["air_net_describe"].pop("time_reference_s")
+    torch.save(payload, path)
+    seconds = _trainer(tmp_path / "seconds", time_reference_s=1.0)
+    assert seconds.load(path)["loop"] == 0
+    scaled = _trainer(tmp_path / "scaled", time_reference_s=0.01)
+    with pytest.raises(TrainingError, match="time_reference"):
+        scaled.load(path)
+
+
+def test_contact_data_weight_is_recorded_and_scales_only_the_interval_term(tmp_path):
+    from spherical_blast_pinn.contact_air.losses import TermResult, combine_contact
+
+    pde = TermResult(total=torch.tensor(1.0, dtype=torch.float64))
+    ic = TermResult(total=torch.tensor(2.0, dtype=torch.float64))
+    interface = TermResult(total=torch.tensor(3.0, dtype=torch.float64))
+    data = TermResult(total=torch.tensor(4.0, dtype=torch.float64))
+    plain = combine_contact(
+        pde=pde, ic=ic, interface=interface, data=data,
+        lambda_pde=0.5, lambda_data=0.2,
+    )
+    weighted = combine_contact(
+        pde=pde, ic=ic, interface=interface, data=data,
+        lambda_pde=0.5, lambda_data=0.2, contact_data_weight=3.0,
+    )
+    assert plain.total.item() == pytest.approx(0.5 + 0.2 * 4.0 + 2.0 + 3.0)
+    assert weighted.total.item() == pytest.approx(0.5 + 3.0 * 0.2 * 4.0 + 2.0 + 3.0)
+
+    trainer = _trainer(tmp_path, contact_data_weight=3.0)
+    result = trainer.train(loops=1)
+    assert result["history"]["loops"][0]["contact_data_weight"] == pytest.approx(3.0)
+    with pytest.raises(TrainingError, match="contact_data_weight"):
+        TrainConfig(contact_data_weight=-1.0)
