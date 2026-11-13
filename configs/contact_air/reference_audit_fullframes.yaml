@@ -7,6 +7,7 @@
 audit:
   version: 2
   repo_root: .
+  require_all_frames: true
   training_config: "configs/contact_air/split_train_r50_500_fullframes.yaml"
   output_dir: outputs/reference_audit_fullframes
   units:

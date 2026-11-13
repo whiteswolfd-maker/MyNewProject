@@ -20,6 +20,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -30,8 +31,93 @@ if str(_REPO_ROOT / "src") not in sys.path:
 if str(_REPO_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 
-from import_lsdyna_profiles_1d import convert  # noqa: E402
+from import_lsdyna_profiles_1d import (  # noqa: E402
+    _input_fingerprint,
+    _profile_frames,
+    convert,
+)
 from spherical_blast_pinn.contact_air.cli import command_build_cache  # noqa: E402
+
+_PROFILE_PATTERNS = {
+    "velocity": "profile1_x-velocity_x_time*.xy",
+    "pressure": "profile2_pressure_x_time*.xy",
+    "density": "profile3_density_x_time*.xy",
+    "alpha_product": "profile4_volume_fraction_x_time*.xy",
+}
+
+
+def _raw_paths(raw_dir: Path) -> dict[str, dict[str, Path]]:
+    paths = {
+        name: _profile_frames(raw_dir, pattern, name)
+        for name, pattern in _PROFILE_PATTERNS.items()
+    }
+    pattern = _alpha_air_pattern(raw_dir)
+    if pattern is not None:
+        paths["alpha_air"] = _profile_frames(raw_dir, pattern, "alpha_air")
+    return paths
+
+
+def _standard_is_current(
+    raw_dir: Path, standard: Path,
+) -> tuple[bool, str]:
+    """Check that an existing standard really covers the current raw frames."""
+    if not standard.is_file():
+        return False, "standard is missing"
+    with np.load(standard, allow_pickle=False) as archive:
+        metadata = json.loads(str(archive["metadata"]))
+    source = metadata.get("source", {})
+    if source.get("frame_selection_policy") != "all_frames":
+        return False, "frame_selection_policy is not all_frames"
+    paths = _raw_paths(raw_dir)
+    raw_keys = sorted(paths["pressure"], key=float)
+    selected = list(source.get("selected_raw_frame_keys", []))
+    raw_meta = list(source.get("raw_frame_keys", []))
+    times = list(metadata.get("frame_times", []))
+    if not (len(raw_keys) == len(selected) == len(raw_meta) == len(times)):
+        return False, (
+            f"frame counts differ: disk={len(raw_keys)} selected={len(selected)} "
+            f"metadata={len(raw_meta)} frame_times={len(times)}"
+        )
+    if set(selected) != set(raw_keys) or set(raw_meta) != set(raw_keys):
+        return False, "raw frame key sets differ from disk"
+    for key, value in zip(selected, times):
+        if abs(float(key) - float(value)) > 1.0e-12 * max(1.0, abs(float(value))):
+            return False, f"frame_time {value!r} does not match raw key {key!r}"
+    fingerprint = _input_fingerprint(paths)
+    if source.get("raw_input_fingerprint") != fingerprint:
+        return False, "raw input fingerprint changed (stale standard)"
+    if source.get("raw_frame_count") != len(raw_keys):
+        return False, "metadata raw_frame_count differs from disk"
+    if source.get("imported_frame_count") != len(raw_keys):
+        return False, "metadata imported_frame_count differs from disk"
+    return True, "current"
+
+
+def _cache_is_current(standard: Path, cache: Path) -> tuple[bool, str]:
+    """Check that a cache covers every frame of the standard and its raw times."""
+    if not cache.is_file():
+        return False, "cache is missing"
+    with np.load(standard, allow_pickle=False) as archive:
+        standard_meta = json.loads(str(archive["metadata"]))
+    frame_times = np.asarray(standard_meta["frame_times"], dtype=np.float64)
+    with np.load(cache, allow_pickle=False) as archive:
+        if "raw_times" not in archive.files:
+            return False, "cache has no raw_times"
+        raw_times = np.asarray(archive["raw_times"], dtype=np.float64)
+        contact_times = np.asarray(archive["contact_times"], dtype=np.float64)
+        shock_times = np.asarray(archive["shock_times"], dtype=np.float64)
+    if raw_times.size != frame_times.size:
+        return False, (
+            f"cache raw_times {raw_times.size} != standard frames {frame_times.size}"
+        )
+    if not np.allclose(raw_times, frame_times, rtol=0.0, atol=1.0e-15):
+        return False, "cache raw_times differ from standard frame_times"
+    if contact_times.size != frame_times.size or shock_times.size != frame_times.size:
+        return False, (
+            f"cache frame arrays {contact_times.size}/{shock_times.size} != "
+            f"standard frames {frame_times.size}"
+        )
+    return True, "current"
 
 
 def _audit(path: Path) -> dict:
@@ -93,10 +179,25 @@ def main(argv=None) -> int:
             "standard": str(standard),
             "cache": str(cache),
         }
+        if args.cache_only:
+            ok, reason = _standard_is_current(raw_dir, standard)
+            if not ok:
+                raise SystemExit(
+                    f"{case_id}: --cache-only refuses a stale/missing standard: "
+                    f"{reason}. Re-run without --cache-only to rebuild it."
+                )
+            entry["standard_validation"] = reason
         if not args.cache_only:
-            if standard.is_file() and not args.overwrite:
-                entry["import"] = "skipped_existing"
-            else:
+            reusable = standard.is_file() and not args.overwrite
+            reason = "not present"
+            if reusable:
+                reusable, reason = _standard_is_current(raw_dir, standard)
+                if reusable:
+                    entry["import"] = "skipped_existing"
+                    entry["standard_validation"] = reason
+                else:
+                    entry["standard_validation"] = f"rebuild: {reason}"
+            if not reusable:
                 pattern = _alpha_air_pattern(raw_dir)
                 summary = convert(
                     source_dir=raw_dir, case_id=case_id,
@@ -110,9 +211,19 @@ def main(argv=None) -> int:
                 entry["import"] = summary
                 entry["standard_bytes"] = int(standard.stat().st_size)
         if not args.import_only:
-            if cache.is_file() and not args.overwrite:
-                entry["cache"] = "skipped_existing"
-            else:
+            reusable = cache.is_file() and not args.overwrite
+            reason = "not present"
+            if reusable:
+                if not standard.is_file():
+                    reusable, reason = False, "standard is missing"
+                else:
+                    reusable, reason = _cache_is_current(standard, cache)
+                if reusable:
+                    entry["cache"] = "skipped_existing"
+                    entry["cache_validation"] = reason
+                else:
+                    entry["cache_validation"] = f"rebuild: {reason}"
+            if not reusable:
                 if not standard.is_file():
                     raise SystemExit(
                         f"{case_id}: standard source {standard} is missing"

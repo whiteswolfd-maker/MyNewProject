@@ -141,7 +141,11 @@
   用 `u(E+p) - D_s E` 检查 RH、在 t0 后早/中/晚多个有效帧上检查接触/空气
   压力与边界轨迹斜率。脉内振荡和后续正 excursion 只标为候选，不称为二次
   激波。不得修改缓存、检查点或训练配置；Kingery-Bulmash 在系数表核实前保持
-  不可用，Henrych 系数标记暂定。
+  不可用，Henrych 系数标记暂定。导入完整性失败（漏帧/多余帧、原始键或时间
+  不一致、缓存 raw_times/帧数不一致、逐值 mismatch）必须返回非零退出码；
+  KB/Henrych 和 JWL 局部差异只记录，不作为失败。全帧验收用
+  `--stage all --import-sample-frames 0`。`prepare_fullframe_data.py` 在跳过
+  现有标准/缓存前会核对全帧键、frame_times、缓存 raw_times 和原始输入指纹。
 - `predict/evaluate --case ...`；预测只读 metadata 与 shock 轨迹，评估才读参考
   内部场。500 mm 与其他半径同一接口。
 - 空气质量数据先抽帧再抽帧内点；右边界只在 `D_s > c_inf` 时刻采样。

@@ -111,8 +111,19 @@ def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
     return digest.hexdigest()
 
 
+def file_identity(path: Path) -> dict:
+    """Cheap identity for a large standard/cache file.
+
+    Hashing tens of gigabytes on every manifest run is not useful: the raw
+    input fingerprint and the per-frame value comparison are the provenance
+    checks.  Size and nanosecond mtime identify the file without reading it.
+    """
+    stat = Path(path).stat()
+    return {"bytes": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+
+
 def case_manifest(case: dict, root: Path, units: dict, ambient: dict,
-                  charge: dict) -> dict:
+                  charge: dict, require_all_frames: bool = False) -> dict:
     raw_dir = Path(case["raw_dir"])
     deck = raw_dir / case["deck"]
     standard = root / case["standard"]
@@ -145,6 +156,115 @@ def case_manifest(case: dict, root: Path, units: dict, ambient: dict,
         _profile_path(raw_dir, pressure_pattern, keys[0]),
         _profile_path(raw_dir, pressure_pattern, keys[-1]),
     ]
+    raw_keys = list(keys)
+    integrity: list[str] = []
+    standard_info: dict = {
+        "path": str(standard),
+        "exists": bool(standard.is_file()),
+    }
+    if standard.is_file():
+        imported_keys = [str(key) for key in selected]
+        metadata_keys = [str(key) for key in source.get("raw_frame_keys", [])]
+        frame_times = [
+            float(value) for value in standard_meta.get("frame_times", [])
+        ]
+        missing = sorted(set(raw_keys) - set(imported_keys), key=float)
+        extra = sorted(set(imported_keys) - set(raw_keys), key=float)
+        metadata_missing = sorted(set(raw_keys) - set(metadata_keys), key=float)
+        metadata_extra = sorted(set(metadata_keys) - set(raw_keys), key=float)
+        time_mismatches = []
+        for key, value in zip(imported_keys, frame_times):
+            if abs(float(key) - value) > 1.0e-12 * max(1.0, abs(value)):
+                time_mismatches.append({"key": key, "frame_time": value})
+        count_ok = (
+            len(raw_keys) == len(imported_keys) == len(metadata_keys)
+            == len(frame_times)
+        )
+        metadata_count_match = (
+            source.get("raw_frame_count") == len(raw_keys)
+            and source.get("imported_frame_count") == len(raw_keys)
+        )
+        imported_equals_raw = (
+            count_ok and not missing and not extra
+            and not metadata_missing and not metadata_extra
+            and not time_mismatches and metadata_count_match
+        )
+        standard_info.update({
+            "file_identity": file_identity(standard),
+            "frames": len(imported_keys),
+            "frame_times_count": len(frame_times),
+            "frame_selection_policy": source.get("frame_selection_policy"),
+            "raw_frame_count": source.get("raw_frame_count"),
+            "imported_frame_count": source.get("imported_frame_count"),
+            "dropped_frame_count": source.get("dropped_frame_count"),
+            "imported_equals_raw": bool(imported_equals_raw),
+            "metadata_count_matches_disk": bool(metadata_count_match),
+            "missing_raw_keys": missing[:20],
+            "extra_imported_keys": extra[:20],
+            "missing_metadata_keys": metadata_missing[:20],
+            "extra_metadata_keys": metadata_extra[:20],
+            "time_mismatch_count": len(time_mismatches),
+            "time_mismatch_examples": time_mismatches[:5],
+            "input_fingerprint": source.get("raw_input_fingerprint"),
+            "time_source": source.get("time_source"),
+            "selected_keys": imported_keys,
+        })
+        if require_all_frames and source.get("frame_selection_policy") != "all_frames":
+            integrity.append(
+                "standard frame_selection_policy is not all_frames"
+            )
+        if require_all_frames and not imported_equals_raw:
+            integrity.append(
+                "imported frames do not match raw frames "
+                f"(missing={len(missing)}, extra={len(extra)}, "
+                f"time_mismatches={len(time_mismatches)}, "
+                f"metadata_counts_match={metadata_count_match})"
+            )
+        if require_all_frames and (
+            missing or extra or metadata_missing or metadata_extra
+        ):
+            integrity.append("imported frame keys do not match raw frame keys")
+        if time_mismatches or len(frame_times) != len(imported_keys):
+            integrity.append("standard frame_times do not match imported keys")
+    else:
+        integrity.append("standard source is missing")
+    cache_info: dict = {"path": str(cache), "exists": bool(cache.is_file())}
+    if cache.is_file():
+        with np.load(cache, allow_pickle=False) as archive:
+            cache_meta = json.loads(str(archive["metadata"]))
+            cache_raw_times = (
+                np.asarray(archive["raw_times"], dtype=np.float64)
+                if "raw_times" in archive.files else np.zeros(0)
+            )
+            cache_contact = np.asarray(archive["contact_times"], dtype=np.float64)
+            cache_shock = np.asarray(archive["shock_times"], dtype=np.float64)
+        standard_times = np.asarray(
+            standard_meta.get("frame_times", []), dtype=np.float64
+        )
+        raw_time_match = (
+            cache_raw_times.size == standard_times.size
+            and np.allclose(cache_raw_times, standard_times, rtol=0.0, atol=1.0e-15)
+        )
+        frame_count_match = (
+            cache_contact.size == standard_times.size
+            and cache_shock.size == standard_times.size
+        )
+        cache_info.update({
+            "file_identity": file_identity(cache),
+            "frame_count": int(cache_contact.size),
+            "shock_frame_count": int(cache_shock.size),
+            "raw_times_count": int(cache_raw_times.size),
+            "raw_times_match_standard": bool(raw_time_match),
+            "frame_counts_match_standard": bool(frame_count_match),
+            "case_t0_s": cache_meta.get("case", {}).get("t0"),
+            "case_t_end_s": cache_meta.get("case", {}).get("t_end"),
+        })
+        if not raw_time_match:
+            integrity.append("cache raw_times do not match standard frame_times")
+        if not frame_count_match:
+            integrity.append("cache contact/shock frame counts do not match standard")
+    else:
+        integrity.append("cache is missing")
     return {
         "case_id": case["case_id"],
         "charge_radius_m": float(case["radius_m"]),
@@ -156,7 +276,7 @@ def case_manifest(case: dict, root: Path, units: dict, ambient: dict,
         "normal_termination": bool(normal),
         "units": units,
         "ambient": ambient,
-        "raw_frame_count": len(keys),
+        "raw_frame_count": len(raw_keys),
         "raw_time_start_s": float(time_values[0]),
         "raw_time_end_s": float(time_values[-1]),
         "raw_time_intervals": {
@@ -165,32 +285,15 @@ def case_manifest(case: dict, root: Path, units: dict, ambient: dict,
             "max_s": float(intervals.max()) if intervals.size else None,
         },
         "profile_fingerprint": {
-            "count": len(keys),
+            "count": len(raw_keys),
             "bytes": int(sum(_profile_path(raw_dir, pressure_pattern, k).stat().st_size
-                             for k in keys)),
+                             for k in raw_keys)),
             "first_frame_sha256": sha256_file(sample_files[0]) if sample_files[0].is_file() else None,
             "last_frame_sha256": sha256_file(sample_files[-1]) if sample_files[-1].is_file() else None,
         },
-        "standard": {
-            "path": str(standard),
-            "sha256": sha256_file(standard) if standard.is_file() else None,
-            "frames": len(selected),
-            "frame_selection_policy": source.get("frame_selection_policy"),
-            "raw_frame_count": source.get("raw_frame_count"),
-            "imported_frame_count": source.get("imported_frame_count"),
-            "dropped_frame_count": source.get("dropped_frame_count"),
-            "imported_equals_raw": (
-                source.get("imported_frame_count") == len(selected)
-                if source.get("imported_frame_count") is not None else None
-            ),
-            "input_fingerprint": source.get("raw_input_fingerprint"),
-            "time_source": source.get("time_source"),
-            "selected_keys": selected,
-        },
-        "cache": {
-            "path": str(cache),
-            "sha256": sha256_file(cache) if cache.is_file() else None,
-        },
+        "standard": standard_info,
+        "cache": cache_info,
+        "integrity_failures": integrity,
     }
 
 

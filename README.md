@@ -356,7 +356,23 @@ s_fE = s_E / T_star
   原始首脉冲共同窗口内与原始完全一致（差 0）。
 - **D PINN**：复用 `contact_air_diagnostics_*` 的输出。
 
-审计只写 `outputs/reference_audit/`（manifest、CSV、JSON、图和 `report.md`），
+全帧验收必须逐帧比较，而不是只看 `--stage all`：
+
+```bash
+PYTHONPATH=src python scripts/audit_reference_data.py \
+  --config configs/contact_air/reference_audit_fullframes.yaml \
+  --stage all --import-sample-frames 0
+```
+
+`reference_audit_fullframes.yaml` 设置了 `require_all_frames: true`，因此默认也
+会逐帧比较；显式传 `0` 仍建议保留。审计在以下导入完整性问题时返回**非零
+退出码**：漏帧/多余帧、原始键或时间数组不一致、缓存 raw_times 或帧数不匹配、
+逐值比较 `mismatch`/`non_finite`/`size_mismatch`。KB/Henrych 偏差、JWL 与局部
+压力差异只记录，不作为失败条件。manifest 对标准/缓存只记录文件大小和 mtime，
+不再对每例几十 GB 文件重复做 SHA-256。
+
+审计只写 `outputs/reference_audit/` 或
+`outputs/reference_audit_fullframes/`（manifest、CSV、JSON、图和 `report.md`），
 不改缓存、检查点或训练配置。经验公式的数值样例测试在
 `tests/test_contact_air_reference_audit.py`；Henrych 系数尚未与原书逐项核对，
 报告必须保留这一限制。

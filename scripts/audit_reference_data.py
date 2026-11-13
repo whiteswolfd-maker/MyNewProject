@@ -196,6 +196,24 @@ def _report(audit: dict, root: Path, out_dir: Path, manifest, metrics_rows,
             )
         statuses = sorted({row.get("status") for row in import_rows})
         lines.append(f"- statuses: {statuses}")
+        bad = [row for row in import_rows if row.get("status") != "ok"]
+        lines.append(
+            f"- import integrity: {'FAIL' if bad else 'pass'} "
+            f"({len(bad)} non-ok row(s))"
+        )
+        if manifest:
+            manifest_failures = [
+                (case["case_id"], failure)
+                for case in manifest.get("cases", [])
+                for failure in case.get("integrity_failures", [])
+            ]
+            lines.append(
+                f"- frame/cache integrity: "
+                f"{'FAIL' if manifest_failures else 'pass'} "
+                f"({len(manifest_failures)} issue(s))"
+            )
+            for case_id, failure in manifest_failures[:20]:
+                lines.append(f"  - {case_id}: {failure}")
     else:
         lines.append("- import comparison not run")
     lines += ["", "## Layer C - empirical references and compatibility", ""]
@@ -351,8 +369,12 @@ def main(argv=None) -> int:
     parser.add_argument("--cases", default=None,
                         help="comma-separated audit case ids for the raw-history stages")
     parser.add_argument(
-        "--import-sample-frames", type=int, default=4,
-        help="evenly spaced frames checked in the import stage; <=0 checks all",
+        "--import-sample-frames", type=int, default=None,
+        help=(
+            "evenly spaced frames checked in the import stage; <=0 checks all. "
+            "Default: all frames when the audit config sets "
+            "require_all_frames, otherwise 4"
+        ),
     )
     args = parser.parse_args(argv)
     audit = _load_audit(Path(args.config))
@@ -369,22 +391,47 @@ def main(argv=None) -> int:
     preservation_rows: list[dict] = []
     consistency = []
     compatibility = []
+    integrity_failures: list[str] = []
+    focus_set = set(focus)
+    require_all_frames = bool(audit.get("require_all_frames", False))
+
+    def collect_manifest(manifest) -> None:
+        for case in manifest.get("cases", []):
+            if case.get("case_id") not in focus_set:
+                continue
+            for failure in case.get("integrity_failures", []):
+                integrity_failures.append(
+                    f"{case.get('case_id')}: {failure}"
+                )
+
+    def collect_imports(rows) -> None:
+        for row in rows:
+            status = row.get("status")
+            if status and status != "ok":
+                integrity_failures.append(
+                    f"{row.get('case_id')}: {row.get('field')} "
+                    f"{row.get('region')} frame {row.get('frame')}: {status}"
+                )
 
     if args.stage in ("manifest", "all"):
         cases = []
         for case in audit["cases"]:
             cases.append(case_manifest(
-                case, root, audit["units"], audit["ambient"], audit["charge"]
+                case, root, audit["units"], audit["ambient"], audit["charge"],
+                require_all_frames=require_all_frames,
             ))
         manifest_payload = {"version": audit["version"], "cases": cases}
         _write_json(out_dir / "manifest.json", manifest_payload)
+        collect_manifest(manifest_payload)
         print(f"manifest: {len(cases)} cases")
 
     if args.stage in ("imports", "all"):
-        sample_frames = (
-            None if args.import_sample_frames <= 0
-            else int(args.import_sample_frames)
-        )
+        if args.import_sample_frames is None:
+            sample_frames = None if require_all_frames else 4
+        elif int(args.import_sample_frames) <= 0:
+            sample_frames = None
+        else:
+            sample_frames = int(args.import_sample_frames)
         for case_id in focus:
             case = _case_config(audit, case_id)
             import_rows.extend(
@@ -392,6 +439,7 @@ def main(argv=None) -> int:
                                   sample_indices=sample_frames)
             )
         _write_csv(out_dir / "raw_import_comparison.csv", import_rows)
+        collect_imports(import_rows)
         print(f"imports: {len(import_rows)} rows")
 
     if args.stage in ("metrics", "all"):
@@ -466,10 +514,29 @@ def main(argv=None) -> int:
                 (out_dir / "constraint_compatibility.json").read_text(encoding="utf-8")
             )
             compatibility = payload.get("cases", [])
+        if manifest_payload is not None:
+            collect_manifest(manifest_payload)
+        if import_rows:
+            collect_imports(import_rows)
         _report(audit, root, out_dir, manifest_payload, metrics_rows,
                 import_rows, preservation_rows, consistency, compatibility)
         print(f"report: {out_dir / 'report.md'}")
 
+    integrity_failures = list(dict.fromkeys(integrity_failures))
+    if integrity_failures:
+        print(
+            f"integrity: FAIL ({len(integrity_failures)} issue(s))",
+            file=sys.stderr,
+        )
+        for failure in integrity_failures[:50]:
+            print(f"  - {failure}", file=sys.stderr)
+        if len(integrity_failures) > 50:
+            print(
+                f"  ... {len(integrity_failures) - 50} more",
+                file=sys.stderr,
+            )
+        return 1
+    print("integrity: ok")
     return 0
 
 
