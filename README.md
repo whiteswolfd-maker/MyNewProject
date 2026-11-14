@@ -451,13 +451,14 @@ PYTHONPATH=src python scripts/diagnose_contact_gradients.py \
   --config configs/contact_air/split_train_r50_500_fullframes.yaml \
   --checkpoint outputs/contact_air_split_r50_500_fullframes_cw3_4000/best.pt \
   --mode training --batches 100 --batch-seed 20261114 \
-  --output outputs/fullframes/contact_training_diagnostics/static_best_seed20261114.json
+  --output outputs/fullframes/contact_training_diagnostics_fixed/static_best_seed20261114.json
 PYTHONPATH=src python scripts/diagnose_contact_gradients.py \
   --config configs/contact_air/split_train_r50_500_fullframes.yaml \
   --checkpoint outputs/contact_air_split_r50_500_fullframes_cw3_4000/best.pt \
   --mode training --batches 1 --adam-trials 100 --adam-seed 20261115 \
-  --output outputs/fullframes/contact_training_diagnostics/adam_best_seed20261115.json
-PYTHONPATH=src python scripts/summarize_contact_training_diagnostics.py
+  --output outputs/fullframes/contact_training_diagnostics_fixed/adam_best_seed20261115.json
+PYTHONPATH=src python scripts/summarize_contact_training_diagnostics.py \
+  --directory outputs/fullframes/contact_training_diagnostics_fixed
 
 # 7. 测试
 python -m pytest -q
@@ -484,9 +485,15 @@ r550 单次采样从约 0.98 s 降到约 0.00089 s，完整交替步从约 6.97 
 训练算例的损失取平均，再对 ContactNet 参数求加权梯度；单步 Adam 试验从同一
 检查点的内存副本重新开始，先更新 AirNet，再记录接触阶段各项、聚合梯度与
 固定训练参考点，随后执行一次原始 ContactNet 更新并重算同一批次和参考点。
-检查点文件在试验前后做 SHA-256 校验；验证算例不进入训练梯度。结果在
-`outputs/fullframes/contact_training_diagnostics/`，报告由
-`scripts/summarize_contact_training_diagnostics.py` 生成。
+检查点文件在试验前后做 SHA-256 校验；验证算例不进入训练梯度。参考指标使用
+metric v3：算例等权 `macro_mse = sum(M_k)/K`、帧数加权
+`pooled_mse = sum(n_k M_k)/sum(n_k)`，覆盖率用逐例整数 `covered_count` 累加，
+不再由 `int(coverage*n)` 恢复；时间三分位为 `[t0,b1)`、`[b1,b2)`、
+`[b2,t_end]`，边界不重复。静态批次、Adam 试验、非有限值或检查点哈希变化任一
+失败都会让诊断命令返回非零；汇总也会在源诊断不完整时返回非零并加显著标记。
+修复版结果在 `outputs/fullframes/contact_training_diagnostics_fixed/`，旧目录
+`outputs/fullframes/contact_training_diagnostics/` 保留但不再作为精确覆盖率
+来源。报告由 `scripts/summarize_contact_training_diagnostics.py` 生成。
 
 ## 8. 数据状态与未解决项
 

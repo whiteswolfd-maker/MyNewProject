@@ -235,32 +235,125 @@ def _static_record(trainer, batches, *, compute_gradients: bool,
     return record
 
 
-def _contact_metrics(trainer, case, times: np.ndarray, low: np.ndarray, up: np.ndarray) -> dict:
-    if times.size == 0:
+def _interval_stats(radius, low, up, scale: float) -> dict:
+    """Per-point interval violation and an exact integer hit count."""
+    radius = torch.as_tensor(radius, dtype=torch.float64).reshape(-1)
+    low = torch.as_tensor(low, dtype=torch.float64).reshape(-1)
+    up = torch.as_tensor(up, dtype=torch.float64).reshape(-1)
+    n = int(radius.numel())
+    if n == 0:
         return {
-            "n": 0, "mean_squared_violation": None, "rmse": None,
-            "mean_violation_over_Rsep": None, "max_violation_over_Rsep": None,
-            "coverage": None,
+            "n": 0, "covered_count": 0, "coverage": None,
+            "mse": None, "rmse": None,
+            "mean_violation_over_Rsep": None,
+            "max_violation_over_Rsep": None,
         }
+    below = torch.clamp(low - radius, min=0.0)
+    above = torch.clamp(radius - up, min=0.0)
+    squared = (below / scale) ** 2 + (above / scale) ** 2
+    violation = (below + above) / scale
+    covered = int(torch.count_nonzero((below == 0.0) & (above == 0.0)))
+    mse = float(squared.mean())
+    return {
+        "n": n,
+        "covered_count": covered,
+        "coverage": covered / n,
+        "mse": mse,
+        "rmse": math.sqrt(mse),
+        "mean_violation_over_Rsep": float(violation.mean()),
+        "max_violation_over_Rsep": float(violation.max()),
+    }
+
+
+def _contact_metrics(trainer, case, times: np.ndarray, low: np.ndarray, up: np.ndarray) -> dict:
+    if np.asarray(times).size == 0:
+        return _interval_stats(
+            np.zeros(0), np.zeros(0), np.zeros(0), float(case.length_scale)
+        )
     t = torch.as_tensor(times, dtype=torch.float64)
     with torch.enable_grad():
         fields = _contact_at(trainer, case, t, create_graph=False)
-    radius = fields.radius.detach().reshape(-1)
-    low_t = torch.as_tensor(low, dtype=torch.float64)
-    up_t = torch.as_tensor(up, dtype=torch.float64)
-    scale = float(case.length_scale)
-    below = torch.clamp(low_t - radius, min=0.0)
-    above = torch.clamp(radius - up_t, min=0.0)
-    squared = (below / scale) ** 2 + (above / scale) ** 2
-    violation = (below + above) / scale
+    return _interval_stats(
+        fields.radius.detach(), low, up, float(case.length_scale)
+    )
+
+
+def _third_masks(times: np.ndarray, t0: float, t_end: float) -> list[np.ndarray]:
+    """Partition [t0, t_end] into three bins with non-overlapping boundaries.
+
+    First ``[t0, b1)``, middle ``[b1, b2)``, late ``[b2, t_end]``.  A frame on
+    a boundary belongs to exactly one segment.
+    """
+    span = float(t_end) - float(t0)
+    b1 = float(t0) + span / 3.0
+    b2 = float(t0) + 2.0 * span / 3.0
+    return [
+        (times >= float(t0)) & (times < b1),
+        (times >= b1) & (times < b2),
+        (times >= b2) & (times <= float(t_end)),
+    ]
+
+
+def _aggregate_metrics(cases: list[dict], *, expected_cases: int) -> dict:
+    """Macro (case-equal) and pooled (frame-weighted) summaries.
+
+    ``macro_mse`` is the arithmetic mean of per-case MSE values, so
+    ``macro_rmse = sqrt(macro_mse)`` is not the mean of per-case RMSEs.
+    ``pooled_mse`` weights each case by its valid frame count and is reported
+    separately.  Coverage uses exact integer hit counts, never
+    ``round(coverage * n)``.
+    """
+    valid = [
+        case for case in cases
+        if int(case.get("n", 0)) > 0 and case.get("mse") is not None
+    ]
+    n_total = int(sum(int(case.get("n", 0)) for case in cases))
+    covered = int(sum(int(case.get("covered_count", 0)) for case in cases))
+    missing = [
+        str(case.get("case_id")) for case in cases
+        if int(case.get("n", 0)) == 0
+    ]
+    if valid:
+        macro_mse = sum(float(case["mse"]) for case in valid) / len(valid)
+        macro_rmse = math.sqrt(macro_mse)
+        pooled_denominator = sum(int(case["n"]) for case in valid)
+        pooled_mse = (
+            sum(float(case["mse"]) * int(case["n"]) for case in valid)
+            / pooled_denominator
+        )
+        pooled_rmse = math.sqrt(pooled_mse)
+        mean_violation_macro = (
+            sum(float(case["mean_violation_over_Rsep"]) for case in valid)
+            / len(valid)
+        )
+        mean_violation_pooled = (
+            sum(float(case["mean_violation_over_Rsep"]) * int(case["n"])
+                for case in valid)
+            / pooled_denominator
+        )
+        max_violation = max(float(case["max_violation_over_Rsep"]) for case in valid)
+    else:
+        macro_mse = macro_rmse = pooled_mse = pooled_rmse = None
+        mean_violation_macro = mean_violation_pooled = None
+        max_violation = None
     return {
-        "n": int(times.size),
-        "mean_squared_violation": float(squared.mean()),
-        "rmse": float(torch.sqrt(torch.mean(squared))),
-        "mean_violation_over_Rsep": float(violation.mean()),
-        "max_violation_over_Rsep": float(violation.max()),
-        "coverage": float(torch.count_nonzero((below == 0.0) & (above == 0.0))
-                          / times.size),
+        "metric_version": 3,
+        "n": n_total,
+        "covered_count": covered,
+        "coverage": (covered / n_total) if n_total else None,
+        "n_cases": len(cases),
+        "n_cases_evaluable": len(valid),
+        "n_cases_missing": missing,
+        "macro_mse": macro_mse,
+        "macro_rmse": macro_rmse,
+        "pooled_mse": pooled_mse,
+        "pooled_rmse": pooled_rmse,
+        "mean_violation_over_Rsep_macro": mean_violation_macro,
+        "mean_violation_over_Rsep_pooled": mean_violation_pooled,
+        "max_violation_over_Rsep": max_violation,
+        "complete_training_target": bool(
+            expected_cases > 0 and len(valid) == expected_cases
+        ),
     }
 
 
@@ -288,66 +381,59 @@ def _reference_points(trainer) -> list[dict]:
 
 def _reference_metrics(trainer, points: list[dict]) -> dict:
     cases = []
-    total_sq = 0.0
-    total_n = 0
-    total_violation = 0.0
-    total_covered = 0
     for point in points:
         case = next(c for c in trainer.cases if c.case_id == point["case_id"])
         metrics = _contact_metrics(
             trainer, case, point["times"], point["low"], point["up"]
         )
-        thirds = []
-        span = point["t_end"] - point["t0"]
-        for which in range(3):
-            lo = point["t0"] + (which / 3.0) * span
-            hi = point["t0"] + ((which + 1) / 3.0) * span
-            mask = ((point["times"] >= lo) & (point["times"] <= hi))
-            thirds.append(_contact_metrics(
+        masks = _third_masks(point["times"], point["t0"], point["t_end"])
+        thirds = [
+            _contact_metrics(
                 trainer, case, point["times"][mask],
                 point["low"][mask], point["up"][mask],
-            ))
-        cases.append({"case_id": point["case_id"], **metrics, "thirds": thirds})
-        if metrics["n"]:
-            total_sq += metrics["mean_squared_violation"] * metrics["n"]
-            total_violation += metrics["mean_violation_over_Rsep"] * metrics["n"]
-            total_covered += int(metrics["coverage"] * metrics["n"])
-            total_n += metrics["n"]
-    return {
-        "n": total_n,
-        "mean_squared_violation": (total_sq / total_n) if total_n else None,
-        "rmse": math.sqrt(total_sq / total_n) if total_n else None,
-        "mean_violation_over_Rsep": (total_violation / total_n) if total_n else None,
-        "coverage": (total_covered / total_n) if total_n else None,
+            )
+            for mask in masks
+        ]
+        cases.append({
+            "case_id": point["case_id"], **metrics, "thirds": thirds,
+        })
+    expected = len(points)
+    segments = []
+    for which in range(3):
+        segment_cases = [
+            {"case_id": case["case_id"], **case["thirds"][which]}
+            for case in cases
+        ]
+        segments.append(_aggregate_metrics(
+            segment_cases, expected_cases=expected
+        ))
+    aggregate = _aggregate_metrics(cases, expected_cases=expected)
+    aggregate.update({
+        "definition": {
+            "macro": "sum(M_k)/K over cases with at least one valid frame; "
+                     "macro_rmse = sqrt(macro_mse)",
+            "pooled": "sum(n_k*M_k)/sum(n_k); pooled_rmse = sqrt(pooled_mse)",
+            "coverage": "sum(covered_count_k)/sum(n_k), exact integer counts",
+            "segments": "[t0,b1),[b1,b2),[b2,t_end]; boundaries belong to one segment",
+        },
         "cases": cases,
-    }
+        "thirds": segments,
+    })
+    return aggregate
 
 
 def _batch_metrics(trainer, batches) -> dict:
     cases = []
-    total_sq = 0.0
-    total_n = 0
-    total_violation = 0.0
-    total_covered = 0
     for case, batch in batches:
-        times = batch.t_contact.detach().numpy()
-        low = batch.low_contact.detach().numpy()
-        up = batch.up_contact.detach().numpy()
-        metrics = _contact_metrics(trainer, case, times, low, up)
+        metrics = _contact_metrics(
+            trainer, case, batch.t_contact.detach().numpy(),
+            batch.low_contact.detach().numpy(),
+            batch.up_contact.detach().numpy(),
+        )
         cases.append({"case_id": case.case_id, **metrics})
-        if metrics["n"]:
-            total_sq += metrics["mean_squared_violation"] * metrics["n"]
-            total_violation += metrics["mean_violation_over_Rsep"] * metrics["n"]
-            total_covered += int(metrics["coverage"] * metrics["n"])
-            total_n += metrics["n"]
-    return {
-        "n": total_n,
-        "mean_squared_violation": (total_sq / total_n) if total_n else None,
-        "rmse": math.sqrt(total_sq / total_n) if total_n else None,
-        "mean_violation_over_Rsep": (total_violation / total_n) if total_n else None,
-        "coverage": (total_covered / total_n) if total_n else None,
-        "cases": cases,
-    }
+    aggregate = _aggregate_metrics(cases, expected_cases=len(batches))
+    aggregate["cases"] = cases
+    return aggregate
 
 
 def _flatten(params) -> torch.Tensor:
@@ -460,6 +546,34 @@ def _split(total: int, n: int) -> list[int]:
     return [base + (1 if i < extra else 0) for i in range(n)]
 
 
+def _failure_reasons(
+    *, static_requested: int, static_completed: int, static_failed: int,
+    adam_requested: int, adam_completed: int, adam_failed: int,
+    adam_available: bool, non_finite: bool, checkpoint_unchanged: bool,
+) -> list[str]:
+    reasons = []
+    if static_failed:
+        reasons.append(f"static failures: {static_failed}/{static_requested}")
+    if static_completed < static_requested:
+        reasons.append(
+            f"static batches incomplete: {static_completed}/{static_requested}"
+        )
+    if adam_requested:
+        if not adam_available:
+            reasons.append("Adam trials requested but optimizer state is missing")
+        if adam_failed:
+            reasons.append(f"Adam failures: {adam_failed}/{adam_requested}")
+        if adam_completed < adam_requested:
+            reasons.append(
+                f"Adam trials incomplete: {adam_completed}/{adam_requested}"
+            )
+    if non_finite:
+        reasons.append("non-finite loss or gradient encountered")
+    if not checkpoint_unchanged:
+        reasons.append("checkpoint SHA-256 changed during the diagnostic")
+    return reasons
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", required=True)
@@ -522,7 +636,7 @@ def main(argv=None) -> int:
                 for entry in record["per_case"]
             )
             g = record["aggregate_gradients"]
-            if not g["finite_all"]:
+            if not g["finite_all"] or not record.get("losses_finite", True):
                 non_finite_any = True
             # Drop the graph-only vector before JSON serialisation.
             record.pop("_vector_g_data", None)
@@ -540,9 +654,12 @@ def main(argv=None) -> int:
             print(f"batch {index + 1}/{requested} FAILED: {exc}", file=sys.stderr)
 
     adam_trials = []
+    adam_failed = 0
+    adam_unavailable = False
     reference = _reference_points(trainer)
     if int(args.adam_trials) > 0:
         if not adam_available:
+            adam_unavailable = True
             print(
                 "checkpoint has no optimizer state; Adam single-step checks "
                 "are not available", file=sys.stderr,
@@ -558,6 +675,7 @@ def main(argv=None) -> int:
                         non_finite_any = True
                     print(f"adam trial {trial + 1}/{args.adam_trials} done")
                 except Exception as exc:
+                    adam_failed += 1
                     adam_trials.append({
                         "trial": trial, "status": "failed",
                         "error": f"{type(exc).__name__}: {exc}",
@@ -571,7 +689,8 @@ def main(argv=None) -> int:
     checkpoint_hash_after = _sha256(checkpoint)
     output = {
         "format": "spherical_blast_pinn.contact_gradient_diagnostic",
-        "version": 2,
+        "version": 3,
+        "metric_version": 3,
         "config": args.config,
         "checkpoint": str(checkpoint),
         "checkpoint_loop": int(payload.get("loop", 0)),
@@ -584,8 +703,8 @@ def main(argv=None) -> int:
         "adam_requested": int(args.adam_trials),
         "adam_completed": sum(1 for entry in adam_trials
                               if entry.get("status") != "failed"),
-        "adam_failed": sum(1 for entry in adam_trials
-                           if entry.get("status") == "failed"),
+        "adam_failed": int(adam_failed),
+        "adam_unavailable": bool(adam_unavailable),
         "checkpoint_sha256": {
             "before": checkpoint_hash_before,
             "after": checkpoint_hash_after,
@@ -603,12 +722,25 @@ def main(argv=None) -> int:
             "and never modify the file"
         ),
     }
+    output["failure_reasons"] = _failure_reasons(
+        static_requested=requested, static_completed=completed,
+        static_failed=failed,
+        adam_requested=int(args.adam_trials),
+        adam_completed=output["adam_completed"],
+        adam_failed=adam_failed, adam_available=adam_available,
+        non_finite=bool(non_finite_any),
+        checkpoint_unchanged=output["checkpoint_sha256"]["unchanged"],
+    )
+    output["ok"] = not output["failure_reasons"]
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(output, indent=2, default=_jsonable),
                    encoding="utf-8")
     print(f"written: {out}")
-    if non_finite_any or failed:
+    if output["failure_reasons"]:
+        print("diagnostic: FAILED", file=sys.stderr)
+        for reason in output["failure_reasons"]:
+            print(f"  - {reason}", file=sys.stderr)
         return 1
     return 0
 
@@ -621,6 +753,38 @@ def _jsonable(value):
     if isinstance(value, (np.floating, np.integer)):
         return value.item()
     raise TypeError(f"not JSON serialisable: {type(value)!r}")
+
+
+def _difference(before, after):
+    if before is None or after is None:
+        return None
+    return after - before
+
+
+def _reference_change(before: dict, after: dict) -> dict:
+    return {
+        "macro_mse": _difference(before["macro_mse"], after["macro_mse"]),
+        "macro_rmse": _difference(before["macro_rmse"], after["macro_rmse"]),
+        "pooled_mse": _difference(before["pooled_mse"], after["pooled_mse"]),
+        "pooled_rmse": _difference(before["pooled_rmse"], after["pooled_rmse"]),
+        "mean_violation_macro": _difference(
+            before["mean_violation_over_Rsep_macro"],
+            after["mean_violation_over_Rsep_macro"],
+        ),
+        "mean_violation_pooled": _difference(
+            before["mean_violation_over_Rsep_pooled"],
+            after["mean_violation_over_Rsep_pooled"],
+        ),
+        "coverage": _difference(before["coverage"], after["coverage"]),
+        "covered_count": after["covered_count"] - before["covered_count"],
+        "n": after["n"],
+        "n_cases_evaluable_before": before["n_cases_evaluable"],
+        "n_cases_evaluable_after": after["n_cases_evaluable"],
+        "n_cases_missing_before": before["n_cases_missing"],
+        "n_cases_missing_after": after["n_cases_missing"],
+        "complete_training_target_before": before["complete_training_target"],
+        "complete_training_target_after": after["complete_training_target"],
+    }
 
 
 def _adam_trial(trainer, checkpoint: Path, reference, args, trial: int) -> dict:
@@ -710,25 +874,12 @@ def _adam_trial(trainer, checkpoint: Path, reference, args, trial: int) -> dict:
             or not after_static.get("losses_finite", True)
             or not before_static.get("aggregate_gradients", {}).get("finite_all", True)
         ),
-        "reference_loss_change": {
-            "mean_squared_violation": (
-                None if ref_before["mean_squared_violation"] is None
-                or ref_after["mean_squared_violation"] is None else
-                ref_after["mean_squared_violation"]
-                - ref_before["mean_squared_violation"]
-            ),
-            "mean_violation_over_Rsep": (
-                None if ref_before["mean_violation_over_Rsep"] is None
-                or ref_after["mean_violation_over_Rsep"] is None else
-                ref_after["mean_violation_over_Rsep"]
-                - ref_before["mean_violation_over_Rsep"]
-            ),
-            "coverage": (
-                None if ref_before["coverage"] is None
-                or ref_after["coverage"] is None else
-                ref_after["coverage"] - ref_before["coverage"]
-            ),
-        },
+        "reference_metric_version": 3,
+        "reference_loss_change": _reference_change(ref_before, ref_after),
+        "reference_thirds_change": [
+            _reference_change(before, after)
+            for before, after in zip(ref_before["thirds"], ref_after["thirds"])
+        ],
     }
 
 

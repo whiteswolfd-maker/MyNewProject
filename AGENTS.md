@@ -146,8 +146,12 @@
   `--mode training`（正式 10 训练算例预算与采样顺序，用于整体判断）和
   `--mode stratified`（早/中/晚窗口的补充定位；初值仍在 `t0`，空窗口明确
   不可评估，不能回退全时段）。静态梯度先对 10 个算例的损失取平均再求加权
-  梯度；`--adam-trials` 从检查点内存副本做独立单步更新，不得改文件。零梯度
-  方向标为不可定义，非有限梯度必须失败。
+  梯度；`--adam-trials` 从检查点内存副本做独立单步更新，不得改文件。参考指标
+  必须同时给出算例等权 `macro_mse/rmse` 与帧数加权 `pooled_mse/rmse`，覆盖率
+  用整数 `covered_count` 累加，禁止 `int(coverage*n)`。三分位边界只归入一个
+  分段；空算例/分段标为不可评估，不能当零。零梯度方向标为不可定义；非有限
+  梯度、静态/Adam 失败、缺少优化器状态或检查点哈希变化必须返回非零。汇总
+  脚本同样不得用 None/NaN 参与统计，源诊断失败时汇总必须非零并标记。
 - `scripts/prepare_fullframe_data.py --cases ...` 是薄编排器：调用现有导入器和
   `build-cache`，把全帧标准/缓存写到 `outputs/fullframes/`；不覆盖旧数据。
 - `scripts/audit_reference_data.py --stage <manifest|imports|metrics|consistency|report|all>`
