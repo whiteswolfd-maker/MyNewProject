@@ -439,7 +439,21 @@ PYTHONPATH=src python -m spherical_blast_pinn.cli.contact_air evaluate \
   --prediction outputs/contact_air_smoke/prediction.npz \
   --output outputs/contact_air_smoke/evaluation.json
 
-# 6. 测试
+# 6. 全帧基线记录、采样基准与接触梯度诊断（均只读）
+PYTHONPATH=src python scripts/record_baseline.py \
+  --config configs/contact_air/split_train_r50_500_fullframes.yaml \
+  --checkpoint-dir outputs/contact_air_split_r50_500_fullframes_cw3_4000 \
+  --output outputs/fullframes/baseline_manifest.json
+PYTHONPATH=src python scripts/benchmark_sampling.py \
+  --config configs/contact_air/split_train_r50_500_fullframes.yaml \
+  --case r550_full --full-step --output outputs/fullframes/sampling_benchmark_full.json
+PYTHONPATH=src python scripts/diagnose_contact_gradients.py \
+  --config configs/contact_air/split_train_r50_500_fullframes.yaml \
+  --checkpoint outputs/contact_air_split_r50_500_fullframes_cw3_4000/best.pt \
+  --prediction-dir outputs/fullframes/compare/new_fullframes_cw3_4000 \
+  --prediction-tag best --output outputs/fullframes/compare/contact_gradient_diag_best.json
+
+# 7. 测试
 python -m pytest -q
 ```
 
@@ -448,6 +462,15 @@ python -m pytest -q
 
 `configs/contact_air/smoke.yaml` 是纯内存合成检查；`smoke_cached.yaml` 走真实
 文件读取、缓存和预测加载链路。两者都是工程检查，不是数据划分或精度结果。
+
+全帧观测在加载时建立“帧号 → 行范围”索引；`AirObservationStore.sample()`
+仍按“先抽帧、再抽帧内点”的顺序调用相同的 `torch.randint`/`torch.bincount`，
+只是不再扫描全部观测。非单调数组走原扫描分支 `_sample_scan()`；回归测试要求
+同一随机种子下 100 次抽样与旧实现逐值一致，并要求真实缓存上一步训练的损失和
+参数完全一致。当前 `_networks()` 显式把网络建在 CPU 上；本机 PyTorch 2.5.1
+（cu121）不支持 RTX 5060 Ti 的 sm_120，因此基准记录的是 CPU 计时。实测
+r550 单次采样从约 0.98 s 降到约 0.00089 s，完整交替步从约 6.97 s 降到约
+0.27 s；这是本机工程测量，不是收敛或精度结果。
 
 ## 8. 数据状态与未解决项
 
@@ -491,7 +514,9 @@ tests/             当前方案测试与端到端流水线
 `R_c` 完整乘积导数、事件平移与帧距、epsilon 因子、有限马赫数 RH 三条守恒、
 初值范围、数据坐标跟随预测 Rc、域外计数、映射/物理 PDE 一致、两阶段梯度隔离、
 检查点恢复与不匹配拒绝、删除内部参考数组后的预测、任意半径按 role 隔离，以及
-标准 `.npz → build-cache → train → resume → predict → evaluate` 新进程全链路。
+标准 `.npz → build-cache → train → resume → predict → evaluate` 新进程全链路，
+以及帧索引采样与旧扫描路径的同种子逐值一致、同步训练损失/参数一致、接触梯度
+零方向处理。
 
 测试数量不是完成标准；以实际工作树、实际解释器和实际命令的输出为准。
 

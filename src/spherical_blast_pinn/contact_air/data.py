@@ -141,10 +141,61 @@ class AirObservationStore:
     valid_pressure: np.ndarray
     frame_index: np.ndarray
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    # Frame index built once at load: observations are stored frame by frame,
+    # so a frame owns a contiguous row range.  The fallback path keeps the
+    # original scan for arrays whose time/frame order is not monotone.
+    _frame_ids: np.ndarray = field(init=False, repr=False, compare=False)
+    _frame_starts: np.ndarray | None = field(init=False, repr=False, compare=False)
+    _frame_ends: np.ndarray | None = field(init=False, repr=False, compare=False)
+    _time_sorted: bool = field(init=False, repr=False, compare=False)
+    _frames_sorted: bool = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        frame = np.asarray(self.frame_index)
+        time = np.asarray(self.time)
+        self._time_sorted = bool(
+            time.size < 2 or np.all(np.diff(time) >= 0.0)
+        )
+        self._frames_sorted = bool(
+            frame.size < 2 or np.all(frame[1:] >= frame[:-1])
+        )
+        if self._frames_sorted:
+            ids, starts, counts = np.unique(
+                frame, return_index=True, return_counts=True
+            )
+            self._frame_ids = ids
+            self._frame_starts = starts.astype(np.int64, copy=False)
+            self._frame_ends = (starts + counts).astype(np.int64, copy=False)
+        else:
+            self._frame_ids = np.unique(frame)
+            self._frame_starts = None
+            self._frame_ends = None
 
     @property
     def size(self) -> int:
         return int(self.time.size)
+
+    def _empty_draw(self) -> dict[str, Any]:
+        empty = _tensor(np.zeros(0))
+        empty_bool = empty.bool()
+        return {
+            "t": empty, "radius": empty, "rho": empty, "u": empty, "p": empty,
+            "valid_rho": empty_bool, "valid_u": empty_bool,
+            "valid_p": empty_bool, "count": 0,
+        }
+
+    def _draw(self, selected: np.ndarray) -> dict[str, Any]:
+        return {
+            "t": _tensor(self.time[selected]),
+            "radius": _tensor(self.radius[selected]),
+            "rho": _tensor(self.density[selected]),
+            "u": _tensor(self.velocity[selected]),
+            "p": _tensor(self.pressure[selected]),
+            "valid_rho": _tensor(self.valid_density[selected]).bool(),
+            "valid_u": _tensor(self.valid_velocity[selected]).bool(),
+            "valid_p": _tensor(self.valid_pressure[selected]).bool(),
+            "count": int(selected.size),
+        }
 
     def sample(
         self,
@@ -154,17 +205,77 @@ class AirObservationStore:
         t_min: float | None = None,
         t_max: float | None = None,
     ) -> dict[str, Any]:
-        """Draw air points **frame first, then point inside the frame**."""
-        empty = _tensor(np.zeros(0))
-        empty_bool = empty.bool()
+        """Draw air points **frame first, then point inside the frame**.
+
+        The draw sequence is unchanged from the pre-index implementation:
+        frame ids are the sorted unique ids in the time window, and the same
+        ``torch.randint``/``torch.bincount`` calls occur in the same order.
+        Only the lookup of the rows belonging to each frame is indexed.
+        """
         if self.size == 0 or count <= 0:
-            return {
-                "t": empty, "radius": empty, "rho": empty, "u": empty, "p": empty,
-                "valid_rho": empty_bool, "valid_u": empty_bool,
-                "valid_p": empty_bool, "count": 0,
-            }
+            return self._empty_draw()
         if torch is None:  # pragma: no cover
             raise RuntimeError("PyTorch is required")
+        if not (self._frames_sorted and self._time_sorted):
+            return self._sample_scan(count, generator, t_min=t_min, t_max=t_max)
+
+        lo = (
+            0 if t_min is None
+            else int(np.searchsorted(self.time, float(t_min), side="left"))
+        )
+        hi = (
+            self.size if t_max is None
+            else int(np.searchsorted(self.time, float(t_max), side="right"))
+        )
+        if hi <= lo:
+            return self._empty_draw()
+        # Frames whose [start, end) row range intersects [lo, hi).  Because
+        # frame_index is nondecreasing, those frames form one contiguous slot
+        # range and every frame's retained rows are contiguous.
+        slot_lo = int(np.searchsorted(self._frame_ends, lo, side="right"))
+        slot_hi = int(np.searchsorted(self._frame_starts, hi, side="left"))
+        if slot_hi <= slot_lo:
+            return self._empty_draw()
+        frames = self._frame_ids[slot_lo:slot_hi]
+        starts = np.maximum(self._frame_starts[slot_lo:slot_hi], lo)
+        ends = np.minimum(self._frame_ends[slot_lo:slot_hi], hi)
+        chosen_frames = torch.randint(
+            0, int(frames.size), (int(count),), generator=generator
+        )
+        frame_counts = torch.bincount(
+            chosen_frames, minlength=int(frames.size)
+        ).cpu().numpy()
+        selected_parts: list[np.ndarray] = []
+        for slot, n_take in enumerate(frame_counts):
+            if int(n_take) <= 0:
+                continue
+            frame_count = int(ends[slot] - starts[slot])
+            picks = torch.randint(
+                0, frame_count, (int(n_take),), generator=generator
+            ).cpu().numpy()
+            # rows inside this frame are the contiguous range
+            # [starts[slot], ends[slot])
+            selected_parts.append(starts[slot] + picks)
+        selected = (
+            np.concatenate(selected_parts)
+            if selected_parts else np.zeros(0, dtype=np.int64)
+        )
+        return self._draw(selected)
+
+    def _sample_scan(
+        self,
+        count: int,
+        generator,
+        *,
+        t_min: float | None,
+        t_max: float | None,
+    ) -> dict[str, Any]:
+        """Original per-frame scan, kept for non-monotone stores.
+
+        It is semantically identical to :meth:`sample`; it exists so unusual
+        arrays (for example a hand-built store with interleaved frames) never
+        take a wrong fast path.
+        """
         allowed = np.ones(self.size, dtype=bool)
         if t_min is not None:
             allowed &= self.time >= float(t_min)
@@ -172,11 +283,7 @@ class AirObservationStore:
             allowed &= self.time <= float(t_max)
         frames = np.unique(self.frame_index[allowed])
         if frames.size == 0:
-            return {
-                "t": empty, "radius": empty, "rho": empty, "u": empty, "p": empty,
-                "valid_rho": empty_bool, "valid_u": empty_bool,
-                "valid_p": empty_bool, "count": 0,
-            }
+            return self._empty_draw()
         by_frame = {
             int(frame): np.flatnonzero(allowed & (self.frame_index == frame))
             for frame in frames
@@ -201,17 +308,7 @@ class AirObservationStore:
             np.concatenate(selected_parts)
             if selected_parts else np.zeros(0, dtype=np.int64)
         )
-        return {
-            "t": _tensor(self.time[selected]),
-            "radius": _tensor(self.radius[selected]),
-            "rho": _tensor(self.density[selected]),
-            "u": _tensor(self.velocity[selected]),
-            "p": _tensor(self.pressure[selected]),
-            "valid_rho": _tensor(self.valid_density[selected]).bool(),
-            "valid_u": _tensor(self.valid_velocity[selected]).bool(),
-            "valid_p": _tensor(self.valid_pressure[selected]).bool(),
-            "count": int(selected.size),
-        }
+        return self._draw(selected)
 
     def subset(self, mask: np.ndarray) -> "AirObservationStore":
         return AirObservationStore(

@@ -137,6 +137,13 @@
   训练采样；不能与训练算例重复 `case_id`。`validation.holdout_fraction: 0`
   表示训练算例全部帧可用，验证完全由该半径带提供。
 - `build-cache --source <标准一维文件或目录> --case ... --radius ... --role ... --out ...`。
+- 观测采样使用加载时建立的帧索引，但**不得改变抽样分布或随机数调用顺序**：
+  仍是先均匀选帧、再均匀选帧内点，重复抽样规则不变；非单调数组走
+  `_sample_scan()` 原扫描分支。预测 `R_c` 决定的域内筛选仍在损失阶段执行，
+  不能提前缓存成固定掩码。`scripts/benchmark_sampling.py` 只做工程计时。
+- `scripts/record_baseline.py` 和 `scripts/diagnose_contact_gradients.py` 是只读
+  工具：前者记录代码/配置/缓存指纹/检查点/环境，后者核对接触标签、独立越界
+  损失、各项对 ContactNet 参数的梯度范数与夹角；零梯度必须标为方向不可定义。
 - `scripts/prepare_fullframe_data.py --cases ...` 是薄编排器：调用现有导入器和
   `build-cache`，把全帧标准/缓存写到 `outputs/fullframes/`；不覆盖旧数据。
 - `scripts/audit_reference_data.py --stage <manifest|imports|metrics|consistency|report|all>`
