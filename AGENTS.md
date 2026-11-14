@@ -152,6 +152,13 @@
   分段；空算例/分段标为不可评估，不能当零。零梯度方向标为不可定义；非有限
   梯度、静态/Adam 失败、缺少优化器状态或检查点哈希变化必须返回非零。汇总
   脚本同样不得用 None/NaN 参与统计，源诊断失败时汇总必须非零并标记。
+
+- `scripts/contact_fullcontact_pair.py` 是配对单步诊断：A 用正式随机接触标签，
+  B 用全部合法训练接触标签（每例均值、算例等权）。A/B 必须从同一检查点、
+  同一非接触批次、同一 AirNet 更新开始，只替换 contact_data 标签；全标签
+  预先生成，不额外消耗随机数；每个 A/B 对独立恢复检查点，检查点不得改写。
+  验证算例不进入梯度或固定参考。A/B 的随机批次损失与全标签损失不能当作同一
+  集合的数值比较。汇总按配对差值分种子、合并报告，不得只挑有利种子。
 - `scripts/prepare_fullframe_data.py --cases ...` 是薄编排器：调用现有导入器和
   `build-cache`，把全帧标准/缓存写到 `outputs/fullframes/`；不覆盖旧数据。
 - `scripts/audit_reference_data.py --stage <manifest|imports|metrics|consistency|report|all>`

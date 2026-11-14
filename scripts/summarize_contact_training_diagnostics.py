@@ -136,6 +136,143 @@ def _source_issues(payload: dict) -> list[str]:
     return issues
 
 
+def _load_manifest(path: Path) -> dict:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("manifest must be a JSON object")
+    experiments = payload.get("experiments")
+    if not isinstance(experiments, list) or not experiments:
+        raise ValueError("manifest.experiments must be a non-empty list")
+    return payload
+
+
+def _require_type(value, name: str, kind, issues: list[str]) -> bool:
+    if not isinstance(value, kind) or isinstance(value, bool) and kind is not bool:
+        issues.append(f"{name} has wrong type: {type(value).__name__}")
+        return False
+    return True
+
+
+def _validate_static(payload: dict, expected: dict, issues: list[str]) -> dict:
+    local: list[str] = []
+    for key in ("requested_batches", "completed_batches", "failed_batches"):
+        _require_type(payload.get(key), key, int, local)
+    batches = payload.get("batches")
+    if not isinstance(batches, list):
+        local.append("batches is not a list")
+        issues.extend(local)
+        return {"complete": False, "n_records": 0}
+    indices = [batch.get("batch") for batch in batches if isinstance(batch, dict)]
+    if len(indices) != len(batches):
+        local.append("batches contains non-object entries")
+    if len(set(indices)) != len(indices):
+        local.append("duplicate static batch indices")
+    requested = payload.get("requested_batches")
+    if isinstance(requested, int) and len(batches) != requested:
+        local.append(
+            f"static record count {len(batches)} != requested {requested}"
+        )
+    if isinstance(requested, int) and set(indices) != set(range(requested)):
+        local.append("static batch indices do not cover 0..requested-1 exactly once")
+    for batch in batches:
+        if batch.get("status") == "failed":
+            continue
+        if not isinstance(batch.get("terms"), dict) or not isinstance(
+            batch.get("aggregate_gradients"), dict
+        ):
+            local.append(f"batch {batch.get('batch')} missing terms/gradients")
+    failed = sum(1 for batch in batches if batch.get("status") == "failed")
+    completed = len(batches) - failed
+    if payload.get("failed_batches") != failed:
+        local.append(
+            f"failed_batches metadata {payload.get('failed_batches')} != records {failed}"
+        )
+    if payload.get("completed_batches") != completed:
+        local.append(
+            f"completed_batches metadata {payload.get('completed_batches')} "
+            f"!= records {completed}"
+        )
+    if expected.get("mode") is not None and payload.get("mode") != expected["mode"]:
+        local.append(
+            f"mode {payload.get('mode')!r} != manifest {expected['mode']!r}"
+        )
+    if expected.get("seed") is not None and payload.get("batch_seed") != expected["seed"]:
+        local.append(
+            f"batch_seed {payload.get('batch_seed')!r} != manifest {expected['seed']!r}"
+        )
+    issues.extend(local)
+    return {"complete": not local and completed == requested, "n_records": len(batches)}
+
+
+def _validate_adam(payload: dict, expected: dict, issues: list[str]) -> dict:
+    local: list[str] = []
+    for key in ("adam_requested", "adam_completed", "adam_failed"):
+        _require_type(payload.get(key), key, int, local)
+    trials = payload.get("adam_trials")
+    if not isinstance(trials, list):
+        local.append("adam_trials is not a list")
+        issues.extend(local)
+        return {"complete": False, "n_records": 0, "reference_complete": False}
+    ids = [trial.get("trial") for trial in trials if isinstance(trial, dict)]
+    if len(ids) != len(trials):
+        local.append("adam_trials contains non-object entries")
+    if len(set(ids)) != len(ids):
+        local.append("duplicate Adam trial indices")
+    requested = payload.get("adam_requested")
+    if isinstance(requested, int) and len(trials) != requested:
+        local.append(f"Adam record count {len(trials)} != requested {requested}")
+    if isinstance(requested, int) and set(ids) != set(range(requested)):
+        local.append("Adam trial indices do not cover 0..requested-1 exactly once")
+    failed = sum(1 for trial in trials if trial.get("status") == "failed")
+    completed = len(trials) - failed
+    if payload.get("adam_failed") != failed:
+        local.append(
+            f"adam_failed metadata {payload.get('adam_failed')} != records {failed}"
+        )
+    if payload.get("adam_completed") != completed:
+        local.append(
+            f"adam_completed metadata {payload.get('adam_completed')} "
+            f"!= records {completed}"
+        )
+    if expected.get("seed") is not None and payload.get("adam_seed") != expected["seed"]:
+        # Older v3 JSONs do not record adam_seed; only flag when present.
+        if payload.get("adam_seed") is not None:
+            local.append(
+                f"adam_seed {payload.get('adam_seed')!r} != manifest {expected['seed']!r}"
+            )
+    reference_complete = True
+    expected_cases = set(expected.get("training_cases") or [])
+    for trial in trials:
+        if trial.get("status") != "ok":
+            continue
+        for key in (
+            "contact_data_loss_change", "reference_loss_change",
+            "reference_contact_before", "reference_contact_after",
+            "parameter_delta",
+        ):
+            if key not in trial:
+                local.append(f"trial {trial.get('trial')} missing {key}")
+        for side in ("reference_contact_before", "reference_contact_after"):
+            reference = trial.get(side, {})
+            if not reference.get("complete_training_target", False):
+                reference_complete = False
+                local.append(f"trial {trial.get('trial')} {side} is incomplete")
+            case_ids = {
+                item.get("case_id") for item in reference.get("cases", [])
+            }
+            if expected_cases and case_ids != expected_cases:
+                reference_complete = False
+                local.append(
+                    f"trial {trial.get('trial')} {side} case set differs from manifest"
+                )
+    issues.extend(local)
+    return {
+        "complete": not local and completed == requested,
+        "n_records": len(trials),
+        "reference_complete": reference_complete,
+    }
+
+
 def _static(paths: list[Path]) -> dict:
     batches = []
     meta = []
@@ -151,10 +288,16 @@ def _static(paths: list[Path]) -> dict:
             "non_finite": payload.get("non_finite"),
             "ok": payload.get("ok"),
         })
-        batches.extend(
-            batch for batch in payload.get("batches", [])
-            if batch.get("status") != "failed"
-        )
+        for batch in payload.get("batches", []):
+            if batch.get("status") == "failed":
+                continue
+            if not isinstance(batch, dict) or not isinstance(
+                batch.get("terms"), dict
+            ) or not all(name in batch["terms"] for name in
+                         ("pde", "contact_ic", "interface", "contact_data")):
+                issues.append(f"{path.name}: batch missing required terms")
+                continue
+            batches.append(batch)
     terms = {
         name: _term_stats(batches, name)
         for name in ("pde", "contact_ic", "interface", "contact_data")
@@ -229,10 +372,20 @@ def _adam(paths: list[Path]) -> dict:
             "checkpoint_loop": payload.get("checkpoint_loop"),
             "ok": payload.get("ok"),
         })
-        trials.extend(
-            trial for trial in payload.get("adam_trials", [])
-            if trial.get("status") == "ok"
-        )
+        for trial in payload.get("adam_trials", []):
+            if trial.get("status") != "ok":
+                continue
+            required = (
+                "contact_data_loss_change", "reference_loss_change",
+                "reference_contact_before", "reference_contact_after",
+                "parameter_delta",
+            )
+            if not isinstance(trial, dict) or any(
+                key not in trial for key in required
+            ):
+                issues.append(f"{path.name}: Adam trial missing required fields")
+                continue
+            trials.append(trial)
     batch_change = [
         trial.get("contact_data_loss_change", {}).get("weighted_current_batch")
         for trial in trials
@@ -479,86 +632,186 @@ def _write_markdown(summary: dict, out: Path) -> None:
     out.write_text("".join(lines), encoding="utf-8")
 
 
+def _majority(entry: dict) -> str:
+    n = int(entry.get("n_evaluable", 0))
+    if n == 0:
+        return "不可判断"
+    improved = int(entry.get("improved") or 0)
+    if improved == n:
+        return "全部改善"
+    if improved == 0:
+        return "全部变差"
+    if improved * 2 == n:
+        return "半数改善"
+    if improved * 2 > n:
+        return "多数改善"
+    return "少数改善（多数变差）"
+
+
 def _report_text(summary: dict) -> str:
     lines = ["# 接触训练诊断报告（修复版，metric v3）\n"]
     if summary["source_issues"]:
-        lines.append("\n> **源诊断失败或不完整，以下不能作为正常结论。**\n")
+        lines.append("\n> **输入不完整或源诊断失败，以下不能作为正常结论。**\n")
         for issue in summary["source_issues"]:
             lines.append(f"> - {issue}\n")
-    lines.append(
-        "\n本轮是同一检查点反复开始的独立单步试验，不是连续训练，"
-        "不能据此证明长期收敛或长期误差的根因。\n"
-    )
+    lines.append("\n本轮是同一检查点反复开始的独立单步试验，不是连续训练，"
+                 "不能据此证明长期收敛或长期误差的根因。\n")
+    lines.append("参考指标同时使用算例等权 macro 与帧数加权 pooled；"
+                 "每个独立参考帧集合为 7,165 帧（10 个训练算例，全部完整），"
+                 "跨试验累计评估点数为 n_trials × 7,165，二者不能混用。\n")
+    if summary.get("not_requested"):
+        lines.append("\n未运行的清单项：" + "；".join(
+            item.get("file", "?") for item in summary["not_requested"]
+        ) + "。\n")
+    if summary.get("unexpected_files"):
+        lines.append("\n清单外文件（未纳入结论）：" + "、".join(
+            summary["unexpected_files"]
+        ) + "。\n")
+
     lines.append("\n## 1. 正式训练分布下的静态梯度\n")
     for tag, entry in summary["static"].items():
         cos = entry["cosines"]["cos_data_vs_other"]
+        contact = entry["terms"]["contact_data"]["grad_norm_median"]
+        pde = entry["terms"]["pde"]["grad_norm_median"]
+        ic = entry["terms"]["contact_ic"]["grad_norm_median"]
+        interface = entry["terms"]["interface"]["grad_norm_median"]
+        values = [value for value in (contact, pde, ic, interface)
+                  if _finite(value)]
+        if not values or not _finite(contact):
+            dominance = "接触梯度大小不可判断"
+        elif contact >= max(values):
+            dominance = "接触梯度是四项中最大"
+        else:
+            dominance = "接触梯度不是四项中最大"
+        if cos["valid_directions"] == 0:
+            conflict = "方向不可判断（无有效方向）"
+        elif cos["negative"] * 2 == cos["valid_directions"]:
+            conflict = "有效方向中负值为半数"
+        elif cos["negative"] * 2 > cos["valid_directions"]:
+            conflict = "有效方向中负值为多数"
+        else:
+            conflict = "有效方向中负值为少数"
         lines.append(
-            f"- {tag}：contact_data 梯度中位数 "
-            f"{_fmt(entry['terms']['contact_data']['grad_norm_median'], 5)}，"
-            f"PDE {_fmt(entry['terms']['pde']['grad_norm_median'], 5)}，"
-            f"data/pde {_fmt(entry['data_to_pde_ratio_median'], 3)}；"
+            f"- {tag}：contact_data 中位 {_fmt(contact, 5)}，"
+            f"PDE {_fmt(pde, 5)}，IC {_fmt(ic, 5)}，interface {_fmt(interface, 5)}；"
+            f"data/pde {_fmt(entry['data_to_pde_ratio_median'], 3)}；{dominance}。"
             f"data-vs-other 有效方向 {cos['valid_directions']}/{cos['requested']}，"
-            f"其中负值 {cos['negative']}，undefined {cos['undefined']}，"
-            f"non_finite {cos['non_finite']}。\n"
+            f"负值 {cos['negative']}，undefined {cos['undefined']}，"
+            f"non_finite {cos['non_finite']}；{conflict}。\n"
         )
-    lines.append("\n## 2. 单步 Adam：两种参考口径\n")
+
+    lines.append("\n## 2. 单步 Adam：macro 与 pooled\n")
     for tag, entry in summary["adam"].items():
         lines.append(
-            f"- {tag}：批次 data {_status_line(entry['batch'])}；"
-            f"macro_mse {_status_line(entry['macro_mse'])}；"
-            f"pooled_mse {_status_line(entry['pooled_mse'])}；"
-            f"覆盖率 {_status_line(entry['coverage'])}。\n"
+            f"- {tag}：batch {_status_line(entry['batch'])}（{_majority(entry['batch'])}）；"
+            f"macro {_status_line(entry['macro_mse'])}（{_majority(entry['macro_mse'])}）；"
+            f"pooled {_status_line(entry['pooled_mse'])}（{_majority(entry['pooled_mse'])}）；"
+            f"覆盖率 {_status_line(entry['coverage'])}（{_majority(entry['coverage'])}）。\n"
         )
         lines.append(
-            f"  中位变化：批次 {_fmt(entry['batch']['median'], 8)}，"
+            f"  中位变化：batch {_fmt(entry['batch']['median'], 8)}，"
             f"macro {_fmt(entry['macro_mse']['median'], 8)}，"
-            f"pooled {_fmt(entry['pooled_mse']['median'], 8)}。"
-            f" 两者同时改善(batch+macro) {entry['both_improved']}/"
-            f"{entry['both_improved_denominator']}；"
+            f"pooled {_fmt(entry['pooled_mse']['median'], 8)}；"
+            f"batch+macro 同时改善 {entry['both_improved']}/"
+            f"{entry['both_improved_denominator']}，"
             f"batch+pooled 同时改善 {entry['both_improved_pooled']}/"
-            f"{entry['both_improved_denominator']}；"
+            f"{entry['both_improved_denominator']}，"
             f"批次好/macro 坏 {entry['batch_good_macro_bad']}。\n"
         )
-    lines.append("\n## 3. 覆盖率修正\n")
+
+    lines.append("\n## 3. 覆盖率（精确整数计数）\n")
     for tag, entry in summary["adam"].items():
         lines.append(
-            f"- {tag}：参考点精确 covered {entry['covered_before_total']} → "
-            f"{entry['covered_after_total']}（n={entry['reference_n_total']}）；"
-            f"覆盖率变化 {_status_line(entry['coverage'])}。"
-            "旧版通过 int(coverage*n) 恢复命中数，可能少算；本版直接累加整数。\n"
+            f"- {tag}：独立参考帧 {entry['reference_n_total']}（跨试验累计）；"
+            f"covered {entry['covered_before_total']} → "
+            f"{entry['covered_after_total']}；覆盖率变化 "
+            f"{_status_line(entry['coverage'])}（{_majority(entry['coverage'])}）。"
+            "旧版的浮点恢复可能少算，本版直接累加整数。\n"
         )
+
     lines.append("\n## 4. 半径与时段折中\n")
     for tag, entry in summary["adam"].items():
-        case_parts = []
+        parts = []
         for case_id, item in sorted(
             entry["per_case"].items(),
             key=lambda pair: int(pair[0].split("_")[0][1:]),
         ):
             if _finite(item.get("median")):
-                case_parts.append(f"{case_id} {_fmt(item['median'], 3)}")
-        lines.append(f"- {tag} 各半径 macro MSE 变化中位数：" + "；".join(case_parts) + "。\n")
+                direction = "改善" if item["median"] < 0 else (
+                    "变差" if item["median"] > 0 else "持平"
+                )
+                parts.append(f"{case_id} {_fmt(item['median'], 3)}（{direction}）")
+        lines.append(f"- {tag} 各半径 macro MSE 中位变化：" + "；".join(parts) + "。\n")
         for which, item in entry["thirds"].items():
             lines.append(
-                f"  时段 {which}：macro {_fmt(item['macro']['median'], 3)}，"
-                f"pooled {_fmt(item['pooled']['median'], 3)}。\n"
+                f"  时段 {which}：macro {_fmt(item['macro']['median'], 3)}"
+                f"（{_majority(item['macro'])}），"
+                f"pooled {_fmt(item['pooled']['median'], 3)}"
+                f"（{_majority(item['pooled'])}）。\n"
             )
-    lines.append("\n## 5. 哪些旧结论保留/修正\n")
-    lines.append(
-        "- 旧分时段诊断把接触与全时段 PDE/界面梯度比较，不能代表正式训练；本版用正式 10 算例聚合，结论以其为准。\n"
-        "- 接触梯度仍是最大项之一，但训练分布下不是旧版的 25–29 倍；方向冲突常见，但更新没有被阻断。\n"
-        f"- best：batch {_status_line(summary['adam']['best']['batch'])}，"
-        f"macro {_status_line(summary['adam']['best']['macro_mse'])}，"
-        f"pooled {_status_line(summary['adam']['best']['pooled_mse'])}。\n"
-        f"- last：batch {_status_line(summary['adam']['last']['batch'])}，"
-        f"macro {_status_line(summary['adam']['last']['macro_mse'])}，"
-        f"pooled {_status_line(summary['adam']['last']['pooled_mse'])}；"
-        "pooled 的改善掩盖了 macro 的多数变差。\n"
-        "- 不同半径和早/中/晚时段存在折中；覆盖率在 best 上多数上升，在 last 上接近持平/略降。\n"
-        "- 旧版通过 int(coverage*n) 逐例恢复命中数，浮点截断会少算；本版直接累加整数并重算。\n"
-    )
+
+    lines.append("\n## 5. 由当前输入生成的结论\n")
     if summary["source_issues"]:
-        lines.append("\n**由于源诊断存在问题，以上结论均应视为不完整。**\n")
+        lines.append("- 源诊断不完整或失败，不能生成正常结论。\n")
+    else:
+        for tag, entry in summary["adam"].items():
+            lines.append(
+                f"- {tag}：batch {_majority(entry['batch'])}；"
+                f"macro {_majority(entry['macro_mse'])}；"
+                f"pooled {_majority(entry['pooled_mse'])}；"
+                f"覆盖率 {_majority(entry['coverage'])}。"
+            )
+            if (entry["macro_mse"]["improved"] is not None
+                    and entry["pooled_mse"]["improved"] is not None
+                    and entry["macro_mse"]["improved"] != entry["pooled_mse"]["improved"]):
+                lines.append(
+                    " macro 与 pooled 的改善次数不同，不能用一个口径代替另一个。"
+                )
+            lines.append("\n")
+        if all(
+            summary["adam"][tag]["macro_mse"]["n_evaluable"] == 0
+            for tag in summary["adam"]
+        ):
+            lines.append("- 所有检查点的 macro 均不可评估，不能判断方向。\n")
+    lines.append("\n“多数”仅在改善数超过有效试验数一半时使用；恰好一半写“半数”。"
+                 "所有比例使用对应有效分母。\n")
     return "".join(lines)
+
+
+def _manifest_expectations(manifest: dict) -> dict:
+    expected = {}
+    for item in manifest.get("experiments", []):
+        kind = item.get("kind")
+        file_name = item.get("file")
+        if kind not in ("static", "adam", "stratified") or not file_name:
+            raise ValueError(f"invalid manifest experiment entry: {item!r}")
+        expected[file_name] = item
+    return expected
+
+
+def _check_group_consistency(paths: list[Path], payloads: list[dict],
+                             manifest: dict, issues: list[str]) -> None:
+    groups: dict[tuple, list[dict]] = {}
+    for path, payload in zip(paths, payloads):
+        kind = "adam" if "adam_trials" in payload else "static"
+        checkpoint = str(payload.get("checkpoint", ""))
+        key = (kind, checkpoint, payload.get("mode"))
+        groups.setdefault(key, []).append({
+            "file": path.name, "payload": payload
+        })
+    for key, entries in groups.items():
+        configs = {entry["payload"].get("config") for entry in entries}
+        versions = {entry["payload"].get("metric_version") for entry in entries}
+        hashes = {
+            entry["payload"].get("checkpoint_sha256", {}).get("after")
+            for entry in entries
+        }
+        if len(configs) > 1:
+            issues.append(f"mixed config in group {key}: {sorted(map(str, configs))}")
+        if len(versions) > 1:
+            issues.append(f"mixed metric_version in group {key}: {versions}")
+        if len(hashes) > 1:
+            issues.append(f"mixed checkpoint hashes in group {key}")
 
 
 def main(argv=None) -> int:
@@ -567,26 +820,121 @@ def main(argv=None) -> int:
         "--directory",
         default="outputs/fullframes/contact_training_diagnostics_fixed",
     )
+    parser.add_argument("--manifest", default=None)
     args = parser.parse_args(argv)
     directory = Path(args.directory)
+    manifest_path = (
+        Path(args.manifest) if args.manifest
+        else directory / "diagnostic_manifest.json"
+    )
+    issues = []
+    if not manifest_path.is_file():
+        issues.append(f"diagnostic manifest not found: {manifest_path}")
+        manifest = {"experiments": [], "checkpoints": {}}
+    else:
+        try:
+            manifest = _load_manifest(manifest_path)
+        except Exception as exc:
+            issues.append(f"invalid diagnostic manifest: {exc}")
+            manifest = {"experiments": [], "checkpoints": {}}
+    expected = _manifest_expectations(manifest) if manifest.get("experiments") else {}
+
+    static_paths = {tag: [] for tag in ("best", "last")}
+    adam_paths = {tag: [] for tag in ("best", "last")}
+    stratified_paths = {tag: [] for tag in ("best", "last")}
+    not_requested = []
+    payloads_for_consistency = []
+    paths_for_consistency = []
+    seen = set()
+    for file_name, item in expected.items():
+        key = (
+            item.get("kind"), item.get("checkpoint"), item.get("mode"),
+            item.get("seed"),
+        )
+        if key in seen:
+            issues.append(f"duplicate manifest entry: {key}")
+        seen.add(key)
+        path = directory / file_name
+        if not path.is_file():
+            if item.get("optional", False):
+                not_requested.append({"file": file_name, "reason": "optional not run"})
+            else:
+                issues.append(f"required result missing: {file_name}")
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            issues.append(f"{file_name}: invalid JSON: {exc}")
+            continue
+        if payload.get("version") != 3 or payload.get("metric_version") != 3:
+            issues.append(f"{file_name}: schema is not metric version 3")
+        if payload.get("format") != "spherical_blast_pinn.contact_gradient_diagnostic":
+            issues.append(f"{file_name}: wrong format field")
+        if not isinstance(payload.get("config"), str):
+            issues.append(f"{file_name}: config is not a string")
+        if payload.get("ok") is False:
+            issues.extend(
+                f"{file_name}: {reason}"
+                for reason in (payload.get("failure_reasons") or ["ok=false"])
+            )
+        checkpoint_info = manifest.get("checkpoints", {}).get(item.get("checkpoint"), {})
+        expected_hash = checkpoint_info.get("sha256")
+        before = payload.get("checkpoint_sha256", {}).get("before")
+        after = payload.get("checkpoint_sha256", {}).get("after")
+        if expected_hash and before != expected_hash:
+            issues.append(f"{file_name}: checkpoint hash != manifest {item['checkpoint']}")
+        if expected_hash and after != expected_hash:
+            issues.append(f"{file_name}: checkpoint after hash != manifest {item['checkpoint']}")
+        if item["kind"] == "adam":
+            validation = _validate_adam(
+                payload, {**item, "training_cases": manifest.get("training_cases")},
+                issues,
+            )
+            adam_paths[item["checkpoint"]].append(path)
+        else:
+            validation = _validate_static(payload, item, issues)
+            target = (
+                stratified_paths if item["kind"] == "stratified"
+                else static_paths
+            )
+            target[item["checkpoint"]].append(path)
+        payloads_for_consistency.append(payload)
+        paths_for_consistency.append(path)
+        if not validation.get("complete", False):
+            issues.append(f"{file_name}: records are incomplete")
+        if payload.get("non_finite"):
+            issues.append(f"{file_name}: non-finite value reported")
+
+    _check_group_consistency(
+        paths_for_consistency, payloads_for_consistency, manifest, issues
+    )
+    # Unexpected files are listed, not treated as failures.
+    expected_names = set(expected)
+    unexpected = sorted(
+        path.name for path in directory.glob("*.json")
+        if path.name not in expected_names
+        and path.name not in (
+            "summary.json", "diagnostic_config.json", "diagnostic_manifest.json"
+        )
+    )
+
     payload = {
         "directory": str(directory),
+        "manifest": str(manifest_path),
+        "manifest_ok": manifest_path.is_file() and not any(
+            item.startswith("invalid diagnostic manifest") for item in issues
+        ),
         "metric_version": 3,
         "static": {},
         "adam": {},
         "stratified": {},
+        "not_requested": not_requested,
+        "unexpected_files": unexpected,
     }
     for tag in ("best", "last"):
-        payload["static"][tag] = _static(sorted(
-            directory.glob(f"static_{tag}_seed*.json")
-        ))
-        payload["adam"][tag] = _adam(sorted(
-            directory.glob(f"adam_{tag}_seed*.json")
-        ))
-        payload["stratified"][tag] = _static(sorted(
-            directory.glob(f"stratified_{tag}_*.json")
-        ))
-    issues = []
+        payload["static"][tag] = _static(static_paths[tag])
+        payload["adam"][tag] = _adam(adam_paths[tag])
+        payload["stratified"][tag] = _static(stratified_paths[tag])
     for group in ("static", "adam", "stratified"):
         for entry in payload[group].values():
             issues.extend(entry.get("source_issues", []))
@@ -602,7 +950,7 @@ def main(argv=None) -> int:
     print(f"markdown: {directory / 'summary.md'}")
     print(f"report: {directory / 'report.md'}")
     if payload["source_issues"]:
-        print("summary: FAILED (source diagnostics incomplete)", file=sys.stderr)
+        print("summary: FAILED (input incomplete or failed)", file=sys.stderr)
         for issue in payload["source_issues"][:50]:
             print(f"  - {issue}", file=sys.stderr)
         return 1

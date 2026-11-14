@@ -459,6 +459,15 @@ PYTHONPATH=src python scripts/diagnose_contact_gradients.py \
   --output outputs/fullframes/contact_training_diagnostics_fixed/adam_best_seed20261115.json
 PYTHONPATH=src python scripts/summarize_contact_training_diagnostics.py \
   --directory outputs/fullframes/contact_training_diagnostics_fixed
+# 汇总按目录中的 diagnostic_manifest.json 核对检查点/模式/种子/文件；
+# 清单缺项、记录数与 metadata 不符、重复试验、混用检查点或配置都会非零退出。
+PYTHONPATH=src python scripts/contact_fullcontact_pair.py \
+  --config configs/contact_air/split_train_r50_500_fullframes.yaml \
+  --checkpoint outputs/contact_air_split_r50_500_fullframes_cw3_4000/best.pt \
+  --trials 100 --seed 20261115 --tag best \
+  --output outputs/fullframes/contact_fullcontact_pair/pair_best_seed20261115.json
+PYTHONPATH=src python scripts/summarize_contact_fullcontact_pair.py \
+  --directory outputs/fullframes/contact_fullcontact_pair
 
 # 7. 测试
 python -m pytest -q
@@ -494,6 +503,14 @@ metric v3：算例等权 `macro_mse = sum(M_k)/K`、帧数加权
 修复版结果在 `outputs/fullframes/contact_training_diagnostics_fixed/`，旧目录
 `outputs/fullframes/contact_training_diagnostics/` 保留但不再作为精确覆盖率
 来源。报告由 `scripts/summarize_contact_training_diagnostics.py` 生成。
+
+配对 A/B 实验（`scripts/contact_fullcontact_pair.py`）从同一检查点、同一非接触
+批次和同一 AirNet 更新开始：A 使用正式随机接触标签，B 只用全部合法训练接触标签
+替换 `contact_data` 的标签集合（每例先均值，再算例等权）。两组各做一次
+ContactNet Adam 更新，在同一固定参考集上比较；每个 A/B 对彼此独立，检查点
+SHA-256 前后校验。全标签为 7,165 帧（10 个训练算例；每例排除 19 个 t0 前帧，
+无 shock-slope 排除）。汇总脚本按 A/B 配对差值分别报告两个种子及合并结果；
+不把 A 的随机批次损失与 B 的全标签损失当作同一集合的数值比较。
 
 ## 8. 数据状态与未解决项
 

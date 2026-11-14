@@ -150,7 +150,7 @@ def test_summary_returns_nonzero_for_failed_source(tmp_path, capsys):
     }), encoding="utf-8")
     code = summary.main(["--directory", str(tmp_path)])
     assert code == 1
-    assert "source diagnostics incomplete" in capsys.readouterr().err
+    assert "input incomplete or failed" in capsys.readouterr().err
     assert "源诊断失败" in (tmp_path / "report.md").read_text(encoding="utf-8")
 
 
@@ -165,3 +165,141 @@ def test_all_undefined_directions_have_no_median_or_fraction():
     assert stats["median"] is None
     assert stats["negative_fraction"] is None
     assert stats["undefined"] == 3
+
+
+def _manifest(tmp_path, experiments, *, checkpoint_hash="h"):
+    payload = {
+        "format": "spherical_blast_pinn.contact_training_diagnostics.manifest",
+        "version": 1, "metric_version": 3,
+        "training_cases": ["a"],
+        "checkpoints": {"best": {"sha256": checkpoint_hash, "loop": 0}},
+        "experiments": experiments,
+    }
+    path = tmp_path / "diagnostic_manifest.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _static_payload(*, requested=1, records=1, seed=1, config="cfg", chash="h"):
+    batches = [
+        {"batch": i, "status": "ok"} for i in range(records)
+    ]
+    return {
+        "format": "spherical_blast_pinn.contact_gradient_diagnostic",
+        "version": 3, "metric_version": 3, "ok": True,
+        "config": config, "checkpoint": "best", "checkpoint_loop": 0,
+        "checkpoint_sha256": {"before": chash, "after": chash,
+                              "unchanged": True},
+        "mode": "training", "batch_seed": seed,
+        "requested_batches": requested, "completed_batches": records,
+        "failed_batches": 0, "non_finite": False, "failure_reasons": [],
+        "batches": batches,
+    }
+
+
+def test_empty_directory_is_a_failure(tmp_path, capsys):
+    code = summary.main(["--directory", str(tmp_path)])
+    assert code == 1
+    assert "manifest not found" in capsys.readouterr().err
+
+
+def test_required_manifest_file_missing_is_a_failure(tmp_path):
+    _manifest(tmp_path, [{
+        "kind": "static", "file": "missing.json", "checkpoint": "best",
+        "mode": "training", "seed": 1, "requested": 1, "optional": False,
+    }])
+    assert summary.main(["--directory", str(tmp_path)]) == 1
+
+
+def test_version_only_json_is_not_accepted(tmp_path):
+    (tmp_path / "static.json").write_text(
+        json.dumps({"version": 3, "metric_version": 3, "ok": True}),
+        encoding="utf-8",
+    )
+    _manifest(tmp_path, [{
+        "kind": "static", "file": "static.json", "checkpoint": "best",
+        "mode": "training", "seed": 1, "requested": 1, "optional": False,
+    }])
+    assert summary.main(["--directory", str(tmp_path)]) == 1
+
+
+def test_metadata_complete_but_records_missing_is_a_failure(tmp_path):
+    (tmp_path / "static.json").write_text(
+        json.dumps(_static_payload(requested=2, records=1)), encoding="utf-8"
+    )
+    _manifest(tmp_path, [{
+        "kind": "static", "file": "static.json", "checkpoint": "best",
+        "mode": "training", "seed": 1, "requested": 2, "optional": False,
+    }])
+    assert summary.main(["--directory", str(tmp_path)]) == 1
+
+
+def test_duplicate_static_batch_indices_are_a_failure(tmp_path):
+    payload = _static_payload(requested=2, records=2)
+    payload["batches"] = [{"batch": 0, "status": "ok"},
+                          {"batch": 0, "status": "ok"}]
+    (tmp_path / "static.json").write_text(json.dumps(payload), encoding="utf-8")
+    _manifest(tmp_path, [{
+        "kind": "static", "file": "static.json", "checkpoint": "best",
+        "mode": "training", "seed": 1, "requested": 2, "optional": False,
+    }])
+    assert summary.main(["--directory", str(tmp_path)]) == 1
+
+
+def test_mixed_config_or_hash_in_one_group_is_a_failure(tmp_path):
+    (tmp_path / "a.json").write_text(
+        json.dumps(_static_payload(seed=1, config="cfg-a", chash="h")),
+        encoding="utf-8",
+    )
+    (tmp_path / "b.json").write_text(
+        json.dumps(_static_payload(seed=2, config="cfg-b", chash="h")),
+        encoding="utf-8",
+    )
+    _manifest(tmp_path, [
+        {"kind": "static", "file": "a.json", "checkpoint": "best",
+         "mode": "training", "seed": 1, "requested": 1, "optional": False},
+        {"kind": "static", "file": "b.json", "checkpoint": "best",
+         "mode": "training", "seed": 2, "requested": 1, "optional": False},
+    ])
+    assert summary.main(["--directory", str(tmp_path)]) == 1
+
+
+def test_half_improvement_is_not_called_majority():
+    half = summary._change_stats([-1.0, 1.0], greater_is_better=False)
+    assert summary._majority(half) == "半数改善"
+    all_bad = summary._change_stats([1.0, 1.0], greater_is_better=False)
+    assert summary._majority(all_bad) == "全部变差"
+    none = summary._change_stats([None, float("nan")], greater_is_better=False)
+    assert summary._majority(none) == "不可判断"
+
+
+def test_report_does_not_confuse_macro_and_pooled():
+    def stats(values, better):
+        return summary._change_stats(values, greater_is_better=better)
+    entry = {
+        "batch": stats([-1.0, -1.0], False),
+        "macro_mse": stats([-1.0, -1.0], False),
+        "pooled_mse": stats([1.0, 1.0], False),
+        "coverage": stats([0.0, 0.0], True),
+        "both_improved": 2,
+        "both_improved_pooled": 0,
+        "both_improved_denominator": 2,
+        "batch_good_macro_bad": 0,
+        "n_trials": 2,
+        "reference_n_total": 10,
+        "covered_before_total": 1,
+        "covered_after_total": 2,
+        "per_case": {},
+        "thirds": {},
+    }
+    text = summary._report_text({
+        "source_issues": [],
+        "not_requested": [],
+        "unexpected_files": [],
+        "static": {},
+        "adam": {"best": entry},
+        "stratified": {},
+    })
+    assert "macro 全部改善" in text
+    assert "pooled 全部变差" in text
+    assert "不能用一个口径代替另一个" in text
