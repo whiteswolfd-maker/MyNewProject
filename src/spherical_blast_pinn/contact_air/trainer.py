@@ -571,6 +571,28 @@ class AlternatingTrainer:
         self._restore_if_changed(self.air_net, air_before, "AirNet")
         return contact_total
 
+    def effective_learning_rates(self) -> dict[str, float]:
+        """Return the optimizers' actual learning rates, not config values."""
+        return {
+            "contact": float(self.opt_contact.param_groups[0]["lr"]),
+            "air": float(self.opt_air.param_groups[0]["lr"]),
+        }
+
+    def set_contact_learning_rate(self, rate: float) -> None:
+        """Override only ContactNet's Adam learning rate.
+
+        Intended to be called after :meth:`load`, because loading restores the
+        optimizer state (including its old learning rate).  Network parameters,
+        Adam moments/step, AirNet learning rate and RNG state are untouched.
+        """
+        value = float(rate)
+        if not math.isfinite(value) or value <= 0.0:
+            raise TrainingError(
+                f"contact learning rate must be a finite positive number, got {rate!r}"
+            )
+        for group in self.opt_contact.param_groups:
+            group["lr"] = value
+
     def step(self) -> dict[str, Any]:
         batches = self._batches()
         air_total, lambda_pde, lambda_data = self._air_update(batches)
@@ -582,6 +604,10 @@ class AlternatingTrainer:
             "loop": self.loop,
             "lambda_pde": lambda_pde,
             "lambda_data": lambda_data,
+            "contact_learning_rate": float(
+                self.opt_contact.param_groups[0]["lr"]
+            ),
+            "air_learning_rate": float(self.opt_air.param_groups[0]["lr"]),
             "air_loss": float(air_total.total.detach()),
             "contact_loss": float(contact_total.total.detach()),
             "air_parts": dict(air_total.parts),
@@ -697,11 +723,13 @@ class AlternatingTrainer:
         records = []
         while self.loop < target:
             record = self.step()
-            # Record the optimizers' actual learning rate: it is not the config
-            # value after a resume unless --learning-rate overrides it.
-            record["learning_rate"] = float(
-                self.opt_contact.param_groups[0]["lr"]
-            )
+            # Record the optimizers' actual learning rates: they are not the
+            # config values after a resume or a CLI override.  ``learning_rate``
+            # is retained for older tools and means the ContactNet value.
+            rates = self.effective_learning_rates()
+            record["learning_rate"] = rates["contact"]
+            record["contact_learning_rate"] = rates["contact"]
+            record["air_learning_rate"] = rates["air"]
             record["contact_data_weight"] = float(self.config.contact_data_weight)
             records.append(record)
             if self.config.log_every > 0 and self.loop % self.config.log_every == 0:
@@ -710,7 +738,8 @@ class AlternatingTrainer:
                     f"loop {self.loop:5d}  air={record['air_loss']:.6e}  "
                     f"contact={record['contact_loss']:.6e}  "
                     f"lambda_data={record['lambda_data']:.3f}  "
-                    f"lr={record['learning_rate']:.3e}  "
+                    f"lr_contact={record['contact_learning_rate']:.3e}  "
+                    f"lr_air={record['air_learning_rate']:.3e}  "
                     f"pde_norm m={parts.get('pde_mass_normalised', float('nan')):.3e} "
                     f"mom={parts.get('pde_momentum_normalised', float('nan')):.3e} "
                     f"e={parts.get('pde_energy_normalised', float('nan')):.3e}"
@@ -894,6 +923,7 @@ class AlternatingTrainer:
                 for sample in self._validation
             ],
             "history": self.history.as_dict(),
+            "effective_learning_rates": self.effective_learning_rates(),
             "torch_rng": torch.get_rng_state(),
             "generator": self.generator.get_state(),
             "numpy_rng": np.random.get_state(),

@@ -273,6 +273,95 @@ def test_training_log_records_the_actual_learning_rate(tmp_path):
     result = trainer.train(loops=1)
     record = result["history"]["loops"][0]
     assert record["learning_rate"] == pytest.approx(1.0e-3)
+    assert record["contact_learning_rate"] == pytest.approx(1.0e-3)
+    assert record["air_learning_rate"] == pytest.approx(1.0e-3)
+
+
+def _optimizer_state_copy(optimizer):
+    return [
+        {
+            name: value.detach().clone() if torch.is_tensor(value) else value
+            for name, value in optimizer.state[parameter].items()
+        }
+        for parameter in optimizer.param_groups[0]["params"]
+    ]
+
+
+def _assert_optimizer_state_equal(optimizer, expected):
+    states = [
+        optimizer.state[parameter]
+        for parameter in optimizer.param_groups[0]["params"]
+    ]
+    assert len(states) == len(expected)
+    for state, reference in zip(states, expected):
+        assert set(state) == set(reference)
+        for name, value in state.items():
+            if torch.is_tensor(value):
+                assert torch.equal(value, reference[name])
+
+
+def test_contact_learning_rate_override_only_changes_contact_optimizer(tmp_path):
+    trainer = _trainer(tmp_path)
+    trainer.step()
+    checkpoint = trainer.save(tmp_path / "base.pt")
+    parameters_before = [
+        parameter.detach().clone() for parameter in trainer.contact_net.parameters()
+    ]
+    contact_state = _optimizer_state_copy(trainer.opt_contact)
+    air_state = _optimizer_state_copy(trainer.opt_air)
+    contact_step = int(next(iter(trainer.opt_contact.state.values()))["step"])
+
+    resumed = _trainer(tmp_path / "resumed")
+    resumed.load(checkpoint)
+    torch_rng = torch.get_rng_state().clone()
+    generator_state = resumed.generator.get_state().clone()
+    resumed.set_contact_learning_rate(2.5e-5)
+
+    assert torch.equal(torch.get_rng_state(), torch_rng)
+    assert torch.equal(resumed.generator.get_state(), generator_state)
+    assert resumed.effective_learning_rates() == {
+        "contact": 2.5e-5, "air": 1.0e-3,
+    }
+    for parameter, expected in zip(
+        resumed.contact_net.parameters(), parameters_before
+    ):
+        assert torch.equal(parameter, expected)
+    _assert_optimizer_state_equal(resumed.opt_contact, contact_state)
+    _assert_optimizer_state_equal(resumed.opt_air, air_state)
+    assert int(next(iter(resumed.opt_contact.state.values()))["step"]) == contact_step
+
+
+def test_contact_learning_rate_is_saved_and_restored(tmp_path):
+    trainer = _trainer(tmp_path)
+    trainer.step()
+    trainer.set_contact_learning_rate(2.5e-5)
+    checkpoint = trainer.save(tmp_path / "saved.pt")
+
+    restored = _trainer(tmp_path / "restored")
+    restored.load(checkpoint)
+    assert restored.effective_learning_rates() == {
+        "contact": 2.5e-5, "air": 1.0e-3,
+    }
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    assert payload["effective_learning_rates"]["contact"] == pytest.approx(2.5e-5)
+    assert payload["effective_learning_rates"]["air"] == pytest.approx(1.0e-3)
+
+
+def test_contact_learning_rate_is_recorded_in_history(tmp_path):
+    trainer = _trainer(tmp_path)
+    trainer.set_contact_learning_rate(2.5e-5)
+    result = trainer.train(loops=1)
+    record = result["history"]["loops"][0]
+    assert record["contact_learning_rate"] == pytest.approx(2.5e-5)
+    assert record["air_learning_rate"] == pytest.approx(1.0e-3)
+    assert record["learning_rate"] == pytest.approx(2.5e-5)
+
+
+@pytest.mark.parametrize("rate", [0.0, -1.0, float("nan"), float("inf")])
+def test_contact_learning_rate_rejects_nonpositive_or_nonfinite(tmp_path, rate):
+    trainer = _trainer(tmp_path)
+    with pytest.raises(TrainingError, match="finite positive"):
+        trainer.set_contact_learning_rate(rate)
 
 
 def test_resume_accepts_the_same_time_reference(tmp_path):

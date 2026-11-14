@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import sys
@@ -429,6 +430,19 @@ def _write_json(path: Path | str, payload: Mapping[str, Any]) -> Path:
     return path
 
 
+def _file_sha256(path: Path | str | None) -> str | None:
+    if path is None:
+        return None
+    target = Path(path)
+    if not target.exists():
+        return None
+    hasher = hashlib.sha256()
+    with target.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(block)
+    return hasher.hexdigest()
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -623,17 +637,51 @@ def command_train(args) -> int:
     if args.resume:
         info = trainer.load(args.resume)
         print(f"resumed from {args.resume} at loop {info['loop']}")
+    start_loop = int(trainer.loop)
+    # Public override first, then the ContactNet-specific override.  Both are
+    # applied after resume because load() restores each optimizer's old lr.
     if args.learning_rate is not None:
         rate = float(args.learning_rate)
         if rate <= 0.0:
             raise CommandError("--learning-rate must be positive")
-        # Applied after a resume because load() restores the Adam state,
-        # including the learning rate stored in it.
         for optimizer in (trainer.opt_contact, trainer.opt_air):
             for group in optimizer.param_groups:
                 group["lr"] = rate
         print(f"learning rate overridden to {rate:.3e} for both optimizers")
+    if args.contact_learning_rate is not None:
+        trainer.set_contact_learning_rate(float(args.contact_learning_rate))
+        print(
+            "ContactNet learning rate overridden to "
+            f"{trainer.effective_learning_rates()['contact']:.3e}"
+        )
+    effective = trainer.effective_learning_rates()
+    _write_json(output_dir / "run_metadata.json", {
+        "config": str(args.config),
+        "config_sha256": _file_sha256(args.config),
+        "resume": str(args.resume) if args.resume else None,
+        "resume_sha256": _file_sha256(args.resume) if args.resume else None,
+        "original_config_learning_rate": float(train_config.learning_rate),
+        "cli_learning_rate": (
+            None if args.learning_rate is None else float(args.learning_rate)
+        ),
+        "cli_contact_learning_rate": (
+            None if args.contact_learning_rate is None
+            else float(args.contact_learning_rate)
+        ),
+        "effective_learning_rates": effective,
+        "start_loop": start_loop,
+        "target_loop": int(train_config.loops),
+        "contact_data_weight": float(train_config.contact_data_weight),
+        "n_schedule": int(train_config.n_schedule),
+        "seed": int(train_config.seed),
+        "learning_rate_priority": (
+            "configured < --learning-rate (both) < --contact-learning-rate "
+            "(ContactNet only)"
+        ),
+    })
     result = trainer.train()
+    result["effective_learning_rates"] = trainer.effective_learning_rates()
+    result["start_loop"] = start_loop
     _write_json(output_dir / "train_result.json", result)
     print(json.dumps({
         "loops": result["loops"],
@@ -911,6 +959,14 @@ def build_parser() -> argparse.ArgumentParser:
             "override the configured learning rate for both optimizers.  "
             "Applied after --resume restores the Adam state, which otherwise "
             "brings back the old learning rate"
+        ),
+    )
+    train.add_argument(
+        "--contact-learning-rate", type=float, default=None,
+        help=(
+            "override only ContactNet's Adam learning rate.  Applied after "
+            "--resume and after --learning-rate, so it takes precedence for "
+            "ContactNet; AirNet keeps the configured or public-override value"
         ),
     )
     train.add_argument(

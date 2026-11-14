@@ -61,6 +61,46 @@ def test_train_predict_and_evaluate_with_synthetic_fixtures(tmp_path):
     assert payload["contact"]["n_contact_frames"] > 0
 
 
+def test_contact_learning_rate_priority_and_resume_restore(tmp_path):
+    train_dir = tmp_path / "train"
+    code = cli.main([
+        "train", "--config", str(SMOKE), "--cases", "all",
+        "--max-loops", "1", "--output-dir", str(train_dir),
+        "--learning-rate", "2.0e-3", "--contact-learning-rate", "5.0e-4",
+    ])
+    assert code == 0
+    metadata = json.loads(
+        (train_dir / "run_metadata.json").read_text(encoding="utf-8")
+    )
+    assert metadata["original_config_learning_rate"] == 1.0e-4
+    assert metadata["cli_learning_rate"] == 2.0e-3
+    assert metadata["cli_contact_learning_rate"] == 5.0e-4
+    assert metadata["effective_learning_rates"] == {
+        "contact": 5.0e-4, "air": 2.0e-3,
+    }
+    result = json.loads(
+        (train_dir / "train_result.json").read_text(encoding="utf-8")
+    )
+    assert result["history"]["loops"][0]["contact_learning_rate"] == 5.0e-4
+    assert result["history"]["loops"][0]["air_learning_rate"] == 2.0e-3
+
+    # Resume with no learning-rate flags: both restored optimizer values stay.
+    code = cli.main([
+        "train", "--config", str(SMOKE), "--cases", "all",
+        "--max-loops", "2", "--output-dir", str(train_dir),
+        "--resume", str(train_dir / "last.pt"),
+    ])
+    assert code == 0
+    metadata = json.loads(
+        (train_dir / "run_metadata.json").read_text(encoding="utf-8")
+    )
+    assert metadata["cli_learning_rate"] is None
+    assert metadata["cli_contact_learning_rate"] is None
+    assert metadata["effective_learning_rates"] == {
+        "contact": 5.0e-4, "air": 2.0e-3,
+    }
+
+
 def test_the_smoke_config_has_only_one_50mm_program_check_case():
     from spherical_blast_pinn.config import load_config
 

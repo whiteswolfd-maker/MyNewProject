@@ -107,7 +107,13 @@
   参数冻结、输入导数保留的 functional AirNet，不用 `no_grad`/整体 detach 包住
   物理残差。
 - 每次反传检查：目标网络有非零有限梯度、非目标网络无梯度、参数未移动。
-- 两个优化器持久存在；不要每轮重建。
+- 两个优化器持久存在；不要每轮重建。学习率覆盖顺序：配置 <
+  `--learning-rate`（两个优化器）< `--contact-learning-rate`（只覆盖
+  ContactNet）；后两者都在 `load()` 恢复 Adam 状态之后应用。每个 loop 的
+  history/日志记录两个优化器的实际 `contact_learning_rate` 和
+  `air_learning_rate`；输出目录的 `run_metadata.json` 同时记录原配置值、
+  CLI 覆盖和最终有效值。学习率必须是有限正数；覆盖不得改变网络参数、
+  Adam 矩/step、AirNet 学习率、RNG、loop 或数据划分。
 - loop 日志包含三个归一化空气 PDE 分项（`pde_*_normalised`）；它们只用于
   记录，不得改变损失、采样或梯度，也不得引入随机数调用。
 - 接触区间监督权重 `training.contact_data_weight`（默认 1.0）只乘

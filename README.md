@@ -427,6 +427,13 @@ PYTHONPATH=src python -m spherical_blast_pinn.cli.contact_air train \
   --max-loops 3 --output-dir outputs/contact_air_smoke \
   --resume outputs/contact_air_smoke/last.pt
 
+# 学习率覆盖顺序：配置 < --learning-rate（两个优化器）<
+# --contact-learning-rate（只覆盖 ContactNet）。两者都在 --resume 恢复
+# Adam 状态之后应用，避免被检查点里的旧学习率覆盖。每个 loop 的 history
+# 和日志记录两个优化器的实际 `contact_learning_rate`/`air_learning_rate`；
+# 旧的 `learning_rate` 字段保留，含义等同 ContactNet 的值。输出目录还写
+# `run_metadata.json`，保存原配置值、CLI 覆盖和最终有效值。
+
 # 4. 预测（给定测得的 R_s 轨迹）
 PYTHONPATH=src python -m spherical_blast_pinn.cli.contact_air predict \
   --config configs/contact_air/smoke_cached.yaml --case tnt_50mm \
