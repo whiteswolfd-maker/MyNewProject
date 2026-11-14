@@ -642,8 +642,10 @@ def command_train(args) -> int:
     # applied after resume because load() restores each optimizer's old lr.
     if args.learning_rate is not None:
         rate = float(args.learning_rate)
-        if rate <= 0.0:
-            raise CommandError("--learning-rate must be positive")
+        if not math.isfinite(rate) or rate <= 0.0:
+            raise CommandError(
+                "--learning-rate must be a finite positive number"
+            )
         for optimizer in (trainer.opt_contact, trainer.opt_air):
             for group in optimizer.param_groups:
                 group["lr"] = rate

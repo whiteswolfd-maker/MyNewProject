@@ -98,14 +98,33 @@ def _residual_rms(case, air, t, r, rc, rc_dot, rs, ds, scales, keep):
         gamma=torch.full_like(fields.density, float(case.gamma_air)),
     )
     scale = residual_scales(case)
-    out = {"n": int(keep.sum())}
-    for name, values, key in (
-        ("mass", residuals.mass, "mass_residual"),
-        ("momentum", residuals.momentum, "momentum_residual"),
-        ("energy", residuals.energy, "energy_residual"),
-    ):
-        normalized = values.reshape(-1) / float(scale[key])
-        out[name] = float(torch.sqrt(torch.mean(normalized * normalized)).detach())
+    normalized = {
+        name: values.reshape(-1) / float(scale[key])
+        for name, values, key in (
+            ("mass", residuals.mass, "mass_residual"),
+            ("momentum", residuals.momentum, "momentum_residual"),
+            ("energy", residuals.energy, "energy_residual"),
+        )
+    }
+    finite = torch.ones_like(normalized["mass"], dtype=torch.bool)
+    for values in normalized.values():
+        finite &= torch.isfinite(values)
+    n_finite = int(finite.sum())
+    out = {
+        "n": n_finite,
+        "n_candidates": int(keep.sum()),
+        "n_nonfinite": int(keep.sum()) - n_finite,
+        "max_radius_abs_error": float(
+            (geometry.radius.reshape(-1) - r[keep]).abs().max()
+        ) if int(keep.sum()) else None,
+    }
+    for name, values in normalized.items():
+        if n_finite == 0:
+            out[name] = None
+        else:
+            out[name] = float(torch.sqrt(torch.mean(
+                values[finite] * values[finite]
+            )).detach())
     return out
 
 

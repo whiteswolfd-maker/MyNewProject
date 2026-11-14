@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from spherical_blast_pinn.contact_air import cli
 
@@ -99,6 +100,17 @@ def test_contact_learning_rate_priority_and_resume_restore(tmp_path):
     assert metadata["effective_learning_rates"] == {
         "contact": 5.0e-4, "air": 2.0e-3,
     }
+
+
+def test_public_learning_rate_rejects_nonfinite(tmp_path, capsys):
+    for value in ("nan", "inf", "-inf", "0", "-1"):
+        code = cli.main([
+            "train", "--config", str(SMOKE), "--cases", "all",
+            "--max-loops", "1", "--output-dir", str(tmp_path / value),
+            f"--learning-rate={value}",
+        ])
+        assert code != 0
+        assert "finite positive" in capsys.readouterr().err
 
 
 def test_the_smoke_config_has_only_one_50mm_program_check_case():
