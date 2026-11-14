@@ -142,8 +142,12 @@
   `_sample_scan()` 原扫描分支。预测 `R_c` 决定的域内筛选仍在损失阶段执行，
   不能提前缓存成固定掩码。`scripts/benchmark_sampling.py` 只做工程计时。
 - `scripts/record_baseline.py` 和 `scripts/diagnose_contact_gradients.py` 是只读
-  工具：前者记录代码/配置/缓存指纹/检查点/环境，后者核对接触标签、独立越界
-  损失、各项对 ContactNet 参数的梯度范数与夹角；零梯度必须标为方向不可定义。
+  工具：前者记录代码/配置/缓存指纹/检查点/环境。后者必须区分
+  `--mode training`（正式 10 训练算例预算与采样顺序，用于整体判断）和
+  `--mode stratified`（早/中/晚窗口的补充定位；初值仍在 `t0`，空窗口明确
+  不可评估，不能回退全时段）。静态梯度先对 10 个算例的损失取平均再求加权
+  梯度；`--adam-trials` 从检查点内存副本做独立单步更新，不得改文件。零梯度
+  方向标为不可定义，非有限梯度必须失败。
 - `scripts/prepare_fullframe_data.py --cases ...` 是薄编排器：调用现有导入器和
   `build-cache`，把全帧标准/缓存写到 `outputs/fullframes/`；不覆盖旧数据。
 - `scripts/audit_reference_data.py --stage <manifest|imports|metrics|consistency|report|all>`

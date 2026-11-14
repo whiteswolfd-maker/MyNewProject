@@ -450,8 +450,14 @@ PYTHONPATH=src python scripts/benchmark_sampling.py \
 PYTHONPATH=src python scripts/diagnose_contact_gradients.py \
   --config configs/contact_air/split_train_r50_500_fullframes.yaml \
   --checkpoint outputs/contact_air_split_r50_500_fullframes_cw3_4000/best.pt \
-  --prediction-dir outputs/fullframes/compare/new_fullframes_cw3_4000 \
-  --prediction-tag best --output outputs/fullframes/compare/contact_gradient_diag_best.json
+  --mode training --batches 100 --batch-seed 20261114 \
+  --output outputs/fullframes/contact_training_diagnostics/static_best_seed20261114.json
+PYTHONPATH=src python scripts/diagnose_contact_gradients.py \
+  --config configs/contact_air/split_train_r50_500_fullframes.yaml \
+  --checkpoint outputs/contact_air_split_r50_500_fullframes_cw3_4000/best.pt \
+  --mode training --batches 1 --adam-trials 100 --adam-seed 20261115 \
+  --output outputs/fullframes/contact_training_diagnostics/adam_best_seed20261115.json
+PYTHONPATH=src python scripts/summarize_contact_training_diagnostics.py
 
 # 7. 测试
 python -m pytest -q
@@ -471,6 +477,16 @@ python -m pytest -q
 （cu121）不支持 RTX 5060 Ti 的 sm_120，因此基准记录的是 CPU 计时。实测
 r550 单次采样从约 0.98 s 降到约 0.00089 s，完整交替步从约 6.97 s 降到约
 0.27 s；这是本机工程测量，不是收敛或精度结果。
+
+接触训练诊断有两种模式：`training` 使用正式 10 算例预算和采样顺序，仅用于判断
+整体更新；`stratified` 把 PDE/界面点和接触标签限制在早、中、晚窗口，初值仍在
+`t0`，没有标签的窗口明确标为不可评估，不得回退到全时段。静态梯度先对 10 个
+训练算例的损失取平均，再对 ContactNet 参数求加权梯度；单步 Adam 试验从同一
+检查点的内存副本重新开始，先更新 AirNet，再记录接触阶段各项、聚合梯度与
+固定训练参考点，随后执行一次原始 ContactNet 更新并重算同一批次和参考点。
+检查点文件在试验前后做 SHA-256 校验；验证算例不进入训练梯度。结果在
+`outputs/fullframes/contact_training_diagnostics/`，报告由
+`scripts/summarize_contact_training_diagnostics.py` 生成。
 
 ## 8. 数据状态与未解决项
 

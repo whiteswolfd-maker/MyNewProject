@@ -60,6 +60,8 @@ def sample_case_batch(
     n_contact: int,
     generator=None,
     zeta_floor: float = 1.0e-4,
+    pde_time_range: tuple[float, float] | None = None,
+    contact_time_range: tuple[float, float] | None = None,
 ) -> CaseBatch:
     if torch is None:  # pragma: no cover
         raise RuntimeError("PyTorch is required")
@@ -72,10 +74,25 @@ def sample_case_batch(
     if t_end <= t0:
         raise SamplingError(f"case {case.case_id!r}: t_end must be after t0")
 
-    def uniform_t(count: int) -> Any:
+    def _window(value, name: str) -> tuple[float, float]:
+        if value is None:
+            return t0, t_end
+        lo, hi = (float(value[0]), float(value[1]))
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            raise SamplingError(f"{name} must be finite")
+        if lo < t0 - 1.0e-15 or hi > t_end + 1.0e-15 or hi <= lo:
+            raise SamplingError(
+                f"{name} must satisfy {t0!r} <= lo < hi <= {t_end!r}; got {value!r}"
+            )
+        return max(lo, t0), min(hi, t_end)
+
+    pde_lo, pde_hi = _window(pde_time_range, "pde_time_range")
+    contact_lo, contact_hi = _window(contact_time_range, "contact_time_range")
+
+    def uniform_t(count: int, lo: float = t0, hi: float = t_end) -> Any:
         if count <= 0:
             return torch.zeros(0, dtype=torch.float64)
-        return t0 + (t_end - t0) * torch.rand(
+        return lo + (hi - lo) * torch.rand(
             count, dtype=torch.float64, generator=generator
         )
 
@@ -90,7 +107,7 @@ def sample_case_batch(
             count, dtype=torch.float64, generator=generator
         )
 
-    t_pde = uniform_t(int(n_pde))
+    t_pde = uniform_t(int(n_pde), pde_lo, pde_hi)
     zeta_pde = uniform_zeta(int(n_pde))
     t_ic = torch.full((int(n_ic),), t0, dtype=torch.float64)
     zeta_ic = uniform_zeta(int(n_ic))
@@ -129,8 +146,8 @@ def sample_case_batch(
     if contact_indices.size:
         contact_times = case.contact.times[contact_indices]
         in_window = (
-            (contact_times >= t0)
-            & (contact_times <= t_end)
+            (contact_times >= contact_lo)
+            & (contact_times <= contact_hi)
             & np.asarray([case.shock.has_slope(float(t)) for t in contact_times])
         )
         contact_indices = contact_indices[in_window]

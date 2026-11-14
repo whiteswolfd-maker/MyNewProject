@@ -315,7 +315,19 @@ class AlternatingTrainer:
         }
 
     # -- batches ---------------------------------------------------------
-    def _batches(self, generator=None) -> list[tuple[CaseData, CaseBatch]]:
+    def _batches(
+        self,
+        generator=None,
+        *,
+        pde_time_range: tuple[float, float] | None = None,
+        contact_time_range: tuple[float, float] | None = None,
+    ) -> list[tuple[CaseData, CaseBatch]]:
+        """Official per-case budget split and sampling order.
+
+        The optional time ranges exist only for the read-only stratified
+        diagnostic; training calls this method without them, so its sampling
+        distribution and RNG sequence are unchanged.
+        """
         cfg = self.config
         n = len(self.cases)
         counts = {
@@ -335,6 +347,8 @@ class AlternatingTrainer:
                     n_right=counts["right"][index], n_data=counts["data"][index],
                     n_contact=counts["contact"][index],
                     generator=self.generator if generator is None else generator,
+                    pde_time_range=pde_time_range,
+                    contact_time_range=contact_time_range,
                 ),
             ))
         return result
@@ -402,14 +416,14 @@ class AlternatingTrainer:
             )
 
     # -- one alternating loop -------------------------------------------
-    def step(self) -> dict[str, Any]:
-        lambda_pde, lambda_data = schedule_weights(self.loop, self.config.n_schedule)
-        batches = self._batches()
+    def _air_update(self, batches) -> tuple[TermResult, float, float]:
+        """AirNet stage, exactly as used by :meth:`step`."""
+        lambda_pde, lambda_data = schedule_weights(
+            self.loop, self.config.n_schedule
+        )
         self.opt_contact.zero_grad(set_to_none=True)
         self.opt_air.zero_grad(set_to_none=True)
         contact_before = self._parameter_snapshot(self.contact_net)
-
-        # ---- AirNet update ------------------------------------------------
         air_results: list[TermResult] = []
         for case, batch in batches:
             closure = self._closures[case.case_id]
@@ -467,63 +481,83 @@ class AlternatingTrainer:
         self._clip()
         self.opt_air.step()
         self._restore_if_changed(self.contact_net, contact_before, "ContactNet")
+        return air_total, lambda_pde, lambda_data
 
-        # ---- ContactNet update -------------------------------------------
+    def contact_stage_terms(
+        self, case: CaseData, batch: CaseBatch,
+    ) -> dict[str, TermResult]:
+        """The four ContactNet-stage terms for one case batch.
+
+        This is the single implementation shared by training and the read-only
+        diagnostics.  The PDE term uses a functional AirNet with frozen
+        parameters; all input derivatives and the contact geometry stay live.
+        """
+        closure = self._closures[case.case_id]
+        scales = self._scales[case.case_id]
+        r0, rs, ds = self._contact_inputs(case, batch.t_pde)
+        c_fields = self.contact_net(
+            batch.t_pde.reshape(-1, 1), r0, rs, ds, closure, create_graph=True
+        )
+        geometry = build_geometry(
+            c_fields.radius, c_fields.speed, rs, ds, batch.zeta_pde.reshape(-1, 1)
+        )
+        # Frozen AirNet parameters, live zeta/t derivatives and live geometry.
+        a_fields, a_derivs = air_fields_with_derivatives(
+            self.air_net, batch.zeta_pde, batch.t_pde, r0, scales,
+            create_graph=True, functional=True,
+        )
+        pde = pde_loss(
+            fields=a_fields, derivatives=a_derivs, geometry=geometry, case=case
+        )
+        t0 = torch.full_like(batch.t_pde, float(case.t0))
+        r00, rs0, ds0 = self._contact_inputs(case, t0)
+        c0 = self.contact_net(
+            t0.reshape(-1, 1), r00, rs0, ds0, closure, create_graph=True
+        )
+        ic = contact_ic_loss(c0, case)
+        if batch.t_pde.numel():
+            air0 = self.air_net.forward_functional(
+                torch.zeros_like(batch.t_pde).reshape(-1, 1),
+                batch.t_pde.reshape(-1, 1), r0.reshape(-1, 1), scales,
+                detach_parameters=True,
+            )
+            interface = interface_loss(
+                air_at_contact=air0, contact=c_fields, case=case
+            )
+        else:
+            interface = TermResult(total=torch.zeros((), dtype=torch.float64))
+        if batch.t_contact.numel():
+            # L_c's data term is the contact-interval supervision, evaluated
+            # at the label times.  Air observations belong to L_a only.
+            r0c, rsc, dsc = self._contact_inputs(case, batch.t_contact)
+            c_contact = self.contact_net(
+                batch.t_contact.reshape(-1, 1), r0c, rsc, dsc, closure,
+                create_graph=True,
+            )
+            data = contact_data_loss(c_contact, batch, case)
+        else:
+            data = TermResult(
+                total=torch.zeros((), dtype=torch.float64),
+                counts={"contact_data": 0},
+            )
+        return {
+            "pde": pde, "contact_ic": ic,
+            "interface": interface, "contact_data": data,
+        }
+
+    def contact_update(
+        self, batches, *, lambda_pde: float, lambda_data: float,
+    ) -> TermResult:
+        """ContactNet stage, exactly as used by :meth:`step`."""
         self.opt_contact.zero_grad(set_to_none=True)
         self.opt_air.zero_grad(set_to_none=True)
         air_before = self._parameter_snapshot(self.air_net)
         contact_results: list[TermResult] = []
         for case, batch in batches:
-            closure = self._closures[case.case_id]
-            scales = self._scales[case.case_id]
-            r0, rs, ds = self._contact_inputs(case, batch.t_pde)
-            c_fields = self.contact_net(
-                batch.t_pde.reshape(-1, 1), r0, rs, ds, closure, create_graph=True
-            )
-            geometry = build_geometry(
-                c_fields.radius, c_fields.speed, rs, ds, batch.zeta_pde.reshape(-1, 1)
-            )
-            # Frozen AirNet parameters, live zeta/t derivatives and live geometry.
-            a_fields, a_derivs = air_fields_with_derivatives(
-                self.air_net, batch.zeta_pde, batch.t_pde, r0, scales,
-                create_graph=True, functional=True,
-            )
-            pde = pde_loss(
-                fields=a_fields, derivatives=a_derivs, geometry=geometry, case=case
-            )
-            t0 = torch.full_like(batch.t_pde, float(case.t0))
-            r00, rs0, ds0 = self._contact_inputs(case, t0)
-            c0 = self.contact_net(
-                t0.reshape(-1, 1), r00, rs0, ds0, closure, create_graph=True
-            )
-            ic = contact_ic_loss(c0, case)
-            if batch.t_pde.numel():
-                air0 = self.air_net.forward_functional(
-                    torch.zeros_like(batch.t_pde).reshape(-1, 1),
-                    batch.t_pde.reshape(-1, 1), r0.reshape(-1, 1), scales,
-                    detach_parameters=True,
-                )
-                interface = interface_loss(
-                    air_at_contact=air0, contact=c_fields, case=case
-                )
-            else:
-                interface = TermResult(total=torch.zeros((), dtype=torch.float64))
-            if batch.t_contact.numel():
-                # L_c's data term is the contact-interval supervision, evaluated
-                # at the label times.  Air observations belong to L_a only.
-                r0c, rsc, dsc = self._contact_inputs(case, batch.t_contact)
-                c_contact = self.contact_net(
-                    batch.t_contact.reshape(-1, 1), r0c, rsc, dsc, closure,
-                    create_graph=True,
-                )
-                data = contact_data_loss(c_contact, batch, case)
-            else:
-                data = TermResult(
-                    total=torch.zeros((), dtype=torch.float64),
-                    counts={"contact_data": 0},
-                )
+            terms = self.contact_stage_terms(case, batch)
             contact_results.append(combine_contact(
-                pde=pde, ic=ic, interface=interface, data=data,
+                pde=terms["pde"], ic=terms["contact_ic"],
+                interface=terms["interface"], data=terms["contact_data"],
                 lambda_pde=lambda_pde, lambda_data=lambda_data,
                 contact_data_weight=self.config.contact_data_weight,
             ))
@@ -535,7 +569,14 @@ class AlternatingTrainer:
         self._clip()
         self.opt_contact.step()
         self._restore_if_changed(self.air_net, air_before, "AirNet")
+        return contact_total
 
+    def step(self) -> dict[str, Any]:
+        batches = self._batches()
+        air_total, lambda_pde, lambda_data = self._air_update(batches)
+        contact_total = self.contact_update(
+            batches, lambda_pde=lambda_pde, lambda_data=lambda_data
+        )
         self.loop += 1
         record = {
             "loop": self.loop,
