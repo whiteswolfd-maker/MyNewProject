@@ -512,6 +512,11 @@ def _adam(paths: list[Path]) -> dict:
         "parameter_delta_l2_median": _median_valid([
             trial.get("parameter_delta", {}).get("l2") for trial in trials
         ]),
+        "reference_n_per_trial": (
+            sorted(set(int(value) for value in reference_n))
+            if reference_n else []
+        ),
+        "reference_n_cumulative": int(sum(reference_n)),
         "reference_n_total": int(sum(reference_n)),
         "covered_before_total": int(sum(
             value for value in covered_before if _finite(value)
@@ -633,19 +638,33 @@ def _write_markdown(summary: dict, out: Path) -> None:
 
 
 def _majority(entry: dict) -> str:
-    n = int(entry.get("n_evaluable", 0))
+    """Describe a change distribution without treating ties as worsening.
+
+    ``n`` is accepted for the paired-experiment summary, ``n_evaluable`` for
+    the training diagnostic summary.  The rule is shared so both reports use
+    the same strict-majority definition.
+    """
+    n = int(entry.get("n_evaluable", entry.get("n", 0)) or 0)
     if n == 0:
         return "不可判断"
     improved = int(entry.get("improved") or 0)
+    worsened = int(entry.get("worsened") or 0)
+    unchanged = int(entry.get("unchanged") or 0)
     if improved == n:
         return "全部改善"
-    if improved == 0:
+    if worsened == n:
         return "全部变差"
+    if unchanged == n:
+        return "全部持平"
     if improved * 2 == n:
         return "半数改善"
     if improved * 2 > n:
         return "多数改善"
-    return "少数改善（多数变差）"
+    if worsened * 2 > n:
+        return "多数变差"
+    if unchanged * 2 > n:
+        return "多数持平"
+    return "无多数（方向不一致）"
 
 
 def _report_text(summary: dict) -> str:
@@ -656,9 +675,25 @@ def _report_text(summary: dict) -> str:
             lines.append(f"> - {issue}\n")
     lines.append("\n本轮是同一检查点反复开始的独立单步试验，不是连续训练，"
                  "不能据此证明长期收敛或长期误差的根因。\n")
-    lines.append("参考指标同时使用算例等权 macro 与帧数加权 pooled；"
-                 "每个独立参考帧集合为 7,165 帧（10 个训练算例，全部完整），"
-                 "跨试验累计评估点数为 n_trials × 7,165，二者不能混用。\n")
+    independent = sorted({
+        value
+        for entry in summary["adam"].values()
+        for value in entry.get("reference_n_per_trial", [])
+    })
+    if independent:
+        per_trial = "、".join(str(value) for value in independent)
+        cumulative = sum(
+            entry.get("reference_n_cumulative", 0)
+            for entry in summary["adam"].values()
+        )
+        lines.append(
+            "参考指标同时使用算例等权 macro 与帧数加权 pooled；"
+            f"每次独立试验的参考帧集合为 {per_trial} 帧（由实际记录计算），"
+            f"所有成功试验累计评估点数为 {cumulative}，二者不能混用。\n"
+        )
+    else:
+        lines.append("参考指标同时使用算例等权 macro 与帧数加权 pooled；"
+                     "没有可用的独立参考帧记录，不能判断评估规模。\n")
     if summary.get("not_requested"):
         lines.append("\n未运行的清单项：" + "；".join(
             item.get("file", "?") for item in summary["not_requested"]
@@ -722,7 +757,10 @@ def _report_text(summary: dict) -> str:
     lines.append("\n## 3. 覆盖率（精确整数计数）\n")
     for tag, entry in summary["adam"].items():
         lines.append(
-            f"- {tag}：独立参考帧 {entry['reference_n_total']}（跨试验累计）；"
+            f"- {tag}：每次独立试验的参考帧集合 "
+            f"{entry.get('reference_n_per_trial') or '不可判断'}；"
+            f"所有成功试验累计评估点 "
+            f"{entry.get('reference_n_cumulative', entry.get('reference_n_total', '不可判断'))}；"
             f"covered {entry['covered_before_total']} → "
             f"{entry['covered_after_total']}；覆盖率变化 "
             f"{_status_line(entry['coverage'])}（{_majority(entry['coverage'])}）。"

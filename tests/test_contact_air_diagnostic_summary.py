@@ -269,6 +269,10 @@ def test_half_improvement_is_not_called_majority():
     assert summary._majority(half) == "半数改善"
     all_bad = summary._change_stats([1.0, 1.0], greater_is_better=False)
     assert summary._majority(all_bad) == "全部变差"
+    all_flat = summary._change_stats([0.0, 0.0], greater_is_better=False)
+    assert summary._majority(all_flat) == "全部持平"
+    mostly_flat = summary._change_stats([-1.0, 0.0, 0.0], greater_is_better=False)
+    assert summary._majority(mostly_flat) == "多数持平"
     none = summary._change_stats([None, float("nan")], greater_is_better=False)
     assert summary._majority(none) == "不可判断"
 

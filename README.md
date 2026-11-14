@@ -468,6 +468,14 @@ PYTHONPATH=src python scripts/contact_fullcontact_pair.py \
   --output outputs/fullframes/contact_fullcontact_pair/pair_best_seed20261115.json
 PYTHONPATH=src python scripts/summarize_contact_fullcontact_pair.py \
   --directory outputs/fullframes/contact_fullcontact_pair
+# 实际 Adam 方向分析：每个检查点/种子 20 个独立配对单步，B 全标签
+PYTHONPATH=src python scripts/contact_fullcontact_pair.py \
+  --config configs/contact_air/split_train_r50_500_fullframes.yaml \
+  --checkpoint outputs/contact_air_split_r50_500_fullframes_cw3_4000/last.pt \
+  --tag last --seed 20261115 --trials 20 --analysis direction \
+  --output outputs/fullframes/contact_adam_direction/direction_last_seed20261115.json
+PYTHONPATH=src python scripts/summarize_contact_adam_direction.py \
+  --directory outputs/fullframes/contact_adam_direction
 
 # 7. 测试
 python -m pytest -q
@@ -508,9 +516,20 @@ metric v3：算例等权 `macro_mse = sum(M_k)/K`、帧数加权
 批次和同一 AirNet 更新开始：A 使用正式随机接触标签，B 只用全部合法训练接触标签
 替换 `contact_data` 的标签集合（每例先均值，再算例等权）。两组各做一次
 ContactNet Adam 更新，在同一固定参考集上比较；每个 A/B 对彼此独立，检查点
-SHA-256 前后校验。全标签为 7,165 帧（10 个训练算例；每例排除 19 个 t0 前帧，
-无 shock-slope 排除）。汇总脚本按 A/B 配对差值分别报告两个种子及合并结果；
-不把 A 的随机批次损失与 B 的全标签损失当作同一集合的数值比较。
+SHA-256 前后校验。汇总脚本要求实验清单，核对预期文件/检查点/配置/种子/试验数、
+逐例全标签非空、运行级配对条件（初始参数与 Adam 状态、AirNet 更新、非接触采样）
+全部成立；缺失、重复、混用或任一条件失败都会非零退出。参考帧数从实际记录计算
+并同时报告“每次独立试验”和“跨试验累计”，不再写死。共同 A 标签只作补充定位，
+不作为 B 优劣的独立否决条件。
+
+实际 Adam 方向分析（`--analysis direction`，汇总脚本
+`scripts/summarize_contact_adam_direction.py`）沿用 B 全标签路径，每个检查点/
+种子 20 个固定配对单步：记录四项加权梯度及其和、真实 Adam 更新、`gC·δ`/
+`gJ·δ`、实际 C/J 变化，并在内存副本上评估 `θ+aδ`（a=1,1/2,1/4,1/8）与中心
+差分。若需要，按实际 Adam 公式重构 δ，并把分子拆成历史一阶矩与当前四项贡献；
+只对当前二阶矩缩放做代数拆分，不是删除某项重跑的因果实验。参数插值后必须
+恢复网络、优化器、AirNet 和 RNG；检查点哈希必须不变。当前结果保存在
+`outputs/fullframes/contact_adam_direction/`。
 
 ## 8. 数据状态与未解决项
 

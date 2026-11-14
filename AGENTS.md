@@ -159,6 +159,20 @@
   预先生成，不额外消耗随机数；每个 A/B 对独立恢复检查点，检查点不得改写。
   验证算例不进入梯度或固定参考。A/B 的随机批次损失与全标签损失不能当作同一
   集合的数值比较。汇总按配对差值分种子、合并报告，不得只挑有利种子。
+  汇总必须使用实验清单核对预期文件、检查点/配置哈希、种子和试验数，并核对
+  requested/completed/failed 与 trials 实际状态、编号唯一性和逐例全标签非空；
+  不能只信源文件 `ok=true`。参考帧数从记录计算，分别报告独立集合与累计评估点；
+  共同 A 标签只作补充，不作为 B 优劣的独立否决条件。
+
+- `scripts/contact_fullcontact_pair.py --analysis direction` 是实际 Adam 方向
+  诊断（汇总 `scripts/summarize_contact_adam_direction.py`）：每个检查点/种子
+  固定 20 个独立配对单步，沿用 B 全标签路径。记录四项加权梯度及总和、真实
+  Adam 更新、`gC·δ`/`gJ·δ`、实际 C/J 变化、同方向 `a=1,1/2,1/4,1/8` 的内存
+  副本评估和中心差分。若 `gC·δ` 为正，按实际 Adam 公式重构 δ，并在固定本次
+  二阶矩分母下把分子拆成历史一阶矩与当前四项贡献；这是代数分解，不是删除
+  某项重跑的因果实验。梯度裁剪、非零 weight_decay、AMSGrad、maximize 等
+  不支持项必须明确拒绝。参数插值后必须恢复参数、优化器状态、AirNet 和 RNG；
+  非目标网络保持冻结；检查点哈希不得变化。
 - `scripts/prepare_fullframe_data.py --cases ...` 是薄编排器：调用现有导入器和
   `build-cache`，把全帧标准/缓存写到 `outputs/fullframes/`；不覆盖旧数据。
 - `scripts/audit_reference_data.py --stage <manifest|imports|metrics|consistency|report|all>`
