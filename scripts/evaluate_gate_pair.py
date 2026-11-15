@@ -71,22 +71,84 @@ def _jsonable(value):
 
 
 def _aggregate_air_rows(rows, field, label, mask_key, scale_key):
+    """Pool finite per-case MSEs without letting ``None`` into the sum.
+
+    ``ana._metrics`` returns ``mse=None`` for a mask with no finite points.
+    A case can also be partially non-finite: those points are dropped from that
+    case's metric and counted, but the pooled value stays finite.  Completeness
+    is reported separately and is false whenever a candidate point was dropped.
+    """
     values = []
+    n_candidates = 0
+    n_nonfinite = 0
+    skipped = []
     for row in rows:
         mask = row.get(mask_key)
         if mask is None:
+            skipped.append({"case_id": row.get("case_id"), "reason": "no_mask"})
             continue
-        values.append(ana._metrics(
+        metric = ana._metrics(
             row["pred"][field], row["target"][field], mask,
             row["scales"][scale_key],
-        ))
+        )
+        n_candidates += int(metric.get("n_candidates", 0))
+        n_nonfinite += int(metric.get("n_nonfinite", 0))
+        if (
+            metric.get("status") != "ok"
+            or metric.get("n", 0) == 0
+            or metric.get("mse") is None
+            or not math.isfinite(float(metric["mse"]))
+        ):
+            skipped.append({
+                "case_id": row.get("case_id"),
+                "reason": metric.get("status", "no_metric"),
+                "n_candidates": int(metric.get("n_candidates", 0)),
+            })
+            continue
+        values.append(metric)
     n = sum(v["n"] for v in values)
     mse = sum(v["mse"] * v["n"] for v in values) / n if n else None
     return {
         "n": n,
-        "n_cases": len(values),
+        "n_candidates": n_candidates,
+        "n_nonfinite": n_nonfinite,
+        "n_cases": len(rows),
+        "n_cases_used": len(values),
+        "n_cases_skipped": len(skipped),
+        "skipped_cases": skipped,
         "mse": mse,
         "rmse": math.sqrt(mse) if mse is not None else None,
+        "status": "ok" if n else "not_evaluable",
+        "complete": bool(
+            n > 0 and n == n_candidates and not skipped
+        ),
+    }
+
+
+def _failure_record(case, c, d):
+    reasons = []
+    if c.get("status") != "ok":
+        reasons.append(f"C:{c.get('status', 'unknown')}")
+    if d.get("status") != "ok":
+        reasons.append(f"D:{d.get('status', 'unknown')}")
+    return {
+        "case_id": case.case_id,
+        "role": case.role,
+        "C_status": c.get("status", "unknown"),
+        "D_status": d.get("status", "unknown"),
+        "C_selected": int(c.get("selected", 0)),
+        "D_selected": int(d.get("selected", 0)),
+        "C_used": int(c.get("used", 0)),
+        "D_used": int(d.get("used", 0)),
+        "C_inside": 0,
+        "D_inside": 0,
+        "common": 0,
+        "C_excluded": 0,
+        "D_excluded": 0,
+        "common_excluded": 0,
+        "evaluated": False,
+        "status": "unevaluable_case",
+        "failure_reasons": reasons,
     }
 
 
@@ -94,35 +156,55 @@ def _early_pair(c_trainer, d_trainer, cases, window):
     lo, hi = WINDOWS[window]
     rows_c = {"train": [], "validation": []}
     rows_d = {"train": [], "validation": []}
-    exclusions = {"train": [], "validation": []}
+    records = {"train": [], "validation": []}
+    expected = {"train": [], "validation": []}
     for case in cases:
+        split = case.role
+        expected[split].append(case.case_id)
         c = ana._window_case(c_trainer, case, lo, hi)
         d = ana._window_case(d_trainer, case, lo, hi)
         if c.get("status") != "ok" or d.get("status") != "ok":
+            records[split].append(_failure_record(case, c, d))
             continue
         assert np.array_equal(c["time"], d["time"])
         assert np.array_equal(c["radius"], d["radius"])
-        common = c["inside"] & d["inside"]
+        common = np.asarray(c["inside"], bool) & np.asarray(d["inside"], bool)
+        record = {
+            "case_id": case.case_id,
+            "role": split,
+            "C_status": c["status"],
+            "D_status": d["status"],
+            "C_selected": int(c["selected"]),
+            "D_selected": int(d["selected"]),
+            "C_used": int(c["used"]),
+            "D_used": int(d["used"]),
+            "C_inside": int(np.asarray(c["inside"], bool).sum()),
+            "D_inside": int(np.asarray(d["inside"], bool).sum()),
+            "common": int(common.sum()),
+            "C_excluded": int(c["used"] - np.asarray(c["inside"], bool).sum()),
+            "D_excluded": int(d["used"] - np.asarray(d["inside"], bool).sum()),
+            "common_excluded": int(c["used"] - common.sum()),
+            "evaluated": False,
+            "status": "ok",
+            "failure_reasons": [],
+        }
+        if int(common.sum()) == 0:
+            record["status"] = "empty_common_domain"
+            record["failure_reasons"].append(
+                "no physical points inside both models' [Rc,Rs] domains"
+            )
+            records[split].append(record)
+            continue
         c["common_mask"] = common
         d["common_mask"] = common
         for row in (c, d):
             row["scales"] = {
                 "rho": case.rho_scale, "u": case.u_scale, "p": case.p_scale,
             }
-        split = case.role
         rows_c[split].append(c)
         rows_d[split].append(d)
-        exclusions[split].append({
-            "case_id": case.case_id,
-            "selected_total": int(c["selected"]),
-            "used": int(c["used"]),
-            "C_inside": int(c["inside"].sum()),
-            "D_inside": int(d["inside"].sum()),
-            "common": int(common.sum()),
-            "C_excluded": int(c["used"] - c["inside"].sum()),
-            "D_excluded": int(d["used"] - d["inside"].sum()),
-            "common_excluded": int(c["used"] - common.sum()),
-        })
+        record["evaluated"] = True
+        records[split].append(record)
 
     def aggregate(rows, mask_key):
         return {
@@ -132,20 +214,107 @@ def _early_pair(c_trainer, d_trainer, cases, window):
 
     result = {"window": window, "by_split": {}}
     for split in ("train", "validation"):
+        c_own = aggregate(rows_c[split], "inside")
+        d_own = aggregate(rows_d[split], "inside")
+        c_common = aggregate(rows_c[split], "common_mask")
+        d_common = aggregate(rows_d[split], "common_mask")
+        split_records = records[split]
+        evaluated_ids = [
+            row["case_id"] for row in split_records if row["evaluated"]
+        ]
+        missing = [
+            {
+                "case_id": row["case_id"],
+                "status": row["status"],
+                "failure_reasons": row["failure_reasons"],
+            }
+            for row in split_records if not row["evaluated"]
+        ]
+        expected_ids = expected[split]
+        field_blocks = {
+            "C_own": c_own, "D_own": d_own,
+            "C_common": c_common, "D_common": d_common,
+        }
+        field_complete = all(
+            block[field]["complete"]
+            for block in field_blocks.values()
+            for field in ("rho", "u", "p")
+        )
+        reasons = []
+        if len(expected_ids) != 10:
+            reasons.append(
+                f"expected {len(expected_ids)} cases, tournament expects 10"
+            )
+        if len(split_records) != len(expected_ids):
+            reasons.append(
+                f"recorded {len(split_records)} cases, expected {len(expected_ids)}"
+            )
+        if set(evaluated_ids) != set(expected_ids):
+            reasons.append("evaluated case ids differ from expected case ids")
+        if missing:
+            reasons.append(f"{len(missing)} case(s) not evaluable")
+        if not field_complete:
+            reasons.append(
+                "at least one field has non-finite or skipped case points"
+            )
+        complete = not reasons
         result["by_split"][split] = {
-            "C_own": aggregate(rows_c[split], "inside"),
-            "D_own": aggregate(rows_d[split], "inside"),
-            "C_common": aggregate(rows_c[split], "common_mask"),
-            "D_common": aggregate(rows_d[split], "common_mask"),
-            "exclusions": exclusions[split],
+            "C_own": c_own,
+            "D_own": d_own,
+            "C_common": c_common,
+            "D_common": d_common,
+            "expected_case_ids": expected_ids,
+            "evaluated_case_ids": evaluated_ids,
+            "missing_cases": missing,
+            "unevaluable_cases": [
+                item for item in missing
+                if item["status"] == "unevaluable_case"
+            ],
+            "empty_common_domain_cases": [
+                item for item in missing
+                if item["status"] == "empty_common_domain"
+            ],
+            "case_records": split_records,
+            "n_expected": len(expected_ids),
+            "n_evaluated": len(evaluated_ids),
+            "n_missing": len(missing),
+            "complete": complete,
+            "incomplete_reasons": reasons,
+            "exclusions": [
+                {
+                    **row,
+                    "selected_total": int(row.get("C_selected", 0)),
+                    "used": int(row.get("C_used", 0)),
+                }
+                for row in split_records
+            ],
             "aggregate_exclusions": {
-                key: int(sum(row[key] for row in exclusions[split]))
+                key: int(sum(row.get(key, 0) for row in split_records))
                 for key in (
-                    "selected_total", "used", "C_inside", "D_inside",
-                    "common", "C_excluded", "D_excluded", "common_excluded",
+                    "C_selected", "D_selected", "C_used", "D_used",
+                    "C_inside", "D_inside", "common", "C_excluded",
+                    "D_excluded", "common_excluded",
                 )
             },
         }
+        result["by_split"][split]["aggregate_exclusions"].update({
+            "selected_total": result["by_split"][split][
+                "aggregate_exclusions"
+            ]["C_selected"],
+            "used": result["by_split"][split]["aggregate_exclusions"]["C_used"],
+        })
+    result["by_split"]["train"]["complete"] = (
+        result["by_split"]["train"]["complete"]
+        and len(result["by_split"]["train"]["expected_case_ids"]) == 10
+    )
+    result["by_split"]["validation"]["complete"] = (
+        result["by_split"]["validation"]["complete"]
+        and len(result["by_split"]["validation"]["expected_case_ids"]) == 10
+    )
+    result["complete"] = (
+        result["by_split"]["train"]["complete"]
+        and result["by_split"]["validation"]["complete"]
+    )
     return result
 
 
@@ -472,6 +641,36 @@ def _report(metrics, output: Path):
                     f"{_fmt(row.get('rho_rmse'))} | {_fmt(row.get('u_rmse'))} | "
                     f"{_fmt(row.get('p_rmse'))} |"
                 )
+        lines.append("")
+        lines.append("### 早期窗口完整性")
+        lines.append("| 窗口 | split | expected | evaluated | missing | empty common | complete |")
+        lines.append("|---|---|---:|---:|---:|---:|---|")
+        for window in ("0_1pct", "0_5pct", "0_10pct"):
+            for split in ("train", "validation"):
+                row = block["early"][window]["by_split"][split]
+                lines.append(
+                    f"| {window} | {split} | {row['n_expected']} | "
+                    f"{row['n_evaluated']} | {row['n_missing']} | "
+                    f"{len(row['empty_common_domain_cases'])} | "
+                    f"{'yes' if row['complete'] else 'NO'} |"
+                )
+        incomplete = [
+            (window, split, row["incomplete_reasons"])
+            for window in ("0_1pct", "0_5pct", "0_10pct")
+            for split in ("train", "validation")
+            for row in (block["early"][window]["by_split"][split],)
+            if not row["complete"]
+        ]
+        if incomplete:
+            for window, split, reasons in incomplete:
+                lines.append(
+                    f"- {window}/{split} incomplete: {'; '.join(reasons)}"
+                )
+        else:
+            lines.append(
+                "- 所有窗口均为 10 个训练算例 + 10 个验证算例，"
+                "无整例缺失或空共同域。"
+            )
         lines.append("")
         lines.append("### 早期实际窗口：自身有效点 RMSE")
         lines.append("| 窗口 | split | C rho/u/p | D rho/u/p |")

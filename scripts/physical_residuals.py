@@ -81,9 +81,17 @@ def _domain(case, contact, t: torch.Tensor, r: torch.Tensor):
     return inside, rc, rc_dot, rs, ds, closure, scales
 
 
-def _residual_rms(case, air, t, r, rc, rc_dot, rs, ds, scales, keep):
+def _residual_values(case, air, t, r, rc, rc_dot, rs, ds, scales, keep):
+    """Per-point normalised residuals on ``keep``; no pooling or RMS."""
     if int(keep.sum()) == 0:
-        return {"mass": None, "momentum": None, "energy": None, "n": 0}
+        empty = torch.zeros(0, dtype=torch.float64)
+        return {
+            "keep": keep,
+            "mass": empty, "momentum": empty, "energy": empty,
+            "finite": torch.zeros(0, dtype=torch.bool),
+            "n_candidates": 0, "n_nonfinite": 0,
+            "max_radius_abs_error": None,
+        }
     length = (rs - rc)[keep]
     if not bool(torch.all(length > 0.0)):
         raise RuntimeError(f"{case.case_id}: non-positive layer thickness on kept points")
@@ -112,26 +120,43 @@ def _residual_rms(case, air, t, r, rc, rc_dot, rs, ds, scales, keep):
     finite = torch.ones_like(normalized["mass"], dtype=torch.bool)
     for values in normalized.values():
         finite &= torch.isfinite(values)
+    return {
+        "keep": keep,
+        **normalized,
+        "finite": finite,
+        "n_candidates": int(keep.sum()),
+        "n_nonfinite": int(keep.sum()) - int(finite.sum()),
+        "max_radius_abs_error": float(
+            (geometry.radius.reshape(-1) - r[keep]).abs().max()
+        ),
+    }
+
+
+def _residual_rms(case, air, t, r, rc, rc_dot, rs, ds, scales, keep):
+    values = _residual_values(
+        case, air, t, r, rc, rc_dot, rs, ds, scales, keep
+    )
+    finite = values["finite"]
     n_finite = int(finite.sum())
     out = {
         "n": n_finite,
-        "n_candidates": int(keep.sum()),
-        "n_nonfinite": int(keep.sum()) - n_finite,
-        "max_radius_abs_error": float(
-            (geometry.radius.reshape(-1) - r[keep]).abs().max()
-        ) if int(keep.sum()) else None,
+        "n_candidates": values["n_candidates"],
+        "n_nonfinite": values["n_nonfinite"],
+        "max_radius_abs_error": values["max_radius_abs_error"],
     }
-    for name, values in normalized.items():
+    for name in ("mass", "momentum", "energy"):
+        field = values[name]
         if n_finite == 0:
             out[name] = None
         else:
             out[name] = float(torch.sqrt(torch.mean(
-                values[finite] * values[finite]
+                field[finite] * field[finite]
             )).detach())
     return out
 
 
-def _interface_errors(case, contact, air, *, points: int):
+def _interface_values(case, contact, air, *, points: int):
+    """Per-time interface residuals at each model's own contact surface."""
     t = torch.linspace(
         float(case.t0), float(case.t_end), int(points), dtype=torch.float64
     )
@@ -151,7 +176,23 @@ def _interface_errors(case, contact, air, *, points: int):
     velocity = (air_fields.velocity - c_fields.speed) / float(case.u_scale)
     pressure = (air_fields.pressure - c_fields.pressure) / float(case.p_scale)
     return {
+        "t": t,
+        "contact_radius": c_fields.radius.detach().reshape(-1),
+        "velocity": velocity.detach().reshape(-1),
+        "pressure": pressure.detach().reshape(-1),
+        "finite": (
+            torch.isfinite(velocity) & torch.isfinite(pressure)
+        ).detach().reshape(-1),
         "n": int(t.numel()),
+    }
+
+
+def _interface_errors(case, contact, air, *, points: int):
+    values = _interface_values(case, contact, air, points=points)
+    velocity = values["velocity"]
+    pressure = values["pressure"]
+    return {
+        "n": values["n"],
         "velocity_rms": float(torch.sqrt(torch.mean(velocity * velocity)).detach()),
         "pressure_rms": float(torch.sqrt(torch.mean(pressure * pressure)).detach()),
     }
