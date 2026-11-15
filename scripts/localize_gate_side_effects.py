@@ -40,7 +40,8 @@ STAGES = (
     ("10_100pct", 0.10, 1.0),
 )
 DEFAULT_OUTPUT = (
-    "outputs/fullframes/time_input_experiment/gate_pair/side_effects_last"
+    "outputs/fullframes/time_input_experiment/gate_pair/"
+    "side_effects_last_delta_fix"
 )
 
 
@@ -152,6 +153,80 @@ def _delta_stats(delta):
             out[f"top_{label}_positive_n"] = 0
             out[f"top_{label}_positive_share"] = None
     return out
+
+
+def _nonfinite_status(n_candidates, finite_c, finite_d):
+    """Classify C/D non-finite patterns without treating them as success."""
+    finite_c = np.asarray(finite_c, dtype=bool)
+    finite_d = np.asarray(finite_d, dtype=bool)
+    n = int(n_candidates)
+    bad_c = ~finite_c
+    bad_d = ~finite_d
+    only_c = bad_c & finite_d
+    only_d = bad_d & finite_c
+    both_bad = bad_c & bad_d
+    counts = {
+        "n_candidates": n,
+        "n_finite_C": int(finite_c.sum()),
+        "n_finite_D": int(finite_d.sum()),
+        "n_nonfinite_C": int(bad_c.sum()),
+        "n_nonfinite_D": int(bad_d.sum()),
+        "n_both_finite": int((finite_c & finite_d).sum()),
+        "n_both_nonfinite": int(both_bad.sum()),
+        "n_only_C_nonfinite": int(only_c.sum()),
+        "n_only_D_nonfinite": int(only_d.sum()),
+        "n_only_C_finite": int((finite_c & bad_d).sum()),
+        "n_only_D_finite": int((finite_d & bad_c).sum()),
+    }
+    if n == 0:
+        status = "empty"
+    elif counts["n_nonfinite_C"] == 0 and counts["n_nonfinite_D"] == 0:
+        status = "ok"
+    elif counts["n_nonfinite_C"] == n and counts["n_nonfinite_D"] == n:
+        status = "all_nan"
+    elif counts["n_nonfinite_C"] == n or counts["n_nonfinite_D"] == n:
+        status = "one_side_all_nan"
+    elif counts["n_only_C_nonfinite"] > 0 and counts["n_only_D_nonfinite"] > 0:
+        status = "different_positions"
+    elif (
+        counts["n_both_nonfinite"] > 0
+        and counts["n_only_C_nonfinite"] == 0
+        and counts["n_only_D_nonfinite"] == 0
+    ):
+        status = "same_position"
+    elif counts["n_only_C_nonfinite"] > 0 or counts["n_only_D_nonfinite"] > 0:
+        status = "one_side_nan"
+    else:
+        status = "mixed"
+    counts["status"] = status
+    counts["complete"] = status == "ok" and n > 0
+    return counts
+
+
+def _nonfinite_summary(records):
+    fields = (
+        "n_candidates", "n_finite_C", "n_finite_D", "n_nonfinite_C",
+        "n_nonfinite_D", "n_both_finite", "n_both_nonfinite",
+        "n_only_C_nonfinite", "n_only_D_nonfinite",
+    )
+    aggregate = {field: 0 for field in fields}
+    statuses = {}
+    failures = []
+    for case_id, record in records.items():
+        for field in fields:
+            aggregate[field] += int(record.get(field, 0))
+        status = record.get("status", "unknown")
+        statuses[status] = statuses.get(status, 0) + 1
+        if not record.get("complete", False):
+            failures.append({"case_id": case_id, "status": status})
+    aggregate.update({
+        "n_cases": len(records),
+        "statuses": statuses,
+        "failure_cases": failures,
+        "complete": bool(records) and not failures,
+        "status": "ok" if records and not failures else "incomplete",
+    })
+    return aggregate
 
 
 def _top_stage_composition(delta, stage_index, stage_names):
@@ -393,6 +468,7 @@ def main(argv=None) -> int:
     }
     case_energy_arrays = {}
     case_interface_arrays = {}
+    nonfinite = {"energy": {}, "interface_pressure": {}}
     all_energy_c = []
     all_energy_d = []
     all_interface_c = []
@@ -438,17 +514,18 @@ def main(argv=None) -> int:
             dd["rs"], dd["ds"], dd["scales"], keep,
         )
         keep_np = interior
-        both = (
-            vc["finite"].numpy() & vd["finite"].numpy()
-        )
-        if not np.array_equal(both, vc["finite"].numpy()) or not np.array_equal(
-            both, vd["finite"].numpy()
-        ):
-            raise RuntimeError(f"{case.case_id}: non-finite residual mismatch")
+        finite_c = vc["finite"].numpy()
+        finite_d = vd["finite"].numpy()
+        both = finite_c & finite_d
         t_keep = dc["t"].numpy()[keep_np]
         r_keep = dc["r"].numpy()[keep_np]
-        energy_c = vc["energy"].detach().numpy()[both]
-        energy_d = vd["energy"].detach().numpy()[both]
+        energy_c_all = vc["energy"].detach().numpy()
+        energy_d_all = vd["energy"].detach().numpy()
+        energy_c = energy_c_all[both]
+        energy_d = energy_d_all[both]
+        nonfinite["energy"][case.case_id] = _nonfinite_status(
+            int(interior.sum()), finite_c, finite_d
+        )
         case_records[case.case_id] = {
             "case_id": case.case_id,
             "role": case.role,
@@ -456,9 +533,17 @@ def main(argv=None) -> int:
             "n_reference": int(dc["t"].numel()),
             "n_common": int(common.sum()),
             "n_interior": int(interior.sum()),
+            "n_energy_candidates": int(interior.sum()),
             "n_energy_compared": int(both.sum()),
             "n_nonfinite_C": int(vc["n_nonfinite"]),
             "n_nonfinite_D": int(vd["n_nonfinite"]),
+            "n_both_nonfinite": nonfinite["energy"][case.case_id][
+                "n_both_nonfinite"
+            ],
+            "energy_nonfinite_status": nonfinite["energy"][case.case_id][
+                "status"
+            ],
+            "energy_complete": nonfinite["energy"][case.case_id]["complete"],
             "n_below_t0": int((t_keep < float(case.t0)).sum()),
         }
         identity_items.append((case.case_id, (
@@ -507,10 +592,24 @@ def main(argv=None) -> int:
         )
         if not np.array_equal(ivc["t"].numpy(), ivd["t"].numpy()):
             raise RuntimeError(f"{case.case_id}: interface time grid differs")
-        iface_finite = ivc["finite"].numpy() & ivd["finite"].numpy()
-        if not np.array_equal(iface_finite, ivc["finite"].numpy()) or not \
-                np.array_equal(iface_finite, ivd["finite"].numpy()):
-            raise RuntimeError(f"{case.case_id}: non-finite interface mismatch")
+        iface_finite_c = ivc["finite"].numpy()
+        iface_finite_d = ivd["finite"].numpy()
+        iface_finite = iface_finite_c & iface_finite_d
+        iface_status = _nonfinite_status(
+            int(ivc["n"]), iface_finite_c, iface_finite_d
+        )
+        nonfinite["interface_pressure"][case.case_id] = iface_status
+        case_records[case.case_id].update({
+            "n_interface_candidates": int(ivc["n"]),
+            "n_interface_compared": int(iface_finite.sum()),
+            "n_interface_nonfinite_C": iface_status["n_nonfinite_C"],
+            "n_interface_nonfinite_D": iface_status["n_nonfinite_D"],
+            "n_interface_both_nonfinite": iface_status[
+                "n_both_nonfinite"
+            ],
+            "interface_nonfinite_status": iface_status["status"],
+            "interface_complete": iface_status["complete"],
+        })
         t_iface = ivc["t"].numpy()[iface_finite]
         iface_c = ivc["pressure"].numpy()[iface_finite]
         iface_d = ivd["pressure"].numpy()[iface_finite]
@@ -694,6 +793,7 @@ def main(argv=None) -> int:
         "by_case": case_aggregates(energy_rows),
         "rows": energy_rows,
         "delta": energy_delta,
+        "nonfinite": _nonfinite_summary(nonfinite["energy"]),
         "early_0_1pct_time_structure": early_time["energy"],
     }
     interface = {
@@ -707,6 +807,7 @@ def main(argv=None) -> int:
         "by_case": case_aggregates(interface_rows),
         "rows": interface_rows,
         "delta": interface_delta,
+        "nonfinite": _nonfinite_summary(nonfinite["interface_pressure"]),
         "early_0_1pct_time_structure": early_time["interface"],
     }
     metrics_path = (
@@ -813,6 +914,23 @@ def main(argv=None) -> int:
             writer.writeheader()
             writer.writerows(early_time_rows)
 
+    assessment_failures = []
+    for kind in ("energy", "interface_pressure"):
+        summary = (
+            energy["nonfinite"] if kind == "energy"
+            else interface["nonfinite"]
+        )
+        if not summary["complete"]:
+            assessment_failures.append(
+                f"{kind}: {summary['status']} "
+                f"({summary['statuses']})"
+            )
+    assessment = {
+        "complete": not assessment_failures,
+        "failure_reasons": assessment_failures,
+        "exit_code": 0 if not assessment_failures else 1,
+    }
+
     payload = {
         "experiment": "C_none_vs_D_similarity_gate_last_4000_side_effects",
         "checkpoints": {
@@ -850,6 +968,7 @@ def main(argv=None) -> int:
             "n_rows": len(early_time_rows),
         },
         "consistency_with_existing_metrics": consistency,
+        "assessment": assessment,
         "notes": [
             "Energy uses one fixed physical reference and a common domain; "
             "interface pressure uses each model's own contact surface.",
@@ -881,8 +1000,9 @@ def main(argv=None) -> int:
             "energy": payload["point_files"]["energy"],
             "interface": payload["point_files"]["interface"],
         },
+        "assessment": assessment,
     }, indent=2))
-    return 0
+    return assessment["exit_code"]
 
 
 def _fmt(value, digits=5):
@@ -904,6 +1024,17 @@ def _write_report(output: Path, payload: dict):
         "门控在该归一化时间上的典型值约为：1% 处 0.473、5% 处 0.959、"
         "10% 处 0.998；时间重合只用于定位，不证明因果。"
     )
+    assessment = payload.get("assessment", {})
+    if assessment:
+        lines.append(
+            f"非有限值完整性：`{assessment.get('complete')}`；"
+            f"退出码 `{assessment.get('exit_code')}`。"
+        )
+        if assessment.get("failure_reasons"):
+            lines.append(
+                "失败原因："
+                + "; ".join(assessment["failure_reasons"])
+            )
     lines.append("")
 
     for kind, title in (
@@ -1034,6 +1165,23 @@ def _write_report(output: Path, payload: dict):
                 f"{_fmt(item['points_per_time_median'])}/"
                 f"{item['points_per_time_max']} | "
                 f"{_fmt(item['time_s_min'])} | {_fmt(item['time_s_max'])} |"
+            )
+        lines.append("")
+        nf = block["nonfinite"]
+        lines.append("### 非有限值检查")
+        lines.append(
+            f"- candidates={nf['n_candidates']}，C 非有限="
+            f"{nf['n_nonfinite_C']}，D 非有限={nf['n_nonfinite_D']}，"
+            f"两边均有限={nf['n_both_finite']}，"
+            f"状态={nf['statuses']}，complete=`{nf['complete']}`。"
+        )
+        if nf["failure_cases"]:
+            lines.append(
+                "- 失败算例："
+                + ", ".join(
+                    f"{item['case_id']}:{item['status']}"
+                    for item in nf["failure_cases"]
+                )
             )
         lines.append("")
 

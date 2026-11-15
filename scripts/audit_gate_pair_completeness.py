@@ -54,7 +54,7 @@ def main(argv=None) -> int:
         "--output",
         default=(
             "outputs/fullframes/time_input_experiment/gate_pair/"
-            "evaluation_completeness_fix/completeness_audit.json"
+            "failure_semantics/completeness_audit.json"
         ),
     )
     args = parser.parse_args(argv)
@@ -139,6 +139,22 @@ def main(argv=None) -> int:
                 })
 
     nonfinite = _nonfinite_paths(payload)
+    failures = []
+    for item in checks:
+        if not item["complete"]:
+            failures.append(
+                f"{item['set']}/{item['window']}/{item['split']}: incomplete"
+            )
+        if item["empty_common_cases"]:
+            failures.append(
+                f"{item['set']}/{item['window']}/{item['split']}: "
+                f"empty common {item['empty_common_cases']}"
+            )
+    for item in t0_checks:
+        if not item["complete"]:
+            failures.append(f"{item['set']}/t0/{item['model']}: incomplete")
+    failures.extend(f"nonfinite:{path}" for path in nonfinite)
+    all_complete = not failures
     result = {
         "metrics_path": str(metrics_path),
         "metrics_sha256": _sha256(metrics_path),
@@ -147,10 +163,9 @@ def main(argv=None) -> int:
             "corrected evaluator now records expected/evaluated/missing cases "
             "explicitly.  This audit checks IDs because the old file did not."
         ),
-        "all_checks_complete": (
-            all(item["complete"] for item in checks)
-            and all(item["complete"] for item in t0_checks)
-        ),
+        "all_checks_complete": all_complete,
+        "failure_reasons": failures,
+        "exit_code": 0 if all_complete else 1,
         "n_checks": len(checks),
         "n_t0_checks": len(t0_checks),
         "nonfinite_numeric_values": nonfinite,
@@ -160,7 +175,7 @@ def main(argv=None) -> int:
             "all 12 window/split/set combinations contain exactly the 10 "
             "expected cases, nonempty physical domains and finite aggregates; "
             "the old numbers are retained, not a newly discovered omission"
-            if all(item["complete"] for item in checks) and not nonfinite
+            if all_complete
             else "the old metrics are incomplete or non-finite"
         ),
     }
@@ -169,10 +184,12 @@ def main(argv=None) -> int:
         "wrote": str(output),
         "sha256": _sha256(output),
         "all_checks_complete": result["all_checks_complete"],
+        "failure_reasons": result["failure_reasons"],
+        "exit_code": result["exit_code"],
         "n_checks": len(checks),
         "nonfinite": len(nonfinite),
     }, indent=2))
-    return 0
+    return result["exit_code"]
 
 
 if __name__ == "__main__":

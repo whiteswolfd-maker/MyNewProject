@@ -105,13 +105,17 @@ def test_missing_case_is_recorded_instead_of_silently_skipped(monkeypatch):
         "status": "unevaluable_case",
         "failure_reasons": ["C:no_reference_rows", "D:no_reference_rows"],
     }]
-    assert "evaluated case ids differ" in " ".join(block["incomplete_reasons"])
+    reasons = " ".join(block["incomplete_reasons"])
+    assert "lack a valid own domain" in reasons
+    assert "lack a common domain" in reasons
 
 
-def test_empty_common_domain_is_marked_incomplete_and_not_nan(monkeypatch):
+def test_disjoint_own_domains_keep_own_metrics_but_common_is_incomplete(
+    monkeypatch,
+):
     cases = _cases()
 
-    # Only D differs on the target case: make a side-specific provider.
+    # Both models have valid targets, but their domains do not overlap.
     def provider_side(case, side):
         row = _row(case)
         if case.case_id == "r500_full":
@@ -132,7 +136,15 @@ def test_empty_common_domain_is_marked_incomplete_and_not_nan(monkeypatch):
     result = gate_eval._early_pair(None, None, cases, "0_1pct")
     block = result["by_split"]["train"]
     assert result["complete"] is False
-    assert block["n_evaluated"] == 9
+    assert block["n_evaluated"] == 10
+    assert block["n_common_evaluated"] == 9
+    assert block["own_complete"] is True
+    assert block["common_complete"] is False
+    assert block["C_own"]["rho"]["n"] == 19
+    assert block["D_own"]["rho"]["n"] == 19
+    assert block["C_common"]["rho"]["n"] == 18
+    assert block["C_common"]["rho"]["n_cases_present"] == 9
+    assert block["C_common"]["rho"]["complete"] is False
     assert block["empty_common_domain_cases"] == [{
         "case_id": "r500_full",
         "status": "empty_common_domain",
@@ -140,6 +152,12 @@ def test_empty_common_domain_is_marked_incomplete_and_not_nan(monkeypatch):
             "no physical points inside both models' [Rc,Rs] domains",
         ],
     }]
+    record = next(
+        row for row in block["case_records"] if row["case_id"] == "r500_full"
+    )
+    assert record["own_C_evaluated"] is True
+    assert record["own_D_evaluated"] is True
+    assert record["common_evaluated"] is False
     for side in ("C_own", "D_own", "C_common", "D_common"):
         for field in ("rho", "u", "p"):
             metric = block[side][field]

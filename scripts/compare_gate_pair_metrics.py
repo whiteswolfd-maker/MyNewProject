@@ -93,7 +93,7 @@ def main(argv=None) -> int:
         "--output",
         default=(
             "outputs/fullframes/time_input_experiment/gate_pair/"
-            "evaluation_completeness_fix/metrics_comparison.json"
+            "failure_semantics/metrics_comparison.json"
         ),
     )
     args = parser.parse_args(argv)
@@ -113,6 +113,7 @@ def main(argv=None) -> int:
     }
     _compare(old, new, "", result)
     result["old_values_preserved"] = not result["missing_or_changed"]
+    result["exit_code"] = 0 if result["old_values_preserved"] else 1
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -120,11 +121,12 @@ def main(argv=None) -> int:
         "wrote": str(output),
         "sha256": _sha256(output),
         "old_values_preserved": result["old_values_preserved"],
+        "exit_code": result["exit_code"],
         "n_differences": len(result["missing_or_changed"]),
         "max_abs_difference": result["max_abs_difference"],
         "max_relative_difference": result["max_relative_difference"],
     }, indent=2))
-    return 0
+    return result["exit_code"]
 
 
 if __name__ == "__main__":

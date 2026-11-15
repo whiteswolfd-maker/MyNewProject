@@ -82,6 +82,56 @@ def test_delta_stats_separates_positive_negative_and_top_points():
     assert result["top_5pct_all_n"] == 1
 
 
+def test_nonfinite_status_separates_same_different_one_side_and_all():
+    same = localise._nonfinite_status(
+        3, np.array([True, False, True]), np.array([True, False, True])
+    )
+    assert same["status"] == "same_position"
+    assert same["n_both_nonfinite"] == 1
+    assert same["complete"] is False
+    different = localise._nonfinite_status(
+        3, np.array([False, True, True]), np.array([True, False, True])
+    )
+    assert different["status"] == "different_positions"
+    one_side = localise._nonfinite_status(
+        3, np.array([True, False, True]), np.array([True, True, True])
+    )
+    assert one_side["status"] == "one_side_nan"
+    one_side_all = localise._nonfinite_status(
+        3, np.array([False, False, False]), np.array([True, True, True])
+    )
+    assert one_side_all["status"] == "one_side_all_nan"
+    all_nan = localise._nonfinite_status(
+        3, np.array([False, False, False]), np.array([False, False, False])
+    )
+    assert all_nan["status"] == "all_nan"
+    assert all_nan["n_both_nonfinite"] == 3
+    ok = localise._nonfinite_status(
+        3, np.array([True, True, True]), np.array([True, True, True])
+    )
+    assert ok["status"] == "ok"
+    assert ok["complete"] is True
+
+
+def test_nonfinite_summary_propagates_failure():
+    records = {
+        "a": {
+            "n_candidates": 2, "n_nonfinite_C": 0, "n_nonfinite_D": 0,
+            "complete": True, "status": "ok",
+        },
+        "b": {
+            "n_candidates": 2, "n_nonfinite_C": 2, "n_nonfinite_D": 2,
+            "complete": False, "status": "all_nan",
+        },
+    }
+    summary = localise._nonfinite_summary(records)
+    assert summary["complete"] is False
+    assert summary["status"] == "incomplete"
+    assert summary["n_nonfinite_C"] == 2
+    assert summary["n_nonfinite_D"] == 2
+    assert summary["failure_cases"] == [{"case_id": "b", "status": "all_nan"}]
+
+
 def test_time_structure_counts_independent_times_and_spatial_points():
     case = SimpleNamespace(
         case_id="r50_full", role="train", charge_radius_m=0.05,

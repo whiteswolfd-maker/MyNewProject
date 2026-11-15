@@ -146,6 +146,9 @@ def _failure_record(case, c, d):
         "C_excluded": 0,
         "D_excluded": 0,
         "common_excluded": 0,
+        "own_C_evaluated": False,
+        "own_D_evaluated": False,
+        "common_evaluated": False,
         "evaluated": False,
         "status": "unevaluable_case",
         "failure_reasons": reasons,
@@ -154,8 +157,10 @@ def _failure_record(case, c, d):
 
 def _early_pair(c_trainer, d_trainer, cases, window):
     lo, hi = WINDOWS[window]
-    rows_c = {"train": [], "validation": []}
-    rows_d = {"train": [], "validation": []}
+    own_c = {"train": [], "validation": []}
+    own_d = {"train": [], "validation": []}
+    common_c = {"train": [], "validation": []}
+    common_d = {"train": [], "validation": []}
     records = {"train": [], "validation": []}
     expected = {"train": [], "validation": []}
     for case in cases:
@@ -168,7 +173,13 @@ def _early_pair(c_trainer, d_trainer, cases, window):
             continue
         assert np.array_equal(c["time"], d["time"])
         assert np.array_equal(c["radius"], d["radius"])
-        common = np.asarray(c["inside"], bool) & np.asarray(d["inside"], bool)
+        c_inside = np.asarray(c["inside"], dtype=bool)
+        d_inside = np.asarray(d["inside"], dtype=bool)
+        common = c_inside & d_inside
+        c["scales"] = {
+            "rho": case.rho_scale, "u": case.u_scale, "p": case.p_scale,
+        }
+        d["scales"] = dict(c["scales"])
         record = {
             "case_id": case.case_id,
             "role": split,
@@ -178,51 +189,73 @@ def _early_pair(c_trainer, d_trainer, cases, window):
             "D_selected": int(d["selected"]),
             "C_used": int(c["used"]),
             "D_used": int(d["used"]),
-            "C_inside": int(np.asarray(c["inside"], bool).sum()),
-            "D_inside": int(np.asarray(d["inside"], bool).sum()),
+            "C_inside": int(c_inside.sum()),
+            "D_inside": int(d_inside.sum()),
             "common": int(common.sum()),
-            "C_excluded": int(c["used"] - np.asarray(c["inside"], bool).sum()),
-            "D_excluded": int(d["used"] - np.asarray(d["inside"], bool).sum()),
+            "C_excluded": int(c["used"] - c_inside.sum()),
+            "D_excluded": int(d["used"] - d_inside.sum()),
             "common_excluded": int(c["used"] - common.sum()),
+            "own_C_evaluated": bool(c_inside.any()),
+            "own_D_evaluated": bool(d_inside.any()),
+            "common_evaluated": bool(common.any()),
             "evaluated": False,
             "status": "ok",
             "failure_reasons": [],
         }
-        if int(common.sum()) == 0:
+        if record["own_C_evaluated"]:
+            own_c[split].append(c)
+        if record["own_D_evaluated"]:
+            own_d[split].append(d)
+        if record["common_evaluated"]:
+            c["common_mask"] = common
+            d["common_mask"] = common
+            common_c[split].append(c)
+            common_d[split].append(d)
+        record["evaluated"] = (
+            record["own_C_evaluated"] and record["own_D_evaluated"]
+        )
+        if not record["evaluated"]:
+            record["status"] = "empty_own_domain"
+            if not record["own_C_evaluated"]:
+                record["failure_reasons"].append("C has no own-domain points")
+            if not record["own_D_evaluated"]:
+                record["failure_reasons"].append("D has no own-domain points")
+        elif not record["common_evaluated"]:
             record["status"] = "empty_common_domain"
             record["failure_reasons"].append(
                 "no physical points inside both models' [Rc,Rs] domains"
             )
-            records[split].append(record)
-            continue
-        c["common_mask"] = common
-        d["common_mask"] = common
-        for row in (c, d):
-            row["scales"] = {
-                "rho": case.rho_scale, "u": case.u_scale, "p": case.p_scale,
-            }
-        rows_c[split].append(c)
-        rows_d[split].append(d)
-        record["evaluated"] = True
         records[split].append(record)
 
-    def aggregate(rows, mask_key):
-        return {
+    def aggregate(rows, mask_key, expected_ids):
+        blocks = {
             field: _aggregate_air_rows(rows, field, "", mask_key, field)
             for field in ("rho", "u", "p")
         }
+        for block in blocks.values():
+            block["n_cases_present"] = len(rows)
+            block["n_cases_expected"] = len(expected_ids)
+            block["complete"] = (
+                block["complete"] and len(rows) == len(expected_ids)
+            )
+        return blocks
 
     result = {"window": window, "by_split": {}}
     for split in ("train", "validation"):
-        c_own = aggregate(rows_c[split], "inside")
-        d_own = aggregate(rows_d[split], "inside")
-        c_common = aggregate(rows_c[split], "common_mask")
-        d_common = aggregate(rows_d[split], "common_mask")
+        expected_ids = expected[split]
+        c_own = aggregate(own_c[split], "inside", expected_ids)
+        d_own = aggregate(own_d[split], "inside", expected_ids)
+        c_common = aggregate(common_c[split], "common_mask", expected_ids)
+        d_common = aggregate(common_d[split], "common_mask", expected_ids)
         split_records = records[split]
         evaluated_ids = [
             row["case_id"] for row in split_records if row["evaluated"]
         ]
-        missing = [
+        common_evaluated_ids = [
+            row["case_id"] for row in split_records
+            if row["common_evaluated"]
+        ]
+        own_missing = [
             {
                 "case_id": row["case_id"],
                 "status": row["status"],
@@ -230,14 +263,28 @@ def _early_pair(c_trainer, d_trainer, cases, window):
             }
             for row in split_records if not row["evaluated"]
         ]
-        expected_ids = expected[split]
-        field_blocks = {
-            "C_own": c_own, "D_own": d_own,
-            "C_common": c_common, "D_common": d_common,
-        }
-        field_complete = all(
+        common_missing = [
+            {
+                "case_id": row["case_id"],
+                "status": row["status"],
+                "failure_reasons": row["failure_reasons"],
+            }
+            for row in split_records if not row["common_evaluated"]
+        ]
+        merged_missing = {}
+        for item in own_missing + common_missing:
+            merged_missing.setdefault(item["case_id"], item)
+        missing = list(merged_missing.values())
+        own_blocks = {"C_own": c_own, "D_own": d_own}
+        common_blocks = {"C_common": c_common, "D_common": d_common}
+        own_complete = all(
             block[field]["complete"]
-            for block in field_blocks.values()
+            for block in own_blocks.values()
+            for field in ("rho", "u", "p")
+        )
+        common_complete = all(
+            block[field]["complete"]
+            for block in common_blocks.values()
             for field in ("rho", "u", "p")
         )
         reasons = []
@@ -247,16 +294,21 @@ def _early_pair(c_trainer, d_trainer, cases, window):
             )
         if len(split_records) != len(expected_ids):
             reasons.append(
-                f"recorded {len(split_records)} cases, expected {len(expected_ids)}"
+                f"recorded {len(split_records)} cases, expected "
+                f"{len(expected_ids)}"
             )
-        if set(evaluated_ids) != set(expected_ids):
-            reasons.append("evaluated case ids differ from expected case ids")
-        if missing:
-            reasons.append(f"{len(missing)} case(s) not evaluable")
-        if not field_complete:
+        if own_missing:
             reasons.append(
-                "at least one field has non-finite or skipped case points"
+                f"{len(own_missing)} case(s) lack a valid own domain"
             )
+        if common_missing:
+            reasons.append(
+                f"{len(common_missing)} case(s) lack a common domain"
+            )
+        if not own_complete:
+            reasons.append("own-domain aggregate is incomplete")
+        if not common_complete:
+            reasons.append("common-domain aggregate is incomplete")
         complete = not reasons
         result["by_split"][split] = {
             "C_own": c_own,
@@ -265,10 +317,17 @@ def _early_pair(c_trainer, d_trainer, cases, window):
             "D_common": d_common,
             "expected_case_ids": expected_ids,
             "evaluated_case_ids": evaluated_ids,
+            "common_evaluated_case_ids": common_evaluated_ids,
             "missing_cases": missing,
+            "own_missing_cases": own_missing,
+            "common_missing_cases": common_missing,
             "unevaluable_cases": [
                 item for item in missing
                 if item["status"] == "unevaluable_case"
+            ],
+            "empty_own_domain_cases": [
+                item for item in missing
+                if item["status"] == "empty_own_domain"
             ],
             "empty_common_domain_cases": [
                 item for item in missing
@@ -277,7 +336,10 @@ def _early_pair(c_trainer, d_trainer, cases, window):
             "case_records": split_records,
             "n_expected": len(expected_ids),
             "n_evaluated": len(evaluated_ids),
+            "n_common_evaluated": len(common_evaluated_ids),
             "n_missing": len(missing),
+            "own_complete": own_complete,
+            "common_complete": common_complete,
             "complete": complete,
             "incomplete_reasons": reasons,
             "exclusions": [
@@ -316,7 +378,6 @@ def _early_pair(c_trainer, d_trainer, cases, window):
         and result["by_split"]["validation"]["complete"]
     )
     return result
-
 
 def _right_boundary(trainer, case, points=128):
     t = torch.linspace(
@@ -624,6 +685,17 @@ def _report(metrics, output: Path):
         "best 另表。C/D 从同初始化、同 seed、同预算、全新 Adam 训练；"
         "只改变 AirNet 门控。"
     )
+    assessment = metrics.get("assessment", {})
+    if assessment:
+        lines.append(
+            f"评估完整性：`{assessment.get('complete')}`；"
+            f"退出码 `{assessment.get('exit_code')}`。"
+        )
+        if assessment.get("failure_reasons"):
+            lines.append(
+                "失败原因："
+                + "; ".join(assessment["failure_reasons"])
+            )
     lines.append("")
     for suffix in ("last", "best"):
         block = metrics["sets"][suffix]
@@ -643,15 +715,20 @@ def _report(metrics, output: Path):
                 )
         lines.append("")
         lines.append("### 早期窗口完整性")
-        lines.append("| 窗口 | split | expected | evaluated | missing | empty common | complete |")
-        lines.append("|---|---|---:|---:|---:|---:|---|")
+        lines.append(
+            "| 窗口 | split | expected | own evaluated | common evaluated "
+            "| missing | own complete | common complete | complete |"
+        )
+        lines.append("|---|---|---:|---:|---:|---:|---|---|---|")
         for window in ("0_1pct", "0_5pct", "0_10pct"):
             for split in ("train", "validation"):
                 row = block["early"][window]["by_split"][split]
                 lines.append(
                     f"| {window} | {split} | {row['n_expected']} | "
-                    f"{row['n_evaluated']} | {row['n_missing']} | "
-                    f"{len(row['empty_common_domain_cases'])} | "
+                    f"{row['n_evaluated']} | {row['n_common_evaluated']} | "
+                    f"{row['n_missing']} | "
+                    f"{'yes' if row['own_complete'] else 'NO'} | "
+                    f"{'yes' if row['common_complete'] else 'NO'} | "
                     f"{'yes' if row['complete'] else 'NO'} |"
                 )
         incomplete = [
@@ -816,6 +893,31 @@ def _report(metrics, output: Path):
     (output / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _assessment(metrics):
+    failures = []
+    for suffix in ("last", "best"):
+        for window in ("0_1pct", "0_5pct", "0_10pct"):
+            for split in ("train", "validation"):
+                block = metrics.get("sets", {}).get(suffix, {}).get(
+                    "early", {}
+                ).get(window, {}).get("by_split", {}).get(split)
+                if block is None:
+                    failures.append(
+                        f"{suffix}/{window}/{split}: missing early block"
+                    )
+                    continue
+                if not block.get("complete", False):
+                    failures.append(
+                        f"{suffix}/{window}/{split}: incomplete "
+                        f"({'; '.join(block.get('incomplete_reasons', []))})"
+                    )
+    return {
+        "complete": not failures,
+        "failure_reasons": failures,
+        "exit_code": 0 if not failures else 1,
+    }
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--output", required=True)
@@ -848,6 +950,7 @@ def main(argv=None) -> int:
     metrics["sets"]["best"] = _metrics_for_suffix(
         c_trainer, d_trainer, cases, C_BEST, D_BEST, "best"
     )
+    metrics["assessment"] = _assessment(metrics)
     (output / "metrics.json").write_text(
         json.dumps(_jsonable(metrics), indent=2), encoding="utf-8"
     )
@@ -859,8 +962,9 @@ def main(argv=None) -> int:
             "C": metrics["sets"]["last"]["loop_C"],
             "D": metrics["sets"]["last"]["loop_D"],
         },
+        "assessment": metrics["assessment"],
     }, indent=2))
-    return 0
+    return metrics["assessment"]["exit_code"]
 
 
 if __name__ == "__main__":
