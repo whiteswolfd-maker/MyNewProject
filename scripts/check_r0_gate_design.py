@@ -220,22 +220,24 @@ def _t0_derivative_check(trainer, case):
     }
 
 
-def _functional_check(trainer, case):
+def _functional_check(trainer, cases):
     zeta = torch.as_tensor(ZETAS, dtype=torch.float64).reshape(-1, 1)
-    t = torch.full_like(zeta, float(case.t0))
-    r0 = torch.full_like(zeta, float(case.charge_radius_m))
-    ordinary, _, _ = gated_fields(
-        trainer.air_net, zeta, t, r0,
-        trainer._scales[case.case_id], case.time_input, functional=False,
-    )
-    frozen, _, _ = gated_fields(
-        trainer.air_net, zeta, t, r0,
-        trainer._scales[case.case_id], case.time_input, functional=True,
-    )
-    differences = [
-        float((ordinary[i] - frozen[i]).abs().max())
-        for i in range(3)
-    ]
+    differences = [0.0, 0.0, 0.0]
+    for case in cases:
+        t = torch.full_like(zeta, float(case.t0))
+        r0 = torch.full_like(zeta, float(case.charge_radius_m))
+        ordinary, _, _ = gated_fields(
+            trainer.air_net, zeta, t, r0,
+            trainer._scales[case.case_id], case.time_input, functional=False,
+        )
+        frozen, _, _ = gated_fields(
+            trainer.air_net, zeta, t, r0,
+            trainer._scales[case.case_id], case.time_input, functional=True,
+        )
+        differences = [
+            max(differences[i], float((ordinary[i] - frozen[i]).abs().max()))
+            for i in range(3)
+        ]
     return differences
 
 
@@ -293,7 +295,7 @@ def main(argv=None) -> int:
         t0_derivative = _t0_derivative_check(
             trainer, trainer.cases[0]
         )
-        functional_diff = _functional_check(trainer, trainer.cases[0])
+        functional_diff = _functional_check(trainer, cases)
         windows = [_window_spread(trainer, cases, f) for f in WINDOWS]
         n_parameters = sum(p.numel() for p in trainer.air_net.parameters())
         results[label] = {
