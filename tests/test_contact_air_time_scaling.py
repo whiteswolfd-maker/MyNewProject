@@ -258,8 +258,11 @@ def test_common_r0_control_uses_each_case_t0_not_global_zero():
     second = SimpleNamespace(
         case_id="case_b",
         t0=5.0e-4,
-        time_input=TimeInput(origin=5.0e-4, scale=1.0e-4),
+        time_input=TimeInput(origin=5.0e-4, scale=2.5e-5),
     )
+    ratio_first = first.t0 / first.time_input.scale
+    ratio_second = second.t0 / second.time_input.scale
+    assert ratio_first != pytest.approx(ratio_second)
     zeta = torch.tensor([[0.2], [0.7]], dtype=torch.float64)
     common_r0 = torch.full_like(zeta, 0.5)
 

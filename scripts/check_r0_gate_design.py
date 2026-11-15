@@ -391,6 +391,13 @@ def _ratio_section(cases):
     }
 
 
+def _checkpoint_fields(path, checks):
+    """Return the two non-overlapping checkpoint fields used in the result."""
+    if not isinstance(checks, dict):
+        raise TypeError("checkpoint_checks must be a dict")
+    return {"checkpoint_path": str(path), "checkpoint_checks": checks}
+
+
 def _checkpoint_section(net, gate_net):
     old_without_gate = dict(net.describe())
     old_without_gate.pop("r0_input_gate", None)
@@ -453,7 +460,7 @@ def main(argv=None) -> int:
         ratio = _ratio_section(cases)
         checkpoint = _checkpoint_section(none_net, gate_net)
         results[label] = {
-            "checkpoint": str(path),
+            **_checkpoint_fields(path, checkpoint),
             "checkpoint_sha256": _sha256(path),
             "checkpoint_loop": int(trainer.loop),
             "none_mode": {
@@ -476,7 +483,6 @@ def main(argv=None) -> int:
                 "right_loss": right,
                 "description": gate_net.describe(),
             },
-            "checkpoint": checkpoint,
         }
         for net in (none_net, gate_net):
             for name in ("_check_scales", "_check_scales_by_case"):
@@ -529,7 +535,7 @@ def main(argv=None) -> int:
                 "functional": item["gate_mode"]["ordinary_functional"],
                 "window_spread": item["gate_mode"]["window_spread"],
                 "none_baseline": item["none_mode"]["baseline_reconstruction"],
-                "checkpoint": item["checkpoint"],
+                "checkpoint": item["checkpoint_checks"],
             }
             for label, item in results.items()
         },

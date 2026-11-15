@@ -1,0 +1,8 @@
+# Paired baseline C for the R0-gate experiment.
+# Same training factors as the candidate; only AirNet r0_input_gate differs.
+inherits: split_train_r50_500_fullframes_similarity.yaml
+
+contact_air:
+  output_dir: outputs/contact_air_time_input_pair_c_none_4000
+  networks:
+    r0_input_gate: none

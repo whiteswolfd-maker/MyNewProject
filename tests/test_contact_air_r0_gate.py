@@ -311,3 +311,14 @@ def test_contact_stage_interface_uses_the_gated_functional_path(tmp_path):
     assert torch.allclose(
         terms["interface"].total, manual.total, rtol=1.0e-12, atol=1.0e-15
     )
+
+
+def test_checkpoint_fields_have_distinct_path_and_checks():
+    from scripts.check_r0_gate_design import _checkpoint_fields
+
+    fields = _checkpoint_fields("outputs/example.pt", {"gate": "none"})
+    assert set(fields) == {"checkpoint_path", "checkpoint_checks"}
+    assert isinstance(fields["checkpoint_path"], str)
+    assert isinstance(fields["checkpoint_checks"], dict)
+    with pytest.raises(TypeError):
+        _checkpoint_fields("outputs/example.pt", "not-a-dict")
