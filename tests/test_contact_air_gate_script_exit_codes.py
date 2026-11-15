@@ -237,6 +237,107 @@ def test_audit_main_rejects_partial_nan_with_finite_mse(tmp_path, monkeypatch):
     assert any("n_nonfinite" in item for item in saved["failure_reasons"])
 
 
+def _set_all_mse(payload, value):
+    for suffix in payload["sets"].values():
+        for window in suffix["early"].values():
+            for block in window["by_split"].values():
+                for side in ("C_own", "D_own", "C_common", "D_common"):
+                    for field in ("rho", "u", "p"):
+                        block[side][field]["mse"] = value
+
+
+def test_audit_main_rejects_duplicate_case_id(tmp_path, monkeypatch):
+    payload, _ = _audit_payload()
+    rows = payload["sets"]["last"]["early"]["0_1pct"]["by_split"]["train"][
+        "exclusions"
+    ]
+    rows.append(dict(rows[0]))
+    metrics = tmp_path / "metrics.json"
+    out = tmp_path / "audit.json"
+    metrics.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        audit.diag, "_build_trainer", lambda config: (_fake_trainer(), {})
+    )
+    code = audit.main([
+        "--metrics", str(metrics), "--output", str(out),
+    ])
+    assert code == 1
+    saved = json.loads(out.read_text(encoding="utf-8"))
+    assert saved["all_checks_complete"] is False
+    assert saved["exit_code"] == 1
+    assert any("duplicate case ids" in item for item in saved["failure_reasons"])
+    check = saved["checks"][0]
+    assert check["n_recorded"] == 11
+    assert check["n_unique_recorded"] == 10
+    assert check["duplicate_case_ids"]
+
+
+def test_audit_main_rejects_exit_code_even_when_complete_true(
+    tmp_path, monkeypatch,
+):
+    payload, _ = _audit_payload()
+    payload["assessment"] = {
+        "complete": True,
+        "failure_reasons": [],
+        "exit_code": 1,
+    }
+    metrics = tmp_path / "metrics.json"
+    out = tmp_path / "audit.json"
+    metrics.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        audit.diag, "_build_trainer", lambda config: (_fake_trainer(), {})
+    )
+    code = audit.main([
+        "--metrics", str(metrics), "--output", str(out),
+    ])
+    assert code == 1
+    saved = json.loads(out.read_text(encoding="utf-8"))
+    assert any(
+        "assessment.exit_code=1" in item
+        for item in saved["failure_reasons"]
+    )
+
+
+def test_audit_main_accepts_zero_mse(tmp_path, monkeypatch):
+    payload, _ = _audit_payload()
+    _set_all_mse(payload, 0.0)
+    metrics = tmp_path / "metrics.json"
+    out = tmp_path / "audit.json"
+    metrics.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        audit.diag, "_build_trainer", lambda config: (_fake_trainer(), {})
+    )
+    code = audit.main([
+        "--metrics", str(metrics), "--output", str(out),
+    ])
+    assert code == 0
+    saved = json.loads(out.read_text(encoding="utf-8"))
+    assert saved["all_checks_complete"] is True
+    assert "zero MSE is allowed" in saved["mse_rule"]
+
+
+def test_audit_main_rejects_negative_mse(tmp_path, monkeypatch):
+    payload, _ = _audit_payload()
+    payload["sets"]["last"]["early"]["0_1pct"]["by_split"]["train"][
+        "C_own"
+    ]["rho"]["mse"] = -1.0
+    metrics = tmp_path / "metrics.json"
+    out = tmp_path / "audit.json"
+    metrics.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        audit.diag, "_build_trainer", lambda config: (_fake_trainer(), {})
+    )
+    code = audit.main([
+        "--metrics", str(metrics), "--output", str(out),
+    ])
+    assert code == 1
+    saved = json.loads(out.read_text(encoding="utf-8"))
+    assert any(
+        "nonnegative finite MSE" in item
+        for item in saved["failure_reasons"]
+    )
+
+
 def test_audit_main_accepts_current_schema_all_finite(tmp_path, monkeypatch):
     payload, _ = _payload_from_early(monkeypatch, partial_nan=False)
     metrics = tmp_path / "metrics.json"

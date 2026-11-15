@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import sys
+from collections import Counter
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -62,11 +63,17 @@ def _field_failures(metric, path):
         return [f"{path}: metric is not a dict"]
     n = metric.get("n")
     mse = metric.get("mse")
-    if not (
-        isinstance(n, (int, float)) and int(n) > 0
-        and mse is not None and math.isfinite(float(mse))
-    ):
-        failures.append(f"{path}: no positive finite MSE")
+    n_valid = isinstance(n, (int, float)) and int(n) > 0
+    mse_valid = (
+        mse is not None
+        and math.isfinite(float(mse))
+        and float(mse) >= 0.0
+    )
+    if not n_valid or not mse_valid:
+        failures.append(
+            f"{path}: need n>0 and nonnegative finite MSE "
+            f"(n={n}, mse={mse})"
+        )
     if "complete" in metric and not bool(metric["complete"]):
         failures.append(f"{path}: recorded complete=false")
     if int(metric.get("n_nonfinite", 0)) > 0:
@@ -186,9 +193,18 @@ def main(argv=None) -> int:
                 path = f"{suffix}/{window}/{split}"
                 rows = block.get("case_records") or block.get("exclusions", [])
                 ids = [row["case_id"] for row in rows]
+                id_counts = Counter(ids)
+                duplicate_ids = {
+                    case_id: count
+                    for case_id, count in id_counts.items()
+                    if count > 1
+                }
+                unique_ids = sorted(id_counts)
                 expected_ids = expected[split]
                 missing = sorted(set(expected_ids) - set(ids))
                 extra = sorted(set(ids) - set(expected_ids))
+                id_set_equal = set(ids) == set(expected_ids)
+                recorded_count_equal = len(rows) == len(expected_ids)
                 empty_common = sorted(
                     row["case_id"] for row in rows
                     if int(row.get("common", 0)) == 0
@@ -231,6 +247,20 @@ def main(argv=None) -> int:
                         f"{block['incomplete_reasons']}"
                     )
                 split_failures.extend(_case_row_failures(rows, path))
+                if duplicate_ids:
+                    split_failures.append(
+                        f"{path}: duplicate case ids="
+                        f"{duplicate_ids}"
+                    )
+                if not recorded_count_equal:
+                    split_failures.append(
+                        f"{path}: recorded_count={len(rows)} "
+                        f"!= expected_count={len(expected_ids)}"
+                    )
+                if not id_set_equal:
+                    split_failures.append(
+                        f"{path}: id_set differs from expected"
+                    )
                 if missing:
                     split_failures.append(f"{path}: missing={missing}")
                 if extra:
@@ -256,8 +286,13 @@ def main(argv=None) -> int:
                     "schema": schema,
                     "expected_case_ids": expected_ids,
                     "recorded_case_ids": ids,
+                    "unique_recorded_case_ids": unique_ids,
+                    "duplicate_case_ids": duplicate_ids,
                     "n_expected": len(expected_ids),
                     "n_recorded": len(rows),
+                    "n_unique_recorded": len(unique_ids),
+                    "recorded_count_equal": recorded_count_equal,
+                    "id_set_equal": id_set_equal,
                     "missing_cases": missing,
                     "extra_cases": extra,
                     "empty_common_cases": empty_common,
@@ -265,7 +300,7 @@ def main(argv=None) -> int:
                     "current_field_count": current_fields,
                     "unrecorded_fields": unrecorded,
                     "aggregate_fields_finite": not any(
-                        "no positive finite MSE" in item
+                        "need n>0 and nonnegative finite MSE" in item
                         for item in field_failures
                     ),
                     "failure_reasons": failures,
@@ -282,13 +317,12 @@ def main(argv=None) -> int:
             )
     nonfinite = _nonfinite_paths(payload)
     failures.extend(f"nonfinite:{path}" for path in nonfinite)
-    if source_assessment is not None and not bool(
-        source_assessment.get("complete")
-    ):
-        failures.append(
-            "source assessment.complete=false: "
-            f"{source_assessment.get('failure_reasons', [])}"
-        )
+    if source_assessment is not None:
+        if not bool(source_assessment.get("complete")):
+            failures.append(
+                "source assessment.complete=false: "
+                f"{source_assessment.get('failure_reasons', [])}"
+            )
         if source_assessment.get("exit_code") not in (None, 0):
             failures.append(
                 f"source assessment.exit_code="
@@ -313,6 +347,9 @@ def main(argv=None) -> int:
         "schema": schema,
         "source_assessment_present": source_assessment is not None,
         "source_assessment": source_assessment,
+        "mse_rule": (
+            "n>0 and MSE nonnegative and finite; zero MSE is allowed"
+        ),
         "legacy_scope_only": schema == "legacy",
         "unrecorded_fields": unrecorded,
         "unrecorded_note": (
