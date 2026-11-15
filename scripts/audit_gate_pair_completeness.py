@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Audit per-case completeness of the existing C/D metrics.json.
 
-This is read-only.  It does not evaluate checkpoints and does not rewrite the
-old report.  The legacy file only stored a row for cases that produced an
-``ok`` window result, so completeness must be checked from the recorded IDs
-rather than inferred from the aggregate count.
+Read-only: it does not evaluate checkpoints and does not rewrite the old
+report.  Current metrics record ``n_nonfinite``/``complete``/``assessment``;
+legacy metrics do not.  Legacy fields are checked with the old rules and are
+explicitly marked as unrecorded, never as "proven zero non-finite".
 """
 from __future__ import annotations
 
@@ -28,6 +28,10 @@ WINDOWS = ("0_1pct", "0_5pct", "0_10pct")
 DEFAULT_METRICS = (
     "outputs/fullframes/time_input_experiment/gate_pair/evaluation/metrics.json"
 )
+CURRENT_FIELD_KEYS = (
+    "n_candidates", "n_nonfinite", "complete", "n_cases_skipped",
+    "n_cases_present", "n_cases_expected",
+)
 
 
 def _sha256(path: Path) -> str:
@@ -45,6 +49,91 @@ def _nonfinite_paths(value, path=""):
     elif isinstance(value, float) and not math.isfinite(value):
         found.append(path)
     return found
+
+
+def _is_current_metric(metric):
+    return any(key in metric for key in CURRENT_FIELD_KEYS)
+
+
+def _field_failures(metric, path):
+    """Independent checks plus the current schema's recorded status."""
+    failures = []
+    if not isinstance(metric, dict):
+        return [f"{path}: metric is not a dict"]
+    n = metric.get("n")
+    mse = metric.get("mse")
+    if not (
+        isinstance(n, (int, float)) and int(n) > 0
+        and mse is not None and math.isfinite(float(mse))
+    ):
+        failures.append(f"{path}: no positive finite MSE")
+    if "complete" in metric and not bool(metric["complete"]):
+        failures.append(f"{path}: recorded complete=false")
+    if int(metric.get("n_nonfinite", 0)) > 0:
+        failures.append(
+            f"{path}: recorded n_nonfinite={metric.get('n_nonfinite')}"
+        )
+    if int(metric.get("n_cases_skipped", 0)) > 0:
+        failures.append(
+            f"{path}: recorded n_cases_skipped={metric.get('n_cases_skipped')}"
+        )
+    if metric.get("status") not in (None, "ok"):
+        failures.append(f"{path}: recorded status={metric.get('status')}")
+
+    if all(key in metric for key in ("n", "n_candidates", "n_nonfinite")):
+        n_int = int(metric["n"])
+        candidates = int(metric["n_candidates"])
+        nonfinite = int(metric["n_nonfinite"])
+        if n_int + nonfinite != candidates:
+            failures.append(
+                f"{path}: n+n_nonfinite={n_int + nonfinite} "
+                f"!= n_candidates={candidates}"
+            )
+    if all(
+        key in metric
+        for key in ("n_cases", "n_cases_used", "n_cases_skipped")
+    ):
+        total = int(metric["n_cases"])
+        used = int(metric["n_cases_used"])
+        skipped = int(metric["n_cases_skipped"])
+        if used + skipped != total:
+            failures.append(
+                f"{path}: n_cases_used+n_cases_skipped="
+                f"{used + skipped} != n_cases={total}"
+            )
+    if all(
+        key in metric for key in ("n_cases_present", "n_cases_expected")
+    ):
+        present = int(metric["n_cases_present"])
+        expected = int(metric["n_cases_expected"])
+        if present != expected:
+            failures.append(
+                f"{path}: n_cases_present={present} "
+                f"!= n_cases_expected={expected}"
+            )
+    return failures
+
+
+def _case_row_failures(rows, path):
+    failures = []
+    for row in rows:
+        case_id = row.get("case_id", "?")
+        prefix = f"{path}/{case_id}"
+        if "evaluated" in row and not bool(row["evaluated"]):
+            failures.append(f"{prefix}: evaluated=false")
+        if "own_C_evaluated" in row and not bool(row["own_C_evaluated"]):
+            failures.append(f"{prefix}: own_C_evaluated=false")
+        if "own_D_evaluated" in row and not bool(row["own_D_evaluated"]):
+            failures.append(f"{prefix}: own_D_evaluated=false")
+        if "common_evaluated" in row and not bool(row["common_evaluated"]):
+            failures.append(f"{prefix}: common_evaluated=false")
+        if "common" in row and "C_inside" in row:
+            if int(row["common"]) > int(row["C_inside"]):
+                failures.append(f"{prefix}: common > C_inside")
+        if "common" in row and "D_inside" in row:
+            if int(row["common"]) > int(row["D_inside"]):
+                failures.append(f"{prefix}: common > D_inside")
+    return failures
 
 
 def main(argv=None) -> int:
@@ -72,6 +161,7 @@ def main(argv=None) -> int:
         for split in ("train", "validation")
     }
     payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    source_assessment = payload.get("assessment")
     checks = []
     t0_checks = []
     for suffix in ("last", "best"):
@@ -93,7 +183,8 @@ def main(argv=None) -> int:
                 block = payload["sets"][suffix]["early"][window][
                     "by_split"
                 ][split]
-                rows = block.get("exclusions", [])
+                path = f"{suffix}/{window}/{split}"
+                rows = block.get("case_records") or block.get("exclusions", [])
                 ids = [row["case_id"] for row in rows]
                 expected_ids = expected[split]
                 missing = sorted(set(expected_ids) - set(ids))
@@ -104,28 +195,65 @@ def main(argv=None) -> int:
                 )
                 zero_used = sorted(
                     row["case_id"] for row in rows
-                    if int(row.get("used", 0)) == 0
+                    if int(row.get("used", row.get("C_used", 0))) == 0
                 )
-                fields_ok = True
+
+                field_failures = []
+                unrecorded = []
+                current_fields = 0
                 for side in ("C_own", "D_own", "C_common", "D_common"):
                     for field in ("rho", "u", "p"):
                         metric = block[side][field]
-                        if not (
-                            int(metric.get("n", 0)) > 0
-                            and metric.get("mse") is not None
-                            and math.isfinite(float(metric["mse"]))
-                        ):
-                            fields_ok = False
-                complete = (
-                    len(rows) == len(expected_ids) == 10
-                    and not missing and not extra
-                    and not empty_common and not zero_used
-                    and fields_ok
-                )
+                        field_path = f"{path}/{side}/{field}"
+                        if _is_current_metric(metric):
+                            current_fields += 1
+                        else:
+                            unrecorded.append(field_path)
+                        field_failures.extend(
+                            _field_failures(metric, field_path)
+                        )
+
+                split_failures = []
+                for key in ("complete", "own_complete", "common_complete"):
+                    if key in block and not bool(block[key]):
+                        split_failures.append(f"{path}: {key}=false")
+                if int(block.get("n_missing", 0)) > 0:
+                    split_failures.append(
+                        f"{path}: n_missing={block.get('n_missing')}"
+                    )
+                if distinct := block.get("missing_cases"):
+                    split_failures.append(
+                        f"{path}: missing_cases={len(distinct)}"
+                    )
+                if block.get("incomplete_reasons"):
+                    split_failures.append(
+                        f"{path}: incomplete_reasons="
+                        f"{block['incomplete_reasons']}"
+                    )
+                split_failures.extend(_case_row_failures(rows, path))
+                if missing:
+                    split_failures.append(f"{path}: missing={missing}")
+                if extra:
+                    split_failures.append(f"{path}: extra={extra}")
+                if empty_common:
+                    split_failures.append(
+                        f"{path}: empty_common={empty_common}"
+                    )
+                if zero_used:
+                    split_failures.append(f"{path}: zero_used={zero_used}")
+
+                failures = split_failures + field_failures
+                if current_fields and unrecorded:
+                    schema = "mixed"
+                elif current_fields:
+                    schema = "current"
+                else:
+                    schema = "legacy"
                 checks.append({
                     "set": suffix,
                     "window": window,
                     "split": split,
+                    "schema": schema,
                     "expected_case_ids": expected_ids,
                     "recorded_case_ids": ids,
                     "n_expected": len(expected_ids),
@@ -134,34 +262,64 @@ def main(argv=None) -> int:
                     "extra_cases": extra,
                     "empty_common_cases": empty_common,
                     "zero_used_cases": zero_used,
-                    "aggregate_fields_finite": fields_ok,
-                    "complete": complete,
+                    "current_field_count": current_fields,
+                    "unrecorded_fields": unrecorded,
+                    "aggregate_fields_finite": not any(
+                        "no positive finite MSE" in item
+                        for item in field_failures
+                    ),
+                    "failure_reasons": failures,
+                    "complete": not failures,
                 })
 
-    nonfinite = _nonfinite_paths(payload)
     failures = []
     for item in checks:
-        if not item["complete"]:
-            failures.append(
-                f"{item['set']}/{item['window']}/{item['split']}: incomplete"
-            )
-        if item["empty_common_cases"]:
-            failures.append(
-                f"{item['set']}/{item['window']}/{item['split']}: "
-                f"empty common {item['empty_common_cases']}"
-            )
+        failures.extend(item["failure_reasons"])
     for item in t0_checks:
         if not item["complete"]:
-            failures.append(f"{item['set']}/t0/{item['model']}: incomplete")
+            failures.append(
+                f"{item['set']}/t0/{item['model']}: incomplete"
+            )
+    nonfinite = _nonfinite_paths(payload)
     failures.extend(f"nonfinite:{path}" for path in nonfinite)
+    if source_assessment is not None and not bool(
+        source_assessment.get("complete")
+    ):
+        failures.append(
+            "source assessment.complete=false: "
+            f"{source_assessment.get('failure_reasons', [])}"
+        )
+        if source_assessment.get("exit_code") not in (None, 0):
+            failures.append(
+                f"source assessment.exit_code="
+                f"{source_assessment.get('exit_code')}"
+            )
+
+    schemas = {item["schema"] for item in checks}
+    schema = (
+        "current" if schemas == {"current"}
+        else "legacy" if schemas == {"legacy"}
+        else "mixed"
+    )
+    unrecorded = sorted(
+        f"{item['set']}/{item['window']}/{item['split']}/{field}"
+        for item in checks
+        for field in item["unrecorded_fields"]
+    )
     all_complete = not failures
     result = {
         "metrics_path": str(metrics_path),
         "metrics_sha256": _sha256(metrics_path),
-        "schema": (
-            "legacy early-window rows exist only for evaluable cases; the "
-            "corrected evaluator now records expected/evaluated/missing cases "
-            "explicitly.  This audit checks IDs because the old file did not."
+        "schema": schema,
+        "source_assessment_present": source_assessment is not None,
+        "source_assessment": source_assessment,
+        "legacy_scope_only": schema == "legacy",
+        "unrecorded_fields": unrecorded,
+        "unrecorded_note": (
+            "Legacy metrics do not contain n_nonfinite/complete fields. "
+            "Their absence is not evidence that non-finite counts were zero; "
+            "only the old MSE/ID/domain checks are proven."
+            if unrecorded else ""
         ),
         "all_checks_complete": all_complete,
         "failure_reasons": failures,
@@ -172,17 +330,22 @@ def main(argv=None) -> int:
         "checks": checks,
         "t0_checks": t0_checks,
         "conclusion": (
-            "all 12 window/split/set combinations contain exactly the 10 "
-            "expected cases, nonempty physical domains and finite aggregates; "
-            "the old numbers are retained, not a newly discovered omission"
-            if all_complete
-            else "the old metrics are incomplete or non-finite"
+            "current-schema completeness and independent case/point checks "
+            "all pass"
+            if all_complete and schema == "current"
+            else (
+                "legacy checks pass; recorded n_nonfinite/completeness fields "
+                "are absent and are NOT proven zero"
+                if all_complete and schema == "legacy"
+                else "the metrics are incomplete, inconsistent, or non-finite"
+            )
         ),
     }
     output.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps({
         "wrote": str(output),
         "sha256": _sha256(output),
+        "schema": result["schema"],
         "all_checks_complete": result["all_checks_complete"],
         "failure_reasons": result["failure_reasons"],
         "exit_code": result["exit_code"],

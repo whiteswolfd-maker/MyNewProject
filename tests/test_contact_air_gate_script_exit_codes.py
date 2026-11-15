@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -25,7 +27,11 @@ gate_eval = _load("evaluate_gate_pair")
 
 
 def _case(case_id, role):
-    return SimpleNamespace(case_id=case_id, role=role)
+    return SimpleNamespace(
+        case_id=case_id, role=role,
+        rho_scale=1.0, u_scale=1.0, p_scale=1.0,
+        t0=0.0, charge_radius_m=0.05,
+    )
 
 
 def _fake_trainer():
@@ -141,6 +147,137 @@ def test_audit_main_returns_zero_when_complete(tmp_path, monkeypatch):
     saved = json.loads(out.read_text(encoding="utf-8"))
     assert saved["all_checks_complete"] is True
     assert saved["exit_code"] == 0
+    assert saved["schema"] == "legacy"
+    assert saved["legacy_scope_only"] is True
+    assert saved["unrecorded_fields"]
+    assert "NOT proven zero" in saved["conclusion"]
+
+
+def _window_row(case, partial_nan):
+    values = [1.0, np.nan] if partial_nan else [1.0, 2.0]
+    row = {
+        "case_id": case.case_id,
+        "role": case.role,
+        "status": "ok",
+        "selected": 2,
+        "used": 2,
+        "time": np.array([0.0, 1.0]),
+        "radius": np.array([1.0, 2.0]),
+        "inside": np.array([True, True]),
+        "pred": {
+            field: np.asarray(values, dtype=float)
+            for field in ("rho", "u", "p")
+        },
+        "target": {
+            field: np.zeros(2, dtype=float)
+            for field in ("rho", "u", "p")
+        },
+    }
+    return row
+
+
+def _payload_from_early(monkeypatch, partial_nan, assessment=None):
+    cases = list(_fake_trainer().cases) + list(
+        _fake_trainer().validation_cases
+    )
+    monkeypatch.setattr(
+        gate_eval.ana, "_window_case",
+        lambda trainer, case, lo, hi: _window_row(case, partial_nan),
+    )
+    early = gate_eval._early_pair(None, None, cases, "0_1pct")
+    expected = {
+        split: [
+            case.case_id for case in cases if case.role == split
+        ]
+        for split in ("train", "validation")
+    }
+    payload = {"sets": {}}
+    for suffix in ("last", "best"):
+        payload["sets"][suffix] = {
+            "t0": {
+                model: {
+                    "cases": {
+                        case_id: {}
+                        for case_id in expected["train"] + expected["validation"]
+                    }
+                }
+                for model in ("C", "D")
+            },
+            "early": {
+                window: {"by_split": early["by_split"]}
+                for window in ("0_1pct", "0_5pct", "0_10pct")
+            },
+        }
+    if assessment is not None:
+        payload["assessment"] = assessment
+    return payload, early
+
+
+def test_audit_main_rejects_partial_nan_with_finite_mse(tmp_path, monkeypatch):
+    # Real _early_pair(): one NaN is filtered from each field, so MSE stays
+    # finite, but n_nonfinite=1 and complete=false are recorded.
+    payload, early = _payload_from_early(monkeypatch, partial_nan=True)
+    block = early["by_split"]["train"]
+    assert block["C_own"]["rho"]["mse"] is not None
+    assert block["C_own"]["rho"]["n_nonfinite"] == 10
+    metrics = tmp_path / "metrics.json"
+    out = tmp_path / "audit.json"
+    metrics.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        audit.diag, "_build_trainer", lambda config: (_fake_trainer(), {})
+    )
+    code = audit.main([
+        "--metrics", str(metrics), "--output", str(out),
+    ])
+    assert code == 1
+    saved = json.loads(out.read_text(encoding="utf-8"))
+    assert saved["schema"] == "current"
+    assert saved["all_checks_complete"] is False
+    assert saved["exit_code"] == 1
+    assert any("n_nonfinite" in item for item in saved["failure_reasons"])
+
+
+def test_audit_main_accepts_current_schema_all_finite(tmp_path, monkeypatch):
+    payload, _ = _payload_from_early(monkeypatch, partial_nan=False)
+    metrics = tmp_path / "metrics.json"
+    out = tmp_path / "audit.json"
+    metrics.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        audit.diag, "_build_trainer", lambda config: (_fake_trainer(), {})
+    )
+    code = audit.main([
+        "--metrics", str(metrics), "--output", str(out),
+    ])
+    assert code == 0
+    saved = json.loads(out.read_text(encoding="utf-8"))
+    assert saved["schema"] == "current"
+    assert saved["all_checks_complete"] is True
+    assert saved["exit_code"] == 0
+
+
+def test_audit_main_rejects_source_assessment_failure(tmp_path, monkeypatch):
+    payload, _ = _payload_from_early(
+        monkeypatch, partial_nan=False,
+        assessment={
+            "complete": False,
+            "failure_reasons": ["source failed"],
+            "exit_code": 1,
+        },
+    )
+    metrics = tmp_path / "metrics.json"
+    out = tmp_path / "audit.json"
+    metrics.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        audit.diag, "_build_trainer", lambda config: (_fake_trainer(), {})
+    )
+    code = audit.main([
+        "--metrics", str(metrics), "--output", str(out),
+    ])
+    assert code == 1
+    saved = json.loads(out.read_text(encoding="utf-8"))
+    assert any(
+        "source assessment" in item for item in saved["failure_reasons"]
+    )
 
 
 def _eval_metrics(complete):
