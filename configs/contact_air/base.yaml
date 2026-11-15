@@ -86,10 +86,15 @@ contact_air:
 
   networks:
     dtype: float64
-    # Both MLPs receive tau = t / time_reference_s instead of raw seconds.
-    # 1.0 keeps the physical seconds (the previous behaviour).  The reference
-    # is a fixed value shared by every case; shock trajectory, contact speed,
-    # PDE and boundary conditions are still evaluated in seconds.
+    # legacy: x_t = t / time_reference_s.  This is the default and keeps the
+    # historical input convention (1.0 means physical seconds).
+    # similarity: x_t = ((t - case.t0) / case.time_scale) /
+    # similarity_input_divisor, where case.time_scale = R_sep/u_a_sep.  The
+    # divisor is a fixed numerical input scale, not a physical constant.
+    # Shock trajectory, contact speed, PDE and boundary conditions remain in
+    # physical seconds in both modes.
+    time_input: legacy
+    similarity_input_divisor: 64.0
     time_reference_s: 1.0
     contact:
       width: 50

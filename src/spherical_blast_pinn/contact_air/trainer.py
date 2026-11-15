@@ -156,14 +156,31 @@ def describe_matches(saved: Mapping[str, Any] | None, current: Mapping[str, Any]
     checkpoint that carries the key is compared exactly, so a 0.01 checkpoint
     cannot resume a 1.0 network (or vice versa).
 
+    Checkpoints written before the similarity mode also lack its metadata.
+    They are interpreted only as legacy: an absent mode means ``legacy``, an
+    absent origin rule means ``zero``, and an absent scale rule means
+    ``time_reference_s``.  The divisor default is 64.0, matching the current
+    minimum experiment.  A mode or divisor mismatch is rejected, not silently
+    reinterpreted.
+
     A completely missing description block is not treated as legacy metadata:
     it means the checkpoint cannot be verified at all, so it is rejected.
     """
     if saved is None:
         return False
+    defaults = {
+        "time_reference_s": 1.0,
+        "time_input": "legacy",
+        "time_origin_rule": "zero",
+        "time_scale_rule": "time_reference_s",
+        "similarity_input_divisor": 64.0,
+    }
     normalized = dict(saved)
-    normalized.setdefault("time_reference_s", 1.0)
-    return normalized == dict(current)
+    normalized_current = dict(current)
+    for key, value in defaults.items():
+        normalized.setdefault(key, value)
+        normalized_current.setdefault(key, value)
+    return normalized == normalized_current
 
 
 def seed_everything(seed: int) -> None:
@@ -430,7 +447,8 @@ class AlternatingTrainer:
             scales = self._scales[case.case_id]
             r0, rs, ds = self._contact_inputs(case, batch.t_pde)
             c_fields = self.contact_net(
-                batch.t_pde.reshape(-1, 1), r0, rs, ds, closure, create_graph=False
+                batch.t_pde.reshape(-1, 1), r0, rs, ds, closure,
+                time_input=case.time_input, create_graph=False,
             )
             c_fields = _detach_contact(c_fields)
             geometry = build_geometry(
@@ -438,7 +456,7 @@ class AlternatingTrainer:
             )
             fields, derivatives = air_fields_with_derivatives(
                 self.air_net, batch.zeta_pde, batch.t_pde, r0, scales,
-                create_graph=True,
+                create_graph=True, time_input=case.time_input,
             )
             pde = pde_loss(
                 fields=fields, derivatives=derivatives, geometry=geometry, case=case
@@ -448,6 +466,7 @@ class AlternatingTrainer:
                 air0 = self.air_net(
                     torch.zeros_like(batch.t_pde).reshape(-1, 1),
                     batch.t_pde.reshape(-1, 1), r0.reshape(-1, 1), scales,
+                    time_input=case.time_input,
                 )
                 interface = interface_loss(
                     air_at_contact=air0, contact=c_fields, case=case
@@ -459,7 +478,7 @@ class AlternatingTrainer:
                 r0d, rsd, dsd = self._contact_inputs(case, batch.t_data)
                 c_data = self.contact_net(
                     batch.t_data.reshape(-1, 1), r0d, rsd, dsd, closure,
-                    create_graph=False,
+                    time_input=case.time_input, create_graph=False,
                 )
                 c_data = _detach_contact(c_data)
             else:
@@ -496,7 +515,8 @@ class AlternatingTrainer:
         scales = self._scales[case.case_id]
         r0, rs, ds = self._contact_inputs(case, batch.t_pde)
         c_fields = self.contact_net(
-            batch.t_pde.reshape(-1, 1), r0, rs, ds, closure, create_graph=True
+            batch.t_pde.reshape(-1, 1), r0, rs, ds, closure,
+            time_input=case.time_input, create_graph=True,
         )
         geometry = build_geometry(
             c_fields.radius, c_fields.speed, rs, ds, batch.zeta_pde.reshape(-1, 1)
@@ -504,7 +524,7 @@ class AlternatingTrainer:
         # Frozen AirNet parameters, live zeta/t derivatives and live geometry.
         a_fields, a_derivs = air_fields_with_derivatives(
             self.air_net, batch.zeta_pde, batch.t_pde, r0, scales,
-            create_graph=True, functional=True,
+            create_graph=True, functional=True, time_input=case.time_input,
         )
         pde = pde_loss(
             fields=a_fields, derivatives=a_derivs, geometry=geometry, case=case
@@ -512,14 +532,15 @@ class AlternatingTrainer:
         t0 = torch.full_like(batch.t_pde, float(case.t0))
         r00, rs0, ds0 = self._contact_inputs(case, t0)
         c0 = self.contact_net(
-            t0.reshape(-1, 1), r00, rs0, ds0, closure, create_graph=True
+            t0.reshape(-1, 1), r00, rs0, ds0, closure,
+            time_input=case.time_input, create_graph=True,
         )
         ic = contact_ic_loss(c0, case)
         if batch.t_pde.numel():
             air0 = self.air_net.forward_functional(
                 torch.zeros_like(batch.t_pde).reshape(-1, 1),
                 batch.t_pde.reshape(-1, 1), r0.reshape(-1, 1), scales,
-                detach_parameters=True,
+                detach_parameters=True, time_input=case.time_input,
             )
             interface = interface_loss(
                 air_at_contact=air0, contact=c_fields, case=case
@@ -532,7 +553,7 @@ class AlternatingTrainer:
             r0c, rsc, dsc = self._contact_inputs(case, batch.t_contact)
             c_contact = self.contact_net(
                 batch.t_contact.reshape(-1, 1), r0c, rsc, dsc, closure,
-                create_graph=True,
+                time_input=case.time_input, create_graph=True,
             )
             data = contact_data_loss(c_contact, batch, case)
         else:
@@ -662,7 +683,8 @@ class AlternatingTrainer:
             r0d, rsd, dsd = self._contact_inputs(case, batch.t_data)
             c_data = self.contact_net(
                 batch.t_data.reshape(-1, 1), r0d, rsd, dsd,
-                self._closures[case.case_id], create_graph=False,
+                self._closures[case.case_id],
+                time_input=case.time_input, create_graph=False,
             )
         c_data = _detach_contact(c_data)
         zeta, inside, outside = data_coordinates(
@@ -672,7 +694,8 @@ class AlternatingTrainer:
         r0 = _full(case.charge_radius_m, batch.t_data)
         with torch.no_grad():
             fields = self.air_net(
-                zeta.detach(), batch.t_data.reshape(-1, 1), r0.reshape(-1, 1), scales
+                zeta.detach(), batch.t_data.reshape(-1, 1), r0.reshape(-1, 1), scales,
+                time_input=case.time_input,
             )
             rho_err, n_rho = masked_rmse(
                 fields.density, batch.rho_data, batch.valid_rho & inside, case.rho_scale
@@ -712,7 +735,8 @@ class AlternatingTrainer:
                     r0, rs, ds = self._contact_inputs(case, batch.t_contact)
                     c_fields = self.contact_net(
                         batch.t_contact.reshape(-1, 1), r0, rs, ds,
-                        self._closures[case.case_id], create_graph=False,
+                        self._closures[case.case_id],
+                        time_input=case.time_input, create_graph=False,
                     )
                 c_fields = _detach_contact(c_fields)
                 violation, n_contact = contact_violation_rmse(c_fields, batch, case)

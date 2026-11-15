@@ -6,9 +6,24 @@ as ``R_s(t) * sigmoid(raw)`` so it stays inside the identified external shock;
 ``dR_s/dt = D_s`` and the autograd derivative of ``raw``.  ``AirNet`` maps
 ``(zeta, t, R0)`` to ``(rho, u, p)``; ``e = p/((gamma_a-1) rho)`` is derived.
 
-The two networks share parameters across all training radii.  No time or radius
-normalisation is applied to the network inputs: ``t`` is in seconds, ``R0`` and
-``zeta`` as defined by the scheme.
+The two networks share parameters across all training radii.  They support two
+explicit time-input conventions:
+
+``legacy``
+    ``x_t = t / time_reference_s``.  This is the historical convention; it does
+    not remove the per-case origin and does not align similarity stages.
+
+``similarity``
+    ``T_star = case.time_scale = R_sep / u_a_sep`` and
+    ``theta = (t - case.t0) / T_star``, then
+    ``x_t = theta / similarity_input_divisor``.  The divisor is only a fixed
+    numerical input scale (64.0 in this experiment); it is not a physical
+    constant and is never selected from validation error.
+
+The conversion is shared by the normal and functional AirNet paths.  ``t``
+remains physical seconds in every derivative: the scaling is inside the
+autograd graph, so ``d x_t / d t = 1 / (divisor * T_star)`` and the PDE/contact
+speed chain rule is unchanged.  ``R0`` and ``zeta`` are never rescaled.
 
 ``AirNet.forward_functional(..., detach_parameters=True)`` evaluates the same
 network with frozen parameter values.  The contact stage uses it so gradients
@@ -29,6 +44,49 @@ from torch.nn import functional as F
 
 class ModelError(RuntimeError):
     """A network input or physical closure is invalid."""
+
+
+TIME_INPUT_MODES = ("legacy", "similarity")
+SIMILARITY_INPUT_DIVISOR_DEFAULT = 64.0
+
+
+@dataclass(frozen=True)
+class TimeInput:
+    """Per-case origin and physical time scale for the similarity input.
+
+    ``origin`` is the model time ``t0`` in seconds and ``scale`` is
+    ``R_sep/u_a_sep`` in seconds.  Both are physical quantities; the network
+    divisor is a separate numerical input scale stored on the network.
+    """
+
+    origin: float
+    scale: float
+
+    def __post_init__(self) -> None:
+        origin = float(self.origin)
+        scale = float(self.scale)
+        if not math.isfinite(origin):
+            raise ModelError("time-input origin must be finite")
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ModelError("time-input scale must be finite and positive")
+        object.__setattr__(self, "origin", origin)
+        object.__setattr__(self, "scale", scale)
+
+
+def _validate_time_input_mode(mode: str) -> str:
+    value = str(mode)
+    if value not in TIME_INPUT_MODES:
+        raise ModelError(
+            f"time input mode must be one of {TIME_INPUT_MODES}, got {value!r}"
+        )
+    return value
+
+
+def _validate_divisor(value: float) -> float:
+    divisor = float(value)
+    if not math.isfinite(divisor) or divisor <= 0.0:
+        raise ModelError("similarity input divisor must be finite and positive")
+    return divisor
 
 
 @dataclass(frozen=True)
@@ -98,14 +156,52 @@ class ContactNet(nn.Module):
     """``(t, R0) -> R_c`` with ``R_c = R_s sigmoid(raw)``."""
 
     def __init__(self, *, width: int = 50, depth: int = 5, dtype=torch.float64,
-                 device="cpu", time_reference_s: float = 1.0) -> None:
+                 device="cpu", time_reference_s: float = 1.0,
+                 time_input_mode: str = "legacy",
+                 similarity_input_divisor: float = SIMILARITY_INPUT_DIVISOR_DEFAULT) -> None:
         super().__init__()
-        if not (float(time_reference_s) > 0.0):
-            raise ModelError("time_reference_s must be positive")
+        if not math.isfinite(float(time_reference_s)) or float(time_reference_s) <= 0.0:
+            raise ModelError("time_reference_s must be finite and positive")
         self.net = _mlp(2, width, depth, dtype=dtype, device=device)
         self.dtype = dtype
         self.device = device
         self.time_reference_s = float(time_reference_s)
+        self.time_input_mode = _validate_time_input_mode(time_input_mode)
+        self.similarity_input_divisor = _validate_divisor(similarity_input_divisor)
+
+    def scaled_time(
+        self, t: torch.Tensor, time_input: TimeInput | None = None
+    ) -> torch.Tensor:
+        """Return the network time argument without breaking autograd.
+
+        In similarity mode the origin and scale are required per case.  The
+        physical ``t`` is never detached, so any later ``grad(..., t)`` remains
+        a derivative with respect to seconds.
+        """
+        if self.time_input_mode == "legacy":
+            return t / self.time_reference_s
+        if time_input is None:
+            raise ModelError(
+                "similarity time input requires TimeInput(case.t0, case.time_scale)"
+            )
+        return (t - time_input.origin) / (
+            time_input.scale * self.similarity_input_divisor
+        )
+
+    def _time_description(self) -> dict[str, Any]:
+        if self.time_input_mode == "legacy":
+            return {
+                "time_input": "legacy",
+                "time_origin_rule": "zero",
+                "time_scale_rule": "time_reference_s",
+                "similarity_input_divisor": self.similarity_input_divisor,
+            }
+        return {
+            "time_input": "similarity",
+            "time_origin_rule": "case.t0",
+            "time_scale_rule": "case.time_scale=R_sep/u_a_sep",
+            "similarity_input_divisor": self.similarity_input_divisor,
+        }
 
     def forward(
         self,
@@ -115,6 +211,7 @@ class ContactNet(nn.Module):
         shock_speed: torch.Tensor,
         closure: JWLClosure,
         *,
+        time_input: TimeInput | None = None,
         create_graph: bool = True,
     ) -> ContactFields:
         if not (
@@ -127,9 +224,10 @@ class ContactNet(nn.Module):
         r0_in = r0.reshape(-1, 1)
         rs_in = shock_radius.reshape(-1, 1)
         ds_in = shock_speed.reshape(-1, 1)
-        # The MLP sees a dimensionless time; the division stays in the autograd
-        # graph, so raw_t below is still d(raw)/dt in 1/s and speed stays m/s.
-        t_scaled = t_leaf / self.time_reference_s
+        # The MLP sees a dimensionless time; the conversion stays in the
+        # autograd graph, so raw_t below is still d(raw)/dt in 1/s and speed
+        # stays m/s.
+        t_scaled = self.scaled_time(t_leaf, time_input)
         raw = self.net(torch.cat([t_scaled, r0_in], dim=-1))
         raw_t = torch.autograd.grad(
             raw.sum(), t_leaf, create_graph=create_graph, retain_graph=create_graph
@@ -156,6 +254,7 @@ class ContactNet(nn.Module):
             "depth": sum(isinstance(m, nn.Linear) for m in self.net) - 1,
             "parameters": sum(p.numel() for p in self.parameters()),
             "time_reference_s": self.time_reference_s,
+            **self._time_description(),
         }
 
 
@@ -163,11 +262,15 @@ class AirNet(nn.Module):
     """``(zeta, t, R0) -> (rho, u, p)`` with positive density/pressure."""
 
     def __init__(self, *, width: int = 32, depth: int = 10, dtype=torch.float64,
-                 device="cpu", time_reference_s: float = 1.0) -> None:
+                 device="cpu", time_reference_s: float = 1.0,
+                 time_input_mode: str = "legacy",
+                 similarity_input_divisor: float = SIMILARITY_INPUT_DIVISOR_DEFAULT) -> None:
         super().__init__()
-        if not (float(time_reference_s) > 0.0):
-            raise ModelError("time_reference_s must be positive")
+        if not math.isfinite(float(time_reference_s)) or float(time_reference_s) <= 0.0:
+            raise ModelError("time_reference_s must be finite and positive")
         self.time_reference_s = float(time_reference_s)
+        self.time_input_mode = _validate_time_input_mode(time_input_mode)
+        self.similarity_input_divisor = _validate_divisor(similarity_input_divisor)
         layers: list[nn.Module] = []
         last = 3
         for _ in range(int(depth)):
@@ -187,14 +290,45 @@ class AirNet(nn.Module):
         self.dtype = dtype
         self.device = device
 
+    def scaled_time(
+        self, t: torch.Tensor, time_input: TimeInput | None = None
+    ) -> torch.Tensor:
+        if self.time_input_mode == "legacy":
+            return t / self.time_reference_s
+        if time_input is None:
+            raise ModelError(
+                "similarity time input requires TimeInput(case.t0, case.time_scale)"
+            )
+        return (t - time_input.origin) / (
+            time_input.scale * self.similarity_input_divisor
+        )
+
+    def _time_description(self) -> dict[str, Any]:
+        if self.time_input_mode == "legacy":
+            return {
+                "time_input": "legacy",
+                "time_origin_rule": "zero",
+                "time_scale_rule": "time_reference_s",
+                "similarity_input_divisor": self.similarity_input_divisor,
+            }
+        return {
+            "time_input": "similarity",
+            "time_origin_rule": "case.t0",
+            "time_scale_rule": "case.time_scale=R_sep/u_a_sep",
+            "similarity_input_divisor": self.similarity_input_divisor,
+        }
+
     def forward(
-        self, zeta: torch.Tensor, t: torch.Tensor, r0: torch.Tensor, scales: Scales
+        self, zeta: torch.Tensor, t: torch.Tensor, r0: torch.Tensor, scales: Scales,
+        *, time_input: TimeInput | None = None,
     ) -> AirFields:
         if zeta.shape != t.shape or zeta.shape != r0.shape:
             raise ModelError("zeta, t and R0 must have the same shape")
         # Dimensionless time; derivatives are still taken with respect to the
-        # physical t passed in, because the division is part of the graph.
-        hidden = self.trunk(torch.cat([zeta, t / self.time_reference_s, r0], dim=-1))
+        # physical t passed in, because the conversion is part of the graph.
+        hidden = self.trunk(
+            torch.cat([zeta, self.scaled_time(t, time_input), r0], dim=-1)
+        )
         return self._heads(hidden, scales)
 
     def _heads(self, hidden: torch.Tensor, scales: Scales) -> AirFields:
@@ -227,16 +361,20 @@ class AirNet(nn.Module):
         scales: Scales,
         *,
         detach_parameters: bool = True,
+        time_input: TimeInput | None = None,
     ) -> AirFields:
         """Evaluate with frozen parameters but live inputs.
 
         Every ``Linear`` uses detached weight/bias when
         ``detach_parameters=True``.  Gradients with respect to ``zeta``/``t``
         remain, so a ContactNet-dependent ``zeta`` still receives its gradient.
+        The time conversion is the same as :meth:`forward`.
         """
         if zeta.shape != t.shape or zeta.shape != r0.shape:
             raise ModelError("zeta, t and R0 must have the same shape")
-        hidden = torch.cat([zeta, t / self.time_reference_s, r0], dim=-1)
+        hidden = torch.cat(
+            [zeta, self.scaled_time(t, time_input), r0], dim=-1
+        )
         for module in self.trunk:
             if isinstance(module, nn.Linear):
                 weight = module.weight.detach() if detach_parameters else module.weight
@@ -276,6 +414,7 @@ class AirNet(nn.Module):
             "depth": sum(isinstance(m, nn.Linear) for m in self.trunk),
             "parameters": sum(p.numel() for p in self.parameters()),
             "time_reference_s": self.time_reference_s,
+            **self._time_description(),
         }
 
 
@@ -312,6 +451,7 @@ def air_fields_with_derivatives(
     *,
     create_graph: bool,
     functional: bool = False,
+    time_input: TimeInput | None = None,
 ) -> tuple[AirFields, dict[str, torch.Tensor]]:
     """Return fields and their first derivatives at fixed ``zeta`` and ``R0``.
 
@@ -322,10 +462,14 @@ def air_fields_with_derivatives(
     t_leaf = t.detach().reshape(-1, 1).requires_grad_(True)
     if functional:
         fields = net.forward_functional(
-            zeta_leaf, t_leaf, r0.reshape(-1, 1), scales, detach_parameters=True
+            zeta_leaf, t_leaf, r0.reshape(-1, 1), scales,
+            detach_parameters=True, time_input=time_input,
         )
     else:
-        fields = net(zeta_leaf, t_leaf, r0.reshape(-1, 1), scales)
+        fields = net(
+            zeta_leaf, t_leaf, r0.reshape(-1, 1), scales,
+            time_input=time_input,
+        )
     derivatives: dict[str, torch.Tensor] = {}
     for name, value in (("rho", fields.density), ("u", fields.velocity), ("p", fields.pressure)):
         derivatives[f"{name}_t"] = torch.autograd.grad(
@@ -345,6 +489,9 @@ __all__ = [
     "JWLClosure",
     "ModelError",
     "Scales",
+    "SIMILARITY_INPUT_DIVISOR_DEFAULT",
+    "TIME_INPUT_MODES",
+    "TimeInput",
     "air_fields_with_derivatives",
     "closure_from_precursor",
     "scales_from_precursor",

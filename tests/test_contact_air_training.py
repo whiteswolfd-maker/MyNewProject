@@ -20,7 +20,8 @@ from spherical_blast_pinn.contact_air.trainer import (
 
 
 def _trainer(tmp_path, *, cases=None, holdout=0.3, external=None,
-             time_reference_s=1.0, contact_data_weight=1.0, log_every=1):
+             time_reference_s=1.0, contact_data_weight=1.0, log_every=1,
+             time_input_mode="legacy", similarity_input_divisor=64.0):
     cases = cases or [
         synthetic_case_for(0.05, case_id="r050", n_frames=11, n_radial=1600),
         synthetic_case_for(0.08, case_id="r080", n_frames=11, n_radial=1600),
@@ -33,9 +34,16 @@ def _trainer(tmp_path, *, cases=None, holdout=0.3, external=None,
         contact_data_weight=contact_data_weight,
     )
     return AlternatingTrainer(
-        cases=cases, contact_net=ContactNet(width=8, depth=1,
-                                            time_reference_s=time_reference_s),
-        air_net=AirNet(width=8, depth=1, time_reference_s=time_reference_s),
+        cases=cases, contact_net=ContactNet(
+            width=8, depth=1, time_reference_s=time_reference_s,
+            time_input_mode=time_input_mode,
+            similarity_input_divisor=similarity_input_divisor,
+        ),
+        air_net=AirNet(
+            width=8, depth=1, time_reference_s=time_reference_s,
+            time_input_mode=time_input_mode,
+            similarity_input_divisor=similarity_input_divisor,
+        ),
         config=config, output_dir=tmp_path,
         external_validation_cases=external or (),
     )
@@ -391,6 +399,77 @@ def test_resume_treats_a_legacy_checkpoint_as_seconds(tmp_path):
     scaled = _trainer(tmp_path / "scaled", time_reference_s=0.01)
     with pytest.raises(TrainingError, match="time_reference"):
         scaled.load(path)
+
+
+def test_similarity_checkpoint_records_and_enforces_mode_and_divisor(tmp_path):
+    trainer = _trainer(tmp_path, time_input_mode="similarity")
+    path = trainer.save(tmp_path / "similarity.pt")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    for key in ("contact_net_describe", "air_net_describe"):
+        assert payload[key]["time_input"] == "similarity"
+        assert payload[key]["time_origin_rule"] == "case.t0"
+        assert payload[key]["time_scale_rule"] == "case.time_scale=R_sep/u_a_sep"
+        assert payload[key]["similarity_input_divisor"] == pytest.approx(64.0)
+    same = _trainer(tmp_path / "same", time_input_mode="similarity")
+    assert same.load(path)["loop"] == 0
+    divisor = _trainer(
+        tmp_path / "divisor", time_input_mode="similarity",
+        similarity_input_divisor=32.0,
+    )
+    with pytest.raises(TrainingError, match="model metadata"):
+        divisor.load(path)
+    legacy = _trainer(tmp_path / "legacy", time_input_mode="legacy")
+    with pytest.raises(TrainingError, match="model metadata"):
+        legacy.load(path)
+
+
+def test_old_checkpoint_is_legacy_only_and_missing_description_is_rejected(tmp_path):
+    trainer = _trainer(tmp_path, time_input_mode="legacy")
+    path = trainer.save(tmp_path / "legacy.pt")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    for key in ("contact_net_describe", "air_net_describe"):
+        for field in (
+            "time_input", "time_origin_rule", "time_scale_rule",
+            "similarity_input_divisor",
+        ):
+            payload[key].pop(field)
+    torch.save(payload, path)
+    legacy = _trainer(tmp_path / "legacy2", time_input_mode="legacy")
+    assert legacy.load(path)["loop"] == 0
+    similarity = _trainer(tmp_path / "similarity", time_input_mode="similarity")
+    with pytest.raises(TrainingError, match="model metadata"):
+        similarity.load(path)
+    payload.pop("contact_net_describe")
+    payload.pop("air_net_describe")
+    torch.save(payload, path)
+    with pytest.raises(TrainingError, match="model metadata"):
+        legacy.load(path)
+
+
+def test_similarity_mode_does_not_change_initialisation_or_sampling(tmp_path):
+    from spherical_blast_pinn.contact_air.trainer import seed_everything
+
+    seed_everything(123)
+    legacy = _trainer(tmp_path / "legacy", time_input_mode="legacy")
+    seed_everything(123)
+    similarity = _trainer(tmp_path / "similarity", time_input_mode="similarity")
+    for left, right in zip(
+        list(legacy.contact_net.parameters()) + list(legacy.air_net.parameters()),
+        list(similarity.contact_net.parameters())
+        + list(similarity.air_net.parameters()),
+    ):
+        assert torch.equal(left, right)
+    generator = torch.Generator().manual_seed(77)
+    a = legacy._batches(generator=generator)
+    generator = torch.Generator().manual_seed(77)
+    b = similarity._batches(generator=generator)
+    for (case_a, batch_a), (case_b, batch_b) in zip(a, b):
+        assert case_a.case_id == case_b.case_id
+        for name in (
+            "t_pde", "t_ic", "t_right", "t_data", "t_contact",
+            "zeta_pde", "zeta_ic",
+        ):
+            assert torch.equal(getattr(batch_a, name), getattr(batch_b, name))
 
 
 def test_contact_data_weight_is_recorded_and_scales_only_the_interval_term(tmp_path):

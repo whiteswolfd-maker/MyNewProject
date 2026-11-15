@@ -162,7 +162,7 @@ def _air_predictions(trainer, case) -> dict:
         r0, rs, ds = trainer._contact_inputs(case, t)
         contact = trainer.contact_net(
             t.reshape(-1, 1), r0, rs, ds, trainer._closures[case.case_id],
-            create_graph=False,
+            time_input=case.time_input, create_graph=False,
         )
     contact = _detach_contact(contact)
     zeta, inside, _ = data_coordinates(
@@ -173,7 +173,7 @@ def _air_predictions(trainer, case) -> dict:
     with torch.no_grad():
         fields = trainer.air_net(
             zeta.detach(), t.reshape(-1, 1), r0.reshape(-1, 1),
-            trainer._scales[case.case_id],
+            trainer._scales[case.case_id], time_input=case.time_input,
         )
     result["inside"][index] = inside.detach().numpy()
     for name, value in (
@@ -318,12 +318,12 @@ def _old_own_mapping_physics(trainer, case) -> dict:
         r0, rs, ds = trainer._contact_inputs(case, t)
         contact = trainer.contact_net(
             t.reshape(-1, 1), r0, rs, ds, trainer._closures[case.case_id],
-            create_graph=True,
+            time_input=case.time_input, create_graph=True,
         )
         geometry = build_geometry(contact.radius, contact.speed, rs, ds, zeta)
         fields, derivatives = air_fields_with_derivatives(
             trainer.air_net, zeta, t, r0, trainer._scales[case.case_id],
-            create_graph=True,
+            create_graph=True, time_input=case.time_input,
         )
         pde = pde_loss(
             fields=fields, derivatives=derivatives, geometry=geometry, case=case
@@ -331,6 +331,7 @@ def _old_own_mapping_physics(trainer, case) -> dict:
         air0 = trainer.air_net(
             torch.zeros_like(zeta).reshape(-1, 1), t.reshape(-1, 1),
             r0.reshape(-1, 1), trainer._scales[case.case_id],
+            time_input=case.time_input,
         )
         u_error = (
             air0.velocity.reshape(-1) - contact.speed.reshape(-1)
@@ -358,7 +359,8 @@ def _initial_condition_metrics(trainer, case) -> dict:
     r0 = torch.full_like(zeta, float(case.charge_radius_m))
     with torch.no_grad():
         fields = trainer.air_net(
-            zeta, t, r0, trainer._scales[case.case_id]
+            zeta, t, r0, trainer._scales[case.case_id],
+            time_input=case.time_input,
         )
     result = {"case_id": case.case_id, "n": int(zeta.numel()),
               "status": "ok"}
@@ -424,12 +426,21 @@ def _reference_physical_points(trainer, cases, limit: int) -> dict:
 
 def _fixed_physical_physics(
     trainer, cases, checkpoints: dict, reference: dict,
-    *, labels=LABELS,
+    *, labels=LABELS, trainers: dict | None = None,
 ) -> dict:
-    """PDE residuals on one data-derived (t,r) set, common to three models."""
+    """PDE residuals on one data-derived (t,r) set, common to all models.
+
+    ``trainers`` maps a label to the trainer whose input convention matches its
+    checkpoint.  This is required when legacy and similarity checkpoints are
+    compared: one trainer cannot load both.
+    """
+    active_trainers = {label: trainer for label in checkpoints}
+    if trainers is not None:
+        active_trainers.update(trainers)
     domains = {}
     for label, path in checkpoints.items():
-        trainer.load(path)
+        active = active_trainers[label]
+        active.load(path)
         domains[label] = {}
         for case in cases:
             item = reference["metadata"]["cases"][case.case_id]
@@ -439,7 +450,7 @@ def _fixed_physical_physics(
                                 dtype=torch.float64)
             slope = reference["arrays"][f"slope_{case.case_id}"]
             inside, rc, rc_dot, rs, ds, _, scales = phys._domain(
-                case, trainer.contact_net, t, r
+                case, active.contact_net, t, r
             )
             finite = (
                 torch.isfinite(rc) & torch.isfinite(rc_dot)
@@ -493,10 +504,11 @@ def _fixed_physical_physics(
         }
         residuals = {}
         for label in labels:
-            trainer.load(checkpoints[label])
+            active = active_trainers[label]
+            active.load(checkpoints[label])
             domain = domains[label][case.case_id]
             residuals[label] = phys._residual_rms(
-                case, trainer.air_net,
+                case, active.air_net,
                 domain["t"], domain["r"], domain["rc"], domain["rc_dot"],
                 domain["rs"], domain["ds"], domain["scales"],
                 torch.as_tensor(interior, dtype=torch.bool),

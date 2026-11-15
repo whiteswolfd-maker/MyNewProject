@@ -71,7 +71,10 @@ def _domain(case, contact, t: torch.Tensor, r: torch.Tensor):
     closure = closure_from_precursor(case.precursor, like=t)
     scales = scales_from_precursor(case.precursor, like=t)
     with torch.enable_grad():
-        fields = contact(t, r0, rs, ds, closure, create_graph=False)
+        fields = contact(
+            t, r0, rs, ds, closure,
+            time_input=case.time_input, create_graph=False,
+        )
     rc = fields.radius.detach().reshape(-1)
     rc_dot = fields.speed.detach().reshape(-1)
     inside = (r >= rc) & (r <= rs) & torch.isfinite(rc) & torch.isfinite(rc_dot)
@@ -87,7 +90,7 @@ def _residual_rms(case, air, t, r, rc, rc_dot, rs, ds, scales, keep):
     zeta = ((r - rc)[keep] / length).reshape(-1, 1)
     fields, derivatives = air_fields_with_derivatives(
         air, zeta, t[keep], torch.full_like(t[keep], float(case.charge_radius_m)),
-        scales, create_graph=False,
+        scales, create_graph=False, time_input=case.time_input,
     )
     geometry = build_geometry(
         rc[keep].reshape(-1, 1), rc_dot[keep].reshape(-1, 1),
@@ -137,10 +140,13 @@ def _interface_errors(case, contact, air, *, points: int):
     closure = closure_from_precursor(case.precursor, like=t)
     scales = scales_from_precursor(case.precursor, like=t)
     with torch.enable_grad():
-        c_fields = contact(t, r0, rs, ds, closure, create_graph=False)
+        c_fields = contact(
+            t, r0, rs, ds, closure,
+            time_input=case.time_input, create_graph=False,
+        )
         air_fields = air(
             torch.zeros_like(t).reshape(-1, 1), t.reshape(-1, 1),
-            r0.reshape(-1, 1), scales,
+            r0.reshape(-1, 1), scales, time_input=case.time_input,
         )
     velocity = (air_fields.velocity - c_fields.speed) / float(case.u_scale)
     pressure = (air_fields.pressure - c_fields.pressure) / float(case.p_scale)

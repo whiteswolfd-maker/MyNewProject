@@ -99,34 +99,36 @@ def _contact_stage_forward(trainer, case, batch):
     contact = trainer.contact_net
     air = trainer.air_net
     c_fields = contact(
-        batch.t_pde.reshape(-1, 1), r0, rs, ds, closure, create_graph=True
+        batch.t_pde.reshape(-1, 1), r0, rs, ds, closure,
+        time_input=case.time_input, create_graph=True,
     )
     geometry = build_geometry(
         c_fields.radius, c_fields.speed, rs, ds, batch.zeta_pde.reshape(-1, 1)
     )
     fields, derivatives = air_fields_with_derivatives(
         air, batch.zeta_pde, batch.t_pde, r0, scales,
-        create_graph=True, functional=True,
+        create_graph=True, functional=True, time_input=case.time_input,
     )
     pde = pde_loss(fields=fields, derivatives=derivatives, geometry=geometry,
                    case=case)
     t0 = torch.full_like(batch.t_pde, float(case.t0))
     r00, rs0, ds0 = _contact_inputs(case, t0)
     c0 = contact(
-        t0.reshape(-1, 1), r00, rs0, ds0, closure, create_graph=True
+        t0.reshape(-1, 1), r00, rs0, ds0, closure,
+        time_input=case.time_input, create_graph=True,
     )
     ic = contact_ic_loss(c0, case)
     air0 = air.forward_functional(
         torch.zeros_like(batch.t_pde).reshape(-1, 1),
         batch.t_pde.reshape(-1, 1), r0.reshape(-1, 1), scales,
-        detach_parameters=True,
+        detach_parameters=True, time_input=case.time_input,
     )
     interface = interface_loss(air_at_contact=air0, contact=c_fields, case=case)
     if batch.t_contact.numel():
         r0c, rsc, dsc = _contact_inputs(case, batch.t_contact)
         c_contact = contact(
             batch.t_contact.reshape(-1, 1), r0c, rsc, dsc, closure,
-            create_graph=True,
+            time_input=case.time_input, create_graph=True,
         )
         data = contact_data_loss(c_contact, batch, case)
     else:

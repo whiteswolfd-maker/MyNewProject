@@ -129,6 +129,28 @@ def test_base_config_does_not_encode_a_default_radius_split():
     assert section["cases"] == []
 
 
+def test_base_and_experiment_configs_select_time_inputs():
+    from spherical_blast_pinn.config import load_config
+    from spherical_blast_pinn.contact_air.cli import _networks, _section
+
+    base = _section(load_config(ROOT / "configs" / "contact_air" / "base.yaml"))
+    contact, air = _networks(base)
+    assert contact.describe()["time_input"] == "legacy"
+    assert air.describe()["time_input"] == "legacy"
+
+    similarity = _section(load_config(
+        ROOT / "configs" / "contact_air"
+        / "split_train_r50_500_fullframes_similarity.yaml"
+    ))
+    contact, air = _networks(similarity)
+    for net in (contact, air):
+        description = net.describe()
+        assert description["time_input"] == "similarity"
+        assert description["time_origin_rule"] == "case.t0"
+        assert description["time_scale_rule"] == "case.time_scale=R_sep/u_a_sep"
+        assert description["similarity_input_divisor"] == pytest.approx(64.0)
+
+
 def test_checkpoint_describe_treats_a_missing_time_reference_as_seconds():
     from spherical_blast_pinn.contact_air.trainer import describe_matches
 

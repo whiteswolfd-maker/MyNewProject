@@ -84,7 +84,8 @@ def _contact_at(trainer, case, times: torch.Tensor, *, create_graph: bool):
     return trainer.contact_net(
         t, r0, rs.reshape(-1, 1).to(torch.float64),
         ds.reshape(-1, 1).to(torch.float64),
-        trainer._closures[case.case_id], create_graph=create_graph,
+        trainer._closures[case.case_id],
+        time_input=case.time_input, create_graph=create_graph,
     )
 
 

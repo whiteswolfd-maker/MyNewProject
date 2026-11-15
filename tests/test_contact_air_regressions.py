@@ -76,7 +76,7 @@ class _TimeContactNet(nn.Module):
         super().__init__()
         self.offset = nn.Parameter(torch.zeros(1, dtype=torch.float64))
 
-    def forward(self, t, r0, rs, ds, closure, *, create_graph=True):
+    def forward(self, t, r0, rs, ds, closure, *, time_input=None, create_graph=True):
         t = t.reshape(-1, 1)
         radius = t + self.offset
         zeros = torch.zeros_like(radius)

@@ -14,10 +14,14 @@
 ## 不得改变的物理选择
 
 - 时间 `t` 是物理秒；`t0=t_sep+epsilon`。半径输入不缩放，不乘 `R0/100mm`。
-  唯一的可选输入缩放是 `networks.time_reference_s`：两个 MLP 的输入变为
-  `tau = t / T_ref`（默认 1.0，即秒）。`T_ref` 是由训练组确定的固定值、所有
-  算例共用；缩放必须留在自动求导图内，激波轨迹、速度、PDE 和边界条件仍按秒，
-  速度仍是 m/s。
+  两个 MLP 有两种显式输入约定：默认 `networks.time_input: legacy` 使用
+  `x_t = t / time_reference_s`；显式 `similarity` 使用
+  `T_star=case.time_scale=R_sep/u_a_sep`、`theta=(t-case.t0)/T_star`、
+  `x_t=theta/similarity_input_divisor`（本轮 divisor=64.0，仅数值缩放，不是
+  物理常数，不得按各例 `t_end` 或验证误差选择）。两种模式的缩放都必须留在
+  自动求导图内，激波轨迹、速度、PDE 和边界条件仍按秒，速度仍是 m/s。
+  检查点记录模式、原点规则、尺度规则和 divisor；模式或 divisor 不一致必须
+  拒绝续训/预测，旧检查点只能按 legacy 解释。
 - 前置保留 CJ 状态、JWL 等熵释律、空气强冲击/精确 Hugoniot 匹配、
   `R_sep=R0 V_sep^(1/3)`、`t_sep` 和 `C` 的来源。不要替换成另一套前置能量。
 - 初始薄层：
@@ -129,9 +133,11 @@
 - 理论 `R_c0 >= R_s_data(t0)`（硬几何无法容纳初始位置）。
 - 数据/接触/PDE 采样在零个有效点上求值；总损失或梯度非有限。
 - 检查点数据/配置/验证划分/网络结构不匹配；旧缓存/旧检查点版本。网络
-  `time_reference_s` 不一致也必须拒绝续训和预测（旧检查点缺该字段按 1.0，
-  整个模型描述块缺失则拒绝）。检查点 `contact_data_weight` 与当前配置不一致
-  也必须拒绝续训（旧检查点缺该字段按 1.0）。
+  `time_reference_s`、`time_input` 模式、输入原点/尺度规则和
+  `similarity_input_divisor` 不一致也必须拒绝续训和预测（旧检查点缺这些字段
+  时只按 legacy、原点 0、`time_reference_s`、divisor 64 解释；整个模型描述块
+  缺失则拒绝）。检查点 `contact_data_weight` 与当前配置不一致也必须拒绝续训
+  （旧检查点缺该字段按 1.0）。
 - 一维源缺少必填 metadata、单位未知、掩码覆盖 NaN、节点约定未支持、
   单元重叠、时间非严格递增。
 

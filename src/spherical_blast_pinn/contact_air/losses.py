@@ -24,7 +24,7 @@ import torch
 
 from .data import CaseData
 from .mapping import MappedGeometry, Residuals, assemble_residuals
-from .models import AirFields, AirNet, ContactFields, Scales
+from .models import AirFields, AirNet, ContactFields, Scales, TimeInput
 from .sampling import CaseBatch
 
 
@@ -114,13 +114,17 @@ def _air_fields_at(
     scales: Scales,
     *,
     functional: bool = False,
+    time_input: TimeInput | None = None,
 ) -> AirFields:
     zeta = zeta.reshape(-1, 1)
     t = t.reshape(-1, 1)
     r0 = r0.reshape(-1, 1)
     if functional:
-        return net.forward_functional(zeta, t, r0, scales, detach_parameters=True)
-    return net(zeta, t, r0, scales)
+        return net.forward_functional(
+            zeta, t, r0, scales,
+            detach_parameters=True, time_input=time_input,
+        )
+    return net(zeta, t, r0, scales, time_input=time_input)
 
 
 def residual_scales(case: CaseData) -> dict[str, float]:
@@ -193,7 +197,10 @@ def air_ic_loss(
         return TermResult(total=_zero(batch.t_ic), counts={"ic": 0})
     t = torch.full_like(zeta, float(case.t0))
     r0 = torch.full_like(zeta, float(case.charge_radius_m))
-    fields = _air_fields_at(net, zeta, t, r0, scales, functional=functional)
+    fields = _air_fields_at(
+        net, zeta, t, r0, scales,
+        functional=functional, time_input=case.time_input,
+    )
     term = (
         _mse(fields.density - case.rho_scale, case.rho_scale)
         + _mse(fields.velocity - case.u_scale, case.u_scale)
@@ -277,7 +284,10 @@ def right_loss(
     )
     zeta = torch.ones_like(t)
     r0 = torch.full_like(t, float(case.charge_radius_m))
-    fields = _air_fields_at(net, zeta, t, r0, scales, functional=functional)
+    fields = _air_fields_at(
+        net, zeta, t, r0, scales,
+        functional=functional, time_input=case.time_input,
+    )
     term = (
         _mse(fields.density - state["density"], case.rho_scale)
         + _mse(fields.velocity - state["velocity"], case.u_scale)
@@ -351,7 +361,10 @@ def air_data_loss(
             "dropping the whole batch"
         )
     r0 = torch.full_like(batch.t_data, float(case.charge_radius_m))
-    fields = _air_fields_at(net, zeta, batch.t_data, r0, scales, functional=functional)
+    fields = _air_fields_at(
+        net, zeta, batch.t_data, r0, scales,
+        functional=functional, time_input=case.time_input,
+    )
     total = _zero(fields.density)
     counts: dict[str, int] = {}
     parts: dict[str, float] = {}

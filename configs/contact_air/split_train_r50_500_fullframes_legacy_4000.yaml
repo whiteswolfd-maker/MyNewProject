@@ -1,0 +1,11 @@
+# Paired legacy control for the time-input experiment.  This is the existing
+# full-frame baseline configuration with an explicit legacy time input and a
+# separate output directory, so rerunning A cannot overwrite the original
+# formal checkpoint.
+inherits: split_train_r50_500_fullframes.yaml
+
+contact_air:
+  output_dir: outputs/contact_air_time_input_legacy_4000
+  networks:
+    time_input: legacy
+    similarity_input_divisor: 64.0

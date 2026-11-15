@@ -1,0 +1,14 @@
+# Same full-frame split and training budget as the legacy baseline, with only
+# the network time input changed:
+#
+#   x_t = ((t - case.t0) / (R_sep/u_a_sep)) / 64.0
+#
+# The divisor is a fixed numerical input scale, not a physical constant.  It is
+# never selected from validation error and is not per-case.
+inherits: split_train_r50_500_fullframes.yaml
+
+contact_air:
+  output_dir: outputs/contact_air_time_input_similarity_4000
+  networks:
+    time_input: similarity
+    similarity_input_divisor: 64.0

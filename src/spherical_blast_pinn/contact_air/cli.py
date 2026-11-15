@@ -61,7 +61,7 @@ from .data import (
 )
 from .geometry import GeometryError
 from .losses import LossError, data_coordinates, masked_rmse
-from .models import AirNet, ContactNet
+from .models import AirNet, ContactNet, ModelError
 from .one_d import (
     OneDDataError,
     ShockDetectionConfig,
@@ -368,17 +368,25 @@ def _networks(section: Mapping[str, Any]):
     contact_section = net_section.get("contact", {})
     air_section = net_section.get("air", {})
     time_reference_s = float(net_section.get("time_reference_s", 1.0))
+    time_input_mode = str(net_section.get("time_input", "legacy"))
+    similarity_input_divisor = float(
+        net_section.get("similarity_input_divisor", 64.0)
+    )
     contact = ContactNet(
         width=int(contact_section.get("width", 50)),
         depth=int(contact_section.get("depth", 5)),
         dtype=dtype, device="cpu",
         time_reference_s=time_reference_s,
+        time_input_mode=time_input_mode,
+        similarity_input_divisor=similarity_input_divisor,
     )
     air = AirNet(
         width=int(air_section.get("width", 32)),
         depth=int(air_section.get("depth", 10)),
         dtype=dtype, device="cpu",
         time_reference_s=time_reference_s,
+        time_input_mode=time_input_mode,
+        similarity_input_divisor=similarity_input_divisor,
     )
     return contact, air
 
@@ -676,6 +684,10 @@ def command_train(args) -> int:
         "contact_data_weight": float(train_config.contact_data_weight),
         "n_schedule": int(train_config.n_schedule),
         "seed": int(train_config.seed),
+        "time_input": str(section.get("networks", {}).get("time_input", "legacy")),
+        "similarity_input_divisor": float(
+            section.get("networks", {}).get("similarity_input_divisor", 64.0)
+        ),
         "learning_rate_priority": (
             "configured < --learning-rate (both) < --contact-learning-rate "
             "(ContactNet only)"
@@ -788,7 +800,10 @@ def command_predict(args) -> int:
     closure = closure_from_precursor(case.precursor, like=t_tensor)
     scales = scales_from_precursor(case.precursor, like=t_tensor)
     with torch.enable_grad():
-        c_fields = contact(t_tensor, r0, rs, ds, closure, create_graph=False)
+        c_fields = contact(
+            t_tensor, r0, rs, ds, closure,
+            time_input=case.time_input, create_graph=False,
+        )
     c_fields = type(c_fields)(
         radius=c_fields.radius.detach(), speed=c_fields.speed.detach(),
         sigmoid=c_fields.sigmoid.detach(), raw=c_fields.raw.detach(),
@@ -796,7 +811,9 @@ def command_predict(args) -> int:
         relative_volume=c_fields.relative_volume.detach(),
     )
     with torch.no_grad():
-        air_fields = air(z_tensor, t_tensor, r0, scales)
+        air_fields = air(
+            z_tensor, t_tensor, r0, scales, time_input=case.time_input
+        )
     length = rs - c_fields.radius
     radius = c_fields.radius + z_tensor * length
     payload_out = {
@@ -1010,7 +1027,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise CommandError(f"unknown command {args.command!r}")
     except (
         CommandError, CaseDataError, PrecursorError, TrainingError, LossError,
-        SamplingError, GeometryError, OneDDataError, ValueError,
+        SamplingError, GeometryError, OneDDataError, ModelError, ValueError,
     ) as exc:
         print(f"\n** {exc} **\n", file=sys.stderr)
         return 6

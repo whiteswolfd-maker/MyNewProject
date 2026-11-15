@@ -25,10 +25,14 @@ AirNet:     (zeta, t, R0) -> (rho, u, p),  e = p / ((gamma_a-1) rho)
 - `R_s` 是**外传空气激波**，由原始径向压力剖面的 `-dp/dr` 识别；不是旧
   `R_b`，也不是仿真外边界 `R_outer`。
 - ContactNet 默认 5 个隐藏层 × 50 神经元；AirNet 默认 10 × 32。`R0` 是米。
-  两个网络的时间输入是 `tau = t / networks.time_reference_s`：默认
-  `time_reference_s: 1.0`，即物理秒；可设为一个由训练组确定的固定值（例如
-  训练组最大 `t_end`），所有算例共用。只有送进 MLP 的数字被缩放，激波轨迹、
-  接触速度、PDE、边界条件和自动求导仍按秒计算，速度仍是 m/s。
+  两个网络的时间输入有两种显式模式：默认 `networks.time_input: legacy` 使用
+  `x_t = t / time_reference_s`（`time_reference_s` 默认 1.0，即物理秒）；
+  `similarity` 使用
+  `x_t = ((t - case.t0) / case.time_scale) / similarity_input_divisor`，
+  其中 `case.time_scale=R_sep/u_a_sep`，本轮 divisor=64.0。divisor 只是固定
+  数值缩放，不是物理常数，不能按各例 `t_end` 或验证误差选择。只有送进 MLP
+  的数字被缩放，激波轨迹、接触速度、PDE、边界条件和自动求导仍按秒计算，速度
+  仍是 m/s。
 - `R_c = R_s sigmoid(raw)` 保证 `0 < R_c < R_s`。完整乘积导数：
   `R_c_dot = D_s s + R_s s (1-s) raw_t`。有限精度下 `L <= 0` 明确报错，不截断
   厚度制造可用几何。
@@ -324,11 +328,12 @@ s_fE = s_E / T_star
   轨迹段采样；先不加激波附近额外权重。
 - 缓存 schema **version 7**；检查点 **version 4**。旧格式明确拒绝并要求重建。
 - 检查点保存两个网络、两个优化器、阶段状态、RNG、配置、数据身份、固定验证
-  样本；恢复先核对再应用。网络元数据中的 `time_reference_s` 也参与核对：
-  旧检查点缺少该字段时按 1.0 处理，整个描述块缺失则拒绝，与当前网络不一致就
-  拒绝续训（预测路径同样检查）。检查点保存的 `contact_data_weight` 必须与
-  当前配置一致（旧检查点缺少该字段按 1.0），否则拒绝续训，避免把 ×3 的实验
-  悄悄退回 ×1。
+  样本；恢复先核对再应用。网络元数据中的 `time_reference_s`、`time_input`
+  模式、输入原点/尺度规则和 `similarity_input_divisor` 也参与核对：旧检查点
+  缺少这些字段时只按 legacy、原点 0、`time_reference_s`、divisor 64 解释，
+  整个描述块缺失则拒绝；模式或 divisor 与当前网络不一致就拒绝续训（预测路径
+  同样检查）。检查点保存的 `contact_data_weight` 必须与当前配置一致（旧检查点
+  缺少该字段按 1.0），否则拒绝续训，避免把 ×3 的实验悄悄退回 ×1。
 - 训练/验证/测试由配置中的显式 `role` 决定；没有固定半径禁令。`role: test`
   不能进入训练。验证有两个来源：训练算例末尾的连续帧组
   （`validation.holdout_fraction > 0`），以及配置中整例 `role: validation`

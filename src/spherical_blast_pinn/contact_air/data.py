@@ -32,6 +32,7 @@ from .geometry import (
     ShockTrajectory,
     build_initial_geometry,
 )
+from .models import TimeInput
 from .one_d import (
     EventAlignment,
     OneDDataError,
@@ -418,6 +419,11 @@ class CaseData:
         return self.length_scale / self.u_scale
 
     @property
+    def time_input(self) -> TimeInput:
+        """Physical origin and similarity time scale for the network input."""
+        return TimeInput(self.t0, self.time_scale)
+
+    @property
     def energy_density_scale(self) -> float:
         return self.p_scale / max(self.gamma_air - 1.0, 1.0e-12) + (
             0.5 * self.rho_scale * self.u_scale ** 2
@@ -632,6 +638,10 @@ class PredictionCaseData:
     @property
     def time_scale(self) -> float:
         return self.length_scale / self.u_scale
+
+    @property
+    def time_input(self) -> TimeInput:
+        return TimeInput(self.t0, self.time_scale)
 
     @property
     def gamma_air(self) -> float:
