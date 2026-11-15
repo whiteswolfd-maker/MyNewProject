@@ -230,3 +230,66 @@ def test_similarity_air_derivatives_and_functional_path_are_consistent():
         functional_direct.pressure.sum(), (zeta, t), retain_graph=True,
     )
     assert bool(zeta_grad.any()) and bool(t_grad.any())
+
+
+def test_common_r0_control_uses_each_case_t0_not_global_zero():
+    """Regression for the fixed diagnostic: t must be case.t0, not zero.
+
+    The two cases intentionally have different origins and time scales, so a
+    global t=0 control cannot accidentally look like t=t0.
+    """
+    from types import SimpleNamespace
+    from scripts.check_airnet_initial_inputs import common_r0_control
+
+    torch.manual_seed(23)
+    net = AirNet(
+        width=8, depth=2, time_input_mode="similarity",
+        similarity_input_divisor=64.0,
+    )
+    scales = scales_from_precursor(
+        default_precursor(0.05).as_dict(),
+        like=torch.zeros(1, 1, dtype=torch.float64),
+    )
+    first = SimpleNamespace(
+        case_id="case_a",
+        t0=1.0e-4,
+        time_input=TimeInput(origin=1.0e-4, scale=2.0e-5),
+    )
+    second = SimpleNamespace(
+        case_id="case_b",
+        t0=5.0e-4,
+        time_input=TimeInput(origin=5.0e-4, scale=1.0e-4),
+    )
+    zeta = torch.tensor([[0.2], [0.7]], dtype=torch.float64)
+    common_r0 = torch.full_like(zeta, 0.5)
+
+    records, fields = common_r0_control(
+        net, [first, second], zeta, common_r0,
+        {"case_a": scales, "case_b": scales},
+    )
+    assert records["case_a"]["t_s"] == pytest.approx(first.t0)
+    assert records["case_a"]["origin_s"] == pytest.approx(first.t0)
+    assert records["case_b"]["t_s"] == pytest.approx(second.t0)
+    assert records["case_b"]["origin_s"] == pytest.approx(second.t0)
+    assert records["case_a"]["scaled_time_max_abs"] == 0.0
+    assert records["case_b"]["scaled_time_max_abs"] == 0.0
+
+    # The two cases have different origins and time scales, yet the normalized
+    # fields coincide once only R0 is made common.
+    assert torch.allclose(
+        fields["case_a"].density / float(scales.rho),
+        fields["case_b"].density / float(scales.rho),
+    )
+    assert torch.allclose(
+        fields["case_a"].velocity / float(scales.u),
+        fields["case_b"].velocity / float(scales.u),
+    )
+    assert torch.allclose(
+        fields["case_a"].pressure / float(scales.p),
+        fields["case_b"].pressure / float(scales.p),
+    )
+
+    # The old t=0 mistake is measurably different for these cases.
+    zero = torch.full_like(zeta, 0.0)
+    assert net.scaled_time(zero, first.time_input).abs().max() > 0.0
+    assert net.scaled_time(zero, second.time_input).abs().max() > 0.0

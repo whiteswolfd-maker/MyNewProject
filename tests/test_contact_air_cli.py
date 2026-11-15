@@ -150,6 +150,15 @@ def test_base_and_experiment_configs_select_time_inputs():
         assert description["time_scale_rule"] == "case.time_scale=R_sep/u_a_sep"
         assert description["similarity_input_divisor"] == pytest.approx(64.0)
 
+    gated = _section(load_config(
+        ROOT / "configs" / "contact_air"
+        / "split_train_r50_500_fullframes_similarity_gate.yaml"
+    ))
+    contact, air = _networks(gated)
+    assert not hasattr(contact, "r0_input_gate")
+    assert air.describe()["r0_input_gate"] == "similarity_time"
+    assert air.describe()["r0_gate_rule"].startswith("R0*(1-exp")
+
 
 def test_checkpoint_describe_treats_a_missing_time_reference_as_seconds():
     from spherical_blast_pinn.contact_air.trainer import describe_matches

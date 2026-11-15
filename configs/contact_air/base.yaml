@@ -95,6 +95,10 @@ contact_air:
     # physical seconds in both modes.
     time_input: legacy
     similarity_input_divisor: 64.0
+    # none: historical R0 input.  similarity_time: only AirNet receives
+    # R0*(1-exp(-(t-case.t0)/case.time_scale)); at t0 the R0 input is zero,
+    # while air_ic_loss remains a soft numeric constraint on the output.
+    r0_input_gate: none
     time_reference_s: 1.0
     contact:
       width: 50

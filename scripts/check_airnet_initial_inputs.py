@@ -70,6 +70,47 @@ def _norm_fields(fields, case) -> dict[str, np.ndarray]:
     }
 
 
+def common_r0_control(
+    net,
+    cases,
+    zeta: torch.Tensor,
+    common_r0: torch.Tensor,
+    scales_by_case: dict,
+) -> tuple[dict, dict]:
+    """Evaluate every case at its own t0 with a common physical R0.
+
+    The previous diagnostic used t=0 globally.  That is wrong: in similarity
+    mode the network time is (t-case.t0)/(T_star*64), so t=0 is not t0 unless
+    the case origin is zero.  Here each case keeps its own t0 and time_input;
+    only R0 is replaced.  The returned record includes the actual t, origin,
+    scale and scaled time, and the function hard-fails if scaled time is not
+    exactly zero.
+    """
+    records = {}
+    fields = {}
+    for case in cases:
+        t = torch.full_like(zeta, float(case.t0))
+        xt = net.scaled_time(t, case.time_input)
+        max_abs = float(xt.abs().max())
+        if max_abs != 0.0:
+            raise RuntimeError(
+                f"{case.case_id}: common-R0 control scaled_time is {max_abs}, "
+                "not zero; t must be the case t0"
+            )
+        records[case.case_id] = {
+            "t_s": float(case.t0),
+            "origin_s": float(case.time_input.origin),
+            "scale_s": float(case.time_input.scale),
+            "scaled_time_max_abs": max_abs,
+        }
+        with torch.no_grad():
+            fields[case.case_id] = net(
+                zeta, t, common_r0, scales_by_case[case.case_id],
+                time_input=case.time_input,
+            )
+    return records, fields
+
+
 def _case_record(trainer, case, zeta: torch.Tensor) -> dict:
     t = torch.full_like(zeta, float(case.t0))
     r0 = torch.full_like(zeta, float(case.charge_radius_m))
@@ -191,21 +232,17 @@ def main(argv=None) -> int:
             for case in cases
         }
 
-        # At fixed t0/zeta, replace the physical R0 by one common value while
-        # keeping each case's time_input.  If the normalised output is then
-        # identical, no other per-case term can be creating the difference.
+        # At each case's own t0 and fixed zeta, replace only the physical R0.
+        # t must be case.t0, not zero: t=0 would change scaled_time whenever
+        # the case origin is not zero.
         common_r0 = torch.full_like(zeta, 0.5)
-        t = torch.full_like(zeta, 0.0)
-        common_fields = {}
-        with torch.no_grad():
-            for case in cases:
-                common_fields[case.case_id] = _norm_fields(
-                    trainer.air_net(
-                        zeta, t, common_r0, trainer._scales[case.case_id],
-                        time_input=case.time_input,
-                    ),
-                    case,
-                )
+        control_records, common_fields_raw = common_r0_control(
+            trainer.air_net, cases, zeta, common_r0, trainer._scales
+        )
+        common_fields = {
+            case.case_id: _norm_fields(common_fields_raw[case.case_id], case)
+            for case in cases
+        }
         reference = common_fields[cases[0].case_id]
         common_max = {
             field: max(
@@ -219,10 +256,12 @@ def main(argv=None) -> int:
             "checkpoint": str(path),
             "checkpoint_sha256": _sha256(path),
             "time_input_mode": trainer.air_net.time_input_mode,
+            "r0_input_gate": trainer.air_net.r0_input_gate,
             "similarity_input_divisor": float(
                 trainer.air_net.similarity_input_divisor
             ),
             "cases": per_case,
+            "common_r0_control": control_records,
             "summary": {
                 "n_cases": len(cases),
                 "all_similarity_x_t_zero": all(
@@ -232,6 +271,18 @@ def main(argv=None) -> int:
                 "max_similarity_x_t_at_t0": max(
                     row["x_t_similarity_at_t0_max_abs"]
                     for row in per_case.values()
+                ),
+                "common_r0_control_all_scaled_time_zero": all(
+                    row["scaled_time_max_abs"] == 0.0
+                    for row in control_records.values()
+                ),
+                "common_r0_control_actual_t_matches_case_t0": all(
+                    row["t_s"] == row["origin_s"]
+                    for row in control_records.values()
+                ),
+                "common_r0_control_max_scaled_time": max(
+                    row["scaled_time_max_abs"]
+                    for row in control_records.values()
                 ),
                 "all_output_scales_equal": len({
                     tuple(row["output_scales"].values())
@@ -288,7 +339,12 @@ def main(argv=None) -> int:
             "t": "each case's physical t0",
             "r0": "each case's actual charge radius, except the common-R0 control",
             "common_r0_m": 0.5,
+            "common_r0_t": "each case's own t0; recorded and asserted scaled_time=0",
             "non_destructive": True,
+            "supersedes": (
+                "initial_input_checks_wrong_t0_control.json, which used t=0 "
+                "for the common-R0 control"
+            ),
         },
         "models": records,
         "legacy_A_t0_time_argument": {
@@ -299,7 +355,8 @@ def main(argv=None) -> int:
         "notes": [
             "The similarity path is x_t=(t-t0)/(T_star*64); at t=t0 it is zero.",
             "The legacy path is x_t=t/time_reference_s; at t=t0 it is not zero.",
-            "The common-R0 control holds t=t0, zeta and time_input fixed; only R0 is replaced by 0.5 m.",
+            "The common-R0 control holds each case's own t=t0, zeta and time_input fixed; only R0 is replaced by 0.5 m.",
+            "The old control used t=0 and is preserved with an explicit error marker in initial_input_checks_wrong_t0_control.json.",
             "Ordinary, helper and functional fields are compared directly, not through a loss.",
             "No gradient, checkpoint or optimizer state is written.",
         ],

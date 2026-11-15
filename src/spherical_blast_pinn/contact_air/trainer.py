@@ -174,6 +174,8 @@ def describe_matches(saved: Mapping[str, Any] | None, current: Mapping[str, Any]
         "time_origin_rule": "zero",
         "time_scale_rule": "time_reference_s",
         "similarity_input_divisor": 64.0,
+        "r0_input_gate": "none",
+        "r0_gate_rule": "none",
     }
     normalized = dict(saved)
     normalized_current = dict(current)

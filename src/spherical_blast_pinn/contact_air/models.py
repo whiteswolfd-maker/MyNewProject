@@ -25,6 +25,11 @@ remains physical seconds in every derivative: the scaling is inside the
 autograd graph, so ``d x_t / d t = 1 / (divisor * T_star)`` and the PDE/contact
 speed chain rule is unchanged.  ``R0`` and ``zeta`` are never rescaled.
 
+``AirNet`` also has an optional ``r0_input_gate``.  Its default ``none`` is the
+historical behavior.  ``similarity_time`` replaces ``R0`` in the network input
+by ``R0 * (1 - exp(-(t-t0)/T_star))``: at t0 the R0 input is zero for every
+case, while the output value is still a soft IC target, not a hard value.
+
 ``AirNet.forward_functional(..., detach_parameters=True)`` evaluates the same
 network with frozen parameter values.  The contact stage uses it so gradients
 can flow through ``zeta``/``t`` into ``ContactNet`` without populating any
@@ -47,6 +52,7 @@ class ModelError(RuntimeError):
 
 
 TIME_INPUT_MODES = ("legacy", "similarity")
+R0_INPUT_GATE_MODES = ("none", "similarity_time")
 SIMILARITY_INPUT_DIVISOR_DEFAULT = 64.0
 
 
@@ -87,6 +93,15 @@ def _validate_divisor(value: float) -> float:
     if not math.isfinite(divisor) or divisor <= 0.0:
         raise ModelError("similarity input divisor must be finite and positive")
     return divisor
+
+
+def _validate_r0_input_gate(mode: str) -> str:
+    value = str(mode)
+    if value not in R0_INPUT_GATE_MODES:
+        raise ModelError(
+            f"R0 input gate must be one of {R0_INPUT_GATE_MODES}, got {value!r}"
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -264,13 +279,19 @@ class AirNet(nn.Module):
     def __init__(self, *, width: int = 32, depth: int = 10, dtype=torch.float64,
                  device="cpu", time_reference_s: float = 1.0,
                  time_input_mode: str = "legacy",
-                 similarity_input_divisor: float = SIMILARITY_INPUT_DIVISOR_DEFAULT) -> None:
+                 similarity_input_divisor: float = SIMILARITY_INPUT_DIVISOR_DEFAULT,
+                 r0_input_gate: str = "none") -> None:
         super().__init__()
         if not math.isfinite(float(time_reference_s)) or float(time_reference_s) <= 0.0:
             raise ModelError("time_reference_s must be finite and positive")
         self.time_reference_s = float(time_reference_s)
         self.time_input_mode = _validate_time_input_mode(time_input_mode)
         self.similarity_input_divisor = _validate_divisor(similarity_input_divisor)
+        self.r0_input_gate = _validate_r0_input_gate(r0_input_gate)
+        if self.r0_input_gate != "none" and self.time_input_mode != "similarity":
+            raise ModelError(
+                "r0_input_gate='similarity_time' requires time_input='similarity'"
+            )
         layers: list[nn.Module] = []
         last = 3
         for _ in range(int(depth)):
@@ -304,19 +325,63 @@ class AirNet(nn.Module):
         )
 
     def _time_description(self) -> dict[str, Any]:
+        gate_rule = (
+            "none"
+            if self.r0_input_gate == "none"
+            else "R0*(1-exp(-(t-case.t0)/case.time_scale))"
+        )
         if self.time_input_mode == "legacy":
             return {
                 "time_input": "legacy",
                 "time_origin_rule": "zero",
                 "time_scale_rule": "time_reference_s",
                 "similarity_input_divisor": self.similarity_input_divisor,
+                "r0_input_gate": self.r0_input_gate,
+                "r0_gate_rule": gate_rule,
             }
         return {
             "time_input": "similarity",
             "time_origin_rule": "case.t0",
             "time_scale_rule": "case.time_scale=R_sep/u_a_sep",
             "similarity_input_divisor": self.similarity_input_divisor,
+            "r0_input_gate": self.r0_input_gate,
+            "r0_gate_rule": gate_rule,
         }
+
+    def _network_inputs(
+        self,
+        zeta: torch.Tensor,
+        t: torch.Tensor,
+        r0: torch.Tensor,
+        time_input: TimeInput | None,
+    ) -> torch.Tensor:
+        """Build the shared AirNet feature vector, ordinary and functional.
+
+        ``r0_input_gate='none'`` is the historical behavior.  The optional
+        ``similarity_time`` gate is
+
+            theta=(t-case.t0)/case.time_scale
+            gate=1-exp(-theta)
+            R0_input=R0*gate
+
+        so at t0 all cases feed R0_input=0 while the output value remains
+        soft-constrained only by ``air_ic_loss``.  For t>t0 the physical R0
+        input returns smoothly.
+        """
+        if self.r0_input_gate == "none":
+            r0_input = r0
+        else:
+            if time_input is None:
+                raise ModelError(
+                    "r0_input_gate='similarity_time' requires "
+                    "TimeInput(case.t0, case.time_scale)"
+                )
+            theta = (t - time_input.origin) / time_input.scale
+            gate = -torch.expm1(-theta)
+            r0_input = r0 * gate
+        return torch.cat(
+            [zeta, self.scaled_time(t, time_input), r0_input], dim=-1
+        )
 
     def forward(
         self, zeta: torch.Tensor, t: torch.Tensor, r0: torch.Tensor, scales: Scales,
@@ -326,9 +391,7 @@ class AirNet(nn.Module):
             raise ModelError("zeta, t and R0 must have the same shape")
         # Dimensionless time; derivatives are still taken with respect to the
         # physical t passed in, because the conversion is part of the graph.
-        hidden = self.trunk(
-            torch.cat([zeta, self.scaled_time(t, time_input), r0], dim=-1)
-        )
+        hidden = self.trunk(self._network_inputs(zeta, t, r0, time_input))
         return self._heads(hidden, scales)
 
     def _heads(self, hidden: torch.Tensor, scales: Scales) -> AirFields:
@@ -372,9 +435,7 @@ class AirNet(nn.Module):
         """
         if zeta.shape != t.shape or zeta.shape != r0.shape:
             raise ModelError("zeta, t and R0 must have the same shape")
-        hidden = torch.cat(
-            [zeta, self.scaled_time(t, time_input), r0], dim=-1
-        )
+        hidden = self._network_inputs(zeta, t, r0, time_input)
         for module in self.trunk:
             if isinstance(module, nn.Linear):
                 weight = module.weight.detach() if detach_parameters else module.weight
@@ -488,6 +549,7 @@ __all__ = [
     "ContactNet",
     "JWLClosure",
     "ModelError",
+    "R0_INPUT_GATE_MODES",
     "Scales",
     "SIMILARITY_INPUT_DIVISOR_DEFAULT",
     "TIME_INPUT_MODES",

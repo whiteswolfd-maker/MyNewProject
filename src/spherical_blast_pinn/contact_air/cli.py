@@ -372,6 +372,7 @@ def _networks(section: Mapping[str, Any]):
     similarity_input_divisor = float(
         net_section.get("similarity_input_divisor", 64.0)
     )
+    r0_input_gate = str(net_section.get("r0_input_gate", "none"))
     contact = ContactNet(
         width=int(contact_section.get("width", 50)),
         depth=int(contact_section.get("depth", 5)),
@@ -387,6 +388,7 @@ def _networks(section: Mapping[str, Any]):
         time_reference_s=time_reference_s,
         time_input_mode=time_input_mode,
         similarity_input_divisor=similarity_input_divisor,
+        r0_input_gate=r0_input_gate,
     )
     return contact, air
 
@@ -687,6 +689,9 @@ def command_train(args) -> int:
         "time_input": str(section.get("networks", {}).get("time_input", "legacy")),
         "similarity_input_divisor": float(
             section.get("networks", {}).get("similarity_input_divisor", 64.0)
+        ),
+        "r0_input_gate": str(
+            section.get("networks", {}).get("r0_input_gate", "none")
         ),
         "learning_rate_priority": (
             "configured < --learning-rate (both) < --contact-learning-rate "
