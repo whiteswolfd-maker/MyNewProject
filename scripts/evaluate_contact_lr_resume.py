@@ -193,7 +193,7 @@ def _field_metrics(pred, target, mask, scale) -> dict:
     if n == 0:
         return {
             "status": "not_evaluable", "n": 0, "n_candidates": candidates,
-            "mse": None, "rmse": None, "n_nonfinite": 0,
+            "mse": None, "rmse": None, "n_nonfinite": candidates,
         }
     error = (pred[use] - target[use]) / float(scale)
     mse = float(np.mean(error * error))
@@ -223,7 +223,7 @@ def _common_metrics(models, labels, name, mask, scale) -> dict:
     }
 
 
-def _air_case_metrics(models: dict, case) -> dict:
+def _air_case_metrics(models: dict, case, *, labels=LABELS, pair_labels=PAIR_LABELS) -> dict:
     scales = {"rho": case.rho_scale, "u": case.u_scale, "p": case.p_scale}
     own = {label: {} for label in models}
     common_two = {name: {} for name in ("rho", "u", "p")}
@@ -246,13 +246,13 @@ def _air_case_metrics(models: dict, case) -> dict:
                 model["pred"][name], model["target"][name],
                 model["valid"][name] & model["inside"], scales[name],
             )
-        pair_mask = _common_mask(models, PAIR_LABELS, name)
+        pair_mask = _common_mask(models, pair_labels, name)
         common_two[name] = _common_metrics(
-            models, PAIR_LABELS, name, pair_mask, scales[name]
+            models, pair_labels, name, pair_mask, scales[name]
         )
-        three_mask = _common_mask(models, LABELS, name)
+        three_mask = _common_mask(models, labels, name)
         common_three[name] = _common_metrics(
-            models, LABELS, name, three_mask, scales[name]
+            models, labels, name, three_mask, scales[name]
         )
     return {
         "case_id": case.case_id,
@@ -362,6 +362,15 @@ def _initial_condition_metrics(trainer, case) -> dict:
         )
     result = {"case_id": case.case_id, "n": int(zeta.numel()),
               "status": "ok"}
+    t0_queries = torch.tensor([float(case.t0)], dtype=torch.float64)
+    with torch.enable_grad():
+        contact0 = diag._contact_at(trainer, case, t0_queries, create_graph=False)
+    initial_rc_error = (
+        contact0.radius.detach().reshape(-1) - float(case.initial.Rc0)
+    ) / float(case.length_scale)
+    result["initial_rc_rmse"] = float(
+        torch.sqrt(torch.mean(initial_rc_error * initial_rc_error))
+    )
     for name, values, scale in (
         ("rho", fields.density, case.rho_scale),
         ("u", fields.velocity, case.u_scale),
@@ -377,7 +386,7 @@ def _initial_condition_metrics(trainer, case) -> dict:
 def _aggregate_initial(rows: list[dict]) -> dict:
     n = sum(row["n"] for row in rows)
     result = {"n": n, "status": "ok" if n else "not_evaluable"}
-    for name in ("rho", "u", "p"):
+    for name in ("rho", "u", "p", "initial_rc"):
         result[f"{name}_rmse"] = (
             math.sqrt(sum(
                 row[f"{name}_rmse"] ** 2 * row["n"] for row in rows
@@ -415,6 +424,7 @@ def _reference_physical_points(trainer, cases, limit: int) -> dict:
 
 def _fixed_physical_physics(
     trainer, cases, checkpoints: dict, reference: dict,
+    *, labels=LABELS,
 ) -> dict:
     """PDE residuals on one data-derived (t,r) set, common to three models."""
     domains = {}
@@ -460,12 +470,12 @@ def _fixed_physical_physics(
             }
     rows = {}
     for case in cases:
-        item = domains[LABELS[0]][case.case_id]
+        item = domains[labels[0]][case.case_id]
         common = item["slope"].copy()
-        for label in LABELS:
+        for label in labels:
             common &= domains[label][case.case_id]["inside"]
         interior = common.copy()
-        for label in LABELS:
+        for label in labels:
             zeta = domains[label][case.case_id]["zeta"]
             interior &= (zeta > 1.0e-12) & (zeta < 1.0 - 1.0e-12)
         counts = {
@@ -479,10 +489,10 @@ def _fixed_physical_physics(
                 "common_interior": int(interior.sum()),
                 "boundary_excluded": int(common.sum() - interior.sum()),
             }
-            for label in LABELS
+            for label in labels
         }
         residuals = {}
-        for label in LABELS:
+        for label in labels:
             trainer.load(checkpoints[label])
             domain = domains[label][case.case_id]
             residuals[label] = phys._residual_rms(
@@ -491,8 +501,15 @@ def _fixed_physical_physics(
                 domain["rs"], domain["ds"], domain["scales"],
                 torch.as_tensor(interior, dtype=torch.bool),
             )
+            residuals[label]["common_interior"] = int(interior.sum())
             residuals[label]["status"] = (
-                "ok" if residuals[label]["n"] > 0 else "not_evaluable"
+                "ok"
+                if residuals[label]["n"] == int(interior.sum())
+                and int(interior.sum()) > 0
+                else (
+                    "not_evaluable" if int(interior.sum()) == 0
+                    else "incomplete_nonfinite"
+                )
             )
         rows[case.case_id] = {
             "case_id": case.case_id,
@@ -528,7 +545,10 @@ def _aggregate_physics_rows(rows: list[dict], label: str) -> dict:
     result["n_candidates"] = sum(
         row["counts"][label]["common_interior"] for row in rows
     )
-    result["status"] = "ok" if result["n"] else "not_evaluable"
+    if all(row["residuals"][label]["status"] == "ok" for row in rows):
+        result["status"] = "ok" if result["n"] else "not_evaluable"
+    else:
+        result["status"] = "incomplete_nonfinite"
     return result
 
 

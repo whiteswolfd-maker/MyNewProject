@@ -547,20 +547,42 @@ class AlternatingTrainer:
 
     def contact_update(
         self, batches, *, lambda_pde: float, lambda_data: float,
-    ) -> TermResult:
-        """ContactNet stage, exactly as used by :meth:`step`."""
+        objective: str = "full", return_terms: bool = False,
+    ) -> TermResult | tuple[TermResult, list[dict]]:
+        """ContactNet stage, exactly as used by :meth:`step`.
+
+        ``objective="contact_data_only"`` is an explicit diagnostic ablation:
+        the backward target is only
+        ``lambda_data * contact_data_weight * L_contact_data``.  The PDE, IC
+        and interface terms are still evaluated and returned for logging, but
+        they are not part of the backward graph.  The default ``"full"`` path
+        is unchanged.
+        """
+        if objective not in ("full", "contact_data_only"):
+            raise TrainingError(f"unknown ContactNet objective {objective!r}")
         self.opt_contact.zero_grad(set_to_none=True)
         self.opt_air.zero_grad(set_to_none=True)
         air_before = self._parameter_snapshot(self.air_net)
         contact_results: list[TermResult] = []
+        terms_by_case: list[dict[str, Any]] = []
         for case, batch in batches:
             terms = self.contact_stage_terms(case, batch)
-            contact_results.append(combine_contact(
-                pde=terms["pde"], ic=terms["contact_ic"],
-                interface=terms["interface"], data=terms["contact_data"],
-                lambda_pde=lambda_pde, lambda_data=lambda_data,
-                contact_data_weight=self.config.contact_data_weight,
-            ))
+            terms_by_case.append({"case_id": case.case_id, "terms": terms})
+            if objective == "contact_data_only":
+                zero = TermResult(total=torch.zeros((), dtype=torch.float64))
+                contact_results.append(combine_contact(
+                    pde=zero, ic=zero, interface=zero,
+                    data=terms["contact_data"],
+                    lambda_pde=lambda_pde, lambda_data=lambda_data,
+                    contact_data_weight=self.config.contact_data_weight,
+                ))
+            else:
+                contact_results.append(combine_contact(
+                    pde=terms["pde"], ic=terms["contact_ic"],
+                    interface=terms["interface"], data=terms["contact_data"],
+                    lambda_pde=lambda_pde, lambda_data=lambda_data,
+                    contact_data_weight=self.config.contact_data_weight,
+                ))
         contact_total = _summarise(contact_results, batches[0][1].t_ic)
         if not bool(torch.isfinite(contact_total.total)):
             raise TrainingError("ContactNet loss is not finite")
@@ -569,6 +591,9 @@ class AlternatingTrainer:
         self._clip()
         self.opt_contact.step()
         self._restore_if_changed(self.air_net, air_before, "AirNet")
+        self.last_contact_terms = terms_by_case
+        if return_terms:
+            return contact_total, terms_by_case
         return contact_total
 
     def effective_learning_rates(self) -> dict[str, float]:

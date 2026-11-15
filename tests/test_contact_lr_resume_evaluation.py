@@ -92,6 +92,35 @@ def test_common_mask_counts_exclusions_and_empty_sets():
     )
     assert empty["status"] == "not_evaluable"
     assert empty["mse"] is None
+    all_nonfinite = evaluation._field_metrics(
+        np.array([np.nan, np.nan]), np.array([1.0, 2.0]),
+        np.array([True, True]), 1.0,
+    )
+    assert all_nonfinite["status"] == "not_evaluable"
+    assert all_nonfinite["n_nonfinite"] == 2
+    partial = evaluation._field_metrics(
+        np.array([1.0, np.nan]), np.array([1.0, 2.0]),
+        np.array([True, True]), 1.0,
+    )
+    assert partial["status"] == "ok"
+    assert partial["n"] == 1
+    assert partial["n_nonfinite"] == 1
+
+
+def test_incomplete_fixed_physics_is_not_reported_as_ok():
+    rows = [{
+        "role": "train",
+        "counts": {"A": {"common_interior": 10}},
+        "residuals": {"A": {
+            "status": "incomplete_nonfinite", "n": 8,
+            "n_nonfinite": 2, "mass": 1.0, "momentum": 1.0,
+            "energy": 1.0,
+        }},
+    }]
+    aggregate = evaluation._aggregate_physics_rows(rows, "A")
+    assert aggregate["status"] == "incomplete_nonfinite"
+    assert aggregate["n_nonfinite"] == 2
+    assert aggregate["n_candidates"] == 10
 
 
 def _analytic():

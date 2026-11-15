@@ -170,6 +170,14 @@
   不能只信源文件 `ok=true`。参考帧数从记录计算，分别报告独立集合与累计评估点；
   共同 A 标签只作补充，不作为 B 优劣的独立否决条件。
 
+- `scripts/run_contact_objective_ablation.py` 是诊断专用的 ContactNet 目标
+  消融：`contact_update(objective="contact_data_only")` 只把
+  `lambda_data * contact_data_weight * L_contact_data` 放入反传目标；
+  PDE/IC/interface 仍计算并逐 step 记录，但不参与反传。默认
+  `objective="full"` 不变；不得把该模式设为正式训练默认，不得用于模型选择。
+  它仍使用正式随机接触采样，不替换成全标签，不取区间中点。`AirNet` 阶段
+  完全复用正式实现；ContactNet 阶段保持梯度隔离和两个优化器历史。
+
 - `scripts/contact_fullcontact_pair.py --analysis direction` 是实际 Adam 方向
   诊断（汇总 `scripts/summarize_contact_adam_direction.py`）：每个检查点/种子
   固定 20 个独立配对单步，沿用 B 全标签路径。记录四项加权梯度及总和、真实
