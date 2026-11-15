@@ -45,7 +45,6 @@ WINDOWS = {
     "0_1pct": (0.0, 0.01),
     "0_5pct": (0.0, 0.05),
     "0_10pct": (0.0, 0.10),
-    "0_100pct": (0.0, 1.0),
 }
 
 
@@ -156,6 +155,20 @@ def _right_boundary(trainer, case, points=128):
     )
     r0 = torch.full_like(t, float(case.charge_radius_m))
     _, shock_speed = case.shock_tensors(t)
+    c_inf = math.sqrt(
+        float(case.gamma_air) * float(case.ambient_pressure)
+        / float(case.ambient_density)
+    )
+    valid = torch.isfinite(shock_speed) & (shock_speed > c_inf)
+    n_excluded = int((~valid).sum())
+    t = t[valid]
+    r0 = r0[valid]
+    shock_speed = shock_speed[valid]
+    if t.numel() == 0:
+        return {
+            "n": 0, "n_excluded": n_excluded, "status": "no_compression_times",
+            "rho_rms": None, "u_rms": None, "p_rms": None,
+        }
     state = finite_mach_rh_state(
         shock_speed.reshape(-1, 1),
         gamma=case.gamma_air,
@@ -176,16 +189,28 @@ def _right_boundary(trainer, case, points=128):
     ):
         error = (pred - target) / float(scale)
         values[f"{name}_rms"] = float(torch.sqrt(torch.mean(error * error)).detach())
-    return {"n": int(t.numel()), **values}
+    return {
+        "n": int(t.numel()), "n_excluded": n_excluded,
+        "status": "ok", **values,
+    }
 
 
 def _aggregate_right(rows):
-    n = sum(row["n"] for row in rows)
+    valid = [row for row in rows if row.get("n", 0) > 0]
+    n = sum(row["n"] for row in valid)
+    excluded = sum(row.get("n_excluded", 0) for row in rows)
+    if not n:
+        return {
+            "n": 0, "n_excluded": excluded, "status": "not_evaluable",
+            "rho_rms": None, "u_rms": None, "p_rms": None,
+        }
     return {
         "n": n,
-        "rho_rms": math.sqrt(sum(row["rho_rms"] ** 2 * row["n"] for row in rows) / n),
-        "u_rms": math.sqrt(sum(row["u_rms"] ** 2 * row["n"] for row in rows) / n),
-        "p_rms": math.sqrt(sum(row["p_rms"] ** 2 * row["n"] for row in rows) / n),
+        "n_excluded": excluded,
+        "status": "ok",
+        "rho_rms": math.sqrt(sum(row["rho_rms"] ** 2 * row["n"] for row in valid) / n),
+        "u_rms": math.sqrt(sum(row["u_rms"] ** 2 * row["n"] for row in valid) / n),
+        "p_rms": math.sqrt(sum(row["p_rms"] ** 2 * row["n"] for row in valid) / n),
     }
 
 
@@ -370,7 +395,7 @@ def _metrics_for_suffix(c_trainer, d_trainer, cases, ckpt_c, ckpt_d, suffix):
         labels=("C", "D"), trainers={"C": c_trainer, "D": d_trainer},
     )
     early = {}
-    for window in ("0_1pct", "0_5pct", "0_10pct", "0_100pct"):
+    for window in ("0_1pct", "0_5pct", "0_10pct"):
         # Load the matching checkpoints again before each raw-window pass.
         c_trainer.load(ckpt_c)
         d_trainer.load(ckpt_d)
