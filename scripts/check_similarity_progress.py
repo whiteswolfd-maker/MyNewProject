@@ -103,15 +103,56 @@ def _event_progress(raw_event_time, t0, time_scale, offset):
     return float((raw_event_time + offset - t0) / time_scale)
 
 
+def _gap_context(times, lower, upper, gap, gap_limit):
+    diffs = np.diff(times)
+    prev_gap = (
+        float(times[lower] - times[lower - 1]) if lower > 0 else None
+    )
+    next_gap = (
+        float(times[upper + 1] - times[upper])
+        if upper + 1 < times.size else None
+    )
+    if gap <= gap_limit:
+        kind = "regular"
+    elif prev_gap is None or next_gap is None:
+        kind = "terminal_gap"
+    else:
+        repeated = int(np.count_nonzero(
+            np.isclose(diffs, gap, rtol=1.0e-3, atol=0.0)
+        ))
+        neighbor = float(np.median([prev_gap, next_gap]))
+        if repeated >= 3:
+            kind = "sparse_output_cadence"
+        elif neighbor > 0.0 and gap > 3.0 * neighbor:
+            kind = "isolated_missing_frame"
+        else:
+            kind = "large_gap_unclassified"
+    return {
+        "gap_kind": kind,
+        "prev_gap": prev_gap,
+        "next_gap": next_gap,
+        "gap_repeat_count": int(np.count_nonzero(
+            np.isclose(diffs, gap, rtol=1.0e-3, atol=0.0)
+        )) if gap is not None and np.isfinite(gap) else None,
+    }
+
+
 def _bracket(theta, times):
     """Bracket a query without endpoint extrapolation or unchecked gaps."""
     times = np.asarray(times, dtype=np.float64)
+    empty_context = {
+        "gap_kind": None,
+        "prev_gap": None,
+        "next_gap": None,
+        "gap_repeat_count": None,
+    }
     if times.size < 2:
         return {
             "supported": False, "reason": "insufficient_points",
             "lower_index": None, "upper_index": None,
             "lower_theta": None, "upper_theta": None,
             "gap": None, "gap_limit": None,
+            **empty_context,
         }
     if theta < times[0] or theta > times[-1]:
         return {
@@ -119,6 +160,7 @@ def _bracket(theta, times):
             "lower_index": None, "upper_index": None,
             "lower_theta": float(times[0]), "upper_theta": float(times[-1]),
             "gap": None, "gap_limit": None,
+            **empty_context,
         }
     index = int(np.searchsorted(times, theta))
     if index < times.size and times[index] == theta:
@@ -129,6 +171,7 @@ def _bracket(theta, times):
         upper = min(index, times.size - 1)
         gap = float(times[upper] - times[lower])
     gap_limit = GAP_FACTOR * float(np.median(np.diff(times)))
+    context = _gap_context(times, lower, upper, gap, gap_limit)
     if gap > gap_limit:
         return {
             "supported": False, "reason": "large_gap",
@@ -136,6 +179,7 @@ def _bracket(theta, times):
             "lower_theta": float(times[lower]),
             "upper_theta": float(times[upper]),
             "gap": gap, "gap_limit": gap_limit,
+            **context,
         }
     return {
         "supported": True, "reason": "ok",
@@ -143,8 +187,8 @@ def _bracket(theta, times):
         "lower_theta": float(times[lower]),
         "upper_theta": float(times[upper]),
         "gap": gap, "gap_limit": gap_limit,
+        **context,
     }
-
 
 def _interp_series(theta, times, values, valid=None):
     """Interpolate one series only inside its valid support."""
@@ -180,29 +224,103 @@ def _interp_series(theta, times, values, valid=None):
 
 
 def _interp_field_at_radius(radius, values, valid, r_norm):
-    """One field at one frame; invalid points are removed per field."""
+    """One field at one frame, preserving original point adjacency.
+
+    A query may interpolate only between two adjacent valid points in the
+    original radial ordering.  It never jumps over an invalid point or
+    extrapolates beyond the stored radius range.
+    """
     radius = np.asarray(radius, dtype=np.float64)
     values = np.asarray(values, dtype=np.float64)
-    keep = np.asarray(valid, dtype=bool) & np.isfinite(radius) & np.isfinite(values)
-    if int(keep.sum()) < 2:
+    valid = np.asarray(valid, dtype=bool)
+    if radius.size != values.size or radius.size != valid.size:
+        return {
+            "supported": False, "reason": "array_size_mismatch",
+            "value": None, "radius_min": None, "radius_max": None,
+        }
+    order = np.argsort(radius)
+    radius = radius[order]
+    values = values[order]
+    valid = valid[order]
+    usable = valid & np.isfinite(radius) & np.isfinite(values)
+    if int(usable.sum()) < 2:
         return {
             "supported": False, "reason": "insufficient_valid_points",
             "value": None,
+            "radius_min": (
+                float(radius[usable].min()) if usable.any() else None
+            ),
+            "radius_max": (
+                float(radius[usable].max()) if usable.any() else None
+            ),
         }
-    use_radius = radius[keep]
-    use_values = values[keep]
-    order = np.argsort(use_radius)
-    use_radius = use_radius[order]
-    use_values = use_values[order]
-    if r_norm < use_radius[0] or r_norm > use_radius[-1]:
+    if r_norm < radius[0] or r_norm > radius[-1]:
         return {
             "supported": False, "reason": "outside_field_radius",
             "value": None,
+            "radius_min": float(radius[usable].min()),
+            "radius_max": float(radius[usable].max()),
         }
+    index = int(np.searchsorted(radius, r_norm))
+    if index < radius.size and radius[index] == r_norm:
+        if not usable[index]:
+            return {
+                "supported": False, "reason": "query_on_invalid_point",
+                "value": None,
+                "radius_min": float(radius[usable].min()),
+                "radius_max": float(radius[usable].max()),
+                "bracket_lower_index": int(index),
+                "bracket_upper_index": int(index),
+                "bracket_lower_radius": float(radius[index]),
+                "bracket_upper_radius": float(radius[index]),
+            }
+        return {
+            "supported": True, "reason": "ok",
+            "value": float(values[index]),
+            "radius_min": float(radius[usable].min()),
+            "radius_max": float(radius[usable].max()),
+            "bracket_lower_index": int(index),
+            "bracket_upper_index": int(index),
+            "bracket_lower_radius": float(radius[index]),
+            "bracket_upper_radius": float(radius[index]),
+            "n_valid": int(usable.sum()),
+        }
+    lower = index - 1
+    upper = index
+    if lower < 0 or upper >= radius.size:
+        return {
+            "supported": False, "reason": "outside_field_radius",
+            "value": None,
+            "radius_min": float(radius[usable].min()),
+            "radius_max": float(radius[usable].max()),
+        }
+    if not usable[lower] or not usable[upper]:
+        return {
+            "supported": False, "reason": "spans_invalid_point",
+            "value": None,
+            "radius_min": float(radius[usable].min()),
+            "radius_max": float(radius[usable].max()),
+            "bracket_lower_index": int(lower),
+            "bracket_upper_index": int(upper),
+            "bracket_lower_radius": float(radius[lower]),
+            "bracket_upper_radius": float(radius[upper]),
+            "lower_valid": bool(usable[lower]),
+            "upper_valid": bool(usable[upper]),
+            "n_valid": int(usable.sum()),
+        }
+    weight = (r_norm - radius[lower]) / (radius[upper] - radius[lower])
     return {
         "supported": True, "reason": "ok",
-        "value": float(np.interp(r_norm, use_radius, use_values)),
-        "n_valid": int(keep.sum()),
+        "value": float((1.0 - weight) * values[lower] + weight * values[upper]),
+        "radius_min": float(radius[usable].min()),
+        "radius_max": float(radius[usable].max()),
+        "bracket_lower_index": int(lower),
+        "bracket_upper_index": int(upper),
+        "bracket_lower_radius": float(radius[lower]),
+        "bracket_upper_radius": float(radius[upper]),
+        "lower_valid": True,
+        "upper_valid": True,
+        "n_valid": int(usable.sum()),
     }
 
 
@@ -240,6 +358,7 @@ class CaseData1D:
         self.frame_theta = np.asarray(self.frame_theta, dtype=np.float64)
         order = np.argsort(self.frame_theta)
         self.frame_theta = self.frame_theta[order]
+        self.frame_ids = self.frame_ids[order]
         self.frame_radius = [self.frame_radius[index] for index in order]
         self.frame_values = [self.frame_values[index] for index in order]
         self.frame_valid = [self.frame_valid[index] for index in order]
@@ -345,13 +464,17 @@ class CaseData1D:
                     self.frame_valid[upper][field], r_norm,
                 )
             if not first["supported"] or not second["supported"]:
+                detail = first if not first["supported"] else second
                 result[field] = {
                     "supported": False, "value": None,
-                    "reason": (
-                        first["reason"] if not first["supported"]
-                        else second["reason"]
-                    ),
+                    "reason": detail["reason"],
                     "bracket": bracket,
+                    "frame_id_lower": int(self.frame_ids[lower]),
+                    "frame_id_upper": int(self.frame_ids[upper]),
+                    "radius_min": detail.get("radius_min"),
+                    "radius_max": detail.get("radius_max"),
+                    "bracket_lower_radius": detail.get("bracket_lower_radius"),
+                    "bracket_upper_radius": detail.get("bracket_upper_radius"),
                 }
                 continue
             if upper == lower:
@@ -370,8 +493,29 @@ class CaseData1D:
                 "bracket": bracket,
                 "lower_frame": int(lower),
                 "upper_frame": int(upper),
+                "frame_id_lower": int(self.frame_ids[lower]),
+                "frame_id_upper": int(self.frame_ids[upper]),
                 "n_valid_lower": first.get("n_valid"),
                 "n_valid_upper": second.get("n_valid"),
+                "n_valid": min(
+                    value for value in (
+                        first.get("n_valid"), second.get("n_valid")
+                    ) if value is not None
+                ),
+                "lower_valid": True,
+                "upper_valid": True,
+                "radius_min": min(
+                    value for value in (
+                        first.get("radius_min"), second.get("radius_min")
+                    ) if value is not None
+                ),
+                "radius_max": max(
+                    value for value in (
+                        first.get("radius_max"), second.get("radius_max")
+                    ) if value is not None
+                ),
+                "bracket_lower_radius": first.get("bracket_lower_radius"),
+                "bracket_upper_radius": second.get("bracket_upper_radius"),
             }
         return result
 
@@ -401,48 +545,62 @@ def _curve_metrics(curves):
         ])
         for name in names
     }
-    complete = np.all([
-        np.all(np.isfinite(arrays[name]), axis=0) for name in names
-    ], axis=0)
     result = {
         "n_theta_total": int(theta.size),
-        "n_theta_complete": int(complete.sum()),
-        "complete_theta_fraction": (
-            float(complete.sum() / theta.size) if theta.size else None
-        ),
+        "theta_counts": {},
     }
-    if not complete.any():
-        return result
-    metrics = {}
     for name, values in arrays.items():
-        values = values[:, complete]
-        median = np.median(values, axis=0)
-        spread = values.max(axis=0) - values.min(axis=0)
+        complete = np.all(np.isfinite(values), axis=0)
+        result["theta_counts"][name] = {
+            "n_complete": int(complete.sum()),
+            "fraction": (
+                float(complete.sum() / theta.size) if theta.size else None
+            ),
+        }
+        if not complete.any():
+            result[name] = None
+            continue
+        subset = values[:, complete]
+        median = np.median(subset, axis=0)
+        spread = subset.max(axis=0) - subset.min(axis=0)
         per_case = {}
         for index, row in enumerate(curves):
-            deviation = values[index] - median
+            deviation = subset[index] - median
             per_case[row["case_id"]] = {
                 "rms": float(np.sqrt(np.mean(deviation * deviation))),
                 "max_abs": float(np.max(np.abs(deviation))),
                 "mean": float(np.mean(deviation)),
             }
-        metrics[name] = {
+        result[name] = {
+            "n_complete": int(complete.sum()),
             "spread_median": _median(spread),
             "spread_p90": _percentile(spread, 90),
             "spread_max": float(np.max(spread)),
             "per_case": per_case,
         }
-    low = arrays["contact_low_over_Rsep"][:, complete]
-    up = arrays["contact_up_over_Rsep"][:, complete]
-    envelope = up.max(axis=0) - low.min(axis=0)
-    result.update(metrics)
-    result["contact_envelope"] = {
-        "median": _median(envelope),
-        "p90": _percentile(envelope, 90),
-        "max": float(np.max(envelope)),
+    contact_complete = (
+        np.all(np.isfinite(arrays["contact_low_over_Rsep"]), axis=0)
+        & np.all(np.isfinite(arrays["contact_up_over_Rsep"]), axis=0)
+    )
+    result["theta_counts"]["contact_envelope"] = {
+        "n_complete": int(contact_complete.sum()),
+        "fraction": (
+            float(contact_complete.sum() / theta.size) if theta.size else None
+        ),
     }
+    if contact_complete.any():
+        low = arrays["contact_low_over_Rsep"][:, contact_complete]
+        up = arrays["contact_up_over_Rsep"][:, contact_complete]
+        envelope = up.max(axis=0) - low.min(axis=0)
+        result["contact_envelope"] = {
+            "n_complete": int(contact_complete.sum()),
+            "median": _median(envelope),
+            "p90": _percentile(envelope, 90),
+            "max": float(np.max(envelope)),
+        }
+    else:
+        result["contact_envelope"] = None
     return result
-
 
 def _window_aggregate(rows, key):
     values = [
@@ -460,32 +618,66 @@ def _window_aggregate(rows, key):
 def _aggregate_windows(rows):
     out = {}
     for low, high in WINDOWS:
-        subset = [
-            row for row in rows
-            if low <= row["theta"] < high and row["complete"]
-        ]
-        entry = {"n_complete": len(subset)}
+        subset = [row for row in rows if low <= row["theta"] < high]
+        entry = {"n_queries": len(subset)}
         for key in (
             "contact_low_spread", "contact_up_spread", "contact_envelope",
             "shock_spread", "common_width",
-            "rho_relstd", "u_relstd", "p_relstd",
-            "rho_std", "u_std", "p_std",
         ):
             entry[key] = _window_aggregate(subset, key)
+        for field in FIELDS:
+            complete_rows = [
+                row for row in subset
+                if row["fields"][field].get("complete", False)
+            ]
+            entry[field] = {
+                "n_complete": len(complete_rows),
+                "std": _window_aggregate(complete_rows, f"{field}_std"),
+                "relstd": _window_aggregate(complete_rows, f"{field}_relstd"),
+            }
         out[f"{low:g}-{high:g}"] = entry
     return out
 
-
-def _record_missing(missing, group, theta, q, case_id, field, reason):
-    missing.append({
+def _record_missing(missing, group, theta, q, case_id, field, reason,
+                    evidence=None, **details):
+    row = {
         "group": group,
         "theta": float(theta),
         "q": None if q is None else float(q),
         "case_id": case_id,
         "field": field,
         "reason": reason,
-    })
+        "gap_kind": details.get("gap_kind"),
+    }
+    missing.append(row)
+    if evidence is not None:
+        evidence.append({
+            "group": group,
+            "theta": float(theta),
+            "q": None if q is None else float(q),
+            "kind": "contact" if field in ("contact_low", "contact_up")
+                    else ("shock" if field == "shock" else "air"),
+            "case_id": case_id,
+            "field": field,
+            "supported": False,
+            "reason": reason,
+            **details,
+        })
 
+
+def _record_support(evidence, group, theta, q, kind, case_id, field,
+                    supported, reason, **details):
+    evidence.append({
+        "group": group,
+        "theta": float(theta),
+        "q": None if q is None else float(q),
+        "kind": kind,
+        "case_id": case_id,
+        "field": field,
+        "supported": bool(supported),
+        "reason": reason,
+        **details,
+    })
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -503,10 +695,11 @@ def main(argv=None) -> int:
     }
     thetas = _theta_grid()
     missing = []
+    evidence = []
 
     payload = {
         "format": "spherical_blast_pinn.similarity_progress_check",
-        "version": 2,
+        "version": 3,
         "config": C_CONFIG,
         "config_sha256": _sha256(Path(C_CONFIG)),
         "coordinate": {
@@ -543,17 +736,45 @@ def main(argv=None) -> int:
                 shock.append(s["value"] if s["supported"] else None)
                 low.append(c["low"]["value"] if c["low"]["supported"] else None)
                 up.append(c["up"]["value"] if c["up"]["supported"] else None)
-                if not s["supported"]:
+                shock_details = {
+                    "lower_theta": s.get("lower_theta"),
+                    "upper_theta": s.get("upper_theta"),
+                    "gap": s.get("gap"),
+                    "gap_limit": s.get("gap_limit"),
+                    "gap_kind": s.get("gap_kind"),
+                }
+                if s["supported"]:
+                    _record_support(
+                        evidence, group_name, theta, None, "shock",
+                        data.case.case_id, "shock", True, "ok",
+                        **shock_details,
+                    )
+                else:
                     _record_missing(
                         missing, group_name, theta, None,
                         data.case.case_id, "shock", s["reason"],
+                        evidence=evidence, **shock_details,
                     )
                 for field, result in (("contact_low", c["low"]),
                                       ("contact_up", c["up"])):
-                    if not result["supported"]:
+                    details = {
+                        "lower_theta": result.get("lower_theta"),
+                        "upper_theta": result.get("upper_theta"),
+                        "gap": result.get("gap"),
+                        "gap_limit": result.get("gap_limit"),
+                        "gap_kind": result.get("gap_kind"),
+                    }
+                    if result["supported"]:
+                        _record_support(
+                            evidence, group_name, theta, None, "contact",
+                            data.case.case_id, field, True, "ok",
+                            **details,
+                        )
+                    else:
                         _record_missing(
                             missing, group_name, theta, None,
                             data.case.case_id, field, result["reason"],
+                            evidence=evidence, **details,
                         )
             curves.append({
                 "case_id": data.case.case_id,
@@ -591,44 +812,46 @@ def main(argv=None) -> int:
             for q in Q_FRACTIONS:
                 r_norm = common_low + float(q) * width
                 field_values = {field: [] for field in FIELDS}
-                missing_here = []
                 for data in cases:
                     values = data.fields(theta, r_norm)
                     for field in FIELDS:
                         result = values[field]
-                        if not result["supported"]:
-                            missing_here.append((data.case.case_id, field))
+                        bracket = result.get("bracket", {})
+                        details = {
+                            "r_over_Rsep": float(r_norm),
+                            "frame_id_lower": result.get("frame_id_lower"),
+                            "frame_id_upper": result.get("frame_id_upper"),
+                            "lower_theta": bracket.get("lower_theta"),
+                            "upper_theta": bracket.get("upper_theta"),
+                            "gap": bracket.get("gap"),
+                            "gap_limit": bracket.get("gap_limit"),
+                            "gap_kind": bracket.get("gap_kind"),
+                            "radius_min": result.get("radius_min"),
+                            "radius_max": result.get("radius_max"),
+                            "bracket_lower_radius": result.get(
+                                "bracket_lower_radius"
+                            ),
+                            "bracket_upper_radius": result.get(
+                                "bracket_upper_radius"
+                            ),
+                            "n_valid": result.get("n_valid"),
+                            "lower_valid": result.get("lower_valid"),
+                            "upper_valid": result.get("upper_valid"),
+                        }
+                        if result["supported"]:
+                            field_values[field].append(result["value"])
+                            _record_support(
+                                evidence, group_name, theta, q, "air",
+                                data.case.case_id, field, True, "ok",
+                                **details,
+                            )
+                        else:
                             _record_missing(
                                 missing, group_name, theta, q,
                                 data.case.case_id, field, result["reason"],
+                                evidence=evidence, **details,
                             )
-                        else:
-                            field_values[field].append(result["value"])
-                complete = (
-                    not missing_here
-                    and all(len(field_values[field]) == len(cases)
-                            for field in FIELDS)
-                )
-                if not complete:
-                    continue
-                arrays = {
-                    field: np.asarray(field_values[field], dtype=np.float64)
-                    for field in FIELDS
-                }
-                means = {
-                    field: float(arrays[field].mean()) for field in FIELDS
-                }
-                stds = {
-                    field: float(arrays[field].std()) for field in FIELDS
-                }
-                relative = {
-                    field: (
-                        stds[field] / abs(means[field])
-                        if abs(means[field]) > 1e-12 else None
-                    )
-                    for field in FIELDS
-                }
-                rows.append({
+                row = {
                     "theta": float(theta),
                     "q": float(q),
                     "r_over_Rsep": float(r_norm),
@@ -637,17 +860,50 @@ def main(argv=None) -> int:
                     "contact_up_spread": float(up.max() - up.min()),
                     "contact_envelope": float(up.max() - low.min()),
                     "shock_spread": float(shock.max() - shock.min()),
-                    "complete": True,
-                    "rho_mean": means["rho"],
-                    "u_mean": means["u"],
-                    "p_mean": means["p"],
-                    "rho_std": stds["rho"],
-                    "u_std": stds["u"],
-                    "p_std": stds["p"],
-                    "rho_relstd": relative["rho"],
-                    "u_relstd": relative["u"],
-                    "p_relstd": relative["p"],
-                })
+                    "fields": {},
+                }
+                for field in FIELDS:
+                    values = np.asarray(field_values[field], dtype=np.float64)
+                    if values.size != len(cases):
+                        row["fields"][field] = {
+                            "complete": False,
+                            "n_valid": int(values.size),
+                        }
+                        continue
+                    mean = float(values.mean())
+                    std = float(values.std())
+                    relative = std / abs(mean) if abs(mean) > 1e-12 else None
+                    row[f"{field}_mean"] = mean
+                    row[f"{field}_std"] = std
+                    row[f"{field}_relstd"] = relative
+                    row["fields"][field] = {
+                        "complete": True,
+                        "n_valid": int(values.size),
+                        "mean": mean,
+                        "std": std,
+                        "relstd": relative,
+                    }
+                rows.append(row)
+
+        theta_q_total = len(thetas) * len(Q_FRACTIONS)
+        field_query_counts = {}
+        for field in FIELDS:
+            complete = sum(
+                1 for row in rows if row["fields"][field]["complete"]
+            )
+            field_query_counts[field] = {
+                "n_complete": int(complete),
+                "n_total": int(theta_q_total),
+                "fraction": (
+                    float(complete / theta_q_total)
+                    if theta_q_total else None
+                ),
+            }
+        query_counts = {
+            "theta_count": int(len(thetas)),
+            "theta_q_count": int(theta_q_total),
+            "field_complete": field_query_counts,
+        }
 
         grid = [
             data.grid_dr_over_Rsep for data in cases
@@ -662,6 +918,8 @@ def main(argv=None) -> int:
             "cases": [],
             "curves": curves,
             "curve_metrics": curve_metrics,
+            "query_counts": query_counts,
+            "theta_counts": curve_metrics["theta_counts"],
             "field_windows": _aggregate_windows(rows),
             "field_rows": rows,
             "resolution": {
@@ -756,23 +1014,35 @@ def main(argv=None) -> int:
                 if window["shock_spread"]["median"] is not None
                 and contact_width else None
             ),
-            "late_rho_relative_std_median": window["rho_relstd"]["median"],
-            "late_u_relative_std_median": window["u_relstd"]["median"],
-            "late_p_relative_std_median": window["p_relstd"]["median"],
+            "late_rho_relative_std_median": window["rho"]["relstd"]["median"],
+            "late_u_relative_std_median": window["u"]["relstd"]["median"],
+            "late_p_relative_std_median": window["p"]["relstd"]["median"],
             "contact_width": contact_width,
         }
 
+    from collections import Counter
     payload["missing"] = missing
+    payload["query_evidence_count"] = len(evidence)
     payload["completeness"] = {
         "expected_cases_per_group": {
             name: len(group["expected_case_ids"])
             for name, group in payload["groups"].items()
         },
-        "missing_count": len(missing),
-        "missing_by_group": {
+        "failed_query_field_count": len(missing),
+        "failed_query_field_by_group": {
             name: sum(1 for item in missing if item["group"] == name)
             for name in payload["groups"]
         },
+        "failed_query_field_by_field": dict(Counter(
+            item["field"] for item in missing
+        )),
+        "failed_query_field_by_reason": dict(Counter(
+            item["reason"] for item in missing
+        )),
+        "failed_query_field_by_gap_kind": dict(Counter(
+            item.get("gap_kind") for item in missing
+            if item.get("gap_kind") is not None
+        )),
         "complete": len(missing) == 0,
     }
     if missing:
@@ -809,34 +1079,72 @@ def main(argv=None) -> int:
 
     field_path = output / "field_spread.csv"
     with field_path.open("w", newline="", encoding="utf-8") as handle:
-        sample = next(
-            (group["field_rows"][0] for group in payload["groups"].values()
-             if group["field_rows"]),
-            None,
-        )
-        fieldnames = ["role"] + (list(sample) if sample else [])
+        fieldnames = [
+            "role", "theta", "q", "r_over_Rsep", "common_width",
+            "contact_low_spread", "contact_up_spread", "contact_envelope",
+            "shock_spread", "field", "complete", "n_valid",
+            "mean", "std", "relstd",
+        ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for group_name, group in payload["groups"].items():
             for row in group["field_rows"]:
-                writer.writerow({"role": group_name, **row})
+                for field in FIELDS:
+                    detail = row["fields"][field]
+                    writer.writerow({
+                        "role": group_name,
+                        "theta": row["theta"],
+                        "q": row["q"],
+                        "r_over_Rsep": row["r_over_Rsep"],
+                        "common_width": row["common_width"],
+                        "contact_low_spread": row["contact_low_spread"],
+                        "contact_up_spread": row["contact_up_spread"],
+                        "contact_envelope": row["contact_envelope"],
+                        "shock_spread": row["shock_spread"],
+                        "field": field,
+                        "complete": detail["complete"],
+                        "n_valid": detail.get("n_valid"),
+                        "mean": detail.get("mean"),
+                        "std": detail.get("std"),
+                        "relstd": detail.get("relstd"),
+                    })
 
     missing_path = output / "missing.csv"
     with missing_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=["group", "theta", "q", "case_id", "field", "reason"],
+            fieldnames=[
+                "group", "theta", "q", "case_id", "field", "reason",
+                "gap_kind",
+            ],
         )
         writer.writeheader()
         for row in missing:
             writer.writerow(row)
 
+    evidence_path = output / "query_evidence.csv"
+    evidence_fields = [
+        "group", "theta", "q", "kind", "case_id", "field", "supported",
+        "reason", "r_over_Rsep", "frame_id_lower", "frame_id_upper",
+        "lower_theta", "upper_theta", "gap", "gap_limit", "gap_kind",
+        "radius_min", "radius_max", "bracket_lower_radius",
+        "bracket_upper_radius", "n_valid", "lower_valid", "upper_valid",
+    ]
+    with evidence_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=evidence_fields)
+        writer.writeheader()
+        for row in evidence:
+            writer.writerow({key: row.get(key) for key in evidence_fields})
+
     print(json.dumps({
         "wrote": str(json_path),
         "diagnostic_status": payload["assessment"]["status"],
         "complete": payload["completeness"]["complete"],
-        "missing_count": len(missing),
-        "missing_by_group": payload["completeness"]["missing_by_group"],
+        "failed_query_field_count": len(missing),
+        "failed_query_field_by_group": payload["completeness"]["failed_query_field_by_group"],
+        "failed_query_field_by_field": payload["completeness"]["failed_query_field_by_field"],
+        "failed_query_field_by_reason": payload["completeness"]["failed_query_field_by_reason"],
+        "failed_query_field_by_gap_kind": payload["completeness"]["failed_query_field_by_gap_kind"],
         "train_indicators": payload["groups"]["train"]["indicators"],
         "validation_indicators": payload["groups"]["validation"]["indicators"],
     }, indent=2, default=_jsonable))
