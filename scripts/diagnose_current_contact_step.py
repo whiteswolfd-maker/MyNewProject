@@ -224,6 +224,29 @@ def _trial(trainer, checkpoint, labels, seed, trial):
     }
 
 
+def _status_reasons(payload) -> list[str]:
+    """Every trial status, not only the checkpoint unchanged flag."""
+    reasons: list[str] = []
+    for tag, entry in payload.get("checkpoints", {}).items():
+        if not entry.get("unchanged", False):
+            reasons.append(f"{tag}: checkpoint SHA-256 changed")
+        trials = entry.get("trials", [])
+        if not trials:
+            reasons.append(f"{tag}: no trials recorded")
+        failed = [
+            row for row in trials
+            if row.get("status") != "ok"
+            or not row.get("finite_gradients", False)
+            or not row.get("air_frozen_during_contact", False)
+            or not row.get("contact_restored_after_evaluation", False)
+        ]
+        if failed:
+            reasons.append(
+                f"{tag}: {len(failed)}/{len(trials)} trial status failed"
+            )
+    return reasons
+
+
 def _summary(rows):
     keys = (
         "J_improves", "C_improves", "J_and_C_improve",
@@ -321,6 +344,11 @@ def main(argv=None) -> int:
                 ]) for seed in SEEDS
             },
             "combined": _summary([record for _, record in rows]),
+            "status_counts": {
+                status: sum(1 for _, record in rows
+                            if record.get("status") == status)
+                for status in ("ok", "failed")
+            },
             "trials": [
                 {"seed": seed, **record} for seed, record in rows
             ],
@@ -329,9 +357,8 @@ def main(argv=None) -> int:
         if before != after:
             raise RuntimeError(f"{checkpoint}: checkpoint changed")
     payload["elapsed_s"] = time.perf_counter() - started
-    payload["status"] = "ok" if all(
-        entry["unchanged"] for entry in payload["checkpoints"].values()
-    ) else "failed"
+    payload["failure_reasons"] = _status_reasons(payload)
+    payload["status"] = "ok" if not payload["failure_reasons"] else "failed"
     output_file = output / "diagnostic.json"
     output_file.write_text(
         json.dumps(payload, indent=2, default=diag._jsonable),
