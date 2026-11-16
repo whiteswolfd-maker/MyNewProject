@@ -20,6 +20,7 @@ def _load(name):
 step = _load("diagnose_current_contact_step")
 decomposition = _load("diagnose_current_contact_update_decomposition")
 first_moment = _load("diagnose_current_contact_first_moment_control")
+multistep = _load("run_first_moment_multistep_control")
 
 
 def _payload(status="ok", *, unchanged=True, finite=True,
@@ -86,3 +87,20 @@ def test_first_moment_rejects_nonstandard_adam():
         changed[key] = 0.1 if key == "weight_decay" else True
         supported, unsupported = first_moment._optimizer_supported(changed)
         assert not supported and unsupported == [key]
+
+
+def test_multistep_failed_pair_propagates():
+    payload = {
+        "pairs": [{
+            "checkpoint": "best", "sample_seed": 1, "status": "failed",
+            "error": "state mismatch",
+        }],
+        "checkpoint_hashes": {"unchanged": True},
+    }
+    reasons = multistep._status_reasons(payload)
+    assert any("state mismatch" in reason for reason in reasons)
+
+
+def test_multistep_nonfinite_tree_detects_nan():
+    assert multistep._finite_tree({"ok": [1.0, 2.0]})
+    assert not multistep._finite_tree({"bad": [1.0, float("nan")]})
