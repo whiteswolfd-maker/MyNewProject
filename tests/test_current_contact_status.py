@@ -19,6 +19,7 @@ def _load(name):
 
 step = _load("diagnose_current_contact_step")
 decomposition = _load("diagnose_current_contact_update_decomposition")
+first_moment = _load("diagnose_current_contact_first_moment_control")
 
 
 def _payload(status="ok", *, unchanged=True, finite=True,
@@ -65,3 +66,23 @@ def test_nonfinite_or_unrestored_trial_is_a_failure():
         payload = _payload(**kwargs)
         assert step._status_reasons(payload)
         assert decomposition._status_reasons(payload)
+
+
+def test_first_moment_failed_trial_propagates():
+    payload = _payload("failed")
+    reasons = first_moment._status_reasons(payload)
+    assert any("trial status failed" in reason for reason in reasons)
+
+
+def test_first_moment_rejects_nonstandard_adam():
+    standard = {
+        "lr": 1.0e-4, "betas": (0.9, 0.999), "eps": 1.0e-8,
+        "weight_decay": 0.0, "amsgrad": False, "maximize": False,
+    }
+    supported, unsupported = first_moment._optimizer_supported(standard)
+    assert supported and unsupported == []
+    for key in ("weight_decay", "amsgrad", "maximize"):
+        changed = dict(standard)
+        changed[key] = 0.1 if key == "weight_decay" else True
+        supported, unsupported = first_moment._optimizer_supported(changed)
+        assert not supported and unsupported == [key]
