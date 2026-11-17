@@ -1,6 +1,7 @@
 """Regression tests for the read-only similarity-progress diagnostic."""
 from __future__ import annotations
 
+import csv
 import importlib.util
 import math
 from pathlib import Path
@@ -50,6 +51,82 @@ def test_bracket_rejects_extrapolation_and_unchecked_large_gap():
     gap = sim._bracket(30.0, [10.0, 11.0, 12.0, 50.0])
     assert gap["supported"] is False
     assert gap["reason"] == "large_gap"
+
+
+def test_repeated_large_gap_is_only_a_candidate():
+    # Median interval 1, three repeated intervals of 3.  The old code called
+    # this "sparse_output_cadence" without checking the raw frame manifest.
+    times = np.array([0.0, 1.0, 2.0, 5.0, 6.0, 7.0, 10.0, 11.0, 12.0, 15.0])
+    bracket = sim._bracket(3.5, times)
+    assert bracket["supported"] is False
+    assert bracket["reason"] == "large_gap"
+    assert bracket["gap_kind"] == "repeated_large_gap_candidate"
+    assert bracket["gap_kind_is_candidate"] is True
+    assert bracket["gap_repeat_count"] >= 3
+    assert bracket["gap_repeat_run_max"] == 1
+    assert "sparse_output_cadence" not in bracket["gap_kind"]
+
+
+def test_plan_gap_interpretation_needs_verified_plan_and_records():
+    unverified = {"standard_available": False}
+    assert sim._plan_gap_interpretation(unverified, []) == \
+        "unverified_candidate"
+    verified = {
+        "standard_available": True,
+        "all_frames_imported": True,
+        "time_source": "profile_filename_3sigfig",
+    }
+    assert sim._plan_gap_interpretation(verified, []) == "no_large_gaps"
+    isolated = [{"gap_repeat_run_max": 1, "n_raw_between": 0,
+                 "n_imported_between": 0, "n_observed_between": 0}]
+    assert sim._plan_gap_interpretation(verified, isolated) == \
+        "isolated_repeated_gap_time_key_quantization_candidate"
+    sustained = [{"gap_repeat_run_max": 12, "n_raw_between": 0,
+                  "n_imported_between": 0, "n_observed_between": 0}]
+    assert sim._plan_gap_interpretation(verified, sustained) == \
+        "sustained_raw_output_cadence"
+    dropped = [{"gap_repeat_run_max": 1, "n_raw_between": 1,
+                "n_imported_between": 0, "n_observed_between": 0}]
+    assert sim._plan_gap_interpretation(verified, dropped) == \
+        "raw_frame_not_imported"
+    filtered = {
+        "standard_available": True,
+        "all_frames_imported": False,
+        "time_source": "profile_filename_3sigfig",
+    }
+    assert sim._plan_gap_interpretation(filtered, isolated) == \
+        "filter_or_import_gap"
+
+
+def test_curve_windows_count_each_theta_once_and_do_not_use_q():
+    theta = [0.5, 1.0, 1.5, 30.0, 30.5]
+    curves = [
+        {
+            "case_id": "a",
+            "theta": theta,
+            "shock_over_Rsep": [2.0, 2.0, 2.0, 3.0, 3.0],
+            "contact_low_over_Rsep": [1.0, 1.0, 1.0, 1.2, 1.2],
+            "contact_up_over_Rsep": [1.1, 1.1, 1.1, 1.3, 1.3],
+        },
+        {
+            "case_id": "b",
+            "theta": theta,
+            "shock_over_Rsep": [2.5, None, 2.5, 3.1, 3.1],
+            "contact_low_over_Rsep": [1.0, 1.0, 1.0, 1.2, 1.2],
+            "contact_up_over_Rsep": [1.1, 1.1, 1.1, 1.3, 1.3],
+        },
+    ]
+    windows = sim._curve_windows(curves)
+    early = windows["0.5-10"]
+    assert early["n_theta"] == 3
+    assert early["shock_spread"]["n_theta"] == 3
+    assert early["shock_spread"]["n_theta_complete"] == 2
+    assert early["contact_low_spread"]["n_theta_complete"] == 3
+    assert early["contact_low_spread"]["median"] == 0.0
+    late = windows["30-60"]
+    assert late["n_theta"] == 2
+    # Each theta contributes one spread value, never one per q fraction.
+    assert late["shock_spread"]["n"] == 2
 
 
 def test_interp_series_never_uses_endpoint_outside_range():
@@ -212,7 +289,55 @@ def test_main_pipeline_with_synthetic_cases(tmp_path, monkeypatch):
         "rho"
     ]["n_complete"] > 0
     assert (tmp_path / "query_evidence.csv").exists()
+    assert (tmp_path / "curve_windows.csv").exists()
     assert payload["query_evidence_count"] > 0
+    assert payload["groups"]["train"]["curve_windows"]["30-60"]["n_theta"] == 60
+    assert payload["groups"]["train"]["air_windows"]["30-60"][
+        "n_theta_q_queries"
+    ] == 60 * len(sim.Q_FRACTIONS)
+    assert payload["groups"]["train"]["frame_plan_summary"][
+        "interpretation_counts"
+    ] == {"unverified_candidate": 1}
+    with (tmp_path / "query_evidence.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        header = next(csv.reader(handle))
+    assert "lower_frame_radius_min" in header
+    assert "upper_frame_radius_max" in header
+
+
+def test_fields_records_front_and_back_frame_support_separately():
+    data = sim.CaseData1D(_FakeCase("synthetic_train", "train"))
+    result = data.fields(10.5, 5.0)["rho"]
+    assert result["supported"] is True
+    lower = result["lower_frame_support"]
+    upper = result["upper_frame_support"]
+    assert lower["frame_id"] == 10
+    assert upper["frame_id"] == 11
+    assert math.isclose(lower["theta"], 10.0)
+    assert math.isclose(upper["theta"], 11.0)
+    assert lower["radius_min"] == 1.0
+    assert lower["radius_max"] == 9.0
+    assert upper["radius_min"] == 1.0
+    assert upper["radius_max"] == 9.0
+    assert lower["n_valid"] == 9
+    assert upper["n_valid"] == 9
+
+
+def test_fields_keeps_both_frame_failures_when_both_are_invalid():
+    case = _BadDensityCase("synthetic_train", "train")
+    data = sim.CaseData1D(case)
+    result = data.fields(10.5, 5.0)["rho"]
+    assert result["supported"] is False
+    assert result["reason"] == "insufficient_valid_points"
+    lower = result["lower_frame_support"]
+    upper = result["upper_frame_support"]
+    assert lower["supported"] is False
+    assert upper["supported"] is False
+    assert lower["reason"] == "insufficient_valid_points"
+    assert upper["reason"] == "insufficient_valid_points"
+    assert lower["frame_id"] == 10
+    assert upper["frame_id"] == 11
 
 
 class _BadDensityCase(_FakeCase):

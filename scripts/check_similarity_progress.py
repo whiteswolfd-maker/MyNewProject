@@ -56,6 +56,7 @@ Q_FRACTIONS = (0.1, 0.3, 0.5, 0.7, 0.9)
 WINDOWS = ((0.5, 10.0), (10.0, 30.0), (30.0, 60.0))
 GAP_FACTOR = 2.0
 FIELDS = ("rho", "u", "p")
+AUDIT_CONFIG = "configs/contact_air/reference_audit_fullframes.yaml"
 
 
 def _sha256(path: Path) -> str:
@@ -103,7 +104,28 @@ def _event_progress(raw_event_time, t0, time_scale, offset):
     return float((raw_event_time + offset - t0) / time_scale)
 
 
+def _repeat_run_length(diffs, gap):
+    """Longest consecutive run of intervals close to ``gap``."""
+    if gap is None or not np.isfinite(gap) or np.asarray(diffs).size == 0:
+        return 0
+    hits = np.isclose(
+        np.asarray(diffs, dtype=np.float64), gap, rtol=1.0e-3, atol=0.0
+    )
+    best = current = 0
+    for hit in hits:
+        current = current + 1 if bool(hit) else 0
+        best = max(best, current)
+    return int(best)
+
+
 def _gap_context(times, lower, upper, gap, gap_limit):
+    """Describe a gap without deciding why it exists.
+
+    A repeated large interval is only a *candidate* explanation.  Whether it
+    is the solver's sparse output cadence, a real missing frame, or an artefact
+    of three-significant-figure output times is decided separately by
+    ``_audit_frame_plan`` from the raw frame manifest and filter records.
+    """
     diffs = np.diff(times)
     prev_gap = (
         float(times[lower] - times[lower - 1]) if lower > 0 else None
@@ -112,28 +134,32 @@ def _gap_context(times, lower, upper, gap, gap_limit):
         float(times[upper + 1] - times[upper])
         if upper + 1 < times.size else None
     )
+    repeat_count = (
+        int(np.count_nonzero(
+            np.isclose(diffs, gap, rtol=1.0e-3, atol=0.0)
+        ))
+        if gap is not None and np.isfinite(gap) else None
+    )
+    repeat_run = _repeat_run_length(diffs, gap)
     if gap <= gap_limit:
         kind = "regular"
     elif prev_gap is None or next_gap is None:
-        kind = "terminal_gap"
+        kind = "terminal_gap_candidate"
     else:
-        repeated = int(np.count_nonzero(
-            np.isclose(diffs, gap, rtol=1.0e-3, atol=0.0)
-        ))
         neighbor = float(np.median([prev_gap, next_gap]))
-        if repeated >= 3:
-            kind = "sparse_output_cadence"
+        if repeat_run >= 3 or (repeat_count or 0) >= 3:
+            kind = "repeated_large_gap_candidate"
         elif neighbor > 0.0 and gap > 3.0 * neighbor:
-            kind = "isolated_missing_frame"
+            kind = "isolated_gap_candidate"
         else:
-            kind = "large_gap_unclassified"
+            kind = "large_gap_candidate"
     return {
         "gap_kind": kind,
+        "gap_kind_is_candidate": kind not in ("regular",),
         "prev_gap": prev_gap,
         "next_gap": next_gap,
-        "gap_repeat_count": int(np.count_nonzero(
-            np.isclose(diffs, gap, rtol=1.0e-3, atol=0.0)
-        )) if gap is not None and np.isfinite(gap) else None,
+        "gap_repeat_count": repeat_count,
+        "gap_repeat_run_max": repeat_run,
     }
 
 
@@ -142,9 +168,11 @@ def _bracket(theta, times):
     times = np.asarray(times, dtype=np.float64)
     empty_context = {
         "gap_kind": None,
+        "gap_kind_is_candidate": None,
         "prev_gap": None,
         "next_gap": None,
         "gap_repeat_count": None,
+        "gap_repeat_run_max": None,
     }
     if times.size < 2:
         return {
@@ -324,6 +352,80 @@ def _interp_field_at_radius(radius, values, valid, r_norm):
     }
 
 
+def _standard_entry(case_id, config_path=None):
+    """Return the audit-config entry for one case, or ``None``."""
+    path = Path(config_path) if config_path is not None else (
+        _REPO_ROOT / AUDIT_CONFIG
+    )
+    if not path.is_file():
+        return None
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:  # pragma: no cover - config is normally present
+        return None
+    for item in (data.get("audit", {}) or {}).get("cases", []) or []:
+        if str(item.get("case_id")) == str(case_id):
+            return item
+    return None
+
+
+def _load_standard_metadata(path):
+    with np.load(path, allow_pickle=False) as archive:
+        return json.loads(str(archive["metadata"]))
+
+
+def _plan_gap_interpretation(plan, large_gaps):
+    """Classify repeated raw-output gaps only after the plan was checked."""
+    if not plan.get("standard_available"):
+        return "unverified_candidate"
+    if not plan.get("all_frames_imported"):
+        return "filter_or_import_gap"
+    if not large_gaps:
+        return "no_large_gaps"
+    if any(
+        gap.get("n_raw_between", 0) > gap.get("n_imported_between", 0)
+        for gap in large_gaps
+    ):
+        return "raw_frame_not_imported"
+    if any(
+        gap.get("n_imported_between", 0) > gap.get("n_observed_between", 0)
+        for gap in large_gaps
+    ):
+        return "imported_frame_not_observed"
+    max_run = max(
+        (gap.get("gap_repeat_run_max") or 0 for gap in large_gaps),
+        default=0,
+    )
+    if max_run >= 3:
+        return "sustained_raw_output_cadence"
+    if str(plan.get("time_source", "")) == "profile_filename_3sigfig":
+        return "isolated_repeated_gap_time_key_quantization_candidate"
+    return "repeated_raw_output_gap_candidate"
+
+
+def _frame_support(frame_id, theta, result):
+    """Spatial support of one field at one time frame.
+
+    Both bracketing frames are recorded separately so a two-frame
+    space-time interpolation can be reconstructed even when one frame
+    fails.
+    """
+    return {
+        "frame_id": None if frame_id is None else int(frame_id),
+        "theta": None if theta is None else float(theta),
+        "supported": bool(result.get("supported", False)),
+        "reason": result.get("reason"),
+        "radius_min": result.get("radius_min"),
+        "radius_max": result.get("radius_max"),
+        "bracket_lower_radius": result.get("bracket_lower_radius"),
+        "bracket_upper_radius": result.get("bracket_upper_radius"),
+        "n_valid": result.get("n_valid"),
+        "lower_valid": result.get("lower_valid"),
+        "upper_valid": result.get("upper_valid"),
+    }
+
+
 class CaseData1D:
     """Native real-data fields and labels for one case."""
 
@@ -368,6 +470,11 @@ class CaseData1D:
         )
 
         labels = cf._full_labels(case)
+        self.label_exclusions = {
+            "excluded_outside_time": int(labels["excluded_outside_time"]),
+            "excluded_no_slope": int(labels["excluded_no_slope"]),
+            "total_frame_candidates": int(labels["total_frame_candidates"]),
+        }
         self.label_theta = (
             np.asarray(labels["times"], dtype=np.float64) - case.t0
         ) / case.time_scale
@@ -404,6 +511,202 @@ class CaseData1D:
             self.event.get("event_time_raw_s"), case.t0, case.time_scale,
             self.event.get("offset_s"),
         )
+        self.frame_plan = self._audit_frame_plan()
+
+    def _audit_frame_plan(self):
+        """Compare the raw frame manifest, imported frames and the cache.
+
+        The raw profile file names carry only three significant figures, so an
+        apparent large interval in the imported time axis is not by itself
+        evidence of a missing frame.  This audit reads the standard metadata
+        written by the importer (selection policy, raw/imported/dropped counts,
+        selected and raw keys) and the cache filter records, then reports what
+        the plan actually contains.  It never asserts sparsity or a missing
+        frame beyond what those records show.
+        """
+        case = self.case
+        result = {
+            "standard_available": False,
+            "standard_path": None,
+            "frame_selection_policy": None,
+            "raw_frame_count": None,
+            "imported_frame_count": None,
+            "dropped_frame_count": None,
+            "standard_frame_count": None,
+            "selected_key_count": None,
+            "raw_key_count": None,
+            "cache_air_frame_count": int(self.frame_ids.size),
+            "contact_sample_count": int(np.asarray(
+                getattr(case.contact, "times", [])
+            ).size),
+            "contact_valid_count": int(np.count_nonzero(np.asarray(
+                getattr(case.contact, "valid", []), dtype=bool
+            ))),
+            "shock_sample_count": int(np.asarray(
+                getattr(case.shock, "times", [])
+            ).size),
+            "shock_valid_count": int(np.count_nonzero(np.asarray(
+                getattr(case.shock, "valid", []), dtype=bool
+            ))),
+            "label_exclusions": dict(self.label_exclusions),
+            "observation_diagnostics_available": False,
+            "frames_without_air_observations": [],
+            "large_gap_count": 0,
+            "large_gaps": [],
+            "max_repeat_run": 0,
+            "interpretation": "unverified_candidate",
+            "note": (
+                "Repeated large gaps are candidates until the raw output plan "
+                "and filter records are checked."
+            ),
+        }
+        entry = _standard_entry(case.case_id)
+        if entry is None:
+            result["reason"] = "case_not_in_audit_config"
+            return result
+        standard = _REPO_ROOT / str(entry.get("standard", ""))
+        result["standard_path"] = str(standard)
+        if not standard.is_file():
+            result["reason"] = "standard_file_missing"
+            return result
+        try:
+            metadata = _load_standard_metadata(standard)
+        except Exception as exc:  # corrupted or not a standard archive
+            result["reason"] = f"standard_unreadable: {exc}"
+            return result
+        source = metadata.get("source", {}) or {}
+        frame_times = np.asarray(metadata.get("frame_times", []), dtype=np.float64)
+        raw_keys = list(source.get("raw_frame_keys", []) or [])
+        selected_keys = list(source.get("selected_raw_frame_keys", []) or [])
+        raw_key_times = np.asarray([float(key) for key in raw_keys], dtype=np.float64)
+        result.update({
+            "standard_available": True,
+            "frame_selection_policy": source.get("frame_selection_policy"),
+            "frame_selection_note": source.get("frame_selection_note"),
+            "time_source": source.get("time_source"),
+            "time_note": source.get("time_note"),
+            "raw_frame_count": source.get("raw_frame_count"),
+            "imported_frame_count": source.get("imported_frame_count"),
+            "dropped_frame_count": source.get("dropped_frame_count"),
+            "standard_frame_count": int(frame_times.size),
+            "selected_key_count": len(selected_keys),
+            "raw_key_count": len(raw_keys),
+            "first_raw_time_s": source.get("first_raw_time_s"),
+            "last_raw_time_s": source.get("last_raw_time_s"),
+            "raw_keys_equal_selected": raw_keys == selected_keys,
+            "all_frames_imported": bool(
+                source.get("frame_selection_policy") == "all_frames"
+                and source.get("raw_frame_count") == source.get("imported_frame_count")
+                and source.get("dropped_frame_count") == 0
+                and int(frame_times.size) == source.get("raw_frame_count")
+                == len(selected_keys) == len(raw_keys)
+                and raw_keys == selected_keys
+            ),
+        })
+
+        # Filter records: which frames never produced air observations, and
+        # why.  The separation report and observation diagnostics were written
+        # by the same cache builder, so this is the actual filter trail.
+        contact_times = np.asarray(
+            getattr(case.contact, "times", []), dtype=np.float64
+        )
+        observed_model = np.unique(np.asarray(case.observations.time, dtype=np.float64))
+        separation_frames = list(
+            (getattr(case, "separation", {}) or {}).get("frames", []) or []
+        )
+        obs_diagnostics = dict(
+            getattr(case.observations, "diagnostics", {}) or {}
+        )
+        result["observation_diagnostics_available"] = bool(obs_diagnostics)
+        obs_frame_reports = {
+            int(item.get("frame")): item
+            for item in obs_diagnostics.get("frames", []) or []
+            if item.get("frame") is not None
+        }
+        if observed_model.size:
+            observed_set = set(np.round(observed_model, 15).tolist())
+            for index, time_value in enumerate(contact_times):
+                if round(float(time_value), 15) in observed_set:
+                    continue
+                separation = (
+                    separation_frames[index]
+                    if index < len(separation_frames) else {}
+                )
+                report = obs_frame_reports.get(index, {})
+                result["frames_without_air_observations"].append({
+                    "frame_index": int(index),
+                    "time_model_s": float(time_value),
+                    "theta": float(
+                        (time_value - case.t0) / case.time_scale
+                    ),
+                    "separation_status": separation.get("status"),
+                    "contact_locatable": separation.get("contact_locatable"),
+                    "shock_identified": separation.get("shock_identified"),
+                    "pure_air_between": separation.get("pure_air_between"),
+                    "separation_reasons": separation.get("reasons"),
+                    "observation_selected": report.get("selected", 0),
+                    "observation_rejected": report.get("rejected", {}),
+                })
+
+        # Audit every observed large interval against the raw key manifest.
+        times = self.frame_theta
+        diffs = np.diff(times)
+        if times.size > 1:
+            median = float(np.median(diffs))
+            limit = GAP_FACTOR * median
+            offset = self.event.get("offset_s")
+            for index in np.flatnonzero(diffs > limit):
+                lower, upper = int(index), int(index + 1)
+                gap = float(diffs[lower])
+                context = _gap_context(times, lower, upper, gap, limit)
+                raw_lower = (
+                    float(times[lower]) * case.time_scale + case.t0 - offset
+                    if offset is not None else None
+                )
+                raw_upper = (
+                    float(times[upper]) * case.time_scale + case.t0 - offset
+                    if offset is not None else None
+                )
+                n_raw_between = n_imported_between = n_observed_between = None
+                if raw_lower is not None and raw_key_times.size:
+                    tol = 1.0e-12 * max(1.0, abs(raw_upper - raw_lower))
+                    n_raw_between = int(np.count_nonzero(
+                        (raw_key_times > raw_lower + tol)
+                        & (raw_key_times < raw_upper - tol)
+                    ))
+                    n_imported_between = int(np.count_nonzero(
+                        (frame_times > raw_lower + tol)
+                        & (frame_times < raw_upper - tol)
+                    ))
+                    n_observed_between = int(np.count_nonzero(
+                        (times > times[lower] + 1.0e-12)
+                        & (times < times[upper] - 1.0e-12)
+                    ))
+                result["large_gaps"].append({
+                    "theta_lower": float(times[lower]),
+                    "theta_upper": float(times[upper]),
+                    "gap": gap,
+                    "gap_kind": context["gap_kind"],
+                    "gap_repeat_count": context["gap_repeat_count"],
+                    "gap_repeat_run_max": context["gap_repeat_run_max"],
+                    "prev_gap": context["prev_gap"],
+                    "next_gap": context["next_gap"],
+                    "raw_time_lower_s": raw_lower,
+                    "raw_time_upper_s": raw_upper,
+                    "n_raw_between": n_raw_between,
+                    "n_imported_between": n_imported_between,
+                    "n_observed_between": n_observed_between,
+                })
+        result["large_gap_count"] = len(result["large_gaps"])
+        result["max_repeat_run"] = max(
+            (gap.get("gap_repeat_run_max") or 0
+             for gap in result["large_gaps"]),
+            default=0,
+        )
+        result["interpretation"] = _plan_gap_interpretation(
+            result, result["large_gaps"]
+        )
+        return result
 
     def _grid_dr_m(self):
         values = []
@@ -445,6 +748,8 @@ class CaseData1D:
                     "supported": False, "value": None,
                     "reason": bracket["reason"],
                     "bracket": bracket,
+                    "lower_frame_support": None,
+                    "upper_frame_support": None,
                 }
                 for field in FIELDS
             }
@@ -463,18 +768,55 @@ class CaseData1D:
                     self.frame_radius[upper], self.frame_values[upper][field],
                     self.frame_valid[upper][field], r_norm,
                 )
+            lower_support = _frame_support(
+                self.frame_ids[lower], self.frame_theta[lower], first
+            )
+            upper_support = _frame_support(
+                self.frame_ids[upper], self.frame_theta[upper], second
+            )
             if not first["supported"] or not second["supported"]:
-                detail = first if not first["supported"] else second
+                failures = []
+                if not first["supported"]:
+                    failures.append(f"lower_frame:{first['reason']}")
+                if not second["supported"]:
+                    failures.append(f"upper_frame:{second['reason']}")
                 result[field] = {
                     "supported": False, "value": None,
-                    "reason": detail["reason"],
+                    "reason": first["reason"] if not first["supported"]
+                              else second["reason"],
+                    "failure_reasons": failures,
                     "bracket": bracket,
                     "frame_id_lower": int(self.frame_ids[lower]),
                     "frame_id_upper": int(self.frame_ids[upper]),
-                    "radius_min": detail.get("radius_min"),
-                    "radius_max": detail.get("radius_max"),
-                    "bracket_lower_radius": detail.get("bracket_lower_radius"),
-                    "bracket_upper_radius": detail.get("bracket_upper_radius"),
+                    "lower_frame_support": lower_support,
+                    "upper_frame_support": upper_support,
+                    "n_valid_lower": first.get("n_valid"),
+                    "n_valid_upper": second.get("n_valid"),
+                    "n_valid": min(
+                        value for value in (
+                            first.get("n_valid"), second.get("n_valid")
+                        ) if value is not None
+                    ) if any(
+                        value is not None for value in (
+                            first.get("n_valid"), second.get("n_valid")
+                        )
+                    ) else None,
+                    "lower_valid": first.get("lower_valid"),
+                    "upper_valid": second.get("upper_valid"),
+                    "radius_min": min(
+                        (value for value in (
+                            lower_support.get("radius_min"),
+                            upper_support.get("radius_min"),
+                        ) if value is not None),
+                        default=None,
+                    ),
+                    "radius_max": max(
+                        (value for value in (
+                            lower_support.get("radius_max"),
+                            upper_support.get("radius_max"),
+                        ) if value is not None),
+                        default=None,
+                    ),
                 }
                 continue
             if upper == lower:
@@ -495,6 +837,8 @@ class CaseData1D:
                 "upper_frame": int(upper),
                 "frame_id_lower": int(self.frame_ids[lower]),
                 "frame_id_upper": int(self.frame_ids[upper]),
+                "lower_frame_support": lower_support,
+                "upper_frame_support": upper_support,
                 "n_valid_lower": first.get("n_valid"),
                 "n_valid_upper": second.get("n_valid"),
                 "n_valid": min(
@@ -605,7 +949,7 @@ def _curve_metrics(curves):
 def _window_aggregate(rows, key):
     values = [
         row[key] for row in rows
-        if row[key] is not None and math.isfinite(row[key])
+        if row.get(key) is not None and math.isfinite(row[key])
     ]
     return {
         "n": len(values),
@@ -615,23 +959,111 @@ def _window_aggregate(rows, key):
     }
 
 
-def _aggregate_windows(rows):
+def _aggregate_numeric(values):
+    values = [
+        float(value) for value in values
+        if value is not None and math.isfinite(value)
+    ]
+    return {
+        "n": len(values),
+        "median": _median(values),
+        "p90": _percentile(values, 90),
+        "max": max(values) if values else None,
+    }
+
+
+def _curve_windows(curves):
+    """Window metrics from the curves alone, one row per theta.
+
+    Contact and shock statistics never pass through the air common layer and
+    never repeat a theta once per q fraction.  ``n_theta`` is the number of
+    theta slots in the window; ``n_theta_complete`` is how many of those have
+    a finite value for every case.
+    """
+    theta = np.asarray(curves[0]["theta"], dtype=np.float64)
+    names = ("shock_over_Rsep", "contact_low_over_Rsep", "contact_up_over_Rsep")
+    arrays = {
+        name: np.stack([
+            np.asarray([
+                np.nan if value is None else value
+                for value in row[name]
+            ], dtype=np.float64)
+            for row in curves
+        ])
+        for name in names
+    }
+    out = {}
+    for low, high in WINDOWS:
+        mask = (theta >= low) & (theta < high)
+        n_theta = int(np.count_nonzero(mask))
+        entry = {
+            "n_theta": n_theta,
+            "n_cases": len(curves),
+            "source": "curves; each theta counted once, independent of q",
+        }
+        for array_name, output_name in (
+            ("shock_over_Rsep", "shock_spread"),
+            ("contact_low_over_Rsep", "contact_low_spread"),
+            ("contact_up_over_Rsep", "contact_up_spread"),
+        ):
+            subset = arrays[array_name][:, mask]
+            complete = np.all(np.isfinite(subset), axis=0)
+            spread = (
+                subset.max(axis=0) - subset.min(axis=0)
+                if complete.any() else np.zeros(0)
+            )
+            entry[output_name] = {
+                "n_theta": n_theta,
+                "n_theta_complete": int(complete.sum()),
+                **_aggregate_numeric(spread),
+            }
+        contact_complete = (
+            np.all(np.isfinite(arrays["contact_low_over_Rsep"][:, mask]), axis=0)
+            & np.all(np.isfinite(arrays["contact_up_over_Rsep"][:, mask]), axis=0)
+        )
+        if contact_complete.any():
+            contact_low = arrays["contact_low_over_Rsep"][:, mask][
+                :, contact_complete
+            ]
+            contact_up = arrays["contact_up_over_Rsep"][:, mask][
+                :, contact_complete
+            ]
+            envelope = contact_up.max(axis=0) - contact_low.min(axis=0)
+        else:
+            envelope = np.zeros(0)
+        entry["contact_envelope"] = {
+            "n_theta": n_theta,
+            "n_theta_complete": int(contact_complete.sum()),
+            **_aggregate_numeric(envelope),
+        }
+        out[f"{low:g}-{high:g}"] = entry
+    return out
+
+
+def _air_windows(rows):
+    """Air-field query windows; these do depend on q and the common layer."""
     out = {}
     for low, high in WINDOWS:
         subset = [row for row in rows if low <= row["theta"] < high]
-        entry = {"n_queries": len(subset)}
-        for key in (
-            "contact_low_spread", "contact_up_spread", "contact_envelope",
-            "shock_spread", "common_width",
-        ):
-            entry[key] = _window_aggregate(subset, key)
+        thetas = sorted({row["theta"] for row in subset})
+        entry = {
+            "n_theta": len(thetas),
+            "n_theta_q_queries": len(subset),
+            "q_fractions": len(Q_FRACTIONS),
+            "source": "air queries; one row per theta and q fraction",
+            "common_width": _window_aggregate(subset, "common_width"),
+        }
         for field in FIELDS:
             complete_rows = [
                 row for row in subset
                 if row["fields"][field].get("complete", False)
             ]
+            complete_thetas = sorted({row["theta"] for row in complete_rows})
             entry[field] = {
-                "n_complete": len(complete_rows),
+                "n_theta": len(thetas),
+                "n_theta_q_queries": len(subset),
+                "n_complete_queries": len(complete_rows),
+                "n_theta_with_complete_query": len(complete_thetas),
                 "std": _window_aggregate(complete_rows, f"{field}_std"),
                 "relstd": _window_aggregate(complete_rows, f"{field}_relstd"),
             }
@@ -699,7 +1131,7 @@ def main(argv=None) -> int:
 
     payload = {
         "format": "spherical_blast_pinn.similarity_progress_check",
-        "version": 3,
+        "version": 4,
         "config": C_CONFIG,
         "config_sha256": _sha256(Path(C_CONFIG)),
         "coordinate": {
@@ -709,6 +1141,12 @@ def main(argv=None) -> int:
             "theta_grid": [THETA_MIN, THETA_MAX, THETA_STEP],
             "q_fractions": list(Q_FRACTIONS),
             "gap_factor": GAP_FACTOR,
+            "gap_classification": "candidate_only",
+            "gap_classification_note": (
+                "Repeated large intervals are labelled as candidates. A "
+                "sparse-output or missing-frame verdict is only formed after "
+                "the raw frame manifest and filter records are read."
+            ),
             "no_time_shift": True,
             "no_extrapolation": True,
             "no_network_prediction": True,
@@ -742,6 +1180,9 @@ def main(argv=None) -> int:
                     "gap": s.get("gap"),
                     "gap_limit": s.get("gap_limit"),
                     "gap_kind": s.get("gap_kind"),
+                    "gap_kind_is_candidate": s.get("gap_kind_is_candidate"),
+                    "gap_repeat_count": s.get("gap_repeat_count"),
+                    "gap_repeat_run_max": s.get("gap_repeat_run_max"),
                 }
                 if s["supported"]:
                     _record_support(
@@ -763,6 +1204,11 @@ def main(argv=None) -> int:
                         "gap": result.get("gap"),
                         "gap_limit": result.get("gap_limit"),
                         "gap_kind": result.get("gap_kind"),
+                        "gap_kind_is_candidate":
+                            result.get("gap_kind_is_candidate"),
+                        "gap_repeat_count": result.get("gap_repeat_count"),
+                        "gap_repeat_run_max":
+                            result.get("gap_repeat_run_max"),
                     }
                     if result["supported"]:
                         _record_support(
@@ -817,10 +1263,17 @@ def main(argv=None) -> int:
                     for field in FIELDS:
                         result = values[field]
                         bracket = result.get("bracket", {})
+                        lower_support = result.get("lower_frame_support") or {}
+                        upper_support = result.get("upper_frame_support") or {}
                         details = {
                             "r_over_Rsep": float(r_norm),
                             "frame_id_lower": result.get("frame_id_lower"),
                             "frame_id_upper": result.get("frame_id_upper"),
+                            "gap_kind_is_candidate":
+                                bracket.get("gap_kind_is_candidate"),
+                            "gap_repeat_count": bracket.get("gap_repeat_count"),
+                            "gap_repeat_run_max":
+                                bracket.get("gap_repeat_run_max"),
                             "lower_theta": bracket.get("lower_theta"),
                             "upper_theta": bracket.get("upper_theta"),
                             "gap": bracket.get("gap"),
@@ -837,7 +1290,20 @@ def main(argv=None) -> int:
                             "n_valid": result.get("n_valid"),
                             "lower_valid": result.get("lower_valid"),
                             "upper_valid": result.get("upper_valid"),
+                            "failure_reasons": result.get("failure_reasons"),
                         }
+                        for prefix, support in (
+                            ("lower", lower_support),
+                            ("upper", upper_support),
+                        ):
+                            for key in (
+                                "frame_id", "theta", "supported", "reason",
+                                "radius_min", "radius_max",
+                                "bracket_lower_radius",
+                                "bracket_upper_radius", "n_valid",
+                                "lower_valid", "upper_valid",
+                            ):
+                                details[f"{prefix}_frame_{key}"] = support.get(key)
                         if result["supported"]:
                             field_values[field].append(result["value"])
                             _record_support(
@@ -902,8 +1368,15 @@ def main(argv=None) -> int:
         query_counts = {
             "theta_count": int(len(thetas)),
             "theta_q_count": int(theta_q_total),
+            "q_fraction_count": len(Q_FRACTIONS),
+            "note": (
+                "theta_count counts independent time positions; theta_q_count "
+                "counts air queries (each theta repeated once per q fraction)."
+            ),
             "field_complete": field_query_counts,
         }
+        curve_windows = _curve_windows(curves)
+        air_windows = _air_windows(rows)
 
         grid = [
             data.grid_dr_over_Rsep for data in cases
@@ -920,7 +1393,8 @@ def main(argv=None) -> int:
             "curve_metrics": curve_metrics,
             "query_counts": query_counts,
             "theta_counts": curve_metrics["theta_counts"],
-            "field_windows": _aggregate_windows(rows),
+            "curve_windows": curve_windows,
+            "air_windows": air_windows,
             "field_rows": rows,
             "resolution": {
                 "cells_per_case": [data.cell_count for data in cases],
@@ -982,42 +1456,95 @@ def main(argv=None) -> int:
                 "grid_dr_m": data.grid_dr_m,
                 "grid_dr_over_Rsep": data.grid_dr_over_Rsep,
                 "source_dir": data.source_dir,
+                "frame_plan": data.frame_plan,
             })
+        interpretations: dict[str, int] = {}
+        for data in cases:
+            key = str(data.frame_plan.get("interpretation"))
+            interpretations[key] = interpretations.get(key, 0) + 1
+        group["frame_plan_summary"] = {
+            "n_cases": len(cases),
+            "n_standard_available": sum(
+                1 for data in cases
+                if data.frame_plan.get("standard_available")
+            ),
+            "n_all_frames_imported": sum(
+                1 for data in cases
+                if data.frame_plan.get("all_frames_imported")
+            ),
+            "n_cases_with_large_gaps": sum(
+                1 for data in cases
+                if data.frame_plan.get("large_gap_count", 0)
+            ),
+            "interpretation_counts": interpretations,
+            "note": (
+                "A repeated gap is a candidate explanation. The interpretation "
+                "is limited to what the raw key manifest and filter records "
+                "show; it does not prove the solver cadence beyond the recorded "
+                "output files."
+            ),
+        }
         payload["groups"][group_name] = group
 
     for group_name, group in payload["groups"].items():
         res = group["resolution"]
         contact_width = res["contact_width_over_Rsep_median"]
-        window = group["field_windows"]["30-60"]
+        curve_window = group["curve_windows"]["30-60"]
+        air_window = group["air_windows"]["30-60"]
         group["indicators"] = {
-            "late_lower_spread_median": window["contact_low_spread"]["median"],
-            "late_upper_spread_median": window["contact_up_spread"]["median"],
-            "late_envelope_width_median": window["contact_envelope"]["median"],
+            "late_lower_spread_median":
+                curve_window["contact_low_spread"]["median"],
+            "late_upper_spread_median":
+                curve_window["contact_up_spread"]["median"],
+            "late_envelope_width_median":
+                curve_window["contact_envelope"]["median"],
             "late_lower_spread_in_contact_widths": (
-                window["contact_low_spread"]["median"] / contact_width
-                if window["contact_low_spread"]["median"] is not None
+                curve_window["contact_low_spread"]["median"] / contact_width
+                if curve_window["contact_low_spread"]["median"] is not None
                 and contact_width else None
             ),
             "late_upper_spread_in_contact_widths": (
-                window["contact_up_spread"]["median"] / contact_width
-                if window["contact_up_spread"]["median"] is not None
+                curve_window["contact_up_spread"]["median"] / contact_width
+                if curve_window["contact_up_spread"]["median"] is not None
                 and contact_width else None
             ),
             "late_envelope_in_contact_widths": (
-                window["contact_envelope"]["median"] / contact_width
-                if window["contact_envelope"]["median"] is not None
+                curve_window["contact_envelope"]["median"] / contact_width
+                if curve_window["contact_envelope"]["median"] is not None
                 and contact_width else None
             ),
-            "late_shock_spread_median": window["shock_spread"]["median"],
+            "late_shock_spread_median":
+                curve_window["shock_spread"]["median"],
             "late_shock_spread_in_contact_widths": (
-                window["shock_spread"]["median"] / contact_width
-                if window["shock_spread"]["median"] is not None
+                curve_window["shock_spread"]["median"] / contact_width
+                if curve_window["shock_spread"]["median"] is not None
                 and contact_width else None
             ),
-            "late_rho_relative_std_median": window["rho"]["relstd"]["median"],
-            "late_u_relative_std_median": window["u"]["relstd"]["median"],
-            "late_p_relative_std_median": window["p"]["relstd"]["median"],
+            "late_rho_relative_std_median":
+                air_window["rho"]["relstd"]["median"],
+            "late_u_relative_std_median":
+                air_window["u"]["relstd"]["median"],
+            "late_p_relative_std_median":
+                air_window["p"]["relstd"]["median"],
+            "late_contact_n_theta":
+                curve_window["contact_low_spread"]["n_theta"],
+            "late_contact_n_theta_complete":
+                curve_window["contact_low_spread"]["n_theta_complete"],
+            "late_shock_n_theta":
+                curve_window["shock_spread"]["n_theta"],
+            "late_shock_n_theta_complete":
+                curve_window["shock_spread"]["n_theta_complete"],
+            "late_air_n_theta": air_window["n_theta"],
+            "late_air_n_theta_q_queries": air_window["n_theta_q_queries"],
+            "late_air_rho_n_complete_queries":
+                air_window["rho"]["n_complete_queries"],
             "contact_width": contact_width,
+            "source_note": (
+                "Contact/shock spreads come from curve_windows (one value per "
+                "theta, independent of q and the air common layer). Air "
+                "relative standard deviations come from air_windows and are "
+                "reported separately as theta-q queries."
+            ),
         }
 
     from collections import Counter
@@ -1043,13 +1570,24 @@ def main(argv=None) -> int:
             item.get("gap_kind") for item in missing
             if item.get("gap_kind") is not None
         )),
+        "frame_plan": {
+            name: group["frame_plan_summary"]
+            for name, group in payload["groups"].items()
+        },
+        "frame_plan_all_cases_verified": all(
+            group["frame_plan_summary"]["n_all_frames_imported"]
+            == group["frame_plan_summary"]["n_cases"]
+            for group in payload["groups"].values()
+        ),
         "complete": len(missing) == 0,
     }
     if missing:
         payload["assessment"]["status"] = "diagnostic_incomplete"
         payload["assessment"]["note"] = (
             "Missing/unsupported queries are listed; do not read the available "
-            "subset as a complete similarity result."
+            "subset as a complete similarity result. A repeated large interval "
+            "is only a candidate explanation until frame_plan records confirm "
+            "or exclude filtering."
         )
 
     json_path = output / "similarity_check.json"
@@ -1075,6 +1613,27 @@ def main(argv=None) -> int:
                         "" if shock is None else shock,
                         "" if low is None else low,
                         "" if up is None else up,
+                    ])
+
+    curve_window_path = output / "curve_windows.csv"
+    curve_metrics = (
+        "contact_low_spread", "contact_up_spread",
+        "contact_envelope", "shock_spread",
+    )
+    with curve_window_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            "role", "window", "metric", "n_theta", "n_theta_complete",
+            "median", "p90", "max",
+        ])
+        for group_name, group in payload["groups"].items():
+            for window, entry in group["curve_windows"].items():
+                for metric in curve_metrics:
+                    values = entry[metric]
+                    writer.writerow([
+                        group_name, window, metric, values["n_theta"],
+                        values["n_theta_complete"], values["median"],
+                        values["p90"], values["max"],
                     ])
 
     field_path = output / "field_spread.csv"
@@ -1127,14 +1686,34 @@ def main(argv=None) -> int:
         "group", "theta", "q", "kind", "case_id", "field", "supported",
         "reason", "r_over_Rsep", "frame_id_lower", "frame_id_upper",
         "lower_theta", "upper_theta", "gap", "gap_limit", "gap_kind",
+        "gap_kind_is_candidate", "gap_repeat_count", "gap_repeat_run_max",
         "radius_min", "radius_max", "bracket_lower_radius",
         "bracket_upper_radius", "n_valid", "lower_valid", "upper_valid",
+        "failure_reasons",
+        "lower_frame_frame_id", "lower_frame_theta",
+        "lower_frame_supported", "lower_frame_reason",
+        "lower_frame_radius_min", "lower_frame_radius_max",
+        "lower_frame_bracket_lower_radius",
+        "lower_frame_bracket_upper_radius", "lower_frame_n_valid",
+        "lower_frame_lower_valid", "lower_frame_upper_valid",
+        "upper_frame_frame_id", "upper_frame_theta",
+        "upper_frame_supported", "upper_frame_reason",
+        "upper_frame_radius_min", "upper_frame_radius_max",
+        "upper_frame_bracket_lower_radius",
+        "upper_frame_bracket_upper_radius", "upper_frame_n_valid",
+        "upper_frame_lower_valid", "upper_frame_upper_valid",
     ]
     with evidence_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=evidence_fields)
         writer.writeheader()
         for row in evidence:
-            writer.writerow({key: row.get(key) for key in evidence_fields})
+            record = {}
+            for key in evidence_fields:
+                value = row.get(key)
+                if isinstance(value, (list, tuple)):
+                    value = "|".join(str(item) for item in value)
+                record[key] = value
+            writer.writerow(record)
 
     print(json.dumps({
         "wrote": str(json_path),
@@ -1145,6 +1724,9 @@ def main(argv=None) -> int:
         "failed_query_field_by_field": payload["completeness"]["failed_query_field_by_field"],
         "failed_query_field_by_reason": payload["completeness"]["failed_query_field_by_reason"],
         "failed_query_field_by_gap_kind": payload["completeness"]["failed_query_field_by_gap_kind"],
+        "frame_plan_all_cases_verified":
+            payload["completeness"]["frame_plan_all_cases_verified"],
+        "frame_plan": payload["completeness"]["frame_plan"],
         "train_indicators": payload["groups"]["train"]["indicators"],
         "validation_indicators": payload["groups"]["validation"]["indicators"],
     }, indent=2, default=_jsonable))
