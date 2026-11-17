@@ -426,6 +426,32 @@ def _frame_support(frame_id, theta, result):
     }
 
 
+def _classify_contact_gap(
+    *, raw_intermediate_count, imported_intermediate_count,
+    invalid_contact_count, filter_excluded_count,
+):
+    """Classify one contact-label gap from the available evidence layers.
+
+    The air-frame audit is not reused here: contact labels have their own
+    validity and ``_full_labels`` exclusions.  A zero raw-frame count means the
+    output manifest itself has no frame between the two label times.  When an
+    intermediate raw/imported frame exists, the contact tables decide whether
+    the label was invalid or filtered out.
+    """
+    if raw_intermediate_count == 0:
+        return "raw_no_intermediate_frame"
+    if (
+        imported_intermediate_count is not None
+        and imported_intermediate_count < raw_intermediate_count
+    ):
+        return "import_missing"
+    if invalid_contact_count > 0:
+        return "label_invalid"
+    if filter_excluded_count > 0:
+        return "filter_excluded"
+    return "insufficient_evidence"
+
+
 class CaseData1D:
     """Native real-data fields and labels for one case."""
 
@@ -470,6 +496,26 @@ class CaseData1D:
         )
 
         labels = cf._full_labels(case)
+        label_times_model = np.asarray(labels["times"], dtype=np.float64)
+        contact_times_all = np.asarray(
+            getattr(case.contact, "times", []), dtype=np.float64
+        )
+        if label_times_model.size and contact_times_all.size:
+            source_indices = np.searchsorted(
+                contact_times_all, label_times_model
+            )
+            mapped = (
+                np.all(source_indices < contact_times_all.size)
+                and np.allclose(
+                    contact_times_all[source_indices], label_times_model,
+                    rtol=0.0, atol=1.0e-15,
+                )
+            )
+        else:
+            source_indices = np.arange(label_times_model.size)
+            mapped = label_times_model.size == 0
+        self.label_source_indices = np.asarray(source_indices, dtype=np.int64)
+        self.label_index_mapped = bool(mapped)
         self.label_exclusions = {
             "excluded_outside_time": int(labels["excluded_outside_time"]),
             "excluded_no_slope": int(labels["excluded_no_slope"]),
@@ -486,6 +532,7 @@ class CaseData1D:
         self.label_low = self.label_low[order]
         self.label_up = self.label_up[order]
         self.label_width = self.label_width[order]
+        self.label_source_indices = self.label_source_indices[order]
         self.label_count = int(labels["n"])
         self.label_theta_min = float(self.label_theta.min())
         self.label_theta_max = float(self.label_theta.max())
@@ -511,6 +558,7 @@ class CaseData1D:
             self.event.get("event_time_raw_s"), case.t0, case.time_scale,
             self.event.get("offset_s"),
         )
+        self._contact_gap_entries = {}
         self.frame_plan = self._audit_frame_plan()
 
     def _audit_frame_plan(self):
@@ -563,16 +611,19 @@ class CaseData1D:
         entry = _standard_entry(case.case_id)
         if entry is None:
             result["reason"] = "case_not_in_audit_config"
+            result["contact_gap_evidence"] = self._contact_gap_evidence()
             return result
         standard = _REPO_ROOT / str(entry.get("standard", ""))
         result["standard_path"] = str(standard)
         if not standard.is_file():
             result["reason"] = "standard_file_missing"
+            result["contact_gap_evidence"] = self._contact_gap_evidence()
             return result
         try:
             metadata = _load_standard_metadata(standard)
         except Exception as exc:  # corrupted or not a standard archive
             result["reason"] = f"standard_unreadable: {exc}"
+            result["contact_gap_evidence"] = self._contact_gap_evidence()
             return result
         source = metadata.get("source", {}) or {}
         frame_times = np.asarray(metadata.get("frame_times", []), dtype=np.float64)
@@ -706,7 +757,226 @@ class CaseData1D:
         result["interpretation"] = _plan_gap_interpretation(
             result, result["large_gaps"]
         )
+        result["contact_gap_evidence"] = self._contact_gap_evidence(
+            raw_key_times=raw_key_times, frame_times=frame_times,
+        )
         return result
+
+    def _contact_gap_evidence(self, raw_key_times=None, frame_times=None):
+        """Per-interval evidence for large contact-label gaps.
+
+        The air ``frame_theta`` audit cannot explain a contact-label gap:
+        contact labels have their own validity mask and ``_full_labels``
+        exclusions.  Each unique label interval is checked against the raw
+        manifest, the standard/imported frames, the original contact table
+        (low/up/valid) and the ``_full_labels`` filter reason.
+        """
+        evidence = {
+            "interval_count": 0,
+            "intervals": [],
+            "classification_counts": {},
+            "failed_field_counts": {"contact_low": 0, "contact_up": 0},
+            "label_index_mapped": bool(self.label_index_mapped),
+            "raw_manifest_source": (
+                "raw_frame_keys" if raw_key_times is not None
+                else ("air_frames_proxy" if self.frame_theta.size else None)
+            ),
+            "standard_manifest_available": frame_times is not None,
+            "solver_deck_output_plan_read": False,
+            "note": (
+                "Contact-label gaps are classified from the actual label "
+                "endpoints and the recorded raw/imported frame manifests. "
+                "The solver deck output interval was not read, so this does "
+                "not claim the solver's intended output plan was complete."
+            ),
+        }
+        self._contact_gap_entries = {}
+        theta = np.asarray(self.label_theta, dtype=np.float64)
+        if theta.size < 2:
+            return evidence
+        diffs = np.diff(theta)
+        median = float(np.median(diffs))
+        limit = GAP_FACTOR * median
+        gap_indices = np.flatnonzero(diffs > limit)
+        if not gap_indices.size:
+            return evidence
+        offset = self.event.get("offset_s")
+        contact = self.case.contact
+        contact_times = np.asarray(
+            getattr(contact, "times", []), dtype=np.float64
+        )
+        contact_low = np.asarray(getattr(contact, "low", []), dtype=np.float64)
+        contact_up = np.asarray(getattr(contact, "up", []), dtype=np.float64)
+        contact_valid = np.asarray(
+            getattr(contact, "valid", []), dtype=bool
+        )
+        has_valid_mask = contact_valid.size == contact_times.size
+
+        def is_contact_valid(index):
+            if not has_valid_mask:
+                return None
+            index = int(index)
+            if 0 <= index < contact_valid.size:
+                return bool(contact_valid[index])
+            return None
+
+        chosen = set(int(index) for index in self.label_source_indices)
+        observed_air_times = np.asarray(self.frame_theta, dtype=np.float64)
+        for index in gap_indices:
+            lower, upper = int(index), int(index + 1)
+            theta_lower = float(theta[lower])
+            theta_upper = float(theta[upper])
+            model_lower = theta_lower * self.case.time_scale + self.case.t0
+            model_upper = theta_upper * self.case.time_scale + self.case.t0
+            tolerance = 1.0e-12 * max(1.0, abs(model_upper - model_lower))
+            raw_lower = raw_upper = None
+            if offset is not None:
+                raw_lower = model_lower - float(offset)
+                raw_upper = model_upper - float(offset)
+            observed_air_between = np.flatnonzero(
+                (observed_air_times > theta_lower + 1.0e-12)
+                & (observed_air_times < theta_upper - 1.0e-12)
+            )
+            if raw_key_times is not None and raw_lower is not None:
+                raw_between = np.flatnonzero(
+                    (raw_key_times > raw_lower + tolerance)
+                    & (raw_key_times < raw_upper - tolerance)
+                )
+                raw_source = "raw_frame_keys"
+            else:
+                raw_between = observed_air_between
+                raw_source = "air_frames_proxy"
+            if frame_times is not None and raw_lower is not None:
+                imported_between = np.flatnonzero(
+                    (frame_times > raw_lower + tolerance)
+                    & (frame_times < raw_upper - tolerance)
+                )
+                imported_count = int(imported_between.size)
+            else:
+                imported_count = None
+            original_between = np.flatnonzero(
+                (contact_times > model_lower + tolerance)
+                & (contact_times < model_upper - tolerance)
+            )
+            invalid_between = [
+                int(item) for item in original_between
+                if not is_contact_valid(item)
+            ]
+            excluded_between = []
+            outside_time = 0
+            no_slope = 0
+            for item in original_between:
+                if not is_contact_valid(item):
+                    continue
+                if int(item) in chosen:
+                    continue
+                excluded_between.append(int(item))
+                time_value = float(contact_times[item])
+                if (
+                    time_value < float(self.case.t0) - tolerance
+                    or time_value > float(self.case.t_end) + tolerance
+                ):
+                    outside_time += 1
+                elif not bool(self.case.shock.has_slope(time_value)):
+                    no_slope += 1
+            classification = _classify_contact_gap(
+                raw_intermediate_count=int(raw_between.size),
+                imported_intermediate_count=imported_count,
+                invalid_contact_count=len(invalid_between),
+                filter_excluded_count=len(excluded_between),
+            )
+            entry = {
+                "key": f"{theta_lower:.12f}|{theta_upper:.12f}",
+                "theta_lower": theta_lower,
+                "theta_upper": theta_upper,
+                "label_time_lower_s": model_lower,
+                "label_time_upper_s": model_upper,
+                "label_gap": float(diffs[lower]),
+                "label_lower_index": (
+                    int(self.label_source_indices[lower])
+                    if lower < self.label_source_indices.size else None
+                ),
+                "label_upper_index": (
+                    int(self.label_source_indices[upper])
+                    if upper < self.label_source_indices.size else None
+                ),
+                "label_lower_valid": (
+                    is_contact_valid(self.label_source_indices[lower])
+                    if lower < self.label_source_indices.size else None
+                ),
+                "label_upper_valid": (
+                    is_contact_valid(self.label_source_indices[upper])
+                    if upper < self.label_source_indices.size else None
+                ),
+                "raw_time_lower_s": raw_lower,
+                "raw_time_upper_s": raw_upper,
+                "raw_manifest_source": raw_source,
+                "raw_intermediate_count": int(raw_between.size),
+                "imported_intermediate_count": imported_count,
+                "observed_air_intermediate_count":
+                    int(observed_air_between.size),
+                "original_contact_intermediate_count":
+                    int(original_between.size),
+                "invalid_contact_intermediate_count":
+                    len(invalid_between),
+                "filter_excluded_intermediate_count":
+                    len(excluded_between),
+                "filter_excluded_outside_time": outside_time,
+                "filter_excluded_no_slope": no_slope,
+                "invalid_contact_frame_indices": invalid_between[:10],
+                "filter_excluded_frame_indices": excluded_between[:10],
+                "classification": classification,
+                "failed_contact_low": 0,
+                "failed_contact_up": 0,
+            }
+            evidence["intervals"].append(entry)
+            self._contact_gap_entries[entry["key"]] = entry
+        evidence["interval_count"] = len(evidence["intervals"])
+        counts = {}
+        for entry in evidence["intervals"]:
+            key = entry["classification"]
+            counts[key] = counts.get(key, 0) + 1
+        evidence["classification_counts"] = counts
+        return evidence
+
+    def finalize_contact_gap_evidence(self):
+        """Keep only intervals that actually produced a failed contact query."""
+        evidence = self.frame_plan.get("contact_gap_evidence")
+        if not evidence:
+            return
+        all_intervals = list(evidence.get("intervals", []))
+        failed = [
+            entry for entry in all_intervals
+            if (entry.get("failed_contact_low", 0)
+                + entry.get("failed_contact_up", 0)) > 0
+        ]
+        evidence["label_gap_interval_count"] = len(all_intervals)
+        evidence["intervals"] = failed
+        evidence["interval_count"] = len(failed)
+        counts = {}
+        for entry in failed:
+            key = entry["classification"]
+            counts[key] = counts.get(key, 0) + 1
+        evidence["classification_counts"] = counts
+
+    def note_contact_gap_failure(self, result, field):
+        """Count failed contact fields per unique label interval."""
+        if field not in ("contact_low", "contact_up"):
+            return
+        lower = result.get("lower_theta")
+        upper = result.get("upper_theta")
+        if lower is None or upper is None:
+            return
+        key = f"{float(lower):.12f}|{float(upper):.12f}"
+        entry = self._contact_gap_entries.get(key)
+        if entry is None:
+            return
+        entry[f"failed_{field}"] += 1
+        evidence = self.frame_plan.get("contact_gap_evidence", {})
+        counts = evidence.setdefault(
+            "failed_field_counts", {"contact_low": 0, "contact_up": 0}
+        )
+        counts[field] += 1
 
     def _grid_dr_m(self):
         values = []
@@ -1131,7 +1401,7 @@ def main(argv=None) -> int:
 
     payload = {
         "format": "spherical_blast_pinn.similarity_progress_check",
-        "version": 4,
+        "version": 5,
         "config": C_CONFIG,
         "config_sha256": _sha256(Path(C_CONFIG)),
         "coordinate": {
@@ -1217,6 +1487,8 @@ def main(argv=None) -> int:
                             **details,
                         )
                     else:
+                        if result["reason"] == "large_gap":
+                            data.note_contact_gap_failure(result, field)
                         _record_missing(
                             missing, group_name, theta, None,
                             data.case.case_id, field, result["reason"],
@@ -1230,6 +1502,8 @@ def main(argv=None) -> int:
                 "contact_low_over_Rsep": low,
                 "contact_up_over_Rsep": up,
             })
+        for data in cases:
+            data.finalize_contact_gap_evidence()
         curve_metrics = _curve_metrics(curves)
 
         rows = []
@@ -1481,7 +1755,40 @@ def main(argv=None) -> int:
                 "A repeated gap is a candidate explanation. The interpretation "
                 "is limited to what the raw key manifest and filter records "
                 "show; it does not prove the solver cadence beyond the recorded "
-                "output files."
+                "output files. This is the air-frame audit only; contact-label "
+                "gaps are in contact_gap_summary."
+            ),
+        }
+        contact_counts: dict[str, int] = {}
+        contact_failed = {"contact_low": 0, "contact_up": 0}
+        contact_intervals = 0
+        contact_cases = 0
+        for data in cases:
+            contact_evidence = (
+                data.frame_plan.get("contact_gap_evidence", {}) or {}
+            )
+            count = int(contact_evidence.get("interval_count", 0))
+            if count:
+                contact_cases += 1
+                contact_intervals += count
+            for key, value in (
+                contact_evidence.get("classification_counts", {}) or {}
+            ).items():
+                contact_counts[key] = contact_counts.get(key, 0) + int(value)
+            failed = contact_evidence.get("failed_field_counts", {}) or {}
+            for field in contact_failed:
+                contact_failed[field] += int(failed.get(field, 0))
+        group["contact_gap_summary"] = {
+            "n_cases_with_intervals": contact_cases,
+            "interval_count": contact_intervals,
+            "classification_counts": contact_counts,
+            "failed_field_counts": contact_failed,
+            "solver_deck_output_plan_read": False,
+            "note": (
+                "Unique contact-label intervals, deduplicated across the lower "
+                "and upper bounds; failed_contact_low/upper keep the field "
+                "counts. The air-frame cadence audit is not used as a proxy. "
+                "The solver deck output interval was not read."
             ),
         }
         payload["groups"][group_name] = group
@@ -1579,6 +1886,10 @@ def main(argv=None) -> int:
             == group["frame_plan_summary"]["n_cases"]
             for group in payload["groups"].values()
         ),
+        "contact_gap_summary": {
+            name: group["contact_gap_summary"]
+            for name, group in payload["groups"].items()
+        },
         "complete": len(missing) == 0,
     }
     if missing:
@@ -1587,7 +1898,9 @@ def main(argv=None) -> int:
             "Missing/unsupported queries are listed; do not read the available "
             "subset as a complete similarity result. A repeated large interval "
             "is only a candidate explanation until frame_plan records confirm "
-            "or exclude filtering."
+            "or exclude filtering. Contact-label gaps are classified separately "
+            "from the air-frame audit; the solver deck output interval was not "
+            "read."
         )
 
     json_path = output / "similarity_check.json"
@@ -1635,6 +1948,39 @@ def main(argv=None) -> int:
                         values["n_theta_complete"], values["median"],
                         values["p90"], values["max"],
                     ])
+
+    contact_gap_path = output / "contact_gap_evidence.csv"
+    contact_fields = [
+        "role", "case_id", "theta_lower", "theta_upper",
+        "label_time_lower_s", "label_time_upper_s", "label_gap",
+        "raw_manifest_source", "raw_intermediate_count",
+        "imported_intermediate_count", "observed_air_intermediate_count",
+        "original_contact_intermediate_count",
+        "invalid_contact_intermediate_count",
+        "filter_excluded_intermediate_count",
+        "filter_excluded_outside_time", "filter_excluded_no_slope",
+        "classification", "failed_contact_low", "failed_contact_up",
+        "raw_time_lower_s", "raw_time_upper_s",
+        "label_lower_index", "label_upper_index",
+        "label_lower_valid", "label_upper_valid",
+        "invalid_contact_frame_indices", "filter_excluded_frame_indices",
+    ]
+    with contact_gap_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=contact_fields)
+        writer.writeheader()
+        for group_name, group in payload["groups"].items():
+            for case in group["cases"]:
+                contact_evidence = case["frame_plan"].get(
+                    "contact_gap_evidence", {}
+                ) or {}
+                for interval in contact_evidence.get("intervals", []):
+                    record = {"role": group_name, "case_id": case["case_id"]}
+                    for key in contact_fields[2:]:
+                        value = interval.get(key)
+                        if isinstance(value, (list, tuple)):
+                            value = "|".join(str(item) for item in value)
+                        record[key] = value
+                    writer.writerow(record)
 
     field_path = output / "field_spread.csv"
     with field_path.open("w", newline="", encoding="utf-8") as handle:
@@ -1727,6 +2073,8 @@ def main(argv=None) -> int:
         "frame_plan_all_cases_verified":
             payload["completeness"]["frame_plan_all_cases_verified"],
         "frame_plan": payload["completeness"]["frame_plan"],
+        "contact_gap_summary":
+            payload["completeness"]["contact_gap_summary"],
         "train_indicators": payload["groups"]["train"]["indicators"],
         "validation_indicators": payload["groups"]["validation"]["indicators"],
     }, indent=2, default=_jsonable))

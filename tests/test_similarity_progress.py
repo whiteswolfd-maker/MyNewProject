@@ -98,6 +98,39 @@ def test_plan_gap_interpretation_needs_verified_plan_and_records():
         "filter_or_import_gap"
 
 
+def test_contact_gap_classification_uses_label_evidence_not_air_cadence():
+    assert sim._classify_contact_gap(
+        raw_intermediate_count=0,
+        imported_intermediate_count=0,
+        invalid_contact_count=0,
+        filter_excluded_count=0,
+    ) == "raw_no_intermediate_frame"
+    assert sim._classify_contact_gap(
+        raw_intermediate_count=2,
+        imported_intermediate_count=1,
+        invalid_contact_count=0,
+        filter_excluded_count=0,
+    ) == "import_missing"
+    assert sim._classify_contact_gap(
+        raw_intermediate_count=2,
+        imported_intermediate_count=2,
+        invalid_contact_count=2,
+        filter_excluded_count=0,
+    ) == "label_invalid"
+    assert sim._classify_contact_gap(
+        raw_intermediate_count=2,
+        imported_intermediate_count=2,
+        invalid_contact_count=0,
+        filter_excluded_count=1,
+    ) == "filter_excluded"
+    assert sim._classify_contact_gap(
+        raw_intermediate_count=2,
+        imported_intermediate_count=2,
+        invalid_contact_count=0,
+        filter_excluded_count=0,
+    ) == "insufficient_evidence"
+
+
 def test_curve_windows_count_each_theta_once_and_do_not_use_q():
     theta = [0.5, 1.0, 1.5, 30.0, 30.5]
     curves = [
@@ -218,9 +251,11 @@ class _FakeContact:
         self.times = np.arange(0.0, 65.0, 1.0)
         self.low = 1.0 + 0.05 * self.times
         self.up = self.low + 0.001
+        self.valid = np.ones(self.times.size, dtype=bool)
+        self.reasons = [""] * self.times.size
 
     def indices(self):
-        return np.arange(self.times.size)
+        return np.flatnonzero(self.valid)
 
 
 class _FakeShock:
@@ -352,6 +387,57 @@ class _BadDensityTrainer(_FakeTrainer):
     def __init__(self):
         self.cases = [_BadDensityCase("synthetic_train", "train")]
         self.validation_cases = [_BadDensityCase("synthetic_val", "validation")]
+
+
+class _ContactExcludedCase(_FakeCase):
+    """Air frames are continuous, but two middle contact labels are invalid."""
+
+    def __init__(self, case_id, role):
+        super().__init__(case_id, role)
+        self.contact.valid[29:31] = False
+
+
+class _ContactExcludedTrainer(_FakeTrainer):
+    def __init__(self):
+        self.cases = [_ContactExcludedCase("synthetic_train", "train")]
+        self.validation_cases = [
+            _ContactExcludedCase("synthetic_val", "validation")
+        ]
+
+
+def test_contact_label_gap_is_not_explained_by_continuous_air_frames(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        sim.diag, "_build_trainer",
+        lambda _config: (_ContactExcludedTrainer(), {}),
+    )
+    rc = sim.main(["--output", str(tmp_path)])
+    assert rc == 1
+    payload = json.loads(
+        (tmp_path / "similarity_check.json").read_text(encoding="utf-8")
+    )
+    plan = payload["groups"]["train"]["cases"][0]["frame_plan"]
+    # The air-frame audit sees a continuous cadence and cannot explain this.
+    assert plan["large_gap_count"] == 0
+    assert plan["interpretation"] == "unverified_candidate"
+    evidence = plan["contact_gap_evidence"]
+    assert evidence["interval_count"] == 1
+    interval = evidence["intervals"][0]
+    assert interval["classification"] == "label_invalid"
+    assert interval["classification"] != "raw_no_intermediate_frame"
+    assert interval["raw_manifest_source"] == "air_frames_proxy"
+    assert interval["raw_intermediate_count"] == 2
+    assert interval["invalid_contact_intermediate_count"] == 2
+    assert interval["failed_contact_low"] == 5
+    assert interval["failed_contact_up"] == 5
+    summary = payload["groups"]["train"]["contact_gap_summary"]
+    assert summary["classification_counts"] == {"label_invalid": 1}
+    assert summary["failed_field_counts"] == {
+        "contact_low": 5, "contact_up": 5,
+    }
+    assert summary["solver_deck_output_plan_read"] is False
+    assert (tmp_path / "contact_gap_evidence.csv").exists()
 
 
 def test_main_flow_keeps_other_fields_when_density_invalid(tmp_path, monkeypatch):
