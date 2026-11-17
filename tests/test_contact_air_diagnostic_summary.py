@@ -61,6 +61,7 @@ def _payload(trials, **overrides):
     payload = {
         "version": 3,
         "metric_version": 3,
+        "phase_weighting": "always_on",
         "ok": True,
         "checkpoint_sha256": {"unchanged": True},
         "adam_requested": len(trials),
@@ -186,7 +187,8 @@ def _static_payload(*, requested=1, records=1, seed=1, config="cfg", chash="h"):
     ]
     return {
         "format": "spherical_blast_pinn.contact_gradient_diagnostic",
-        "version": 3, "metric_version": 3, "ok": True,
+        "version": 3, "metric_version": 3, "phase_weighting": "always_on",
+        "ok": True,
         "config": config, "checkpoint": "best", "checkpoint_loop": 0,
         "checkpoint_sha256": {"before": chash, "after": chash,
                               "unchanged": True},
@@ -195,6 +197,17 @@ def _static_payload(*, requested=1, records=1, seed=1, config="cfg", chash="h"):
         "failed_batches": 0, "non_finite": False, "failure_reasons": [],
         "batches": batches,
     }
+
+
+def test_source_without_phase_weighting_is_not_summarized_as_current(tmp_path):
+    payload = _static_payload()
+    payload.pop("phase_weighting")
+    (tmp_path / "static.json").write_text(json.dumps(payload), encoding="utf-8")
+    _manifest(tmp_path, [{
+        "kind": "static", "file": "static.json", "checkpoint": "best",
+        "mode": "training", "seed": 1, "requested": 1, "optional": False,
+    }])
+    assert summary.main(["--directory", str(tmp_path)]) == 1
 
 
 def test_empty_directory_is_a_failure(tmp_path, capsys):

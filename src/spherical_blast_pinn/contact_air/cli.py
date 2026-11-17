@@ -35,6 +35,7 @@ import hashlib
 import json
 import math
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -399,6 +400,13 @@ def _train_config(
 ) -> TrainConfig:
     training = dict(section.get("training", {}))
     sampling = dict(section.get("sampling", {}))
+    if "contact_phase_weighting" in training:
+        warnings.warn(
+            "training.contact_phase_weighting is obsolete and ignored: contact "
+            "and air theta weighting is always on.",
+            UserWarning,
+            stacklevel=2,
+        )
     values = {
         "n_pde": int(sampling.get("n_pde", 512)),
         "n_ic": int(sampling.get("n_ic", 128)),
@@ -684,6 +692,7 @@ def command_train(args) -> int:
         "start_loop": start_loop,
         "target_loop": int(train_config.loops),
         "contact_data_weight": float(train_config.contact_data_weight),
+        "phase_weighting": "always_on",
         "n_schedule": int(train_config.n_schedule),
         "seed": int(train_config.seed),
         "time_input": str(section.get("networks", {}).get("time_input", "legacy")),

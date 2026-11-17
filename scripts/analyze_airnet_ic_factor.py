@@ -245,7 +245,18 @@ def _loss_record(lambda_pde, lambda_data, per_case) -> dict:
         sum(float(row["combined"].total.detach()) for row in per_case) / n
     )
     return {
-        "raw_unweighted": raw,
+        # ``data`` is now the theta-cell-weighted air data loss; the other
+        # terms remain unweighted.  Keep the semantics explicit for readers of
+        # old and new JSON files.
+        "term_values": raw,
+        "term_value_semantics": {
+            "data": "theta_cell_weighted",
+            "pde": "unweighted",
+            "ic": "unweighted",
+            "interface": "unweighted",
+            "right": "unweighted",
+        },
+        "phase_weighting": "always_on",
         "weighted_contribution": weighted,
         "total": total,
         "ic_share_of_total": weighted["ic"] / max(abs(total), 1.0e-300),

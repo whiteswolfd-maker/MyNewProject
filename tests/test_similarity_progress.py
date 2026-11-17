@@ -98,6 +98,40 @@ def test_plan_gap_interpretation_needs_verified_plan_and_records():
         "filter_or_import_gap"
 
 
+def test_plan_gap_interpretation_does_not_compare_unknown_counts():
+    """A missing time conversion leaves counts unknown, not comparable."""
+    verified = {
+        "standard_available": True,
+        "all_frames_imported": True,
+        "time_source": "profile_filename_3sigfig",
+    }
+    unknown = [{
+        "gap_repeat_run_max": 1,
+        "n_raw_between": None,
+        "n_imported_between": None,
+        "n_observed_between": None,
+    }]
+    assert sim._plan_gap_interpretation(verified, unknown) == \
+        "isolated_repeated_gap_time_key_quantization_candidate"
+    unknown_sustained = [{
+        "gap_repeat_run_max": 12,
+        "n_raw_between": None,
+        "n_imported_between": None,
+        "n_observed_between": None,
+    }]
+    assert sim._plan_gap_interpretation(verified, unknown_sustained) == \
+        "sustained_raw_output_cadence"
+    # One known and one unknown side also cannot be ordered.
+    mixed = [{
+        "gap_repeat_run_max": 1,
+        "n_raw_between": 1,
+        "n_imported_between": None,
+        "n_observed_between": None,
+    }]
+    assert sim._plan_gap_interpretation(verified, mixed) == \
+        "isolated_repeated_gap_time_key_quantization_candidate"
+
+
 def test_contact_gap_classification_uses_label_evidence_not_air_cadence():
     assert sim._classify_contact_gap(
         raw_intermediate_count=0,
@@ -126,6 +160,25 @@ def test_contact_gap_classification_uses_label_evidence_not_air_cadence():
     assert sim._classify_contact_gap(
         raw_intermediate_count=2,
         imported_intermediate_count=2,
+        invalid_contact_count=0,
+        filter_excluded_count=0,
+    ) == "insufficient_evidence"
+    # Unknown raw count must never be read as a zero count.
+    assert sim._classify_contact_gap(
+        raw_intermediate_count=None,
+        imported_intermediate_count=None,
+        invalid_contact_count=2,
+        filter_excluded_count=0,
+    ) == "label_invalid"
+    assert sim._classify_contact_gap(
+        raw_intermediate_count=None,
+        imported_intermediate_count=None,
+        invalid_contact_count=0,
+        filter_excluded_count=1,
+    ) == "filter_excluded"
+    assert sim._classify_contact_gap(
+        raw_intermediate_count=None,
+        imported_intermediate_count=None,
         invalid_contact_count=0,
         filter_excluded_count=0,
     ) == "insufficient_evidence"
@@ -405,6 +458,28 @@ class _ContactExcludedTrainer(_FakeTrainer):
         ]
 
 
+class _MissingAirFramesCase(_ContactExcludedCase):
+    """Air frames 29/30 are absent while the contact table keeps them invalid."""
+
+    def __init__(self, case_id, role):
+        super().__init__(case_id, role)
+        obs = self.observations
+        keep = ~np.isin(obs.time, (29.0, 30.0))
+        for name in (
+            "frame_index", "time", "radius", "density", "velocity", "pressure",
+            "valid_density", "valid_velocity", "valid_pressure",
+        ):
+            setattr(obs, name, getattr(obs, name)[keep])
+
+
+class _MissingAirFramesTrainer(_FakeTrainer):
+    def __init__(self):
+        self.cases = [_MissingAirFramesCase("synthetic_train", "train")]
+        self.validation_cases = [
+            _MissingAirFramesCase("synthetic_val", "validation")
+        ]
+
+
 def test_contact_label_gap_is_not_explained_by_continuous_air_frames(
     tmp_path, monkeypatch,
 ):
@@ -426,8 +501,11 @@ def test_contact_label_gap_is_not_explained_by_continuous_air_frames(
     interval = evidence["intervals"][0]
     assert interval["classification"] == "label_invalid"
     assert interval["classification"] != "raw_no_intermediate_frame"
-    assert interval["raw_manifest_source"] == "air_frames_proxy"
-    assert interval["raw_intermediate_count"] == 2
+    # No raw manifest is available here: the raw count is unknown, and the
+    # two air frames inside the interval are reported separately.
+    assert interval["raw_manifest_source"] is None
+    assert interval["raw_intermediate_count"] is None
+    assert interval["observed_air_intermediate_count"] == 2
     assert interval["invalid_contact_intermediate_count"] == 2
     assert interval["failed_contact_low"] == 5
     assert interval["failed_contact_up"] == 5
@@ -438,6 +516,88 @@ def test_contact_label_gap_is_not_explained_by_continuous_air_frames(
     }
     assert summary["solver_deck_output_plan_read"] is False
     assert (tmp_path / "contact_gap_evidence.csv").exists()
+
+
+def test_missing_air_frame_does_not_turn_unknown_raw_count_into_zero(
+    tmp_path, monkeypatch,
+):
+    """Raw manifest is unavailable and no air frame lies inside the gap.
+
+    The old proxy used an empty observed-air interval as a zero raw count and
+    labelled this ``raw_no_intermediate_frame`` even though the original
+    contact table has two invalid intermediate records.
+    """
+    monkeypatch.setattr(
+        sim.diag, "_build_trainer",
+        lambda _config: (_MissingAirFramesTrainer(), {}),
+    )
+    rc = sim.main(["--output", str(tmp_path)])
+    assert rc == 1
+    payload = json.loads(
+        (tmp_path / "similarity_check.json").read_text(encoding="utf-8")
+    )
+    plan = payload["groups"]["train"]["cases"][0]["frame_plan"]
+    # Without the standard manifest the air-frame audit cannot even verify the
+    # plan, so its large-gap count stays zero; this test is about the contact
+    # evidence, where the air frames inside the label gap are absent.
+    assert plan["large_gap_count"] == 0
+    evidence = plan["contact_gap_evidence"]
+    assert evidence["raw_manifest_source"] is None
+    assert evidence["interval_count"] == 1
+    interval = evidence["intervals"][0]
+    assert interval["raw_manifest_source"] is None
+    assert interval["raw_intermediate_count"] is None
+    assert interval["observed_air_intermediate_count"] == 0
+    assert interval["original_contact_intermediate_count"] == 2
+    assert interval["invalid_contact_intermediate_count"] == 2
+    assert interval["classification"] == "label_invalid"
+    assert interval["classification"] != "raw_no_intermediate_frame"
+    summary = payload["groups"]["train"]["contact_gap_summary"]
+    assert summary["classification_counts"] == {"label_invalid": 1}
+    with (tmp_path / "contact_gap_evidence.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        csv_rows = list(csv.DictReader(handle))
+    assert len(csv_rows) == 2  # train and validation synthetics
+    assert all(row["raw_intermediate_count"] == "" for row in csv_rows)
+    assert all(
+        row["observed_air_intermediate_count"] == "0" for row in csv_rows
+    )
+    assert all(row["classification"] == "label_invalid" for row in csv_rows)
+
+
+def test_contact_gap_raw_count_unknown_without_time_conversion():
+    case = _ContactExcludedCase("synthetic_train", "train")
+    case.event_alignment["offset_s"] = None
+    data = sim.CaseData1D(case)
+    frame_times = np.arange(0.0, 65.0, 1.0)
+    evidence = data._contact_gap_evidence(
+        raw_key_times=frame_times.copy(), frame_times=frame_times,
+    )
+    assert evidence["raw_manifest_source"] == "raw_frame_keys"
+    assert evidence["interval_count"] == 1
+    interval = evidence["intervals"][0]
+    assert interval["raw_time_lower_s"] is None
+    assert interval["raw_intermediate_count"] is None
+    assert interval["imported_intermediate_count"] is None
+    assert interval["observed_air_intermediate_count"] == 2
+    assert interval["classification"] == "label_invalid"
+
+
+def test_contact_gap_empty_raw_manifest_is_unknown_not_zero():
+    data = sim.CaseData1D(_ContactExcludedCase("synthetic_train", "train"))
+    frame_times = np.arange(0.0, 65.0, 1.0)
+    evidence = data._contact_gap_evidence(
+        raw_key_times=np.zeros(0, dtype=np.float64),
+        frame_times=frame_times,
+    )
+    assert evidence["raw_manifest_source"] is None
+    assert evidence["interval_count"] == 1
+    interval = evidence["intervals"][0]
+    assert interval["raw_manifest_source"] is None
+    assert interval["raw_intermediate_count"] is None
+    assert interval["observed_air_intermediate_count"] == 2
+    assert interval["classification"] == "label_invalid"
 
 
 def test_main_flow_keeps_other_fields_when_density_invalid(tmp_path, monkeypatch):

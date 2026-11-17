@@ -375,6 +375,11 @@ def _load_standard_metadata(path):
         return json.loads(str(archive["metadata"]))
 
 
+def _known_count_greater(left, right):
+    """Compare two evidence counts only when both are known."""
+    return left is not None and right is not None and left > right
+
+
 def _plan_gap_interpretation(plan, large_gaps):
     """Classify repeated raw-output gaps only after the plan was checked."""
     if not plan.get("standard_available"):
@@ -384,12 +389,16 @@ def _plan_gap_interpretation(plan, large_gaps):
     if not large_gaps:
         return "no_large_gaps"
     if any(
-        gap.get("n_raw_between", 0) > gap.get("n_imported_between", 0)
+        _known_count_greater(
+            gap.get("n_raw_between"), gap.get("n_imported_between")
+        )
         for gap in large_gaps
     ):
         return "raw_frame_not_imported"
     if any(
-        gap.get("n_imported_between", 0) > gap.get("n_observed_between", 0)
+        _known_count_greater(
+            gap.get("n_imported_between"), gap.get("n_observed_between")
+        )
         for gap in large_gaps
     ):
         return "imported_frame_not_observed"
@@ -433,15 +442,18 @@ def _classify_contact_gap(
     """Classify one contact-label gap from the available evidence layers.
 
     The air-frame audit is not reused here: contact labels have their own
-    validity and ``_full_labels`` exclusions.  A zero raw-frame count means the
-    output manifest itself has no frame between the two label times.  When an
-    intermediate raw/imported frame exists, the contact tables decide whether
-    the label was invalid or filtered out.
+    validity and ``_full_labels`` exclusions.  ``raw_intermediate_count=None``
+    means the raw manifest or the raw-time conversion is unavailable, so a
+    zero count is not evidence and cannot produce
+    ``raw_no_intermediate_frame``.  Only an explicitly counted zero from the
+    raw output manifest does.  When an intermediate raw/imported frame exists,
+    the contact tables decide whether the label was invalid or filtered out.
     """
-    if raw_intermediate_count == 0:
+    if raw_intermediate_count is not None and raw_intermediate_count == 0:
         return "raw_no_intermediate_frame"
     if (
-        imported_intermediate_count is not None
+        raw_intermediate_count is not None
+        and imported_intermediate_count is not None
         and imported_intermediate_count < raw_intermediate_count
     ):
         return "import_missing"
@@ -771,6 +783,10 @@ class CaseData1D:
         manifest, the standard/imported frames, the original contact table
         (low/up/valid) and the ``_full_labels`` filter reason.
         """
+        raw_times = (
+            None if raw_key_times is None
+            else np.asarray(raw_key_times, dtype=np.float64)
+        )
         evidence = {
             "interval_count": 0,
             "intervals": [],
@@ -778,16 +794,20 @@ class CaseData1D:
             "failed_field_counts": {"contact_low": 0, "contact_up": 0},
             "label_index_mapped": bool(self.label_index_mapped),
             "raw_manifest_source": (
-                "raw_frame_keys" if raw_key_times is not None
-                else ("air_frames_proxy" if self.frame_theta.size else None)
+                "raw_frame_keys" if raw_times is not None and raw_times.size
+                else None
             ),
             "standard_manifest_available": frame_times is not None,
             "solver_deck_output_plan_read": False,
             "note": (
                 "Contact-label gaps are classified from the actual label "
                 "endpoints and the recorded raw/imported frame manifests. "
-                "The solver deck output interval was not read, so this does "
-                "not claim the solver's intended output plan was complete."
+                "When the raw manifest or the raw-time conversion is "
+                "unavailable the raw intermediate count is unknown (null); "
+                "observed air frames are reported separately and are never "
+                "used as a raw count. The solver deck output interval was not "
+                "read, so this does not claim the solver's intended output "
+                "plan was complete."
             ),
         }
         self._contact_gap_entries = {}
@@ -837,15 +857,23 @@ class CaseData1D:
                 (observed_air_times > theta_lower + 1.0e-12)
                 & (observed_air_times < theta_upper - 1.0e-12)
             )
-            if raw_key_times is not None and raw_lower is not None:
-                raw_between = np.flatnonzero(
-                    (raw_key_times > raw_lower + tolerance)
-                    & (raw_key_times < raw_upper - tolerance)
-                )
+            raw_between = None
+            raw_source = None
+            if raw_times is not None and raw_times.size:
                 raw_source = "raw_frame_keys"
-            else:
-                raw_between = observed_air_between
-                raw_source = "air_frames_proxy"
+                if raw_lower is not None:
+                    manifest_lower = float(np.min(raw_times))
+                    manifest_upper = float(np.max(raw_times))
+                    # A raw count of zero is only meaningful when the raw
+                    # manifest brackets the whole label interval.
+                    if (
+                        manifest_lower <= raw_lower
+                        and raw_upper <= manifest_upper
+                    ):
+                        raw_between = np.flatnonzero(
+                            (raw_times > raw_lower + tolerance)
+                            & (raw_times < raw_upper - tolerance)
+                        )
             if frame_times is not None and raw_lower is not None:
                 imported_between = np.flatnonzero(
                     (frame_times > raw_lower + tolerance)
@@ -879,8 +907,11 @@ class CaseData1D:
                     outside_time += 1
                 elif not bool(self.case.shock.has_slope(time_value)):
                     no_slope += 1
+            raw_intermediate_count = (
+                None if raw_between is None else int(raw_between.size)
+            )
             classification = _classify_contact_gap(
-                raw_intermediate_count=int(raw_between.size),
+                raw_intermediate_count=raw_intermediate_count,
                 imported_intermediate_count=imported_count,
                 invalid_contact_count=len(invalid_between),
                 filter_excluded_count=len(excluded_between),
@@ -911,7 +942,7 @@ class CaseData1D:
                 "raw_time_lower_s": raw_lower,
                 "raw_time_upper_s": raw_upper,
                 "raw_manifest_source": raw_source,
-                "raw_intermediate_count": int(raw_between.size),
+                "raw_intermediate_count": raw_intermediate_count,
                 "imported_intermediate_count": imported_count,
                 "observed_air_intermediate_count":
                     int(observed_air_between.size),

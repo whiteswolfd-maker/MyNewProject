@@ -542,7 +542,13 @@ class CaseData:
             source=dict(self.source),
             notes=list(self.notes) + [f"frame subset {indices.tolist()}"],
             separation=dict(self.separation),
-            raw_times_s=None if self.raw_times_s is None else self.raw_times_s[indices],
+            # Keep the full raw output clock.  The subset contact table is a
+            # valid-frame subset, but the theta-cell weights are defined on the
+            # original raw output cadence (including frames not selected here).
+            raw_times_s=(
+                None if self.raw_times_s is None
+                else np.asarray(self.raw_times_s, dtype=np.float64)
+            ),
         )
 
     def as_dict(self) -> dict[str, Any]:

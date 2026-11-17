@@ -188,7 +188,14 @@ def _static_record(trainer, batches, *, compute_gradients: bool,
             finite_all = finite_all and finite
             vectors[name] = vector
             record["terms"][name] = {
+                # ``raw_loss`` is the evaluated term value.  For contact_data
+                # that value is already theta-cell weighted; the semantics field
+                # makes this explicit for cross-run comparisons.
                 "raw_loss": raw_loss,
+                "loss_semantics": (
+                    "theta_cell_weighted" if name == "contact_data"
+                    else "unweighted"
+                ),
                 "coefficient": coeffs[name],
                 "weighted_loss": coeffs[name] * raw_loss,
                 "grad_norm_weighted": float(vector.norm()),
@@ -219,6 +226,10 @@ def _static_record(trainer, batches, *, compute_gradients: bool,
         for name in _TERM_NAMES:
             record["terms"][name] = {
                 "raw_loss": float(aggregate[name].total.detach()),
+                "loss_semantics": (
+                    "theta_cell_weighted" if name == "contact_data"
+                    else "unweighted"
+                ),
                 "coefficient": coeffs[name],
                 "weighted_loss": coeffs[name] * float(aggregate[name].total.detach()),
                 "counts": {k: int(v) for k, v in aggregate[name].counts.items()},
@@ -692,6 +703,8 @@ def main(argv=None) -> int:
         "format": "spherical_blast_pinn.contact_gradient_diagnostic",
         "version": 3,
         "metric_version": 3,
+        "phase_weighting": "always_on",
+        "contact_data_loss_semantics": "theta_cell_weighted",
         "config": args.config,
         "checkpoint": str(checkpoint),
         "checkpoint_loop": int(payload.get("loop", 0)),

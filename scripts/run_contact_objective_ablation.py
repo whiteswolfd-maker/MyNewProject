@@ -91,6 +91,10 @@ def _term_values(terms_by_case: list[dict]) -> dict:
         ]
         result[name] = {
             "raw_mean": sum(values) / n,
+            "mean_semantics": (
+                "theta_cell_weighted" if name == "contact_data"
+                else "unweighted"
+            ),
             "per_case": {
                 entry["case_id"]: value
                 for entry, value in zip(terms_by_case, values)
@@ -288,6 +292,7 @@ def _train(trainer, checkpoint: Path, target: int, output: Path,
         record = {
             "loop": int(trainer.loop),
             "objective": objective,
+            "phase_weighting": "always_on",
             "air_loss": float(air_total.total.detach()),
             "contact_target": float(contact_total.total.detach()),
             "lambda_pde": float(lambda_pde),
@@ -322,6 +327,7 @@ def _train(trainer, checkpoint: Path, target: int, output: Path,
         "start_loop": start_loop,
         "target_loop": target,
         "objective": objective,
+        "phase_weighting": "always_on",
         "effective_learning_rates": trainer.effective_learning_rates(),
         "history": history,
         "last_validation": trainer.evaluate(),

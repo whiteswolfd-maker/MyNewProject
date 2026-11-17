@@ -285,13 +285,28 @@ L_c = lambda_IC L_c_IC + lambda_data * w_c L_c_data
     + lambda_PDE L_PDE + lambda_interface L_interface
 
 L_c_IC   = [(R_c(t0)-Rc0)/s_R]^2
-L_c_data = mean[(ReLU(R_c,low-R_c)/s_R)^2 + (ReLU(R_c-R_c,up)/s_R)^2]
+L_c_data = sum_i w_i ell_i / sum_i w_i
+ell_i    = (ReLU(R_c,low,i-R_c,i)/s_R)^2
+         + (ReLU(R_c,i-R_c,up,i)/s_R)^2
 ```
 
 - `w_c = training.contact_data_weight`（默认 1.0）**只乘接触区间监督项**，
   不动初值、界面、空气数据和 PDE 权重；命令行 `--contact-data-weight`
-  可覆盖。每条 loop 记录未加权的 `contact_parts`，并记录实际 `w_c`，避免
-  用乘权后的总损失做跨实验比较。
+  可覆盖。每条 loop 同时记录加权和未加权的接触分项、实际 `w_c` 以及权重
+  ESS，避免用乘权后的总损失做跨实验比较。
+- 接触数据和空气观测按相似时间（theta）单元加权，不再使用“每帧一票”的按帧
+  均值。权重来自真实 raw 输出节奏：每个 raw 帧的 theta 单元取相邻帧半间距
+  （端点单侧，重复时刻平分）；接触项为 `sum_i w_i ell_i / sum_i w_i`；空气项
+  把每个抽样帧的单元权重平均分给该帧在本 batch 中被抽到的点，再按字段有效
+  掩码做加权均值。抽样概率不变，不按权重重复抽样；初值、界面、PDE、网络、
+  优化器、归一化尺度和所有其他损失系数不变。验证评分仍用未加权按帧指标，
+  另记录加权接触/空气指标、权重均值和有效样本量。旧的
+  `training.contact_phase_weighting` 键已被移除并忽略（加载旧配置/旧检查点时
+  给出警告）；加权不可关闭。新检查点的签名包含完整 raw 时钟；在此改动前保存
+  的旧检查点按不含 raw 时钟的 legacy 签名加载并警告，无法再校验旧 raw 时钟，
+  加权从续训点开始生效。旧检查点保存的验证样本若缺 `contact_weights`/
+  `data_weights`，其加权指标保持未提供；验证评分仍按未加权帧指标，可与旧
+  `best_score` 比较。
 
 区间内零罚、区间外距离平方；接触标签在自己的 `t_contact` 上重新计算网络。两个
 网络复用同一组映射空气残差，不复制“接触面 PDE”。

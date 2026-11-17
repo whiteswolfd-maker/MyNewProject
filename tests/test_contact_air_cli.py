@@ -28,6 +28,14 @@ def test_precheck_reports_the_precursor_and_the_missing_one_d_source(tmp_path):
     assert row["precursor"]["epsilon_formula"].startswith("R_sep /")
 
 
+def test_legacy_phase_weighting_config_key_warns_and_is_ignored():
+    with pytest.warns(UserWarning, match="contact_phase_weighting"):
+        config = cli._train_config(
+            {"training": {"contact_phase_weighting": False}}, None
+        )
+    assert "contact_phase_weighting" not in config.__dataclass_fields__
+
+
 def test_train_predict_and_evaluate_with_synthetic_fixtures(tmp_path):
     train_dir = tmp_path / "train"
     code = cli.main([

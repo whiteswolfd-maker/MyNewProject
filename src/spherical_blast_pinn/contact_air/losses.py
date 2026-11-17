@@ -86,23 +86,51 @@ def _selected_difference(
     return difference, mask_flat
 
 
+def _selected_weights(weights, selected: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    weight = torch.as_tensor(
+        weights, dtype=like.dtype, device=like.device
+    ).reshape(-1)
+    if weight.numel() != selected.numel():
+        raise LossError(
+            f"data weights have {weight.numel()} entries but the batch has "
+            f"{selected.numel()} data points"
+        )
+    if not bool(torch.isfinite(weight).all()) or bool((weight < 0.0).any()):
+        raise LossError("data weights must be finite and non-negative")
+    chosen = weight[selected]
+    total = chosen.sum()
+    if not bool(torch.isfinite(total)) or not bool(total > 0.0):
+        raise LossError("selected data weights must have a positive finite sum")
+    return chosen.detach(), total
+
+
 def _masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
-                scale: float) -> tuple[torch.Tensor, int]:
+                scale: float, *, weights=None) -> tuple[torch.Tensor, int]:
     difference, selected = _selected_difference(pred, target, mask)
     count = int(selected.sum())
     if count == 0:
         return _zero(pred), 0
-    return ((difference / float(scale)) ** 2).mean(), count
+    squared = (difference / float(scale)) ** 2
+    if weights is None:
+        return squared.mean(), count
+    chosen, total = _selected_weights(weights, selected, pred)
+    return (chosen * squared).sum() / total, count
 
 
 def masked_rmse(
-    pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, scale: float
+    pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, scale: float,
+    *, weights=None,
 ) -> tuple[float | None, int]:
     difference, selected = _selected_difference(pred, target, mask)
     count = int(selected.sum())
     if count == 0:
         return None, 0
-    value = torch.sqrt(torch.mean((difference / float(scale)) ** 2))
+    squared = (difference / float(scale)) ** 2
+    if weights is None:
+        value = torch.sqrt(torch.mean(squared))
+    else:
+        chosen, total = _selected_weights(weights, selected, pred)
+        value = torch.sqrt((chosen * squared).sum() / total)
     return float(value.detach()), count
 
 
@@ -368,15 +396,32 @@ def air_data_loss(
     total = _zero(fields.density)
     counts: dict[str, int] = {}
     parts: dict[str, float] = {}
+    data_weights = getattr(batch, "data_weights", None)
     for name, pred, target, mask, scale in (
         ("rho", fields.density, batch.rho_data, batch.valid_rho, case.rho_scale),
         ("u", fields.velocity, batch.u_data, batch.valid_u, case.u_scale),
         ("p", fields.pressure, batch.p_data, batch.valid_p, case.p_scale),
     ):
-        term, count = _masked_mse(pred, target, mask & inside, scale)
+        term, count = _masked_mse(
+            pred, target, mask & inside, scale, weights=data_weights
+        )
         total = total + term
         counts[f"data_{name}"] = count
         parts[f"data_{name}"] = float(term.detach())
+        if data_weights is not None:
+            unweighted, _ = _masked_mse(pred, target, mask & inside, scale)
+            parts[f"data_{name}_unweighted"] = float(unweighted.detach())
+    if data_weights is not None:
+        weight = torch.as_tensor(
+            data_weights, dtype=fields.density.dtype,
+            device=fields.density.device,
+        ).reshape(-1)
+        total_weight = weight.sum()
+        if not bool(torch.isfinite(total_weight)) or not bool(total_weight > 0.0):
+            raise LossError("data weights must have a positive finite sum")
+        parts["data_weight_ess"] = float(
+            (total_weight * total_weight / (weight * weight).sum()).detach()
+        )
     counts["data_domain_valid"] = in_domain
     counts["data_outside_domain"] = outside_count
     return TermResult(total=total, counts=counts, parts=parts)
@@ -417,14 +462,48 @@ def _contact_violation_values(
     ) ** 2, int(radius.numel())
 
 
+def _contact_weight_values(batch: CaseBatch, values: torch.Tensor) -> torch.Tensor | None:
+    """Aligned, detached contact-label weights, or ``None`` for uniform."""
+    weights = getattr(batch, "contact_weights", None)
+    if weights is None:
+        return None
+    weight = torch.as_tensor(
+        weights, dtype=values.dtype, device=values.device
+    ).reshape(-1)
+    if weight.numel() != values.numel():
+        raise LossError(
+            f"batch has {weight.numel()} contact weights but the prediction has "
+            f"{values.numel()} contact labels"
+        )
+    if not bool(torch.isfinite(weight).all()) or bool((weight < 0.0).any()):
+        raise LossError("contact weights must be finite and non-negative")
+    total = weight.sum()
+    if not bool(torch.isfinite(total)) or not bool(total > 0.0):
+        raise LossError("contact weights must have a positive finite sum")
+    return weight.detach()
+
+
 def contact_data_loss(contact: ContactFields, batch: CaseBatch, case: CaseData) -> TermResult:
     values, count = _contact_violation_values(contact, batch, case)
     if count == 0:
         return TermResult(total=_zero(contact.radius), counts={"contact_data": 0})
-    term = values.mean()
+    weights = _contact_weight_values(batch, values)
+    if weights is None:
+        term = values.mean()
+        parts = {"contact_data": float(term.detach())}
+    else:
+        unweighted = values.mean()
+        total = weights.sum()
+        term = (weights * values).sum() / total
+        ess = total * total / (weights * weights).sum()
+        parts = {
+            "contact_data": float(term.detach()),
+            "contact_data_unweighted": float(unweighted.detach()),
+            "contact_weight_mean": float(weights.mean().detach()),
+            "contact_weight_ess": float(ess.detach()),
+        }
     return TermResult(
-        total=term, counts={"contact_data": count},
-        parts={"contact_data": float(term.detach())},
+        total=term, counts={"contact_data": count}, parts=parts,
     )
 
 
@@ -435,6 +514,21 @@ def contact_violation_rmse(
     if count == 0:
         return None, 0
     return float(torch.sqrt(torch.mean(values)).detach()), count
+
+
+def contact_weighted_violation_rmse(
+    contact: ContactFields, batch: CaseBatch, case: CaseData
+) -> tuple[float | None, int]:
+    """Weighted RMSE for reporting only; the validation score stays unweighted."""
+    values, count = _contact_violation_values(contact, batch, case)
+    if count == 0:
+        return None, 0
+    weights = _contact_weight_values(batch, values)
+    if weights is None:
+        return None, 0
+    return float(
+        torch.sqrt((weights * values).sum() / weights.sum()).detach()
+    ), count
 
 
 def combine_air(
@@ -487,6 +581,7 @@ __all__ = [
     "contact_data_loss",
     "contact_ic_loss",
     "contact_violation_rmse",
+    "contact_weighted_violation_rmse",
     "data_coordinates",
     "finite_mach_rh_state",
     "interface_loss",

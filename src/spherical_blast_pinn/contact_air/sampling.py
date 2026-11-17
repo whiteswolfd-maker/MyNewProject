@@ -44,10 +44,109 @@ class CaseBatch:
     t_contact: Any
     low_contact: Any
     up_contact: Any
+    contact_weights: Any = None
+    data_weights: Any = None
 
     @property
     def n_pde(self) -> int:
         return int(self.t_pde.numel())
+
+
+def _cell_weights(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Voronoi half-spacing weights for sorted unique times."""
+    unique, inverse, counts = np.unique(theta, return_inverse=True, return_counts=True)
+    cell = np.zeros(unique.size, dtype=np.float64)
+    if unique.size == 1:
+        # A single frame has no time extent; any positive weight is equivalent
+        # after the per-case normalisation.
+        cell[0] = 1.0
+    else:
+        cell[0] = 0.5 * (unique[1] - unique[0])
+        cell[-1] = 0.5 * (unique[-1] - unique[-2])
+        cell[1:-1] = 0.5 * (unique[2:] - unique[:-2])
+    if not np.all(np.isfinite(cell)) or np.any(cell <= 0.0):
+        raise SamplingError("contact-time cells must be finite and positive")
+    return cell, inverse, counts
+
+
+def phase_time_weights(case: CaseData) -> np.ndarray:
+    """Similarity-time cell represented by each contact row.
+
+    The weight is defined on the **raw output cadence**: half the theta
+    distance to the previous and next raw output frame, with one-sided
+    half-distance at the ends.  A training/validation frame subset keeps its
+    original raw frame times (including frames whose contact row is invalid),
+    so a valid label does not absorb the whole time cell of an invalid
+    neighbour.  If the raw cadence is unavailable, the contact times are used
+    as a fallback.  Exact repeated times share one unique-time cell equally.
+    """
+    times = np.asarray(getattr(case.contact, "times", []), dtype=np.float64)
+    if times.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    if not np.all(np.isfinite(times)):
+        raise SamplingError("contact times must be finite")
+    theta = (times - float(case.t0)) / float(case.time_scale)
+    raw_times = getattr(case, "raw_times_s", None)
+    offset = (getattr(case, "event_alignment", {}) or {}).get("offset_s")
+    if raw_times is not None and np.asarray(raw_times).size and offset is not None:
+        raw = np.asarray(raw_times, dtype=np.float64)
+        if not np.all(np.isfinite(raw)) or not np.all(np.diff(raw) > 0.0):
+            raise SamplingError("raw output times must be finite and strictly increasing")
+        raw_theta = (raw + float(offset) - float(case.t0)) / float(case.time_scale)
+        cell, _, _ = _cell_weights(raw_theta)
+        positions = np.searchsorted(raw_theta, theta, side="left")
+        if np.any(positions >= raw_theta.size) or not np.allclose(
+            raw_theta[positions], theta, rtol=1.0e-12, atol=1.0e-15
+        ):
+            raise SamplingError(
+                "contact time is not in the raw output frame table"
+            )
+        contact_counts = np.bincount(positions, minlength=raw_theta.size)
+        weights = cell[positions] / contact_counts[positions].astype(np.float64)
+    else:
+        cell, inverse, counts = _cell_weights(theta)
+        weights = cell[inverse] / counts[inverse].astype(np.float64)
+    if not np.all(np.isfinite(weights)) or np.any(weights <= 0.0):
+        raise SamplingError("contact-time weights must be finite and positive")
+    total = float(weights.sum())
+    if not math.isfinite(total) or total <= 0.0:
+        raise SamplingError("contact-time weights must have a positive finite sum")
+    return weights
+
+
+def air_observation_weights(case: CaseData, times) -> np.ndarray:
+    """Per-point air weights: split each frame's theta cell over its draws.
+
+    Air points are drawn frame first, then inside the frame.  A point is matched
+    to its frame by its model time (``case.contact.times``), not by a stored
+    frame id: a validation subset renumbers its contact rows while the
+    observation store keeps the original frame ids.  The frame's cell weight is
+    divided by the number of points drawn from that frame in this batch, so
+    every sampled frame contributes its theta cell once.  Frames with no points
+    in the batch contribute nothing; this is the usual Monte-Carlo estimate over
+    the uniformly drawn frames.
+    """
+    values = np.asarray(times, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    contact_times = np.asarray(case.contact.times, dtype=np.float64)
+    cells = phase_time_weights(case)
+    # Exact repeated contact times share one unique-time cell.  Aggregate the
+    # per-row cells before matching observations; otherwise every observation
+    # at that time would receive only the first duplicate row's share.
+    unique_times, inverse = np.unique(contact_times, return_inverse=True)
+    unique_cells = np.zeros(unique_times.size, dtype=np.float64)
+    np.add.at(unique_cells, inverse, cells)
+    positions = np.searchsorted(unique_times, values, side="left")
+    if np.any(positions >= unique_times.size) or not np.allclose(
+        unique_times[positions], values, rtol=1.0e-12, atol=1.0e-15
+    ):
+        raise SamplingError(
+            "air observation time is not in the contact/frame time table"
+        )
+    counts = np.bincount(positions, minlength=unique_times.size)
+    denominator = counts[positions].astype(np.float64)
+    return unique_cells[positions] / denominator
 
 
 def sample_case_batch(
@@ -142,6 +241,10 @@ def sample_case_batch(
     data = case.observations.sample(
         int(n_data), generator, t_min=t0, t_max=t_end
     )
+    data_weights = torch.as_tensor(
+        air_observation_weights(case, data["t"]),
+        dtype=torch.float64,
+    )
     contact_indices = case.contact.indices()
     if contact_indices.size:
         contact_times = case.contact.times[contact_indices]
@@ -151,6 +254,7 @@ def sample_case_batch(
             & np.asarray([case.shock.has_slope(float(t)) for t in contact_times])
         )
         contact_indices = contact_indices[in_window]
+    contact_weights = torch.zeros(0, dtype=torch.float64)
     if contact_indices.size and int(n_contact) > 0:
         if contact_indices.size <= int(n_contact):
             chosen = contact_indices
@@ -162,6 +266,10 @@ def sample_case_batch(
         t_contact = torch.as_tensor(case.contact.times[chosen], dtype=torch.float64)
         low_contact = torch.as_tensor(case.contact.low[chosen], dtype=torch.float64)
         up_contact = torch.as_tensor(case.contact.up[chosen], dtype=torch.float64)
+        all_weights = phase_time_weights(case)
+        contact_weights = torch.as_tensor(
+            all_weights[chosen], dtype=torch.float64
+        )
     else:
         t_contact = torch.zeros(0, dtype=torch.float64)
         low_contact = torch.zeros(0, dtype=torch.float64)
@@ -176,6 +284,8 @@ def sample_case_batch(
         rho_data=data["rho"], u_data=data["u"], p_data=data["p"],
         valid_rho=data["valid_rho"], valid_u=data["valid_u"], valid_p=data["valid_p"],
         t_contact=t_contact, low_contact=low_contact, up_contact=up_contact,
+        contact_weights=contact_weights,
+        data_weights=data_weights,
     )
 
 
@@ -187,4 +297,11 @@ def split_counts(total: int, n_cases: int) -> list[int]:
     return [base + (1 if index < extra else 0) for index in range(n_cases)]
 
 
-__all__ = ["CaseBatch", "SamplingError", "sample_case_batch", "split_counts"]
+__all__ = [
+    "CaseBatch",
+    "SamplingError",
+    "air_observation_weights",
+    "phase_time_weights",
+    "sample_case_batch",
+    "split_counts",
+]
