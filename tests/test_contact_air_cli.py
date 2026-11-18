@@ -28,14 +28,6 @@ def test_precheck_reports_the_precursor_and_the_missing_one_d_source(tmp_path):
     assert row["precursor"]["epsilon_formula"].startswith("R_sep /")
 
 
-def test_legacy_phase_weighting_config_key_warns_and_is_ignored():
-    with pytest.warns(UserWarning, match="contact_phase_weighting"):
-        config = cli._train_config(
-            {"training": {"contact_phase_weighting": False}}, None
-        )
-    assert "contact_phase_weighting" not in config.__dataclass_fields__
-
-
 def test_train_predict_and_evaluate_with_synthetic_fixtures(tmp_path):
     train_dir = tmp_path / "train"
     code = cli.main([
@@ -157,15 +149,6 @@ def test_base_and_experiment_configs_select_time_inputs():
         assert description["time_origin_rule"] == "case.t0"
         assert description["time_scale_rule"] == "case.time_scale=R_sep/u_a_sep"
         assert description["similarity_input_divisor"] == pytest.approx(64.0)
-
-    gated = _section(load_config(
-        ROOT / "configs" / "contact_air"
-        / "split_train_r50_500_fullframes_similarity_gate.yaml"
-    ))
-    contact, air = _networks(gated)
-    assert not hasattr(contact, "r0_input_gate")
-    assert air.describe()["r0_input_gate"] == "similarity_time"
-    assert air.describe()["r0_gate_rule"].startswith("R0*(1-exp")
 
 
 def test_checkpoint_describe_treats_a_missing_time_reference_as_seconds():

@@ -61,7 +61,7 @@ def _payload(trials, **overrides):
     payload = {
         "version": 3,
         "metric_version": 3,
-        "phase_weighting": "always_on",
+        "phase_weighting": "uniform",
         "ok": True,
         "checkpoint_sha256": {"unchanged": True},
         "adam_requested": len(trials),
@@ -187,7 +187,7 @@ def _static_payload(*, requested=1, records=1, seed=1, config="cfg", chash="h"):
     ]
     return {
         "format": "spherical_blast_pinn.contact_gradient_diagnostic",
-        "version": 3, "metric_version": 3, "phase_weighting": "always_on",
+        "version": 3, "metric_version": 3, "phase_weighting": "uniform",
         "ok": True,
         "config": config, "checkpoint": "best", "checkpoint_loop": 0,
         "checkpoint_sha256": {"before": chash, "after": chash,

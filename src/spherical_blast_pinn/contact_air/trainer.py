@@ -19,7 +19,6 @@ import hashlib
 import json
 import math
 import random
-import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -38,7 +37,6 @@ from .losses import (
     contact_data_loss,
     contact_ic_loss,
     contact_violation_rmse,
-    contact_weighted_violation_rmse,
     data_coordinates,
     interface_loss,
     masked_rmse,
@@ -667,7 +665,7 @@ class AlternatingTrainer:
         self.loop += 1
         record = {
             "loop": self.loop,
-            "phase_weighting": "always_on",
+            "phase_weighting": "uniform",
             "lambda_pde": lambda_pde,
             "lambda_data": lambda_data,
             "contact_learning_rate": float(
@@ -698,10 +696,8 @@ class AlternatingTrainer:
     def _air_errors(self, case: CaseData, batch: CaseBatch) -> dict[str, Any]:
         if batch.t_data.numel() == 0:
             return {
-                "air_rmse": None, "air_weighted_rmse": None,
+                "air_rmse": None,
                 "rho_rmse": None, "u_rmse": None, "p_rmse": None,
-                "rho_rmse_weighted": None, "u_rmse_weighted": None,
-                "p_rmse_weighted": None,
                 "n_rho": 0, "n_u": 0, "n_p": 0,
                 "n_outside_domain": 0,
             }
@@ -724,7 +720,6 @@ class AlternatingTrainer:
                 zeta.detach(), batch.t_data.reshape(-1, 1), r0.reshape(-1, 1), scales,
                 time_input=case.time_input,
             )
-            data_weights = getattr(batch, "data_weights", None)
             rho_err, n_rho = masked_rmse(
                 fields.density, batch.rho_data, batch.valid_rho & inside,
                 case.rho_scale,
@@ -737,36 +732,10 @@ class AlternatingTrainer:
                 fields.pressure, batch.p_data, batch.valid_p & inside,
                 case.p_scale,
             )
-            if data_weights is None:
-                rho_weighted = u_weighted = p_weighted = None
-            else:
-                rho_weighted, _ = masked_rmse(
-                    fields.density, batch.rho_data, batch.valid_rho & inside,
-                    case.rho_scale, weights=data_weights,
-                )
-                u_weighted, _ = masked_rmse(
-                    fields.velocity, batch.u_data, batch.valid_u & inside,
-                    case.u_scale, weights=data_weights,
-                )
-                p_weighted, _ = masked_rmse(
-                    fields.pressure, batch.p_data, batch.valid_p & inside,
-                    case.p_scale, weights=data_weights,
-                )
         components = [value for value in (rho_err, u_err, p_err) if value is not None]
-        weighted_components = [
-            value for value in (rho_weighted, u_weighted, p_weighted)
-            if value is not None
-        ]
         return {
             "air_rmse": sum(components) / len(components) if components else None,
-            "air_weighted_rmse": (
-                sum(weighted_components) / len(weighted_components)
-                if weighted_components else None
-            ),
             "rho_rmse": rho_err, "u_rmse": u_err, "p_rmse": p_err,
-            "rho_rmse_weighted": rho_weighted,
-            "u_rmse_weighted": u_weighted,
-            "p_rmse_weighted": p_weighted,
             "n_rho": n_rho, "n_u": n_u, "n_p": n_p,
             "n_outside_domain": int(outside),
         }
@@ -786,7 +755,6 @@ class AlternatingTrainer:
             batch = sample.batch
             air = self._air_errors(case, batch)
             violation = None
-            weighted_violation = None
             n_contact = 0
             if batch.t_contact.numel():
                 with torch.enable_grad():
@@ -798,9 +766,6 @@ class AlternatingTrainer:
                     )
                 c_fields = _detach_contact(c_fields)
                 violation, n_contact = contact_violation_rmse(c_fields, batch, case)
-                weighted_violation, _ = contact_weighted_violation_rmse(
-                    c_fields, batch, case
-                )
             available = [
                 value for value in (air["air_rmse"], violation) if value is not None
             ]
@@ -810,7 +775,6 @@ class AlternatingTrainer:
                 "evaluable": bool(available),
                 **air,
                 "contact_violation": violation,
-                "contact_weighted_violation": weighted_violation,
                 "n_contact": n_contact,
                 "score": score,
             })
@@ -880,7 +844,7 @@ class AlternatingTrainer:
 
     # -- checkpoint ------------------------------------------------------
     @staticmethod
-    def _case_signature(case: CaseData, *, include_raw_times: bool = True) -> str:
+    def _case_signature(case: CaseData) -> str:
         digest = hashlib.sha256()
 
         def add(name: str, value) -> None:
@@ -910,11 +874,10 @@ class AlternatingTrainer:
         add("contact_low", case.contact.low)
         add("contact_up", case.contact.up)
         add("contact_valid", case.contact.valid)
-        if include_raw_times:
-            add(
-                "raw_times",
-                np.zeros(0) if case.raw_times_s is None else case.raw_times_s,
-            )
+        add(
+            "raw_times",
+            np.zeros(0) if case.raw_times_s is None else case.raw_times_s,
+        )
         add("obs_time", case.observations.time)
         add("obs_radius", case.observations.radius)
         add("obs_density", case.observations.density)
@@ -945,16 +908,6 @@ class AlternatingTrainer:
                 value.detach().cpu().numpy() if hasattr(value, "detach")
                 else np.asarray(value)
             )
-        weights = getattr(batch, "contact_weights", None)
-        payload["contact_weights"] = (
-            None if weights is None
-            else torch.as_tensor(weights).detach().cpu().numpy()
-        )
-        data_weights = getattr(batch, "data_weights", None)
-        payload["data_weights"] = (
-            None if data_weights is None
-            else torch.as_tensor(data_weights).detach().cpu().numpy()
-        )
         return payload
 
     @staticmethod
@@ -976,14 +929,6 @@ class AlternatingTrainer:
             t_contact=array("t_contact", "float64"),
             low_contact=array("low_contact", "float64"),
             up_contact=array("up_contact", "float64"),
-            contact_weights=(
-                None if payload.get("contact_weights") is None
-                else array("contact_weights", "float64")
-            ),
-            data_weights=(
-                None if payload.get("data_weights") is None
-                else array("data_weights", "float64")
-            ),
         )
 
     @staticmethod
@@ -1033,11 +978,7 @@ class AlternatingTrainer:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "format": "spherical_blast_pinn.contact_air_checkpoint",
-            "version": 4,
-            # 1 = pre-theta-weighting signature (no raw output clock);
-            # 2 = full raw-clock signature.  Version-1 payloads still load via
-            # their legacy signature, with an explicit warning.
-            "signature_version": 2,
+            "version": 5,
             "loop": self.loop,
             "stage_state": self.stage_state,
             "contact_net": self.contact_net.state_dict(),
@@ -1076,11 +1017,11 @@ class AlternatingTrainer:
         payload = torch.load(path, map_location="cpu", weights_only=False)
         if payload.get("format") != "spherical_blast_pinn.contact_air_checkpoint":
             raise TrainingError(f"{path}: not a contact-air checkpoint")
-        if payload.get("version") != 4:
+        if payload.get("version") != 5:
             raise TrainingError(
                 f"{path}: checkpoint version {payload.get('version')!r} is not "
-                "supported. Retrain: version 4 carries the R_s/shock-trajectory "
-                "contract and the two-optimizer stage state"
+                "supported. Retrain: version 5 uses uniform frame weighting "
+                "without theta-cell weights"
             )
         expected = [case.case_id for case in self.cases]
         if list(payload.get("case_ids", [])) != expected:
@@ -1088,49 +1029,27 @@ class AlternatingTrainer:
                 f"{path}: checkpoint case ids {payload.get('case_ids')!r} do not match "
                 f"the current training cases {expected!r}"
             )
-        signature_version = int(payload.get("signature_version", 1))
-        legacy_signature = False
-
-        def signature_matches(stored, cases, message: str) -> bool:
-            """Check a current signature, falling back to the legacy one.
-
-            Version-2+ checkpoints must carry the full raw output clock.  A
-            checkpoint written before theta weighting (no ``signature_version``)
-            has a legacy digest that omits only ``raw_times``; accepting it keeps
-            the documented resume path alive while warning that the raw clock
-            cannot be verified against the old file.
-            """
-            values = list(stored)
-            if values == [self._case_signature(case) for case in cases]:
-                return False
-            if signature_version < 2 and values == [
-                self._case_signature(case, include_raw_times=False)
-                for case in cases
-            ]:
-                return True
-            raise TrainingError(message)
-
-        if signature_matches(
-            payload.get("case_signatures", []),
-            self.cases,
-            f"{path}: training data / precursor / shock trajectory / split "
-            "signature does not match the current cases (including the full raw "
-            "output clock); refusing to resume on different data",
-        ):
-            legacy_signature = True
+        if list(payload.get("case_signatures", [])) != [
+            self._case_signature(case) for case in self.cases
+        ]:
+            raise TrainingError(
+                f"{path}: training data / precursor / shock trajectory / split "
+                "signature does not match the current cases (including the full raw "
+                "output clock); refusing to resume on different data"
+            )
         validation_ids = [case.case_id for case in self.validation_cases]
         if list(payload.get("validation_case_ids", [])) != validation_ids:
             raise TrainingError(
                 f"{path}: checkpoint validation case ids do not match the current split"
             )
-        if signature_matches(
-            payload.get("validation_case_signatures", []),
-            self.validation_cases,
-            f"{path}: checkpoint validation split/data signature differs from the "
-            "current one (including the full raw output clock); the fixed "
-            "validation frames would change",
-        ):
-            legacy_signature = True
+        if list(payload.get("validation_case_signatures", [])) != [
+            self._case_signature(case) for case in self.validation_cases
+        ]:
+            raise TrainingError(
+                f"{path}: checkpoint validation split/data signature differs from the "
+                "current one (including the full raw output clock); the fixed "
+                "validation frames would change"
+            )
         saved_config = payload.get("config", {})
         for key in (
             "validation_holdout_fraction", "validation_data_points",
@@ -1181,24 +1100,6 @@ class AlternatingTrainer:
             )
             for entry in saved_validation
         ]
-        if legacy_signature:
-            warnings.warn(
-                f"{path}: legacy checkpoint signature (saved before always-on "
-                "theta weighting). The full raw output clock cannot be verified "
-                "against this checkpoint; theta weights are computed from the "
-                "current raw clock and apply from the resumed loop. Saved "
-                "validation samples without contact/data weights will not report "
-                "weighted metrics.",
-                UserWarning,
-                stacklevel=2,
-            )
-        if "contact_phase_weighting" in saved_config:
-            warnings.warn(
-                f"{path}: obsolete checkpoint config key contact_phase_weighting "
-                "is ignored; contact and air theta weighting is always on.",
-                UserWarning,
-                stacklevel=2,
-            )
         self.contact_net.load_state_dict(payload["contact_net"])
         self.air_net.load_state_dict(payload["air_net"])
         self.opt_contact.load_state_dict(payload["opt_contact"])

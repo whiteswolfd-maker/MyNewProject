@@ -83,7 +83,7 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
 def _case_data(audit: dict, case_id: str):
     training_config = audit.get(
         "training_config",
-        "configs/contact_air/split_train_r50_500_cw3.yaml",
+        "configs/contact_air/split_train_r50_500_fullframes.yaml",
     )
     config = load_config(_REPO_ROOT / str(training_config))
     section = _section(config)
@@ -343,8 +343,8 @@ def _report(audit: dict, root: Path, out_dir: Path, manifest, metrics_rows,
         "",
         "## Layer D - PINN",
         "",
-        "See `outputs/contact_air_diagnostics_cw3_4000/` for the 20-radius "
-        "diagnostics already produced for the current cw3 model.",
+        "See `outputs/contact_air_diagnostics_*` for the 20-radius diagnostics; "
+        "rerun them on the current model before citing numbers.",
         "",
         "## Limitations",
         "",
@@ -362,7 +362,7 @@ def _report(audit: dict, root: Path, out_dir: Path, manifest, metrics_rows,
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", default=str(
-        _REPO_ROOT / "configs/contact_air/reference_audit.yaml"))
+        _REPO_ROOT / "configs/contact_air/reference_audit_fullframes.yaml"))
     parser.add_argument("--stage", default="all",
                         choices=("manifest", "imports", "metrics", "consistency",
                                  "report", "all"))

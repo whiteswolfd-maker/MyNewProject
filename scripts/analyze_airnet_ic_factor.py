@@ -256,7 +256,7 @@ def _loss_record(lambda_pde, lambda_data, per_case) -> dict:
             "interface": "unweighted",
             "right": "unweighted",
         },
-        "phase_weighting": "always_on",
+        "phase_weighting": "uniform",
         "weighted_contribution": weighted,
         "total": total,
         "ic_share_of_total": weighted["ic"] / max(abs(total), 1.0e-300),

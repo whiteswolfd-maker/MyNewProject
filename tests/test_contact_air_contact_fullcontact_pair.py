@@ -11,7 +11,6 @@ import pytest
 import torch
 
 from spherical_blast_pinn.contact_air.models import AirNet, ContactNet
-from spherical_blast_pinn.contact_air.sampling import phase_time_weights
 from spherical_blast_pinn.contact_air.testing import synthetic_case_for
 from spherical_blast_pinn.contact_air.trainer import (
     AlternatingTrainer,
@@ -76,12 +75,6 @@ def _mass_mean(trainer, case, labels, batch):
     return float(_mass_values(trainer, case, labels, batch).mean())
 
 
-def _mass_weighted_mean(trainer, case, labels, batch):
-    values = _mass_values(trainer, case, labels, batch)
-    weights = batch.contact_weights.reshape(-1)
-    return float((weights * values).sum() / weights.sum())
-
-
 def test_full_contact_loss_is_per_case_mean_then_equal_case_mean(tmp_path):
     trainer = _trainer(tmp_path)
     labels = _labels(trainer)
@@ -91,15 +84,11 @@ def test_full_contact_loss_is_per_case_mean_then_equal_case_mean(tmp_path):
     for case, batch in full:
         terms = trainer.contact_stage_terms(case, batch)
         assert terms["contact_data"].counts["contact_data"] == labels[case.case_id]["n"]
-        independent = _mass_weighted_mean(
+        independent = _mass_mean(
             trainer, case, labels[case.case_id], batch
         )
         assert float(terms["contact_data"].total.detach()) == pytest.approx(
             independent, rel=1.0e-12, abs=1.0e-15
-        )
-        assert terms["contact_data"].parts["contact_data_unweighted"] == pytest.approx(
-            _mass_mean(trainer, case, labels[case.case_id], batch),
-            rel=1.0e-12, abs=1.0e-15,
         )
         case_means.append(independent)
     expected = sum(case_means) / len(case_means)
@@ -132,26 +121,6 @@ def test_all_label_batches_change_only_contact_labels(tmp_path):
     assert pair._non_contact_equal(batches, full)
     for (case, original), (_, changed) in zip(batches, full):
         assert changed.t_contact.numel() == labels[case.case_id]["n"]
-        assert changed.contact_weights is not None
-
-
-def test_full_labels_carry_aligned_phase_weights(tmp_path):
-    trainer = _trainer(tmp_path)
-    labels = _labels(trainer)
-    batches = trainer._batches(generator=torch.Generator().manual_seed(5))
-    full = pair._all_label_batches(trainer, batches, labels)
-    for case, batch in full:
-        current = labels[case.case_id]
-        all_weights = phase_time_weights(case)
-        selected = np.searchsorted(case.contact.times, current["times"])
-        expected_weights = all_weights[selected]
-        assert batch.contact_weights is not None
-        assert np.allclose(
-            batch.contact_weights.detach().numpy(), expected_weights
-        )
-        terms = trainer.contact_stage_terms(case, batch)
-        assert "contact_data_unweighted" in terms["contact_data"].parts
-        assert terms["contact_data"].parts["contact_weight_ess"] > 0.0
 
 
 def test_paired_trial_starts_from_identical_state_and_preserves_checkpoint(tmp_path):

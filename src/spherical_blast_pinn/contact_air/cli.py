@@ -35,7 +35,6 @@ import hashlib
 import json
 import math
 import sys
-import warnings
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -154,8 +153,12 @@ def _select_specs(section: Mapping[str, Any], which: str) -> list[dict[str, Any]
 #: dependent derived values (R_sep, t0, Rc0, Rs0) intentionally differ.
 _SHARED_PRECURSOR_SCALARS = (
     "epsilon_denominator_factor", "shock_model", "air_density", "air_pressure",
-    "gamma_air", "material_source", "material_source_verified",
+    "gamma_air", "material_source_verified",
 )
+# ``material_source`` is a provenance label, not a physics value.  The JWL,
+# detonation and shared dimensionless blocks below are compared numerically, so
+# relocating the same deck must not force a cache rebuild.  The verified flag
+# is still checked.
 _SHARED_DIMENSIONLESS = (
     "V_cj", "V_sep", "C", "p_sep", "u_c_sep", "D_s_sep",
 )
@@ -400,13 +403,6 @@ def _train_config(
 ) -> TrainConfig:
     training = dict(section.get("training", {}))
     sampling = dict(section.get("sampling", {}))
-    if "contact_phase_weighting" in training:
-        warnings.warn(
-            "training.contact_phase_weighting is obsolete and ignored: contact "
-            "and air theta weighting is always on.",
-            UserWarning,
-            stacklevel=2,
-        )
     values = {
         "n_pde": int(sampling.get("n_pde", 512)),
         "n_ic": int(sampling.get("n_ic", 128)),
@@ -692,7 +688,7 @@ def command_train(args) -> int:
         "start_loop": start_loop,
         "target_loop": int(train_config.loops),
         "contact_data_weight": float(train_config.contact_data_weight),
-        "phase_weighting": "always_on",
+        "phase_weighting": "uniform",
         "n_schedule": int(train_config.n_schedule),
         "seed": int(train_config.seed),
         "time_input": str(section.get("networks", {}).get("time_input", "legacy")),
@@ -736,11 +732,11 @@ def _load_checkpoint(path: Path, contact: ContactNet, air: AirNet) -> dict[str, 
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if payload.get("format") != "spherical_blast_pinn.contact_air_checkpoint":
         raise CommandError(f"{path}: not a contact-air checkpoint")
-    if payload.get("version") != 4:
+    if payload.get("version") != 5:
         raise CommandError(
             f"{path}: checkpoint version {payload.get('version')!r} is not supported; "
-            "retrain: version 4 carries the R_s trajectory contract and the "
-            "two-optimizer stage state"
+            "retrain: version 5 uses uniform frame weighting without theta-cell "
+            "weights"
         )
     _check_checkpoint_state(contact, payload["contact_net"], "contact_net", Path(path))
     _check_checkpoint_state(air, payload["air_net"], "air_net", Path(path))

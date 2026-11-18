@@ -31,7 +31,6 @@ for path in (_REPO_ROOT, _REPO_ROOT / "src", _SCRIPTS):
         sys.path.insert(0, str(path))
 
 import diagnose_contact_gradients as diag  # noqa: E402
-from spherical_blast_pinn.contact_air.sampling import phase_time_weights  # noqa: E402
 
 
 def _sha256(path: Path) -> str:
@@ -63,11 +62,6 @@ def _all_label_batches(trainer, batches, labels: dict):
     result = []
     for case, batch in batches:
         current = labels[case.case_id]
-        all_weights = phase_time_weights(case)
-        selected = np.searchsorted(case.contact.times, current["times"])
-        weights = torch.as_tensor(
-            all_weights[selected], dtype=torch.float64
-        )
         result.append((
             case,
             dataclasses.replace(
@@ -75,7 +69,6 @@ def _all_label_batches(trainer, batches, labels: dict):
                 t_contact=torch.as_tensor(current["times"], dtype=torch.float64),
                 low_contact=torch.as_tensor(current["low"], dtype=torch.float64),
                 up_contact=torch.as_tensor(current["up"], dtype=torch.float64),
-                contact_weights=weights,
             ),
         ))
     return result

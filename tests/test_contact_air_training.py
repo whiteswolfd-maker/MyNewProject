@@ -11,7 +11,6 @@ import torch
 import pytest
 
 from spherical_blast_pinn.contact_air.models import AirNet, ContactNet
-from spherical_blast_pinn.contact_air.sampling import phase_time_weights
 from spherical_blast_pinn.contact_air.testing import synthetic_case_for
 from spherical_blast_pinn.contact_air.trainer import (
     AlternatingTrainer,
@@ -521,23 +520,22 @@ def test_resume_rejects_a_different_contact_data_weight(tmp_path):
         different.load(path)
 
 
-def test_phase_weighting_is_always_on_and_logged(tmp_path):
+def test_frame_weighting_is_uniform(tmp_path):
     trainer = _trainer(tmp_path)
     record = trainer.step()
-    assert "contact_data_unweighted" in record["contact_parts"]
-    assert "contact_weight_ess" in record["contact_parts"]
-    assert "data_rho_unweighted" in record["air_parts"]
-    assert "data_weight_ess" in record["air_parts"]
+    assert record["phase_weighting"] == "uniform"
+    for name in ("contact_data_unweighted", "contact_weight_ess"):
+        assert name not in record["contact_parts"]
+    for name in ("data_rho_unweighted", "data_weight_ess"):
+        assert name not in record["air_parts"]
     for coverage in record["right_boundary_coverage_by_case"].values():
         assert set(coverage) == {"n", "theta_min", "theta_max", "theta_median"}
     for _, batch in trainer._batches():
-        assert batch.contact_weights is not None
-        assert batch.contact_weights.numel() == batch.t_contact.numel()
-        assert batch.data_weights is not None
-        assert batch.data_weights.numel() == batch.t_data.numel()
+        assert not hasattr(batch, "contact_weights")
+        assert not hasattr(batch, "data_weights")
 
 
-def test_trainer_split_keeps_full_raw_clock_weights(tmp_path):
+def test_trainer_split_keeps_full_raw_clock(tmp_path):
     case = synthetic_case_for(
         0.05, case_id="r050", n_frames=11, n_radial=1600
     )
@@ -545,71 +543,6 @@ def test_trainer_split_keeps_full_raw_clock_weights(tmp_path):
     trainer = _trainer(tmp_path, cases=[case], holdout=0.3)
     training_case = trainer.cases[0]
     assert training_case.raw_times_s.size == case.raw_times_s.size
-    positions = np.searchsorted(
-        case.contact.times, training_case.contact.times
-    )
-    assert np.allclose(
-        phase_time_weights(training_case),
-        phase_time_weights(case)[positions],
-    )
-
-
-def test_validation_without_saved_weights_has_no_weighted_metric(tmp_path):
-    import dataclasses
-
-    trainer = _trainer(tmp_path)
-    sample = trainer._validation[0]
-    case = next(
-        item for item in trainer.validation_cases
-        if item.case_id == sample.case_id
-    )
-    plain = dataclasses.replace(
-        sample.batch, data_weights=None, contact_weights=None
-    )
-    air = trainer._air_errors(case, plain)
-    assert air["air_weighted_rmse"] is None
-    assert air["rho_rmse_weighted"] is None
-
-
-def test_resume_accepts_old_checkpoint_without_weight_payloads(tmp_path):
-    trainer = _trainer(tmp_path)
-    path = trainer.save(tmp_path / "old_payload.pt")
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    payload["config"]["contact_phase_weighting"] = False
-    for entry in payload.get("validation", []):
-        entry["batch"].pop("contact_weights", None)
-        entry["batch"].pop("data_weights", None)
-    torch.save(payload, path)
-    same = _trainer(tmp_path / "same")
-    with pytest.warns(UserWarning, match="contact_phase_weighting"):
-        assert same.load(path)["loop"] == 0
-    # The old validation payload has no weights; weighted metrics stay absent,
-    # while training batches are sampled with the always-on weights.
-    for sample in same._validation:
-        assert sample.batch.contact_weights is None
-        assert sample.batch.data_weights is None
-
-
-def test_resume_accepts_a_legacy_signature_with_a_warning(tmp_path):
-    trainer = _trainer(tmp_path)
-    path = trainer.save(tmp_path / "legacy_signature.pt")
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    assert payload["signature_version"] == 2
-    # Simulate a checkpoint written before raw_times entered the signature.
-    payload.pop("signature_version")
-    payload["case_signatures"] = [
-        AlternatingTrainer._case_signature(case, include_raw_times=False)
-        for case in trainer.cases
-    ]
-    payload["validation_case_signatures"] = [
-        AlternatingTrainer._case_signature(case, include_raw_times=False)
-        for case in trainer.validation_cases
-    ]
-    torch.save(payload, path)
-    same = _trainer(tmp_path / "same")
-    with pytest.warns(UserWarning, match="legacy checkpoint signature"):
-        info = same.load(path)
-    assert info["loop"] == 0
 
 
 def test_resume_rejects_a_changed_raw_clock_in_a_new_checkpoint(tmp_path):

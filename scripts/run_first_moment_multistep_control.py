@@ -46,7 +46,7 @@ from spherical_blast_pinn.contact_air.cli import _networks  # noqa: E402
 
 C_CONFIG = (
     "configs/contact_air/"
-    "split_train_r50_500_fullframes_similarity_none_pair.yaml"
+    "split_train_r50_500_fullframes_similarity.yaml"
 )
 CHECKPOINTS = {
     "best": Path("outputs/contact_air_time_input_pair_c_none_4000/best.pt"),

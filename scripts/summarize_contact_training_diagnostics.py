@@ -104,10 +104,10 @@ def _source_issues(payload: dict) -> list[str]:
     issues = []
     if payload.get("version") != 3 or payload.get("metric_version") != 3:
         issues.append("source schema is not metric version 3; rerun required")
-    if payload.get("phase_weighting") != "always_on":
+    if payload.get("phase_weighting") != "uniform":
         issues.append(
-            "source predates always-on theta weighting; its contact_data values "
-            "are not comparable to current runs; rerun required"
+            "source does not use uniform frame weighting; its contact_data "
+            "values are not comparable to current runs; rerun required"
         )
     if payload.get("ok") is False:
         issues.extend(payload.get("failure_reasons") or ["source reported ok=false"])

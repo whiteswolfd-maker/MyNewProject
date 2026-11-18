@@ -20,11 +20,11 @@ inherits: base.yaml
 
 contact_air:
   precursor:
-    material_source: "G:/R50_R100_reference_v2/R50_full/R50_full_reference.k"
+    material_source: "G:/50-500/50/R50_d3plot_v4.k"
     material_source_verified: true
 
   contact_interval:
-    # Caches for R150-R1000 were built with this window (see all_real.yaml).
+    # The current d3plot caches were built with this event-search window.
     event_search_window_s: 5.0e-5
 
   cases:
@@ -49,7 +49,7 @@ contact_air:
     - {case_id: r950_full,  role: validation, charge_radius_m: 0.950, cache: outputs/fullframes/cache/r950_full.npz,  synthetic: false}
     - {case_id: r1000_full, role: validation, charge_radius_m: 1.000, cache: outputs/fullframes/cache/r1000_full.npz, synthetic: false}
 
-  output_dir: outputs/contact_air_split_r50_500_fullframes_cw3_4000
+  output_dir: outputs/contact_air_fullframes_legacy_4000
 
   # Sampling counts are totals split across the 10 training cases, not
   # per-case budgets.  The base 512/128/128/128/128 would give only ~51 PDE,

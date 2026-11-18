@@ -47,7 +47,7 @@ ZETAS = np.linspace(0.01, 0.99, 33)
 CONFIG = "configs/contact_air/split_train_r50_500_fullframes_similarity.yaml"
 B_LAST = "outputs/contact_air_time_input_similarity_4000/last.pt"
 B_BEST = "outputs/contact_air_time_input_similarity_4000/best.pt"
-LEGACY_CONFIG = "configs/contact_air/split_train_r50_500_fullframes_legacy_4000.yaml"
+LEGACY_CONFIG = "configs/contact_air/split_train_r50_500_fullframes.yaml"
 
 
 def _sha256(path: Path) -> str:

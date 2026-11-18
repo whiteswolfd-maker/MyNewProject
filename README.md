@@ -130,7 +130,7 @@ python scripts/import_lsdyna_d3plot_1d.py \
   --expected-cells 50000 --expected-outer-radius-m 5.0 \
   --out outputs/fullframes/standard/r50_full.npz
 PYTHONPATH=src python -m spherical_blast_pinn.contact_air.cli build-cache \
-  --config configs/contact_air/split_train_r50_500_fullframes_similarity_none_pair.yaml \
+  --config configs/contact_air/split_train_r50_500_fullframes_similarity.yaml \
   --case r50_full --source outputs/fullframes/standard/r50_full.npz \
   --out outputs/fullframes/cache/r50_full.npz
 ```
@@ -318,28 +318,21 @@ L_c = lambda_IC L_c_IC + lambda_data * w_c L_c_data
     + lambda_PDE L_PDE + lambda_interface L_interface
 
 L_c_IC   = [(R_c(t0)-Rc0)/s_R]^2
-L_c_data = sum_i w_i ell_i / sum_i w_i
+L_c_data = mean_i ell_i
 ell_i    = (ReLU(R_c,low,i-R_c,i)/s_R)^2
          + (ReLU(R_c,i-R_c,up,i)/s_R)^2
 ```
 
 - `w_c = training.contact_data_weight`（默认 1.0）**只乘接触区间监督项**，
   不动初值、界面、空气数据和 PDE 权重；命令行 `--contact-data-weight`
-  可覆盖。每条 loop 同时记录加权和未加权的接触分项、实际 `w_c` 以及权重
-  ESS，避免用乘权后的总损失做跨实验比较。
-- 接触数据和空气观测按相似时间（theta）单元加权，不再使用“每帧一票”的按帧
-  均值。权重来自真实 raw 输出节奏：每个 raw 帧的 theta 单元取相邻帧半间距
-  （端点单侧，重复时刻平分）；接触项为 `sum_i w_i ell_i / sum_i w_i`；空气项
-  把每个抽样帧的单元权重平均分给该帧在本 batch 中被抽到的点，再按字段有效
-  掩码做加权均值。抽样概率不变，不按权重重复抽样；初值、界面、PDE、网络、
-  优化器、归一化尺度和所有其他损失系数不变。验证评分仍用未加权按帧指标，
-  另记录加权接触/空气指标、权重均值和有效样本量。旧的
-  `training.contact_phase_weighting` 键已被移除并忽略（加载旧配置/旧检查点时
-  给出警告）；加权不可关闭。新检查点的签名包含完整 raw 时钟；在此改动前保存
-  的旧检查点按不含 raw 时钟的 legacy 签名加载并警告，无法再校验旧 raw 时钟，
-  加权从续训点开始生效。旧检查点保存的验证样本若缺 `contact_weights`/
-  `data_weights`，其加权指标保持未提供；验证评分仍按未加权帧指标，可与旧
-  `best_score` 比较。
+  可覆盖。每条 loop 记录实际 `w_c` 与接触分项。
+- 接触标签和空气观测**按帧等权**。抽样仍是帧优先：空气先均匀抽帧、再抽帧内
+  一个单元；接触标签在合法帧中均匀抽取（超过预算时无放回随机子集）。损失对
+  选中的标签/观测做普通均值，不乘 theta 单元权重，也不读 raw 输出节奏。因此
+  每帧的期望损失贡献相同，输出 cadence 不均匀不会改变损失权重。
+  `training.contact_phase_weighting` 键已删除；旧检查点（version 4）及其
+  `contact_weights`/`data_weights` 字段不再兼容，必须重训。验证评分同样使用
+  未加权按帧指标。
 
 区间内零罚、区间外距离平方；接触标签在自己的 `t_contact` 上重新计算网络。两个
 网络复用同一组映射空气残差，不复制“接触面 PDE”。
@@ -374,7 +367,8 @@ s_fE = s_E / T_star
   分项。
 - 多半径均衡采样；空气数据先抽帧再抽帧内点；接触标签用自己的时刻；只在有效
   轨迹段采样；先不加激波附近额外权重。
-- 缓存 schema **version 7**；检查点 **version 4**。旧格式明确拒绝并要求重建。
+- 缓存 schema **version 7**；检查点 **version 5**。旧格式（包括 version 4 的
+  theta 权重检查点）明确拒绝并要求重建。
 - 检查点保存两个网络、两个优化器、阶段状态、RNG、配置、数据身份、固定验证
   样本；恢复先核对再应用。网络元数据中的 `time_reference_s`、`time_input`
   模式、输入原点/尺度规则和 `similarity_input_divisor` 也参与核对：旧检查点
@@ -391,7 +385,7 @@ s_fE = s_E / T_star
 
 ### 参考数据与实现审计（只读）
 
-`configs/contact_air/reference_audit.yaml` +
+`configs/contact_air/reference_audit_fullframes.yaml` +
 `scripts/audit_reference_data.py` + `contact_air/reference_audit.py` 提供不依赖
 训练链路的核验：
 
@@ -408,13 +402,11 @@ s_fE = s_E / T_star
   属于同一连续轨迹段；接触区间与 JWL/空气压力在 t0 之后的早、中、晚多个有效
   帧上采样，报告多个纯空气单元及压力随距离的变化；接触速度只称为两条区间
   边界轨迹的差分斜率，不称为物理速度上下界；
-- `configs/contact_air/reference_audit_fullframes.yaml` 是同一审计的全帧版本，
-  读取 `outputs/fullframes/standard|` 与 `outputs/fullframes/cache|`，不覆盖
-  旧的 strided 审计输出；`scripts/summarize_fullframe_data.py` 生成 20 例的
-  原始/导入/缓存有效帧清单。
-- R50 全帧验收：原始 968 帧全部导入（`dropped_frames=0`），968 个标准帧逐值
-  与原始文件一致（最大相对差 1.8e-16），固定测点 Z=0.5/0.75/1.0 的峰值在
-  原始首脉冲共同窗口内与原始完全一致（差 0）。
+- 当前全帧审计读取 `outputs/fullframes/standard|` 与
+  `outputs/fullframes/cache|`；`scripts/summarize_fullframe_data.py` 生成 20 例
+  的原始/导入/缓存有效帧清单。
+- 当前 d3plot 数据集每例 1002 个 state；导入器记录
+  `frame_selection_policy=all_states`，state 时间来自 d3plot header 的全精度值。
 - **D PINN**：复用 `contact_air_diagnostics_*` 的输出。
 
 全帧验收必须逐帧比较，而不是只看 `--stage all`：
@@ -501,20 +493,20 @@ PYTHONPATH=src python -m spherical_blast_pinn.cli.contact_air evaluate \
 
 # 6. 全帧基线记录、采样基准与接触梯度诊断（均只读）
 PYTHONPATH=src python scripts/record_baseline.py \
-  --config configs/contact_air/split_train_r50_500_fullframes.yaml \
-  --checkpoint-dir outputs/contact_air_split_r50_500_fullframes_cw3_4000 \
+  --config configs/contact_air/split_train_r50_500_fullframes_similarity.yaml \
+  --checkpoint-dir outputs/contact_air_time_input_similarity_4000 \
   --output outputs/fullframes/baseline_manifest.json
 PYTHONPATH=src python scripts/benchmark_sampling.py \
-  --config configs/contact_air/split_train_r50_500_fullframes.yaml \
+  --config configs/contact_air/split_train_r50_500_fullframes_similarity.yaml \
   --case r550_full --full-step --output outputs/fullframes/sampling_benchmark_full.json
 PYTHONPATH=src python scripts/diagnose_contact_gradients.py \
-  --config configs/contact_air/split_train_r50_500_fullframes.yaml \
-  --checkpoint outputs/contact_air_split_r50_500_fullframes_cw3_4000/best.pt \
+  --config configs/contact_air/split_train_r50_500_fullframes_similarity.yaml \
+  --checkpoint outputs/contact_air_time_input_similarity_4000/best.pt \
   --mode training --batches 100 --batch-seed 20261114 \
   --output outputs/fullframes/contact_training_diagnostics_fixed/static_best_seed20261114.json
 PYTHONPATH=src python scripts/diagnose_contact_gradients.py \
-  --config configs/contact_air/split_train_r50_500_fullframes.yaml \
-  --checkpoint outputs/contact_air_split_r50_500_fullframes_cw3_4000/best.pt \
+  --config configs/contact_air/split_train_r50_500_fullframes_similarity.yaml \
+  --checkpoint outputs/contact_air_time_input_similarity_4000/best.pt \
   --mode training --batches 1 --adam-trials 100 --adam-seed 20261115 \
   --output outputs/fullframes/contact_training_diagnostics_fixed/adam_best_seed20261115.json
 PYTHONPATH=src python scripts/summarize_contact_training_diagnostics.py \
@@ -522,16 +514,16 @@ PYTHONPATH=src python scripts/summarize_contact_training_diagnostics.py \
 # 汇总按目录中的 diagnostic_manifest.json 核对检查点/模式/种子/文件；
 # 清单缺项、记录数与 metadata 不符、重复试验、混用检查点或配置都会非零退出。
 PYTHONPATH=src python scripts/contact_fullcontact_pair.py \
-  --config configs/contact_air/split_train_r50_500_fullframes.yaml \
-  --checkpoint outputs/contact_air_split_r50_500_fullframes_cw3_4000/best.pt \
+  --config configs/contact_air/split_train_r50_500_fullframes_similarity.yaml \
+  --checkpoint outputs/contact_air_time_input_similarity_4000/best.pt \
   --trials 100 --seed 20261115 --tag best \
   --output outputs/fullframes/contact_fullcontact_pair/pair_best_seed20261115.json
 PYTHONPATH=src python scripts/summarize_contact_fullcontact_pair.py \
   --directory outputs/fullframes/contact_fullcontact_pair
 # 实际 Adam 方向分析：每个检查点/种子 20 个独立配对单步，B 全标签
 PYTHONPATH=src python scripts/contact_fullcontact_pair.py \
-  --config configs/contact_air/split_train_r50_500_fullframes.yaml \
-  --checkpoint outputs/contact_air_split_r50_500_fullframes_cw3_4000/last.pt \
+  --config configs/contact_air/split_train_r50_500_fullframes_similarity.yaml \
+  --checkpoint outputs/contact_air_time_input_similarity_4000/last.pt \
   --tag last --seed 20261115 --trials 20 --analysis direction \
   --output outputs/fullframes/contact_adam_direction/direction_last_seed20261115.json
 PYTHONPATH=src python scripts/summarize_contact_adam_direction.py \
@@ -593,16 +585,16 @@ SHA-256 前后校验。汇总脚本要求实验清单，核对预期文件/检�
 
 ## 8. 数据状态与未解决项
 
-- **没有真实 50 mm 一维 ALE1D 数据。** 未执行真实 50 mm 试跑。
-- **二进制 ALE1D 读取未实现。** 不猜测槽位；需要真实文件样例、LS-DYNA 版本、
-  字段/材料组映射、单位、时间轴、节点/单元约定。
-- 中间格式可用不等于二进制读取已验证。
-- 接触阈值、激波 prominence/距离参数尚未由真实数据确认。
-- 材料卡 JWL/detonation/air 数值仍是配置占位值，
-  `material_source_verified: false`；使用前必须对照实际卡片。
-- 训练/验证/测试半径尚未确定；`base.yaml` 的 `cases` 为空是刻意的，不预设
-  50/80/100 训练、500 测试。
-- `outputs/` 下可能存在历史结果；它们不是本次输入，也不会被自动读取。
+- 当前有 20 个真实 d3plot state 算例：R50–R1000，每例 1002 个 state；标准与
+  缓存位于 `outputs/fullframes/standard|` 与 `outputs/fullframes/cache|`。
+- 二进制 ALE1D 读取已实现（`scripts/import_lsdyna_d3plot_1d.py`），读取
+  d3plot 第一个体积平均层；`BEAMIP=10` 的逐 ALE 组层不进入训练。
+- 接触阈值、激波 prominence/距离参数仍是配置值，尚未由独立实验确认。
+- 材料卡来自 R50 的 v4 deck（`G:/50-500/50/R50_d3plot_v4.k`），
+  `material_source_verified: true`；其余半径只改了输出块，使用同一材料卡。
+- 训练/验证按半径带划分：R50–R500 训练，R550–R1000 验证；没有单独 test 带。
+- `outputs/` 下的 `similarity_check_20261118_d3plot_*` 是只读诊断结果，不进入
+  训练；旧 profile 数据和旧结果已删除。
 
 ## 9. 仓库布局
 

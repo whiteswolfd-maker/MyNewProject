@@ -47,7 +47,7 @@ import diagnose_contact_gradients as diag  # noqa: E402
 
 C_CONFIG = (
     "configs/contact_air/"
-    "split_train_r50_500_fullframes_similarity_none_pair.yaml"
+    "split_train_r50_500_fullframes_similarity.yaml"
 )
 THETA_MIN = 0.5
 THETA_MAX = 60.0

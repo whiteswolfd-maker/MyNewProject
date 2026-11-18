@@ -40,7 +40,7 @@ ALPHAS = (1.0, 0.5, 0.25, 0.125)
 TERMS = ("pde", "contact_ic", "interface", "contact_data")
 C_CONFIG = (
     "configs/contact_air/"
-    "split_train_r50_500_fullframes_similarity_none_pair.yaml"
+    "split_train_r50_500_fullframes_similarity.yaml"
 )
 CHECKPOINTS = {
     "best": Path(

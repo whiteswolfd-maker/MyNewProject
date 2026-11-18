@@ -8,8 +8,8 @@ checkpoint or training output; the only file it writes is the requested JSON.
 Example:
 
     PYTHONPATH=src python scripts/record_baseline.py \
-        --config configs/contact_air/split_train_r50_500_fullframes.yaml \
-        --checkpoint-dir outputs/contact_air_split_r50_500_fullframes_cw3_4000 \
+        --config configs/contact_air/split_train_r50_500_fullframes_similarity.yaml \
+        --checkpoint-dir outputs/contact_air_time_input_similarity_4000 \
         --output outputs/fullframes/baseline_manifest.json
 """
 from __future__ import annotations
@@ -174,7 +174,7 @@ def main(argv=None) -> int:
         "format": "spherical_blast_pinn.baseline_manifest",
         "version": 1,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "baseline_name": "fullframes_cw3_4000",
+        "baseline_name": "fullframes_similarity_4000",
         "config": {
             "path": str(config_path),
             "sha256": _sha256(config_path),

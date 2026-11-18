@@ -703,7 +703,7 @@ def main(argv=None) -> int:
         "format": "spherical_blast_pinn.contact_gradient_diagnostic",
         "version": 3,
         "metric_version": 3,
-        "phase_weighting": "always_on",
+        "phase_weighting": "uniform",
         "contact_data_loss_semantics": "theta_cell_weighted",
         "config": args.config,
         "checkpoint": str(checkpoint),
