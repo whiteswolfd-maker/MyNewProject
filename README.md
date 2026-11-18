@@ -99,13 +99,46 @@ t/mm³，速度 m/s、mm/us、km/s、cm/us，压力 Pa/kPa/MPa/GPa/bar/kbar。
   `node_to_cell_convention = "preconverted_cell_representatives"`；任意字符串
   或未转换的节点数据拒绝。
 
-**LS-DYNA 二进制 ALE1D 槽位尚未核实，因此没有实现猜测式二进制读取。** 真实
-接入需要文件样例、版本和字段映射；在此之前只能使用上述中间格式。
+### LS-DYNA d3plot ALE1D state 导入（当前数据集）
 
-### LS-DYNA ASCII profile 导入
+`scripts/import_lsdyna_d3plot_1d.py` 读取 `*DATABASE_BINARY_D3PLOT` 生成的
+d3plot state 数据库，不再依赖 3 位有效数字的 profile 文件名。状态时间取
+d3plot state header 的全精度值。
 
-`scripts/import_lsdyna_profiles_1d.py` 把 `*DATABASE_PROFILE` 生成的 `.xy`
-文本剖面转换为上述标准中间格式。它只读取 ASCII profile，不解析
+ALE1D 的 beam 数据在 LS-PrePost 中的标签与实际含义不一致；当前读取的是第一个
+（体积平均）层：
+
+- axial stress → 体积平均压力；
+- rs-shear → 体积平均密度；
+- tr-shear → 压缩比；
+- plastic strain → 内能/体积；
+- axial strain → 体积分数加权 ALE group ID，`alpha_air = gid - 1`，
+  `alpha_product = 2 - gid`，裁剪到 `[0,1]`；
+- 单元速度取梁单元两节点的 x 速度平均；
+- 单元边界取每个 state 的节点坐标，支持固定网格和显式 `--allow-moving-mesh`。
+
+当前生产 deck 使用 `BEAMIP=0`；它仍输出上述 5 个体积平均量，但不写额外的
+ALE 分组层，d3plot 约为 `BEAMIP=10` 的三分之一。导入器仍然兼容 `BEAMIP=10`
+的 d3plot，只读取第一层。
+
+示例：
+
+```bash
+python scripts/import_lsdyna_d3plot_1d.py \
+  --d3plot G:/50-500/50/d3plot \
+  --case r50_full --radius-m 0.05 \
+  --expected-cells 50000 --expected-outer-radius-m 5.0 \
+  --out outputs/fullframes/standard/r50_full.npz
+PYTHONPATH=src python -m spherical_blast_pinn.contact_air.cli build-cache \
+  --config configs/contact_air/split_train_r50_500_fullframes_similarity_none_pair.yaml \
+  --case r50_full --source outputs/fullframes/standard/r50_full.npz \
+  --out outputs/fullframes/cache/r50_full.npz
+```
+
+### LS-DYNA ASCII profile 导入（历史路径）
+
+`scripts/import_lsdyna_profiles_1d.py` 保留用于旧 `*DATABASE_PROFILE` ASCII
+数据，不是当前 d3plot 数据集的入口。它只读取 ASCII profile，不解析
 `d3plot`/`d3dump` 二进制槽位。
 
 - 压力、密度、径向速度分别来自 pressure、density、x-velocity profile；

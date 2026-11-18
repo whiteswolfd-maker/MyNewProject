@@ -470,30 +470,48 @@ class CaseData1D:
     def __init__(self, case):
         self.case = case
         obs = case.observations
-        self.frame_ids = np.unique(obs.frame_index)
+        if (
+            getattr(obs, "_frames_sorted", False)
+            and getattr(obs, "_frame_starts", None) is not None
+        ):
+            self.frame_ids = np.asarray(obs._frame_ids)
+            selections = [
+                slice(int(start), int(end))
+                for start, end in zip(obs._frame_starts, obs._frame_ends)
+            ]
+        else:
+            self.frame_ids = np.unique(obs.frame_index)
+            selections = [obs.frame_index == frame for frame in self.frame_ids]
         self.frame_theta = []
         self.frame_radius = []
         self.frame_values = []
         self.frame_valid = []
-        for frame in self.frame_ids:
-            mask = obs.frame_index == frame
+        for selection in selections:
             self.frame_theta.append(
-                (float(obs.time[mask][0]) - case.t0) / case.time_scale
+                (float(obs.time[selection][0]) - case.t0) / case.time_scale
             )
-            raw_radius = np.asarray(obs.radius[mask], dtype=np.float64)
-            self.frame_radius.append(raw_radius / case.length_scale)
+            raw_radius = np.asarray(obs.radius[selection], dtype=np.float64)
+            # float32 keeps all 20 cases of the 1002-state d3plot dataset
+            # within memory; the diagnostic only needs plotting/interpolation
+            # precision, not the solver's full float64 arrays.
+            self.frame_radius.append(
+                np.asarray(raw_radius / case.length_scale, dtype=np.float32)
+            )
             self.frame_values.append({
-                "rho": np.asarray(obs.density[mask], dtype=np.float64)
-                / case.rho_scale,
-                "u": np.asarray(obs.velocity[mask], dtype=np.float64)
-                / case.u_scale,
-                "p": np.asarray(obs.pressure[mask], dtype=np.float64)
-                / case.p_scale,
+                "rho": np.asarray(
+                    obs.density[selection] / case.rho_scale, dtype=np.float32
+                ),
+                "u": np.asarray(
+                    obs.velocity[selection] / case.u_scale, dtype=np.float32
+                ),
+                "p": np.asarray(
+                    obs.pressure[selection] / case.p_scale, dtype=np.float32
+                ),
             })
             self.frame_valid.append({
-                "rho": np.asarray(obs.valid_density[mask], dtype=bool),
-                "u": np.asarray(obs.valid_velocity[mask], dtype=bool),
-                "p": np.asarray(obs.valid_pressure[mask], dtype=bool),
+                "rho": np.asarray(obs.valid_density[selection], dtype=bool),
+                "u": np.asarray(obs.valid_velocity[selection], dtype=bool),
+                "p": np.asarray(obs.valid_pressure[selection], dtype=bool),
             })
         self.frame_theta = np.asarray(self.frame_theta, dtype=np.float64)
         order = np.argsort(self.frame_theta)
@@ -641,7 +659,16 @@ class CaseData1D:
         frame_times = np.asarray(metadata.get("frame_times", []), dtype=np.float64)
         raw_keys = list(source.get("raw_frame_keys", []) or [])
         selected_keys = list(source.get("selected_raw_frame_keys", []) or [])
-        raw_key_times = np.asarray([float(key) for key in raw_keys], dtype=np.float64)
+        try:
+            raw_key_times = np.asarray(
+                [float(key) for key in raw_keys], dtype=np.float64
+            )
+            raw_key_time_source = "raw_frame_keys"
+        except (TypeError, ValueError):
+            # d3plot-state standards use state IDs as raw keys; the imported
+            # frame_times are the actual state times.
+            raw_key_times = frame_times.copy()
+            raw_key_time_source = "frame_times_for_state_keys"
         result.update({
             "standard_available": True,
             "frame_selection_policy": source.get("frame_selection_policy"),
@@ -657,8 +684,11 @@ class CaseData1D:
             "first_raw_time_s": source.get("first_raw_time_s"),
             "last_raw_time_s": source.get("last_raw_time_s"),
             "raw_keys_equal_selected": raw_keys == selected_keys,
+            "raw_key_time_source": raw_key_time_source,
             "all_frames_imported": bool(
-                source.get("frame_selection_policy") == "all_frames"
+                source.get("frame_selection_policy") in (
+                    "all_frames", "all_states"
+                )
                 and source.get("raw_frame_count") == source.get("imported_frame_count")
                 and source.get("dropped_frame_count") == 0
                 and int(frame_times.size) == source.get("raw_frame_count")
@@ -1415,6 +1445,10 @@ def _record_support(evidence, group, theta, q, kind, case_id, field,
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--group", choices=("both", "train", "validation"), default="both",
+        help="limit the run to one group to keep memory bounded",
+    )
     args = parser.parse_args(argv)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -1426,6 +1460,8 @@ def main(argv=None) -> int:
             CaseData1D(case) for case in trainer.validation_cases
         ],
     }
+    if args.group != "both":
+        groups = {args.group: groups[args.group]}
     thetas = _theta_grid()
     missing = []
     evidence = []
@@ -2106,8 +2142,10 @@ def main(argv=None) -> int:
         "frame_plan": payload["completeness"]["frame_plan"],
         "contact_gap_summary":
             payload["completeness"]["contact_gap_summary"],
-        "train_indicators": payload["groups"]["train"]["indicators"],
-        "validation_indicators": payload["groups"]["validation"]["indicators"],
+        "train_indicators":
+            payload["groups"].get("train", {}).get("indicators"),
+        "validation_indicators":
+            payload["groups"].get("validation", {}).get("indicators"),
     }, indent=2, default=_jsonable))
     return 0 if not missing else 1
 

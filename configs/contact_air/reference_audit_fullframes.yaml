@@ -1,9 +1,10 @@
-# Read-only audit of the ORIGINAL and FULL-FRAME imported data.
+# Read-only audit of the d3plot-state imported data.
 #
-# This is the full-frame counterpart of reference_audit.yaml.  It reads the
-# all-frames standards in outputs/fullframes/standard and the caches in
-# outputs/fullframes/cache.  The old strided standards/caches are not touched.
-# Every case is audited; frame_selection_policy must be all_frames.
+# It reads the d3plot-state standards in outputs/fullframes/standard and the
+# caches in outputs/fullframes/cache.  The source decks are BEAMIP=0
+# ``R*_d3plot_v5.k`` files under G:/50-500 and D:/550-1000; each state time
+# comes from the d3plot header with full precision.  Every case is audited;
+# the importer records frame_selection_policy=all_states.
 audit:
   version: 2
   repo_root: .
@@ -66,121 +67,121 @@ audit:
   cases:
   - case_id: r50_full
     radius_m: 0.05
-    raw_dir: G:/R50_R100_reference_v2/R50_full_alpha_profiles
-    deck: R50_full_reference_alpha_profiles.k
+    raw_dir: G:/50-500/50
+    deck: R50_d3plot_v5.k
     standard: outputs/fullframes/standard/r50_full.npz
     cache: outputs/fullframes/cache/r50_full.npz
   - case_id: r100_full
     radius_m: 0.1
-    raw_dir: G:/R50_R100_reference_v2/R100
-    deck: R100_full_reference_vf_fixed.k
+    raw_dir: G:/50-500/100
+    deck: R100_d3plot_v5.k
     standard: outputs/fullframes/standard/r100_full.npz
     cache: outputs/fullframes/cache/r100_full.npz
   - case_id: r150_full
     radius_m: 0.15
-    raw_dir: G:/R50_R100_reference_v2/R150
-    deck: R150_full_reference.k
+    raw_dir: G:/50-500/150
+    deck: R150_d3plot_v5.k
     standard: outputs/fullframes/standard/r150_full.npz
     cache: outputs/fullframes/cache/r150_full.npz
   - case_id: r200_full
     radius_m: 0.2
-    raw_dir: G:/R50_R100_reference_v2/R200
-    deck: R200_full_reference.k
+    raw_dir: G:/50-500/200
+    deck: R200_d3plot_v5.k
     standard: outputs/fullframes/standard/r200_full.npz
     cache: outputs/fullframes/cache/r200_full.npz
   - case_id: r250_full
     radius_m: 0.25
-    raw_dir: G:/R50_R100_reference_v2/R250
-    deck: R250_full_reference.k
+    raw_dir: G:/50-500/250
+    deck: R250_d3plot_v5.k
     standard: outputs/fullframes/standard/r250_full.npz
     cache: outputs/fullframes/cache/r250_full.npz
   - case_id: r300_full
     radius_m: 0.3
-    raw_dir: G:/R50_R100_reference_v2/R300
-    deck: R300_full_reference.k
+    raw_dir: G:/50-500/300
+    deck: R300_d3plot_v5.k
     standard: outputs/fullframes/standard/r300_full.npz
     cache: outputs/fullframes/cache/r300_full.npz
   - case_id: r350_full
     radius_m: 0.35
-    raw_dir: G:/R50_R100_reference_v2/R350
-    deck: R350_full_reference.k
+    raw_dir: G:/50-500/350
+    deck: R350_d3plot_v5.k
     standard: outputs/fullframes/standard/r350_full.npz
     cache: outputs/fullframes/cache/r350_full.npz
   - case_id: r400_full
     radius_m: 0.4
-    raw_dir: G:/R50_R100_reference_v2/R400
-    deck: R400_full_reference.k
+    raw_dir: G:/50-500/400
+    deck: R400_d3plot_v5.k
     standard: outputs/fullframes/standard/r400_full.npz
     cache: outputs/fullframes/cache/r400_full.npz
   - case_id: r450_full
     radius_m: 0.45
-    raw_dir: G:/R50_R100_reference_v2/R450
-    deck: R450_full_reference.k
+    raw_dir: G:/50-500/450
+    deck: R450_d3plot_v5.k
     standard: outputs/fullframes/standard/r450_full.npz
     cache: outputs/fullframes/cache/r450_full.npz
   - case_id: r500_full
     radius_m: 0.5
-    raw_dir: G:/R50_R100_reference_v2/R500
-    deck: R500_full_reference.k
+    raw_dir: G:/50-500/500
+    deck: R500_d3plot_v5.k
     standard: outputs/fullframes/standard/r500_full.npz
     cache: outputs/fullframes/cache/r500_full.npz
   - case_id: r550_full
     radius_m: 0.55
-    raw_dir: G:/R50_R100_reference_v2/R550
-    deck: R550_full_reference.k
+    raw_dir: D:/550-1000/550
+    deck: R550_d3plot_v5.k
     standard: outputs/fullframes/standard/r550_full.npz
     cache: outputs/fullframes/cache/r550_full.npz
   - case_id: r600_full
     radius_m: 0.6
-    raw_dir: G:/R50_R100_reference_v2/R600
-    deck: R600_full_reference.k
+    raw_dir: D:/550-1000/600
+    deck: R600_d3plot_v5.k
     standard: outputs/fullframes/standard/r600_full.npz
     cache: outputs/fullframes/cache/r600_full.npz
   - case_id: r650_full
     radius_m: 0.65
-    raw_dir: G:/R50_R100_reference_v2/R650
-    deck: R650_full_reference.k
+    raw_dir: D:/550-1000/650
+    deck: R650_d3plot_v5.k
     standard: outputs/fullframes/standard/r650_full.npz
     cache: outputs/fullframes/cache/r650_full.npz
   - case_id: r700_full
     radius_m: 0.7
-    raw_dir: D:/R700-1000/R700
-    deck: R700_full_reference.k
+    raw_dir: D:/550-1000/700
+    deck: R700_d3plot_v5.k
     standard: outputs/fullframes/standard/r700_full.npz
     cache: outputs/fullframes/cache/r700_full.npz
   - case_id: r750_full
     radius_m: 0.75
-    raw_dir: D:/R700-1000/R750
-    deck: R750_full_reference.k
+    raw_dir: D:/550-1000/750
+    deck: R750_d3plot_v5.k
     standard: outputs/fullframes/standard/r750_full.npz
     cache: outputs/fullframes/cache/r750_full.npz
   - case_id: r800_full
     radius_m: 0.8
-    raw_dir: D:/R700-1000/R800
-    deck: R800_full_reference.k
+    raw_dir: D:/550-1000/800
+    deck: R800_d3plot_v5.k
     standard: outputs/fullframes/standard/r800_full.npz
     cache: outputs/fullframes/cache/r800_full.npz
   - case_id: r850_full
     radius_m: 0.85
-    raw_dir: D:/R700-1000/R850
-    deck: R850_full_reference.k
+    raw_dir: D:/550-1000/850
+    deck: R850_d3plot_v5.k
     standard: outputs/fullframes/standard/r850_full.npz
     cache: outputs/fullframes/cache/r850_full.npz
   - case_id: r900_full
     radius_m: 0.9
-    raw_dir: D:/R700-1000/R900
-    deck: R900_full_reference.k
+    raw_dir: D:/550-1000/900
+    deck: R900_d3plot_v5.k
     standard: outputs/fullframes/standard/r900_full.npz
     cache: outputs/fullframes/cache/r900_full.npz
   - case_id: r950_full
     radius_m: 0.95
-    raw_dir: D:/R700-1000/R950
-    deck: R950_full_reference.k
+    raw_dir: D:/550-1000/950
+    deck: R950_d3plot_v5.k
     standard: outputs/fullframes/standard/r950_full.npz
     cache: outputs/fullframes/cache/r950_full.npz
   - case_id: r1000_full
     radius_m: 1.0
-    raw_dir: D:/R700-1000/R1000
-    deck: R1000_full_reference.k
+    raw_dir: D:/550-1000/1000
+    deck: R1000_d3plot_v5.k
     standard: outputs/fullframes/standard/r1000_full.npz
     cache: outputs/fullframes/cache/r1000_full.npz
