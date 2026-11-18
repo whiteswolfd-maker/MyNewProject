@@ -8,6 +8,10 @@ ContactNet 与 AirNet 交替训练。旧 ProductNet/FrontNet、旧三维球壳�
 所有内部物理量采用 SI：米、秒、kg/m³、m/s、Pa。压力一律为绝对压力；超压只在
 输出诊断时形成，不进入 EOS/PDE/RH。
 
+完整的设计说明（物理假设、几何、数据标签、网络、PDE、边界条件、损失、采样、
+验证和已知限制）见
+[docs/contact_air_model_design.md](docs/contact_air_model_design.md)。
+
 ---
 
 ## 1. 几何与网络

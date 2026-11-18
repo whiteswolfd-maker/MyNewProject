@@ -8,7 +8,7 @@ files never reach the upload clone.
 
 What is synced
 --------------
-directories : src/, tests/, scripts/, configs/
+directories : src/, tests/, scripts/, configs/, docs/
 files       : README.md, AGENTS.md, CLAUDE.md, pyproject.toml,
               requirements.txt, conftest.py, .gitignore
 
@@ -32,7 +32,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-SYNC_DIRS = ("src", "tests", "scripts", "configs")
+SYNC_DIRS = ("src", "tests", "scripts", "configs", "docs")
 SYNC_FILES = (
     "README.md", "AGENTS.md", "CLAUDE.md",
     "pyproject.toml", "requirements.txt", "conftest.py", ".gitignore",

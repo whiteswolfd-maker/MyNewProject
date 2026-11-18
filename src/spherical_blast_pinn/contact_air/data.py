@@ -514,6 +514,14 @@ class CaseData:
             valid=self.contact.valid[contact_mask],
             reasons=[reason for reason, keep in zip(self.contact.reasons, contact_mask) if keep]
             if self.contact.reasons else [],
+            reference=(
+                None if self.contact.reference is None
+                else self.contact.reference[contact_mask]
+            ),
+            reference_source=(
+                None if self.contact.reference_source is None
+                else self.contact.reference_source[contact_mask]
+            ),
         )
         selected_times = self.contact.times[indices]
         t_end = max(
@@ -1082,6 +1090,14 @@ def save_case(case: CaseData, path: Path | str) -> Path:
         contact_low=case.contact.low,
         contact_up=case.contact.up,
         contact_valid=case.contact.valid,
+        contact_reference=(
+            np.zeros(0) if case.contact.reference is None
+            else case.contact.reference
+        ),
+        contact_reference_source=(
+            np.zeros(0, dtype="<U1") if case.contact.reference_source is None
+            else case.contact.reference_source
+        ),
         shock_times=case.shock.times,
         shock_radius=case.shock.radii,
         shock_valid=case.shock.valid,
@@ -1107,10 +1123,23 @@ def load_case(path: Path | str, *, role: str | None = None) -> CaseData:
             )
         case_meta = metadata["case"]
         precursor = metadata["precursor"]
+        reference = (
+            np.asarray(archive["contact_reference"], dtype=np.float64)
+            if "contact_reference" in archive.files else None
+        )
+        if reference is not None and reference.size == 0:
+            reference = None
+        reference_source = (
+            np.asarray(archive["contact_reference_source"]).astype(str)
+            if "contact_reference_source" in archive.files else None
+        )
+        if reference_source is not None and reference_source.size == 0:
+            reference_source = None
         contact = ContactIntervalTable(
             case_id=case_meta["case_id"], times=np.asarray(archive["contact_times"]),
             low=np.asarray(archive["contact_low"]), up=np.asarray(archive["contact_up"]),
             valid=np.asarray(archive["contact_valid"]),
+            reference=reference, reference_source=reference_source,
         )
         shock = ShockTrajectory.from_arrays(
             case_id=case_meta["case_id"], times=np.asarray(archive["shock_times"]),

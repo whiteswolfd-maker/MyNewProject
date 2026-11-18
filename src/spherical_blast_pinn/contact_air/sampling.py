@@ -49,6 +49,7 @@ class CaseBatch:
     t_contact: Any
     low_contact: Any
     up_contact: Any
+    contact_reference: Any = None
 
     @property
     def n_pde(self) -> int:
@@ -156,6 +157,7 @@ def sample_case_batch(
             & np.asarray([case.shock.has_slope(float(t)) for t in contact_times])
         )
         contact_indices = contact_indices[in_window]
+    contact_reference = None
     if contact_indices.size and int(n_contact) > 0:
         if contact_indices.size <= int(n_contact):
             chosen = contact_indices
@@ -167,6 +169,10 @@ def sample_case_batch(
         t_contact = torch.as_tensor(case.contact.times[chosen], dtype=torch.float64)
         low_contact = torch.as_tensor(case.contact.low[chosen], dtype=torch.float64)
         up_contact = torch.as_tensor(case.contact.up[chosen], dtype=torch.float64)
+        if case.contact.reference is not None:
+            contact_reference = torch.as_tensor(
+                case.contact.reference[chosen], dtype=torch.float64
+            )
     else:
         t_contact = torch.zeros(0, dtype=torch.float64)
         low_contact = torch.zeros(0, dtype=torch.float64)
@@ -181,6 +187,7 @@ def sample_case_batch(
         rho_data=data["rho"], u_data=data["u"], p_data=data["p"],
         valid_rho=data["valid_rho"], valid_u=data["valid_u"], valid_p=data["valid_p"],
         t_contact=t_contact, low_contact=low_contact, up_contact=up_contact,
+        contact_reference=contact_reference,
     )
 
 

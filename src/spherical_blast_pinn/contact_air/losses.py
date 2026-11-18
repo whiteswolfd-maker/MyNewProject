@@ -530,6 +530,74 @@ def contact_violation_cells_rmse(
     return float(torch.sqrt(torch.mean(cells * cells)).detach()), count
 
 
+def contact_point_loss(
+    contact: ContactFields,
+    batch: CaseBatch,
+    case: CaseData,
+    *,
+    scale: str = "separation_radius",
+) -> TermResult:
+    """Pointwise contact target from the spherical-shell alpha reconstruction.
+
+    ``batch.contact_reference`` is the derived sub-cell interface position.
+    The interval remains the data uncertainty and is not used in this term.
+    """
+    reference = getattr(batch, "contact_reference", None)
+    if reference is None:
+        raise LossError(
+            "point contact target requires contact_reference in the batch/cache"
+        )
+    radius = contact.radius.reshape(-1)
+    target = _flatten_checked("contact_reference", reference, radius.numel())
+    count = int(radius.numel())
+    if count == 0:
+        return TermResult(total=_zero(contact.radius), counts={"contact_data": 0})
+    if not bool(torch.isfinite(target).all()):
+        raise LossError("contact reference contains non-finite values")
+    if scale == "separation_radius":
+        denominator = float(case.length_scale)
+    elif scale == "cell_width":
+        denominator = _contact_cell_width(case)
+    else:
+        raise LossError(f"unknown contact point scale {scale!r}")
+    error = (radius - target) / float(denominator)
+    raw = torch.mean(error * error)
+    cells = (radius - target) / _contact_cell_width(case)
+    return TermResult(
+        total=raw,
+        counts={"contact_data": count},
+        parts={
+            "contact_data": float(raw.detach()),
+            "contact_data_raw": float(raw.detach()),
+            "contact_data_cells_rmse": float(
+                torch.sqrt(torch.mean(cells * cells)).detach()
+            ),
+        },
+    )
+
+
+def contact_point_rmse(
+    contact: ContactFields,
+    batch: CaseBatch,
+    case: CaseData,
+    *,
+    scale: str = "separation_radius",
+) -> tuple[float | None, int]:
+    reference = getattr(batch, "contact_reference", None)
+    if reference is None:
+        return None, 0
+    radius = contact.radius.reshape(-1)
+    target = _flatten_checked("contact_reference", reference, radius.numel())
+    if radius.numel() == 0:
+        return None, 0
+    denominator = (
+        float(case.length_scale) if scale == "separation_radius"
+        else _contact_cell_width(case)
+    )
+    error = (radius - target) / float(denominator)
+    return float(torch.sqrt(torch.mean(error * error)).detach()), int(radius.numel())
+
+
 def combine_air(
     *, pde: TermResult, ic: TermResult, interface: TermResult,
     right: TermResult, data: TermResult, lambda_pde: float, lambda_data: float,
@@ -579,6 +647,8 @@ __all__ = [
     "combine_contact",
     "contact_data_loss",
     "contact_ic_loss",
+    "contact_point_loss",
+    "contact_point_rmse",
     "contact_violation_cells_rmse",
     "contact_violation_rmse",
     "data_coordinates",

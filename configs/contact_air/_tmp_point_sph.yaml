@@ -1,0 +1,107 @@
+inherits: split_train_r50_500_fullframes_similarity.yaml
+contact_air:
+  output_dir: outputs/contact_weight_ab/point_sph_ft4500
+  cases:
+  - case_id: r50_full
+    role: train
+    charge_radius_m: 0.05
+    cache: outputs/fullframes/cache_point/r50_full.npz
+    synthetic: false
+  - case_id: r100_full
+    role: train
+    charge_radius_m: 0.1
+    cache: outputs/fullframes/cache_point/r100_full.npz
+    synthetic: false
+  - case_id: r150_full
+    role: train
+    charge_radius_m: 0.15
+    cache: outputs/fullframes/cache_point/r150_full.npz
+    synthetic: false
+  - case_id: r200_full
+    role: train
+    charge_radius_m: 0.2
+    cache: outputs/fullframes/cache_point/r200_full.npz
+    synthetic: false
+  - case_id: r250_full
+    role: train
+    charge_radius_m: 0.25
+    cache: outputs/fullframes/cache_point/r250_full.npz
+    synthetic: false
+  - case_id: r300_full
+    role: train
+    charge_radius_m: 0.3
+    cache: outputs/fullframes/cache_point/r300_full.npz
+    synthetic: false
+  - case_id: r350_full
+    role: train
+    charge_radius_m: 0.35
+    cache: outputs/fullframes/cache_point/r350_full.npz
+    synthetic: false
+  - case_id: r400_full
+    role: train
+    charge_radius_m: 0.4
+    cache: outputs/fullframes/cache_point/r400_full.npz
+    synthetic: false
+  - case_id: r450_full
+    role: train
+    charge_radius_m: 0.45
+    cache: outputs/fullframes/cache_point/r450_full.npz
+    synthetic: false
+  - case_id: r500_full
+    role: train
+    charge_radius_m: 0.5
+    cache: outputs/fullframes/cache_point/r500_full.npz
+    synthetic: false
+  - case_id: r550_full
+    role: validation
+    charge_radius_m: 0.55
+    cache: outputs/fullframes/cache_point/r550_full.npz
+    synthetic: false
+  - case_id: r600_full
+    role: validation
+    charge_radius_m: 0.6
+    cache: outputs/fullframes/cache_point/r600_full.npz
+    synthetic: false
+  - case_id: r650_full
+    role: validation
+    charge_radius_m: 0.65
+    cache: outputs/fullframes/cache_point/r650_full.npz
+    synthetic: false
+  - case_id: r700_full
+    role: validation
+    charge_radius_m: 0.7
+    cache: outputs/fullframes/cache_point/r700_full.npz
+    synthetic: false
+  - case_id: r750_full
+    role: validation
+    charge_radius_m: 0.75
+    cache: outputs/fullframes/cache_point/r750_full.npz
+    synthetic: false
+  - case_id: r800_full
+    role: validation
+    charge_radius_m: 0.8
+    cache: outputs/fullframes/cache_point/r800_full.npz
+    synthetic: false
+  - case_id: r850_full
+    role: validation
+    charge_radius_m: 0.85
+    cache: outputs/fullframes/cache_point/r850_full.npz
+    synthetic: false
+  - case_id: r900_full
+    role: validation
+    charge_radius_m: 0.9
+    cache: outputs/fullframes/cache_point/r900_full.npz
+    synthetic: false
+  - case_id: r950_full
+    role: validation
+    charge_radius_m: 0.95
+    cache: outputs/fullframes/cache_point/r950_full.npz
+    synthetic: false
+  - case_id: r1000_full
+    role: validation
+    charge_radius_m: 1.0
+    cache: outputs/fullframes/cache_point/r1000_full.npz
+    synthetic: false
+  training:
+    contact_target: point
+    contact_point_scale: separation_radius

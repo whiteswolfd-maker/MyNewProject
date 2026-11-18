@@ -36,6 +36,8 @@ from .losses import (
     combine_contact,
     contact_data_loss,
     contact_ic_loss,
+    contact_point_loss,
+    contact_point_rmse,
     contact_violation_cells_rmse,
     contact_violation_rmse,
     data_coordinates,
@@ -143,6 +145,8 @@ class TrainConfig:
     contact_loss_shape: str = "quadratic"
     contact_loss_beta: float = 1.0
     contact_smooth_l1_delta: float = 1.0
+    contact_target: str = "interval"
+    contact_point_scale: str = "separation_radius"
 
     def __post_init__(self) -> None:
         for name in ("n_pde", "n_ic", "n_right", "n_data", "n_contact"):
@@ -183,6 +187,14 @@ class TrainConfig:
         ) <= 0.0:
             raise TrainingError(
                 "contact_smooth_l1_delta must be finite and positive"
+            )
+        if self.contact_target not in ("interval", "point"):
+            raise TrainingError(
+                "contact_target must be 'interval' or 'point'"
+            )
+        if self.contact_point_scale not in ("separation_radius", "cell_width"):
+            raise TrainingError(
+                "contact_point_scale must be 'separation_radius' or 'cell_width'"
             )
 
 
@@ -596,13 +608,19 @@ class AlternatingTrainer:
                 batch.t_contact.reshape(-1, 1), r0c, rsc, dsc, closure,
                 time_input=case.time_input, create_graph=True,
             )
-            data = contact_data_loss(
-                c_contact, batch, case,
-                normalization=self.config.contact_normalization,
-                loss_shape=self.config.contact_loss_shape,
-                beta=self.config.contact_loss_beta,
-                delta=self.config.contact_smooth_l1_delta,
-            )
+            if self.config.contact_target == "point":
+                data = contact_point_loss(
+                    c_contact, batch, case,
+                    scale=self.config.contact_point_scale,
+                )
+            else:
+                data = contact_data_loss(
+                    c_contact, batch, case,
+                    normalization=self.config.contact_normalization,
+                    loss_shape=self.config.contact_loss_shape,
+                    beta=self.config.contact_loss_beta,
+                    delta=self.config.contact_smooth_l1_delta,
+                )
         else:
             data = TermResult(
                 total=torch.zeros((), dtype=torch.float64),
@@ -702,6 +720,8 @@ class AlternatingTrainer:
             "contact_smooth_l1_delta": float(
                 self.config.contact_smooth_l1_delta
             ),
+            "contact_target": self.config.contact_target,
+            "contact_point_scale": self.config.contact_point_scale,
             "lambda_pde": lambda_pde,
             "lambda_data": lambda_data,
             "contact_learning_rate": float(
@@ -792,6 +812,7 @@ class AlternatingTrainer:
             air = self._air_errors(case, batch)
             violation = None
             cells_violation = None
+            point_violation = None
             n_contact = 0
             if batch.t_contact.numel():
                 with torch.enable_grad():
@@ -806,6 +827,10 @@ class AlternatingTrainer:
                 cells_violation, _ = contact_violation_cells_rmse(
                     c_fields, batch, case
                 )
+                point_violation, _ = contact_point_rmse(
+                    c_fields, batch, case,
+                    scale=self.config.contact_point_scale,
+                )
             available = [
                 value for value in (air["air_rmse"], violation) if value is not None
             ]
@@ -816,6 +841,7 @@ class AlternatingTrainer:
                 **air,
                 "contact_violation": violation,
                 "contact_violation_cells": cells_violation,
+                "contact_point_rmse": point_violation,
                 "n_contact": n_contact,
                 "score": score,
             })
@@ -949,6 +975,11 @@ class AlternatingTrainer:
                 value.detach().cpu().numpy() if hasattr(value, "detach")
                 else np.asarray(value)
             )
+        reference = getattr(batch, "contact_reference", None)
+        payload["contact_reference"] = (
+            None if reference is None
+            else torch.as_tensor(reference).detach().cpu().numpy()
+        )
         return payload
 
     @staticmethod
@@ -970,6 +1001,10 @@ class AlternatingTrainer:
             t_contact=array("t_contact", "float64"),
             low_contact=array("low_contact", "float64"),
             up_contact=array("up_contact", "float64"),
+            contact_reference=(
+                None if payload.get("contact_reference") is None
+                else array("contact_reference", "float64")
+            ),
         )
 
     @staticmethod
@@ -1115,6 +1150,8 @@ class AlternatingTrainer:
         for key, default in (
             ("contact_normalization", "separation_radius"),
             ("contact_loss_shape", "quadratic"),
+            ("contact_target", "interval"),
+            ("contact_point_scale", "separation_radius"),
         ):
             saved = saved_config.get(key, default)
             current = getattr(self.config, key)

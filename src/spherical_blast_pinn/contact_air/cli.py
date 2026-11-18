@@ -439,6 +439,10 @@ def _train_config(
         "contact_smooth_l1_delta": float(
             training.get("contact_smooth_l1_delta", 1.0)
         ),
+        "contact_target": str(training.get("contact_target", "interval")),
+        "contact_point_scale": str(
+            training.get("contact_point_scale", "separation_radius")
+        ),
     }
     if loops is not None:
         values["loops"] = int(loops)
@@ -704,6 +708,8 @@ def command_train(args) -> int:
         "contact_smooth_l1_delta": float(
             train_config.contact_smooth_l1_delta
         ),
+        "contact_target": str(train_config.contact_target),
+        "contact_point_scale": str(train_config.contact_point_scale),
         "phase_weighting": "uniform",
         "n_schedule": int(train_config.n_schedule),
         "seed": int(train_config.seed),

@@ -395,6 +395,8 @@ class ContactIntervalTable:
     up: np.ndarray
     valid: np.ndarray
     reasons: list[str] = field(default_factory=list)
+    reference: np.ndarray | None = None
+    reference_source: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         self.times = np.asarray(self.times, dtype=np.float64).reshape(-1)
@@ -418,6 +420,33 @@ class ContactIntervalTable:
             )
         if self.reasons and len(self.reasons) != n:
             raise GeometryError("contact interval reasons must have one entry per frame")
+        if self.reference is not None:
+            reference = np.asarray(self.reference, dtype=np.float64).reshape(-1)
+            if reference.size != n:
+                raise GeometryError(
+                    "contact reference must have one entry per frame"
+                )
+            tolerance = np.maximum(1.0e-9, 1.0e-9 * np.maximum(np.abs(self.low), 1.0))
+            outside = self.valid & (
+                ~np.isfinite(reference)
+                | (reference < self.low - tolerance)
+                | (reference > self.up + tolerance)
+            )
+            if np.any(outside):
+                indices = np.flatnonzero(outside)[:3].tolist()
+                raise GeometryError(
+                    f"case {self.case_id!r}: contact reference outside [low, up] "
+                    f"at frames {indices}; the spherical reconstruction must stay "
+                    "inside the measured mixing interval"
+                )
+            self.reference = reference
+        if self.reference_source is not None:
+            source = np.asarray(self.reference_source).reshape(-1)
+            if source.size != n:
+                raise GeometryError(
+                    "contact reference_source must have one entry per frame"
+                )
+            self.reference_source = source.astype(str)
 
     @property
     def n_valid(self) -> int:
@@ -434,6 +463,10 @@ class ContactIntervalTable:
         )
 
     def as_dict(self) -> dict[str, Any]:
+        source_counts: dict[str, int] = {}
+        if self.reference_source is not None:
+            for value in self.reference_source:
+                source_counts[str(value)] = source_counts.get(str(value), 0) + 1
         return {
             "case_id": self.case_id,
             "n_frames": int(self.times.size),
@@ -442,10 +475,21 @@ class ContactIntervalTable:
                 None if not self.times.size
                 else [float(self.times.min()), float(self.times.max())]
             ),
+            "n_reference": (
+                None if self.reference is None
+                else int(np.count_nonzero(np.isfinite(self.reference) & self.valid))
+            ),
+            "reference_source_counts": source_counts or None,
             "definition": (
                 "[R_c,low, R_c,up] is the interval between the actual cell "
                 "boundaries bracketing the contact mixing segment. No midpoint "
                 "is stored; it is never a label or network geometry."
+            ),
+            "reference_definition": (
+                "optional derived point target: spherical-shell volume "
+                "inversion of alpha_product inside the mixed cell; zero-width "
+                "frames use the shared boundary. It is not a midpoint and not "
+                "an alpha=0.5 isosurface."
             ),
         }
 
