@@ -36,6 +36,7 @@ from .losses import (
     combine_contact,
     contact_data_loss,
     contact_ic_loss,
+    contact_violation_cells_rmse,
     contact_violation_rmse,
     data_coordinates,
     interface_loss,
@@ -138,6 +139,10 @@ class TrainConfig:
     validation_data_points: int = 256
     validation_contact_points: int = 256
     contact_data_weight: float = 1.0
+    contact_normalization: str = "separation_radius"
+    contact_loss_shape: str = "quadratic"
+    contact_loss_beta: float = 1.0
+    contact_smooth_l1_delta: float = 1.0
 
     def __post_init__(self) -> None:
         for name in ("n_pde", "n_ic", "n_right", "n_data", "n_contact"):
@@ -160,6 +165,25 @@ class TrainConfig:
             self.contact_data_weight
         ) < 0.0:
             raise TrainingError("contact_data_weight must be finite and non-negative")
+        if self.contact_normalization not in ("separation_radius", "interval_width"):
+            raise TrainingError(
+                "contact_normalization must be 'separation_radius' or "
+                "'interval_width'"
+            )
+        if self.contact_loss_shape not in ("quadratic", "smooth_l1"):
+            raise TrainingError(
+                "contact_loss_shape must be 'quadratic' or 'smooth_l1'"
+            )
+        if not math.isfinite(float(self.contact_loss_beta)) or float(
+            self.contact_loss_beta
+        ) <= 0.0:
+            raise TrainingError("contact_loss_beta must be finite and positive")
+        if not math.isfinite(float(self.contact_smooth_l1_delta)) or float(
+            self.contact_smooth_l1_delta
+        ) <= 0.0:
+            raise TrainingError(
+                "contact_smooth_l1_delta must be finite and positive"
+            )
 
 
 def describe_matches(saved: Mapping[str, Any] | None, current: Mapping[str, Any]) -> bool:
@@ -572,7 +596,13 @@ class AlternatingTrainer:
                 batch.t_contact.reshape(-1, 1), r0c, rsc, dsc, closure,
                 time_input=case.time_input, create_graph=True,
             )
-            data = contact_data_loss(c_contact, batch, case)
+            data = contact_data_loss(
+                c_contact, batch, case,
+                normalization=self.config.contact_normalization,
+                loss_shape=self.config.contact_loss_shape,
+                beta=self.config.contact_loss_beta,
+                delta=self.config.contact_smooth_l1_delta,
+            )
         else:
             data = TermResult(
                 total=torch.zeros((), dtype=torch.float64),
@@ -666,6 +696,12 @@ class AlternatingTrainer:
         record = {
             "loop": self.loop,
             "phase_weighting": "uniform",
+            "contact_normalization": self.config.contact_normalization,
+            "contact_loss_shape": self.config.contact_loss_shape,
+            "contact_loss_beta": float(self.config.contact_loss_beta),
+            "contact_smooth_l1_delta": float(
+                self.config.contact_smooth_l1_delta
+            ),
             "lambda_pde": lambda_pde,
             "lambda_data": lambda_data,
             "contact_learning_rate": float(
@@ -755,6 +791,7 @@ class AlternatingTrainer:
             batch = sample.batch
             air = self._air_errors(case, batch)
             violation = None
+            cells_violation = None
             n_contact = 0
             if batch.t_contact.numel():
                 with torch.enable_grad():
@@ -766,6 +803,9 @@ class AlternatingTrainer:
                     )
                 c_fields = _detach_contact(c_fields)
                 violation, n_contact = contact_violation_rmse(c_fields, batch, case)
+                cells_violation, _ = contact_violation_cells_rmse(
+                    c_fields, batch, case
+                )
             available = [
                 value for value in (air["air_rmse"], violation) if value is not None
             ]
@@ -775,6 +815,7 @@ class AlternatingTrainer:
                 "evaluable": bool(available),
                 **air,
                 "contact_violation": violation,
+                "contact_violation_cells": cells_violation,
                 "n_contact": n_contact,
                 "score": score,
             })
@@ -1071,6 +1112,28 @@ class AlternatingTrainer:
                 f"{self.config.contact_data_weight!r}; pass the same "
                 "--contact-data-weight (or configure it) before resuming"
             )
+        for key, default in (
+            ("contact_normalization", "separation_radius"),
+            ("contact_loss_shape", "quadratic"),
+        ):
+            saved = saved_config.get(key, default)
+            current = getattr(self.config, key)
+            if str(saved) != str(current):
+                raise TrainingError(
+                    f"{path}: checkpoint {key}={saved!r} does not match the "
+                    f"current {current!r}; the contact-loss convention changed"
+                )
+        for key, default in (
+            ("contact_loss_beta", 1.0),
+            ("contact_smooth_l1_delta", 1.0),
+        ):
+            saved = saved_config.get(key, default)
+            current = getattr(self.config, key)
+            if float(saved) != float(current):
+                raise TrainingError(
+                    f"{path}: checkpoint {key}={saved!r} does not match the "
+                    f"current {current!r}; the contact-loss convention changed"
+                )
         # The time scale is a plain attribute, not a state_dict entry, so the
         # shape check alone cannot detect a 0.01 checkpoint resumed into a 1.0
         # network.  Check the model metadata before restoring anything.

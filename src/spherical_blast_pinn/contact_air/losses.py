@@ -394,11 +394,15 @@ def contact_ic_loss(contact: ContactFields, case: CaseData) -> TermResult:
     )
 
 
-def _contact_violation_values(
+def _contact_outside_distance(
     contact: ContactFields, batch: CaseBatch, case: CaseData,
-) -> tuple[torch.Tensor, int]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Return ``(distance, low, up, count)`` with distance in metres."""
     if batch.t_contact.numel() == 0:
-        return torch.zeros(0, dtype=contact.radius.dtype, device=contact.radius.device), 0
+        empty = torch.zeros(
+            0, dtype=contact.radius.dtype, device=contact.radius.device
+        )
+        return empty, empty, empty, 0
     radius = contact.radius.reshape(-1)
     if radius.numel() != batch.t_contact.reshape(-1).numel():
         raise LossError(
@@ -414,20 +418,94 @@ def _contact_violation_values(
         raise LossError("contact labels have R_c,low > R_c,up")
     below = torch.clamp(low - radius, min=0.0)
     above = torch.clamp(radius - up, min=0.0)
-    return (below / float(case.length_scale)) ** 2 + (
-        above / float(case.length_scale)
-    ) ** 2, int(radius.numel())
+    return below + above, low, up, int(radius.numel())
 
 
-def contact_data_loss(contact: ContactFields, batch: CaseBatch, case: CaseData) -> TermResult:
-    values, count = _contact_violation_values(contact, batch, case)
+def _contact_cell_width(case: CaseData) -> float:
+    """One contact-cell width for this case, used as the local loss scale.
+
+    The contact interval is zero or one ALE cell wide; the median positive
+    interval is that cell.  If a case has no positive interval at all, fall
+    back to the current 50,000-cell / 100 R0 mesh cell width R0/500.
+    """
+    widths = torch.as_tensor(
+        case.contact.up - case.contact.low, dtype=torch.float64
+    )
+    positive = widths[widths > 0.0]
+    if positive.numel():
+        return float(torch.median(positive))
+    return float(case.charge_radius_m) / 500.0
+
+
+def _contact_violation_values(
+    contact: ContactFields, batch: CaseBatch, case: CaseData,
+) -> tuple[torch.Tensor, int]:
+    distance, _low, _up, count = _contact_outside_distance(contact, batch, case)
+    if count == 0:
+        return distance, 0
+    return (distance / float(case.length_scale)) ** 2, count
+
+
+def contact_data_loss(
+    contact: ContactFields,
+    batch: CaseBatch,
+    case: CaseData,
+    *,
+    normalization: str = "separation_radius",
+    loss_shape: str = "quadratic",
+    beta: float = 1.0,
+    delta: float = 1.0,
+) -> TermResult:
+    """Contact-interval supervision with an explicit error scale.
+
+    ``normalization='separation_radius'`` is the historical behaviour.
+    ``normalization='interval_width'`` divides each label's outside distance by
+    its own interval width (floored at one cell), so the residual is measured
+    in contact cells.  ``loss_shape='smooth_l1'`` is a Huber loss in those
+    normalized units; ``beta`` is the fixed loss-balancing coefficient.
+    """
+    if normalization not in ("separation_radius", "interval_width"):
+        raise LossError(f"unknown contact normalization {normalization!r}")
+    if loss_shape not in ("quadratic", "smooth_l1"):
+        raise LossError(f"unknown contact loss shape {loss_shape!r}")
+    if not math.isfinite(float(beta)) or float(beta) <= 0.0:
+        raise LossError("contact loss beta must be finite and positive")
+    if not math.isfinite(float(delta)) or float(delta) <= 0.0:
+        raise LossError("contact smooth-L1 delta must be finite and positive")
+
+    distance, low, up, count = _contact_outside_distance(contact, batch, case)
     if count == 0:
         return TermResult(total=_zero(contact.radius), counts={"contact_data": 0})
-    term = values.mean()
+
+    width = up - low
+    cell_scale = torch.clamp(width, min=_contact_cell_width(case))
+    if normalization == "separation_radius":
+        scale = torch.full_like(distance, float(case.length_scale))
+    else:
+        scale = cell_scale
+    residual = distance / scale
+    if loss_shape == "quadratic":
+        loss = residual * residual
+    else:
+        magnitude = torch.abs(residual)
+        loss = torch.where(
+            magnitude <= float(delta),
+            0.5 * residual * residual,
+            float(delta) * (magnitude - 0.5 * float(delta)),
+        )
+    raw = loss.mean()
+    term = float(beta) * raw
+    cells = distance / cell_scale
     return TermResult(
         total=term,
         counts={"contact_data": count},
-        parts={"contact_data": float(term.detach())},
+        parts={
+            "contact_data": float(term.detach()),
+            "contact_data_raw": float(raw.detach()),
+            "contact_data_cells_rmse": float(
+                torch.sqrt(torch.mean(cells * cells)).detach()
+            ),
+        },
     )
 
 
@@ -438,6 +516,18 @@ def contact_violation_rmse(
     if count == 0:
         return None, 0
     return float(torch.sqrt(torch.mean(values)).detach()), count
+
+
+def contact_violation_cells_rmse(
+    contact: ContactFields, batch: CaseBatch, case: CaseData
+) -> tuple[float | None, int]:
+    """Unweighted RMSE in contact-cell units, for diagnostics only."""
+    distance, low, up, count = _contact_outside_distance(contact, batch, case)
+    if count == 0:
+        return None, 0
+    scale = torch.clamp(up - low, min=_contact_cell_width(case))
+    cells = distance / scale
+    return float(torch.sqrt(torch.mean(cells * cells)).detach()), count
 
 
 def combine_air(
@@ -489,6 +579,7 @@ __all__ = [
     "combine_contact",
     "contact_data_loss",
     "contact_ic_loss",
+    "contact_violation_cells_rmse",
     "contact_violation_rmse",
     "data_coordinates",
     "finite_mach_rh_state",

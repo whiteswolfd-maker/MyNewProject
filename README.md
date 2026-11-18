@@ -333,6 +333,14 @@ ell_i    = (ReLU(R_c,low,i-R_c,i)/s_R)^2
   `training.contact_phase_weighting` 键已删除；旧检查点（version 4）及其
   `contact_weights`/`data_weights` 字段不再兼容，必须重训。验证评分同样使用
   未加权按帧指标。
+- 接触数据项的默认尺度仍是 `s_R = R_sep`、二次损失。可选的实验开关：
+  `training.contact_normalization: interval_width` 按每个接触标签自己的区间
+  宽度（零宽时取该 case 的一个单元宽）归一化，使残差以“接触单元”为单位；
+  `training.contact_loss_shape: smooth_l1` 使用 Huber 形状（
+  `training.contact_smooth_l1_delta`，默认 1.0），避免远端误差梯度爆炸；
+  `training.contact_loss_beta`（默认 1.0）是固定的损失平衡系数。默认配置
+  不改变旧行为；验证分数仍用 `R_sep` 归一化，另记录
+  `contact_violation_cells` 供诊断。
 
 区间内零罚、区间外距离平方；接触标签在自己的 `t_contact` 上重新计算网络。两个
 网络复用同一组映射空气残差，不复制“接触面 PDE”。

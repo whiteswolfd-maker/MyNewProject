@@ -143,10 +143,9 @@
 - 数据/接触/PDE 采样在零个有效点上求值；总损失或梯度非有限。
 - 检查点数据/配置/验证划分/网络结构不匹配；旧缓存/旧检查点版本。网络
   `time_reference_s`、`time_input` 模式、输入原点/尺度规则和
-  `similarity_input_divisor` 不一致也必须拒绝续训和预测（旧检查点缺这些字段
-  时只按 legacy、原点 0、`time_reference_s`、divisor 64 解释；整个模型描述块
-  缺失则拒绝）。检查点 `contact_data_weight` 与当前配置不一致也必须拒绝续训
-  （旧检查点缺该字段按 1.0）。
+  `similarity_input_divisor` 不一致也必须拒绝续训和预测；模型描述块缺失也
+  拒绝。检查点 `contact_data_weight` 与当前配置不一致也必须拒绝续训；旧
+  version 4 检查点整体拒绝，不按缺字段默认值解释。
 - 一维源缺少必填 metadata、单位未知、掩码覆盖 NaN、节点约定未支持、
   单元重叠、时间非严格递增。
 

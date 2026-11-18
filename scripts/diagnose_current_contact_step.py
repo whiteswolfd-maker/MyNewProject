@@ -44,10 +44,10 @@ C_CONFIG = (
 )
 CHECKPOINTS = {
     "best": Path(
-        "outputs/contact_air_time_input_pair_c_none_4000/best.pt"
+        "outputs/contact_air_time_input_similarity_4000/best.pt"
     ),
     "last": Path(
-        "outputs/contact_air_time_input_pair_c_none_4000/last.pt"
+        "outputs/contact_air_time_input_similarity_4000/last.pt"
     ),
 }
 

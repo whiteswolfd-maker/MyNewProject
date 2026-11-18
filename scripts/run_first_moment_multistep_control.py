@@ -49,8 +49,8 @@ C_CONFIG = (
     "split_train_r50_500_fullframes_similarity.yaml"
 )
 CHECKPOINTS = {
-    "best": Path("outputs/contact_air_time_input_pair_c_none_4000/best.pt"),
-    "last": Path("outputs/contact_air_time_input_pair_c_none_4000/last.pt"),
+    "best": Path("outputs/contact_air_time_input_similarity_4000/best.pt"),
+    "last": Path("outputs/contact_air_time_input_similarity_4000/last.pt"),
 }
 SAMPLE_SEEDS = (20261115, 20261116)
 BATCH_SEED_STRIDE = 104729

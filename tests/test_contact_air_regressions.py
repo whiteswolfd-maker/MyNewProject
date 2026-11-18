@@ -114,9 +114,9 @@ def test_contact_data_loss_is_evaluated_at_the_label_times(tmp_path, monkeypatch
     trainer.opt_contact = torch.optim.Adam(trainer.contact_net.parameters(), lr=1.0e-3)
     seen: list[tuple[torch.Tensor, torch.Tensor]] = []
 
-    def wrapper(contact, batch, case):
+    def wrapper(contact, batch, case, **kwargs):
         seen.append((batch.t_contact.detach().clone(), contact.radius.detach().clone()))
-        return real_loss(contact, batch, case)
+        return real_loss(contact, batch, case, **kwargs)
 
     monkeypatch.setattr(trainer_module, "contact_data_loss", wrapper)
     trainer.step()

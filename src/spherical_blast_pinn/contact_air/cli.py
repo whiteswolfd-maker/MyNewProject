@@ -429,6 +429,16 @@ def _train_config(
         "contact_data_weight": float(
             training.get("contact_data_weight", 1.0)
         ),
+        "contact_normalization": str(
+            training.get("contact_normalization", "separation_radius")
+        ),
+        "contact_loss_shape": str(
+            training.get("contact_loss_shape", "quadratic")
+        ),
+        "contact_loss_beta": float(training.get("contact_loss_beta", 1.0)),
+        "contact_smooth_l1_delta": float(
+            training.get("contact_smooth_l1_delta", 1.0)
+        ),
     }
     if loops is not None:
         values["loops"] = int(loops)
@@ -688,6 +698,12 @@ def command_train(args) -> int:
         "start_loop": start_loop,
         "target_loop": int(train_config.loops),
         "contact_data_weight": float(train_config.contact_data_weight),
+        "contact_normalization": str(train_config.contact_normalization),
+        "contact_loss_shape": str(train_config.contact_loss_shape),
+        "contact_loss_beta": float(train_config.contact_loss_beta),
+        "contact_smooth_l1_delta": float(
+            train_config.contact_smooth_l1_delta
+        ),
         "phase_weighting": "uniform",
         "n_schedule": int(train_config.n_schedule),
         "seed": int(train_config.seed),
