@@ -409,7 +409,7 @@ def test_similarity_checkpoint_records_and_enforces_mode_and_divisor(tmp_path):
     for key in ("contact_net_describe", "air_net_describe"):
         assert payload[key]["time_input"] == "similarity"
         assert payload[key]["time_origin_rule"] == "case.t0"
-        assert payload[key]["time_scale_rule"] == "case.time_scale=R_sep/u_a_sep"
+        assert payload[key]["time_scale_rule"] == "case.t_end - case.t0 (window)"
         assert payload[key]["similarity_input_divisor"] == pytest.approx(64.0)
     same = _trainer(tmp_path / "same", time_input_mode="similarity")
     assert same.load(path)["loop"] == 0
@@ -593,3 +593,33 @@ def test_logging_does_not_consume_sampling_randomness(tmp_path):
         assert left["air_loss"] == pytest.approx(right["air_loss"])
         assert left["contact_loss"] == pytest.approx(right["contact_loss"])
         assert left["counts"] == right["counts"]
+
+
+def test_data_only_joint_loop_keeps_data_and_contact_but_no_physics_parts(tmp_path):
+    case = synthetic_case_for(0.05, case_id="r050", n_frames=11, n_radial=1600)
+    config = TrainConfig(
+        n_pde=0, n_ic=4, n_right=0, n_data=8, n_contact=6,
+        loops=1, learning_rate=1.0e-3, log_every=0, checkpoint_every=0,
+        validate_every=0, seed=11, validation_holdout_fraction=0.0,
+        validation_data_points=0, validation_contact_points=0,
+        training_mode="joint", physics_terms="data_only",
+    )
+    trainer = AlternatingTrainer(
+        cases=[case],
+        contact_net=ContactNet(width=8, depth=1),
+        air_net=AirNet(width=8, depth=1),
+        config=config,
+        output_dir=tmp_path,
+    )
+    contact_before = [p.detach().clone() for p in trainer.contact_net.parameters()]
+    air_before = [p.detach().clone() for p in trainer.air_net.parameters()]
+    record = trainer.step()
+    assert record["physics_terms"] == "data_only"
+    assert record["lambda_pde"] == 0.0
+    assert record["lambda_data"] == 1.0
+    assert record["counts"]["air.data_p"] > 0
+    assert record["counts"]["contact.contact_data"] > 0
+    assert "air.pde_points" not in record["counts"]
+    assert "air.right" not in record["counts"]
+    assert any(not torch.equal(p, q) for p, q in zip(contact_before, trainer.contact_net.parameters()))
+    assert any(not torch.equal(p, q) for p, q in zip(air_before, trainer.air_net.parameters()))

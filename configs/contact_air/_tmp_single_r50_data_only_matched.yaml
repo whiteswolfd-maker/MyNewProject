@@ -1,0 +1,14 @@
+# Data-only baseline with the *same air-data budget* as the PINN run.
+#
+# The PINN run uses n_data=512 plus n_ic=64 measured t0 points, i.e. 576
+# labelled air points per loop.  The data-rich baseline
+# (_tmp_single_r50_data_only.yaml) uses 2048 + 64; this file removes that data
+# advantage so the comparison isolates the physics loss.
+inherits: _tmp_single_r50_data_only.yaml
+
+contact_air:
+  output_dir: outputs/single_r50_data_only_matched
+
+  sampling:
+    n_data: 512
+    n_ic: 64

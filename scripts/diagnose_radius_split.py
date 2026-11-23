@@ -347,7 +347,7 @@ def main(argv=None) -> int:
     parser.add_argument("--out-json", required=True)
     parser.add_argument("--plots-dir", required=True)
     parser.add_argument(
-        "--plot-cases", default="r50_full,r250_full,r500_full,r550_full,r750_full,r1000_full",
+        "--plot-cases", default="r50_full,r100_full",
     )
     args = parser.parse_args(argv)
 

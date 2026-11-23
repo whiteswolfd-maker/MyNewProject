@@ -377,6 +377,9 @@ def _networks(section: Mapping[str, Any]):
         net_section.get("similarity_input_divisor", 64.0)
     )
     r0_input_gate = str(net_section.get("r0_input_gate", "none"))
+    contact_output = str(net_section.get("contact_output", "sigmoid_rs"))
+    contact_time_features = str(contact_section.get("time_features", "linear"))
+    contact_chebyshev_degree = int(contact_section.get("chebyshev_degree", 0))
     contact = ContactNet(
         width=int(contact_section.get("width", 50)),
         depth=int(contact_section.get("depth", 5)),
@@ -384,6 +387,9 @@ def _networks(section: Mapping[str, Any]):
         time_reference_s=time_reference_s,
         time_input_mode=time_input_mode,
         similarity_input_divisor=similarity_input_divisor,
+        contact_output=contact_output,
+        time_features=contact_time_features,
+        chebyshev_degree=contact_chebyshev_degree,
     )
     air = AirNet(
         width=int(air_section.get("width", 32)),
@@ -443,6 +449,11 @@ def _train_config(
         "contact_point_scale": str(
             training.get("contact_point_scale", "separation_radius")
         ),
+        "training_mode": str(training.get("training_mode", "alternating")),
+        "pressure_data_loss": str(
+            training.get("pressure_data_loss", "linear")
+        ),
+        "physics_terms": str(training.get("physics_terms", "full")),
     }
     if loops is not None:
         values["loops"] = int(loops)
@@ -710,6 +721,8 @@ def command_train(args) -> int:
         ),
         "contact_target": str(train_config.contact_target),
         "contact_point_scale": str(train_config.contact_point_scale),
+        "training_mode": str(train_config.training_mode),
+        "physics_terms": str(train_config.physics_terms),
         "phase_weighting": "uniform",
         "n_schedule": int(train_config.n_schedule),
         "seed": int(train_config.seed),

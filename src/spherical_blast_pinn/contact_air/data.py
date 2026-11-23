@@ -420,8 +420,8 @@ class CaseData:
 
     @property
     def time_input(self) -> TimeInput:
-        """Physical origin and similarity time scale for the network input."""
-        return TimeInput(self.t0, self.time_scale)
+        """Physical origin and the normalized training window."""
+        return TimeInput(self.t0, self.time_scale, window=self.t_end - self.t0)
 
     @property
     def energy_density_scale(self) -> float:
@@ -655,7 +655,7 @@ class PredictionCaseData:
 
     @property
     def time_input(self) -> TimeInput:
-        return TimeInput(self.t0, self.time_scale)
+        return TimeInput(self.t0, self.time_scale, window=self.t_end - self.t0)
 
     @property
     def gamma_air(self) -> float:

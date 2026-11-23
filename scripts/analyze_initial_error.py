@@ -356,10 +356,14 @@ def main(argv=None) -> int:
             contact[case.case_id] = entry
         result["contact_windows"][label] = contact
 
-    # R350 contact by thirds, last and best.
+    # R350 contact by thirds, last and best.  R350 was removed on 2026-11-23;
+    # skip the section when that case is not configured.
+    thirds_case = next((c for c in cases if c.case_id == "r350_full"), None)
     for label, (trainer, path) in models.items():
+        if thirds_case is None:
+            continue
         trainer.load(path)
-        case = next(c for c in cases if c.case_id == "r350_full")
+        case = thirds_case
         indices = case.contact.indices()
         times = np.asarray(case.contact.times[indices], dtype=np.float64)
         low = np.asarray(case.contact.low[indices], dtype=np.float64)

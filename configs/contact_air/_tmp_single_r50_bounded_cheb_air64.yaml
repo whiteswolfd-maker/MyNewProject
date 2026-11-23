@@ -1,0 +1,13 @@
+# R50 bounded_rs + Chebyshev ContactNet + wider AirNet.
+#
+# ContactNet is unchanged from _tmp_single_r50_bounded_cheb.yaml.  AirNet
+# 32x10 -> 64x10 to target the remaining pressure/density error.
+inherits: _tmp_single_r50_bounded_cheb.yaml
+
+contact_air:
+  output_dir: outputs/single_r50_bounded_cheb_air64
+
+  networks:
+    air:
+      width: 64
+      depth: 10

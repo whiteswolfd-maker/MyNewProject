@@ -7,7 +7,7 @@ same observations and random seeds.  The fallback is used only for timing.
 
     PYTHONPATH=src python scripts/benchmark_sampling.py \
         --config configs/contact_air/split_train_r50_500_fullframes.yaml \
-        --case r550_full --calls 30 \
+        --case r50_full --calls 30 \
         --output outputs/fullframes/sampling_benchmark.json
 
 Add ``--full-step`` to build the configured 10/10 split and time one complete
@@ -145,7 +145,7 @@ def _contact_stage_forward(trainer, case, batch):
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", required=True)
-    parser.add_argument("--case", default="r550_full")
+    parser.add_argument("--case", default="r50_full")
     parser.add_argument("--calls", type=int, default=30)
     parser.add_argument("--scan-calls", type=int, default=5)
     parser.add_argument("--full-step", action="store_true")

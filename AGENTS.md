@@ -201,20 +201,10 @@
   某项重跑的因果实验。梯度裁剪、非零 weight_decay、AMSGrad、maximize 等
   不支持项必须明确拒绝。参数插值后必须恢复参数、优化器状态、AirNet 和 RNG；
   非目标网络保持冻结；检查点哈希不得变化。
-- `scripts/prepare_fullframe_data.py --cases ...` 是薄编排器：调用现有导入器和
-  `build-cache`，把全帧标准/缓存写到 `outputs/fullframes/`；不覆盖旧数据。
-- `scripts/audit_reference_data.py --stage <manifest|imports|metrics|consistency|report|all>`
-  是只读数据审计：独立解析原始 `.xy`、按容差核对导入值、从**初次入射脉冲**
-  （到达阈值 → 严格回零 → 脉冲内最大值）提取固定半径峰值并与 Henrych 对比、
-  用 `u(E+p) - D_s E` 检查 RH、在 t0 后早/中/晚多个有效帧上检查接触/空气
-  压力与边界轨迹斜率。脉内振荡和后续正 excursion 只标为候选，不称为二次
-  激波。不得修改缓存、检查点或训练配置；Kingery-Bulmash 在系数表核实前保持
-  不可用，Henrych 系数标记暂定。导入完整性失败（漏帧/多余帧、原始键或时间
-  不一致、缓存 raw_times/帧数不一致、逐值 mismatch）必须返回非零退出码；
-  KB/Henrych 和 JWL 局部差异只记录，不作为失败。全帧验收用
-  `--stage all --import-sample-frames 0`。`prepare_fullframe_data.py` 在跳过
-  现有标准/缓存前会核对全帧键、frame_times、缓存 raw_times、原始输入指纹和
-  缓存记录的标准数据指纹；本次重建了标准就强制重建缓存。
+- 全帧编排与参考数据审计脚本（`prepare_fullframe_data.py`、
+  `audit_reference_data.py`、`summarize_fullframe_data.py`、
+  `check_similarity_progress.py`）及 `reference_audit_fullframes.yaml` 已于
+  2026-11-23 删除。不要恢复它们。
 - `predict/evaluate --case ...`；预测只读 metadata 与 shock 轨迹，评估才读参考
   内部场。500 mm 与其他半径同一接口。
 - 空气质量数据先抽帧再抽帧内点；右边界只在 `D_s > c_inf` 时刻采样。

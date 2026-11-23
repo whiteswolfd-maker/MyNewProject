@@ -1,0 +1,17 @@
+# Temporary training config for the METH=2/TSSFAC=0.2 data.
+# R150-R1000 were removed on 2026-11-23; this config keeps R50 and R100.
+inherits: split_train_r50_500_fullframes_similarity.yaml
+
+contact_air:
+  precursor:
+    material_source: "G:/50-500/50/R50_meth2_tssfac02.k"
+    material_source_verified: true
+  output_dir: outputs/contact_air_meth2_50_500_try
+  cases:
+    - {case_id: r50_full, role: train, charge_radius_m: 0.050, cache: outputs/fullframes/cache/r50_full.npz, synthetic: false}
+    - {case_id: r100_full, role: train, charge_radius_m: 0.100, cache: outputs/fullframes/cache/r100_full.npz, synthetic: false}
+
+  validation:
+    holdout_fraction: 0.0
+    data_points: 256
+    contact_points: 256

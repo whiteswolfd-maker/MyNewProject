@@ -147,6 +147,9 @@ class TrainConfig:
     contact_smooth_l1_delta: float = 1.0
     contact_target: str = "interval"
     contact_point_scale: str = "separation_radius"
+    training_mode: str = "alternating"
+    pressure_data_loss: str = "linear"
+    physics_terms: str = "full"
 
     def __post_init__(self) -> None:
         for name in ("n_pde", "n_ic", "n_right", "n_data", "n_contact"):
@@ -169,10 +172,12 @@ class TrainConfig:
             self.contact_data_weight
         ) < 0.0:
             raise TrainingError("contact_data_weight must be finite and non-negative")
-        if self.contact_normalization not in ("separation_radius", "interval_width"):
+        if self.contact_normalization not in (
+            "separation_radius", "interval_width", "charge_radius"
+        ):
             raise TrainingError(
-                "contact_normalization must be 'separation_radius' or "
-                "'interval_width'"
+                "contact_normalization must be 'separation_radius', "
+                "'interval_width' or 'charge_radius'"
             )
         if self.contact_loss_shape not in ("quadratic", "smooth_l1"):
             raise TrainingError(
@@ -195,6 +200,23 @@ class TrainConfig:
         if self.contact_point_scale not in ("separation_radius", "cell_width"):
             raise TrainingError(
                 "contact_point_scale must be 'separation_radius' or 'cell_width'"
+            )
+        if self.training_mode not in ("alternating", "joint"):
+            raise TrainingError(
+                "training_mode must be 'alternating' or 'joint'"
+            )
+        if self.pressure_data_loss not in ("linear", "log"):
+            raise TrainingError(
+                "pressure_data_loss must be 'linear' or 'log'"
+            )
+        if self.physics_terms not in ("full", "data_only"):
+            raise TrainingError(
+                "physics_terms must be 'full' or 'data_only'"
+            )
+        if self.physics_terms == "data_only" and self.training_mode != "joint":
+            raise TrainingError(
+                "physics_terms='data_only' is implemented only for "
+                "training_mode='joint'"
             )
 
 
@@ -227,6 +249,8 @@ def describe_matches(saved: Mapping[str, Any] | None, current: Mapping[str, Any]
         "similarity_input_divisor": 64.0,
         "r0_input_gate": "none",
         "r0_gate_rule": "none",
+        "time_features": "linear",
+        "chebyshev_degree": 0,
     }
     normalized = dict(saved)
     normalized_current = dict(current)
@@ -537,7 +561,10 @@ class AlternatingTrainer:
             else:
                 c_data = None
             data = (
-                air_data_loss(self.air_net, batch, case, scales, c_data)
+                air_data_loss(
+                    self.air_net, batch, case, scales, c_data,
+                    pressure_loss=self.config.pressure_data_loss,
+                )
                 if c_data is not None else
                 TermResult(total=torch.zeros((), dtype=torch.float64))
             )
@@ -704,7 +731,181 @@ class AlternatingTrainer:
         for group in self.opt_contact.param_groups:
             group["lr"] = value
 
+    def _joint_terms(
+        self, case: CaseData, batch: CaseBatch, *, lambda_pde: float,
+        lambda_data: float,
+    ) -> tuple[TermResult, TermResult]:
+        """Flow and interface terms for one joint backward.
+
+        The flow term uses a detached ContactNet geometry: the interface
+        network is supervised by the contact-interval data only, while the
+        flow network sees the current interface position and speed as fixed
+        boundary data.  Both terms share one graph and one backward pass.
+        """
+        closure = self._closures[case.case_id]
+        scales = self._scales[case.case_id]
+        zero = TermResult(total=torch.zeros((), dtype=torch.float64))
+
+        if batch.t_data.numel():
+            r0d, rsd, dsd = self._contact_inputs(case, batch.t_data)
+            c_data = self.contact_net(
+                batch.t_data.reshape(-1, 1), r0d, rsd, dsd, closure,
+                time_input=case.time_input, create_graph=False,
+            )
+            data = air_data_loss(
+                self.air_net, batch, case, scales, _detach_contact(c_data),
+                pressure_loss=self.config.pressure_data_loss,
+            )
+        else:
+            data = zero
+
+        if self.config.physics_terms == "data_only":
+            # Controlled ablation: the same AirNet/ContactNet, the same data
+            # coordinates and the same contact supervision, but no PDE,
+            # interface or shock-RH term.  The data weight is fixed at 1.0
+            # because there is no PDE-data schedule to balance.
+            flow = combine_air(
+                pde=zero, ic=zero, interface=zero, right=zero, data=data,
+                lambda_pde=0.0, lambda_data=1.0,
+            )
+        else:
+            r0, rs, ds = self._contact_inputs(case, batch.t_pde)
+            c_fields = self.contact_net(
+                batch.t_pde.reshape(-1, 1), r0, rs, ds, closure,
+                time_input=case.time_input, create_graph=False,
+            )
+            c_fields = _detach_contact(c_fields)
+            geometry = build_geometry(
+                c_fields.radius, c_fields.speed, rs, ds, batch.zeta_pde.reshape(-1, 1)
+            )
+            fields, derivatives = air_fields_with_derivatives(
+                self.air_net, batch.zeta_pde, batch.t_pde, r0, scales,
+                create_graph=True, time_input=case.time_input,
+            )
+            pde = pde_loss(
+                fields=fields, derivatives=derivatives, geometry=geometry, case=case
+            )
+            if batch.t_pde.numel():
+                air0 = self.air_net(
+                    torch.zeros_like(batch.t_pde).reshape(-1, 1),
+                    batch.t_pde.reshape(-1, 1), r0.reshape(-1, 1), scales,
+                    time_input=case.time_input,
+                )
+                interface = interface_loss(
+                    air_at_contact=air0, contact=c_fields, case=case
+                )
+            else:
+                interface = zero
+            right = right_loss(net=self.air_net, batch=batch, case=case, scales=scales)
+            flow = combine_air(
+                pde=pde, ic=zero, interface=interface, right=right, data=data,
+                lambda_pde=lambda_pde, lambda_data=lambda_data,
+            )
+
+        if batch.t_contact.numel():
+            r0c, rsc, dsc = self._contact_inputs(case, batch.t_contact)
+            c_contact = self.contact_net(
+                batch.t_contact.reshape(-1, 1), r0c, rsc, dsc, closure,
+                time_input=case.time_input, create_graph=True,
+            )
+            contact_data = contact_data_loss(
+                c_contact, batch, case,
+                normalization=self.config.contact_normalization,
+                loss_shape=self.config.contact_loss_shape,
+                beta=self.config.contact_loss_beta,
+                delta=self.config.contact_smooth_l1_delta,
+            )
+            contact = TermResult(
+                total=float(self.config.contact_data_weight) * contact_data.total,
+                counts=dict(contact_data.counts),
+                parts=dict(contact_data.parts),
+            )
+        else:
+            contact = zero
+        return flow, contact
+
+    def joint_step(self) -> dict[str, Any]:
+        """One simultaneous flow + interface update.
+
+        A single total loss is differentiated once.  AirNet receives gradients
+        from the flow term; ContactNet receives gradients from the contact
+        interval term.  The two existing Adam optimizers are stepped together,
+        preserving checkpoint compatibility with the alternating trainer.
+        """
+        batches = self._batches()
+        lambda_pde, lambda_data = schedule_weights(
+            self.loop, self.config.n_schedule
+        )
+        effective_pde, effective_data = (
+            (0.0, 1.0) if self.config.physics_terms == "data_only"
+            else (lambda_pde, lambda_data)
+        )
+        self.opt_contact.zero_grad(set_to_none=True)
+        self.opt_air.zero_grad(set_to_none=True)
+        flow_results: list[TermResult] = []
+        contact_results: list[TermResult] = []
+        for case, batch in batches:
+            flow, contact = self._joint_terms(
+                case, batch, lambda_pde=lambda_pde, lambda_data=lambda_data
+            )
+            flow_results.append(flow)
+            contact_results.append(contact)
+        flow_total = _summarise(flow_results, batches[0][1].t_ic)
+        contact_total = _summarise(contact_results, batches[0][1].t_ic)
+        total = flow_total.total + contact_total.total
+        if not bool(torch.isfinite(total)):
+            raise TrainingError("joint loss is not finite")
+        total.backward()
+        for net, name in ((self.air_net, "AirNet"), (self.contact_net, "ContactNet")):
+            grads = [p.grad for p in net.parameters() if p.grad is not None]
+            if not grads:
+                raise TrainingError(f"joint: {name} has no gradient")
+            if not all(bool(torch.isfinite(g).all()) for g in grads):
+                raise TrainingError(f"joint: non-finite {name} gradient")
+        self._clip()
+        self.opt_air.step()
+        self.opt_contact.step()
+        self.loop += 1
+        parts = {**flow_total.parts, **contact_total.parts}
+        counts = {**flow_total.counts, **contact_total.counts}
+        record = {
+            "loop": self.loop,
+            "training_mode": "joint",
+            "physics_terms": self.config.physics_terms,
+            "phase_weighting": "uniform",
+            "contact_normalization": self.config.contact_normalization,
+            "contact_loss_shape": self.config.contact_loss_shape,
+            "contact_loss_beta": float(self.config.contact_loss_beta),
+            "contact_smooth_l1_delta": float(
+                self.config.contact_smooth_l1_delta
+            ),
+            "contact_target": self.config.contact_target,
+            "contact_point_scale": self.config.contact_point_scale,
+            "lambda_pde": effective_pde,
+            "lambda_data": effective_data,
+            "contact_learning_rate": float(
+                self.opt_contact.param_groups[0]["lr"]
+            ),
+            "air_learning_rate": float(self.opt_air.param_groups[0]["lr"]),
+            "air_loss": float(flow_total.total.detach()),
+            "contact_loss": float(contact_total.total.detach()),
+            "air_parts": dict(flow_total.parts),
+            "contact_parts": dict(contact_total.parts),
+            "counts": {**{f"air.{k}": v for k, v in flow_total.counts.items()},
+                       **{f"contact.{k}": v for k, v in contact_total.counts.items()}},
+            "scales_by_case": {
+                case.case_id: case.scale_dict() for case, _ in batches
+            },
+            "event_alignment_by_case": {
+                case.case_id: dict(case.event_alignment) for case, _ in batches
+            },
+        }
+        self.history.loops.append(record)
+        return record
+
     def step(self) -> dict[str, Any]:
+        if self.config.training_mode == "joint":
+            return self.joint_step()
         batches = self._batches()
         air_total, lambda_pde, lambda_data = self._air_update(batches)
         contact_total = self.contact_update(
@@ -713,6 +914,7 @@ class AlternatingTrainer:
         self.loop += 1
         record = {
             "loop": self.loop,
+            "physics_terms": self.config.physics_terms,
             "phase_weighting": "uniform",
             "contact_normalization": self.config.contact_normalization,
             "contact_loss_shape": self.config.contact_loss_shape,
@@ -1171,6 +1373,21 @@ class AlternatingTrainer:
                     f"{path}: checkpoint {key}={saved!r} does not match the "
                     f"current {current!r}; the contact-loss convention changed"
                 )
+        saved = saved_config.get("pressure_data_loss", "linear")
+        current = self.config.pressure_data_loss
+        if str(saved) != str(current):
+            raise TrainingError(
+                f"{path}: checkpoint pressure_data_loss={saved!r} does not match "
+                f"the current {current!r}; the pressure data loss changed"
+            )
+        saved = saved_config.get("physics_terms", "full")
+        current = self.config.physics_terms
+        if str(saved) != str(current):
+            raise TrainingError(
+                f"{path}: checkpoint physics_terms={saved!r} does not match "
+                f"the current {current!r}; a data-only baseline cannot resume "
+                "from a physics-informed checkpoint"
+            )
         # The time scale is a plain attribute, not a state_dict entry, so the
         # shape check alone cannot detect a 0.01 checkpoint resumed into a 1.0
         # network.  Check the model metadata before restoring anything.

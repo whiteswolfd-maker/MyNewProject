@@ -1,0 +1,36 @@
+# Data-only baseline for the R50 single-radius comparison.
+#
+# Same ContactNet, same AirNet, same inputs, same geometry, same contact
+# interval loss and the same total number of loops as
+# _tmp_single_r50_bounded_cheb_logp.yaml.  The only change is the loss:
+#
+#   full PINN : lambda_pde L_pde + lambda_data L_air_data
+#               + L_interface + L_RH + L_contact
+#   this file : L_air_data + L_contact
+#
+# n_pde and n_right are zero because no PDE/RH term is evaluated.  The freed
+# budget is given to air data: 2048 + 64 t0 points instead of 512 + 64.
+inherits: _tmp_single_r50_bounded_cheb_logp.yaml
+
+contact_air:
+  output_dir: outputs/single_r50_data_only
+
+  sampling:
+    n_pde: 0
+    n_ic: 64
+    n_right: 0
+    n_data: 2048
+    n_contact: 983
+
+  training:
+    physics_terms: data_only
+    loops: 6600
+    n_schedule: 3300
+    log_every: 50
+    checkpoint_every: 100
+    validate_every: 0
+
+  validation:
+    holdout_fraction: 0.0
+    data_points: 0
+    contact_points: 0

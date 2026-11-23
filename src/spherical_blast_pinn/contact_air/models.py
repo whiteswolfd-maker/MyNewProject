@@ -63,10 +63,16 @@ class TimeInput:
     ``origin`` is the model time ``t0`` in seconds and ``scale`` is
     ``R_sep/u_a_sep`` in seconds.  Both are physical quantities; the network
     divisor is a separate numerical input scale stored on the network.
+
+    ``window`` is the optional physical training window ``t_end - t0``.  When
+    it is set, the similarity input is ``(t - origin)/window`` and lies in
+    ``[0, 1]``; the divisor is not applied.  It is a numerical coordinate
+    normalization, not a physical time.
     """
 
     origin: float
     scale: float
+    window: float | None = None
 
     def __post_init__(self) -> None:
         origin = float(self.origin)
@@ -75,6 +81,11 @@ class TimeInput:
             raise ModelError("time-input origin must be finite")
         if not math.isfinite(scale) or scale <= 0.0:
             raise ModelError("time-input scale must be finite and positive")
+        if self.window is not None:
+            window = float(self.window)
+            if not math.isfinite(window) or window <= 0.0:
+                raise ModelError("time-input window must be finite and positive")
+            object.__setattr__(self, "window", window)
         object.__setattr__(self, "origin", origin)
         object.__setattr__(self, "scale", scale)
 
@@ -173,16 +184,54 @@ class ContactNet(nn.Module):
     def __init__(self, *, width: int = 50, depth: int = 5, dtype=torch.float64,
                  device="cpu", time_reference_s: float = 1.0,
                  time_input_mode: str = "legacy",
-                 similarity_input_divisor: float = SIMILARITY_INPUT_DIVISOR_DEFAULT) -> None:
+                 similarity_input_divisor: float = SIMILARITY_INPUT_DIVISOR_DEFAULT,
+                 contact_output: str = "sigmoid_rs",
+                 time_features: str = "linear",
+                 chebyshev_degree: int = 0) -> None:
         super().__init__()
         if not math.isfinite(float(time_reference_s)) or float(time_reference_s) <= 0.0:
             raise ModelError("time_reference_s must be finite and positive")
-        self.net = _mlp(2, width, depth, dtype=dtype, device=device)
         self.dtype = dtype
         self.device = device
         self.time_reference_s = float(time_reference_s)
         self.time_input_mode = _validate_time_input_mode(time_input_mode)
         self.similarity_input_divisor = _validate_divisor(similarity_input_divisor)
+        if contact_output not in (
+            "sigmoid_rs", "softplus_shift", "softplus_scaled", "bounded_rs"
+        ):
+            raise ModelError(
+                "contact_output must be 'sigmoid_rs', 'softplus_shift', "
+                "'softplus_scaled' or 'bounded_rs'"
+            )
+        if time_features not in ("linear", "log1p", "sqrt", "chebyshev"):
+            raise ModelError(
+                "time_features must be 'linear', 'log1p', 'sqrt' or 'chebyshev'"
+            )
+        degree = int(chebyshev_degree)
+        if time_features == "chebyshev" and degree < 1:
+            raise ModelError(
+                "chebyshev time features require chebyshev_degree >= 1"
+            )
+        if time_features != "chebyshev" and degree != 0:
+            raise ModelError(
+                "chebyshev_degree is only valid with time_features='chebyshev'"
+            )
+        self.contact_output = contact_output
+        self.time_features = time_features
+        self.chebyshev_degree = degree
+        if time_features == "linear":
+            input_dim = 2
+        elif time_features == "chebyshev":
+            input_dim = degree + 1
+        else:
+            input_dim = 3
+        self.net = _mlp(input_dim, width, depth, dtype=dtype, device=device)
+        if time_features == "chebyshev":
+            self.poly = nn.Linear(input_dim, 1, dtype=dtype, device=device)
+            nn.init.zeros_(self.poly.weight)
+            nn.init.zeros_(self.poly.bias)
+        else:
+            self.poly = None
 
     def scaled_time(
         self, t: torch.Tensor, time_input: TimeInput | None = None
@@ -199,6 +248,8 @@ class ContactNet(nn.Module):
             raise ModelError(
                 "similarity time input requires TimeInput(case.t0, case.time_scale)"
             )
+        if time_input.window is not None:
+            return (t - time_input.origin) / time_input.window
         return (t - time_input.origin) / (
             time_input.scale * self.similarity_input_divisor
         )
@@ -214,9 +265,26 @@ class ContactNet(nn.Module):
         return {
             "time_input": "similarity",
             "time_origin_rule": "case.t0",
-            "time_scale_rule": "case.time_scale=R_sep/u_a_sep",
+            "time_scale_rule": "case.t_end - case.t0 (window)",
             "similarity_input_divisor": self.similarity_input_divisor,
         }
+
+    def _features(self, t_scaled: torch.Tensor, r0_in: torch.Tensor) -> torch.Tensor:
+        if self.time_features == "linear":
+            return torch.cat([t_scaled, r0_in], dim=-1)
+        if self.time_features == "chebyshev":
+            x = 2.0 * torch.clamp(t_scaled, min=0.0, max=1.0) - 1.0
+            terms = [x]
+            previous, current = torch.ones_like(x), x
+            for _ in range(2, self.chebyshev_degree + 1):
+                previous, current = current, 2.0 * x * current - previous
+                terms.append(current)
+            return torch.cat(terms + [r0_in], dim=-1)
+        if self.time_features == "log1p":
+            extra = torch.log1p(torch.clamp(t_scaled, min=0.0)) / math.log(2.0)
+        else:  # sqrt
+            extra = torch.sqrt(torch.clamp(t_scaled, min=0.0) + 1.0e-6)
+        return torch.cat([t_scaled, extra, r0_in], dim=-1)
 
     def forward(
         self,
@@ -243,14 +311,36 @@ class ContactNet(nn.Module):
         # autograd graph, so raw_t below is still d(raw)/dt in 1/s and speed
         # stays m/s.
         t_scaled = self.scaled_time(t_leaf, time_input)
-        raw = self.net(torch.cat([t_scaled, r0_in], dim=-1))
+        features = self._features(t_scaled, r0_in)
+        raw = self.net(features)
+        if self.poly is not None:
+            raw = raw + self.poly(features)
         raw_t = torch.autograd.grad(
             raw.sum(), t_leaf, create_graph=create_graph, retain_graph=create_graph
         )[0]
         s = torch.sigmoid(raw)
-        radius = rs_in * s
-        # Full product rule: R_s(t) sigmoid(raw(t)).
-        speed = ds_in * s + rs_in * s * (1.0 - s) * raw_t
+        if self.contact_output == "sigmoid_rs":
+            radius = rs_in * s
+            # Full product rule: R_s(t) sigmoid(raw(t)).
+            speed = ds_in * s + rs_in * s * (1.0 - s) * raw_t
+        elif self.contact_output == "softplus_shift":
+            # Paper-style direct radius.  softplus(raw) is dimensionless, so
+            # it is scaled by R0 before adding to the physical lower bound.
+            radius = r0_in * (1.0 + F.softplus(raw))
+            speed = r0_in * s * raw_t
+        elif self.contact_output == "bounded_rs":
+            # Lower-bounded and upper-bounded moving-domain form:
+            #   R0 < R_c < R_s, no hard cap and no zero-gradient branch.
+            # The paper's charge-radius lower bound is retained; the upper
+            # bound is the identified shock, required because the air layer
+            # ends at R_s.
+            radius = r0_in + (rs_in - r0_in) * s
+            speed = ds_in * s + (rs_in - r0_in) * s * (1.0 - s) * raw_t
+        else:
+            # Scale-aware variant for multi-radius extrapolation; the output
+            # form is the same as softplus_shift.
+            radius = r0_in * (1.0 + F.softplus(raw))
+            speed = r0_in * s * raw_t
         V = closure.V_sep * (radius / closure.R_sep) ** 3
         pressure = closure.pressure(V)
         if not bool(torch.isfinite(radius).all() and torch.isfinite(speed).all()):
@@ -264,7 +354,15 @@ class ContactNet(nn.Module):
         return {
             "name": "ContactNet",
             "inputs": ["t_s", "R0_m"],
-            "geometry": "R_c = R_s(t) * sigmoid(raw)",
+            "geometry": {
+                "sigmoid_rs": "R_c = R_s(t) * sigmoid(raw)",
+                "softplus_shift": "R_c = R0 * (1 + softplus(raw))",
+                "softplus_scaled": "R_c = R0 * (1 + softplus(raw))",
+                "bounded_rs": "R_c = R0 + (R_s(t)-R0)*sigmoid(raw)",
+            }[self.contact_output],
+            "contact_output": self.contact_output,
+            "time_features": self.time_features,
+            "chebyshev_degree": self.chebyshev_degree,
             "width": self.net[0].out_features,
             "depth": sum(isinstance(m, nn.Linear) for m in self.net) - 1,
             "parameters": sum(p.numel() for p in self.parameters()),
@@ -320,6 +418,8 @@ class AirNet(nn.Module):
             raise ModelError(
                 "similarity time input requires TimeInput(case.t0, case.time_scale)"
             )
+        if time_input.window is not None:
+            return (t - time_input.origin) / time_input.window
         return (t - time_input.origin) / (
             time_input.scale * self.similarity_input_divisor
         )
@@ -342,7 +442,7 @@ class AirNet(nn.Module):
         return {
             "time_input": "similarity",
             "time_origin_rule": "case.t0",
-            "time_scale_rule": "case.time_scale=R_sep/u_a_sep",
+            "time_scale_rule": "case.t_end - case.t0 (window)",
             "similarity_input_divisor": self.similarity_input_divisor,
             "r0_input_gate": self.r0_input_gate,
             "r0_gate_rule": gate_rule,

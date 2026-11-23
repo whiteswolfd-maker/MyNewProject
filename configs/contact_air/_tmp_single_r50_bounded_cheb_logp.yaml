@@ -1,0 +1,13 @@
+# R50 bounded_rs + Chebyshev ContactNet + AirNet 64x10 + log pressure data loss.
+#
+# The linear p data loss is normalized by p_a_sep ~ 7.1e7 Pa, while late-time
+# data pressures are 1e5-1e6 Pa; the model can collapse p toward zero and still
+# keep the normalized loss small.  The log loss uses relative pressure error,
+# with the ambient pressure as the floor.
+inherits: _tmp_single_r50_bounded_cheb_air64.yaml
+
+contact_air:
+  output_dir: outputs/single_r50_bounded_cheb_logp
+
+  training:
+    pressure_data_loss: log

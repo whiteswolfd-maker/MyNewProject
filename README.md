@@ -188,24 +188,9 @@ PYTHONPATH=src python scripts/import_lsdyna_profiles_1d.py \
   --out outputs/fullframes/standard/r50_full.npz
 ```
 
-全帧数据与缓存的统一准备命令（调用上面的导入器和既有 `build-cache`）：
-
-```bash
-PYTHONPATH=src python scripts/prepare_fullframe_data.py --cases r50_full
-PYTHONPATH=src python scripts/prepare_fullframe_data.py          # all 20
-PYTHONPATH=src python scripts/summarize_fullframe_data.py       # frame inventory
-```
-
-输出在 `outputs/fullframes/standard/` 与 `outputs/fullframes/cache/`，不会覆盖
-旧的 `outputs/contact_air_r*/` 或 `outputs/contact_air_split_*`。
-
-缓存复用不只看帧数和时间。`build-cache` 在缓存 metadata 的
-`case.source.standard_data_digest` 中记录生成时标准文件的内容指纹
-（`sha256(npz member name|crc32|size)`：读取 `.npz` ZIP 目录，不重读几十 GB
-数组；任一数组或 metadata 改变都会改变指纹）。`prepare_fullframe_data.py`
-在使用已有缓存前核对该指纹，并且**只要本次运行重建了标准文件，就强制重建
-对应缓存**；`--cache-only` 和审计也做同一检查。没有指纹的旧缓存视为
-`rebuild: cache has no standard data fingerprint`，不会被当作 current。
+全帧数据与缓存的统一编排脚本（`prepare_fullframe_data.py`、
+`summarize_fullframe_data.py`）和旧参考数据审计已于 2026-11-23 从本项目中
+删除。既有的 `build-cache` 命令仍可直接使用。
 
 ## 3. 接触区间、激波与事件对齐
 
@@ -395,63 +380,14 @@ s_fE = s_E / T_star
   `best.pt`，但绝不进入训练采样，且不能与训练算例共用 `case_id`。两者可同时
   使用；要把验证完全交给半径带，就把 `holdout_fraction` 设为 0。
 
-### 参考数据与实现审计（只读）
+### 参考数据与实现审计（已删除）
 
-`configs/contact_air/reference_audit_fullframes.yaml` +
-`scripts/audit_reference_data.py` + `contact_air/reference_audit.py` 提供不依赖
-训练链路的核验：
-
-- **A 原始仿真**：20 个算例的文件身份、求解器版本、正常结束、原始时间范围、
-  均匀球装药质量 `W=4/3 pi rho R^3`、固定半径压力历程；
-- **B 导入链路**：用独立的最小 `.xy` 解析器和配置中的单位因子，逐值与
-  `standard_1d.npz` 比较，状态按容差判定而不是只要等长就写 `ok`；峰值比较
-  先由**原始完整时序**确定初次入射脉冲窗口，再在同一固定物理半径、相同环境
-  压力和同一窗口内比较原始与导入峰值，并记录峰值帧是否被保留；
-- **C 经验关系与相容性**：Henrych（球形自由空气、入射超压，系数状态
-  `provisional`）逐点比较；Kingery-Bulmash 因缺少可核实系数表仍标记
-  `unavailable`，不猜测、不替换；RH 用实测激波位置差分和两侧实测状态独立
-  检查，能量通量必须是 `u(E+p) - D_s E`，且中心差分的前/中/后三帧必须有效、
-  属于同一连续轨迹段；接触区间与 JWL/空气压力在 t0 之后的早、中、晚多个有效
-  帧上采样，报告多个纯空气单元及压力随距离的变化；接触速度只称为两条区间
-  边界轨迹的差分斜率，不称为物理速度上下界；
-- 当前全帧审计读取 `outputs/fullframes/standard|` 与
-  `outputs/fullframes/cache|`；`scripts/summarize_fullframe_data.py` 生成 20 例
-  的原始/导入/缓存有效帧清单。
-- 当前 d3plot 数据集每例 1002 个 state；导入器记录
-  `frame_selection_policy=all_states`，state 时间来自 d3plot header 的全精度值。
-- **D PINN**：复用 `contact_air_diagnostics_*` 的输出。
-
-全帧验收必须逐帧比较，而不是只看 `--stage all`：
-
-```bash
-PYTHONPATH=src python scripts/audit_reference_data.py \
-  --config configs/contact_air/reference_audit_fullframes.yaml \
-  --stage all --import-sample-frames 0
-```
-
-`reference_audit_fullframes.yaml` 设置了 `require_all_frames: true`，因此默认也
-会逐帧比较；显式传 `0` 仍建议保留。审计在以下导入完整性问题时返回**非零
-退出码**：漏帧/多余帧、原始键或时间数组不一致、缓存 raw_times 或帧数不匹配、
-缓存标准数据指纹缺失（全帧模式）或与当前标准不匹配、逐值比较
-`mismatch`/`non_finite`/`size_mismatch`。KB/Henrych 偏差、JWL 与局部压力差异
-只记录，不作为失败条件。manifest 对标准/缓存只记录文件大小和 mtime，标准
-内容指纹用 `.npz` 成员 CRC 目录计算，不对每例几十 GB 文件重复做整文件
-SHA-256。
-
-审计只写 `outputs/reference_audit/` 或
-`outputs/reference_audit_fullframes/`（manifest、CSV、JSON、图和 `report.md`），
-不改缓存、检查点或训练配置。经验公式的数值样例测试在
-`tests/test_contact_air_reference_audit.py`；Henrych 系数尚未与原书逐项核对，
-报告必须保留这一限制。
-
-本轮审计工具修正记录：旧版 RH 能量通量写成 `(E+p)(u-D_s)`，每侧多减
-`D_s p`，会伪造能量残差；旧版“整段最大值 + 1% 阈值”会把脉冲内振荡误标为
-二次脉冲。`one_d.py` 的缓存期 RH 诊断也从“比内能 + 相对动能”改为激波坐标系
-总焓 `h + (u-D_s)^2/2`，`h = gamma p / ((gamma-1) rho)`。旧报告中的 −54%～−64% 能量残差、`partial_contaminated` 状态和单一
-中间帧的 0.19～0.33 JWL/空气比均已撤回，以本轮重算结果为准。现有缓存中由
-旧公式写入的 `event_frame_rh_diagnostic` 不重写；审计用缓存状态重新计算，
-并把旧值单独保存为 `event_frame_rh_diagnostic_cache_recorded`。Kingery-Bulmash
-仍未完成，不能把 `unavailable` 当作已完成。
+旧的参考数据审计链路（`reference_audit_fullframes.yaml`、
+`audit_reference_data.py`、`prepare_fullframe_data.py`、
+`summarize_fullframe_data.py`、`check_similarity_progress.py`）已于
+2026-11-23 删除，因为它绑定 D:/550-1000 等已不再保留的数据。
+`contact_air/reference_audit.py` 中与路径无关的纯函数仍保留，由
+`tests/test_contact_air_reference_audit.py` 覆盖。
 
 ## 7. 命令
 
@@ -510,7 +446,7 @@ PYTHONPATH=src python scripts/record_baseline.py \
   --output outputs/fullframes/baseline_manifest.json
 PYTHONPATH=src python scripts/benchmark_sampling.py \
   --config configs/contact_air/split_train_r50_500_fullframes_similarity.yaml \
-  --case r550_full --full-step --output outputs/fullframes/sampling_benchmark_full.json
+  --case r50_full --full-step --output outputs/fullframes/sampling_benchmark_full.json
 PYTHONPATH=src python scripts/diagnose_contact_gradients.py \
   --config configs/contact_air/split_train_r50_500_fullframes_similarity.yaml \
   --checkpoint outputs/contact_air_time_input_similarity_4000/best.pt \
@@ -557,7 +493,7 @@ python -m pytest -q
 同一随机种子下 100 次抽样与旧实现逐值一致，并要求真实缓存上一步训练的损失和
 参数完全一致。当前 `_networks()` 显式把网络建在 CPU 上；本机 PyTorch 2.5.1
 （cu121）不支持 RTX 5060 Ti 的 sm_120，因此基准记录的是 CPU 计时。实测
-r550 单次采样从约 0.98 s 降到约 0.00089 s，完整交替步从约 6.97 s 降到约
+r50 单次采样从约 0.98 s 降到约 0.00089 s，完整交替步从约 6.97 s 降到约
 0.27 s；这是本机工程测量，不是收敛或精度结果。
 
 接触训练诊断有两种模式：`training` 使用正式 10 算例预算和采样顺序，仅用于判断
@@ -597,16 +533,18 @@ SHA-256 前后校验。汇总脚本要求实验清单，核对预期文件/检�
 
 ## 8. 数据状态与未解决项
 
-- 当前有 20 个真实 d3plot state 算例：R50–R1000，每例 1002 个 state；标准与
-  缓存位于 `outputs/fullframes/standard|` 与 `outputs/fullframes/cache|`。
+- 当前保留 2 个真实 d3plot state 算例：R50 与 R100，每例 1002 个 state；
+  标准与缓存位于 `outputs/fullframes/standard|` 与 `outputs/fullframes/cache|`。
+  R150–R1000 的数据已于 2026-11-23 删除。
 - 二进制 ALE1D 读取已实现（`scripts/import_lsdyna_d3plot_1d.py`），读取
   d3plot 第一个体积平均层；`BEAMIP=10` 的逐 ALE 组层不进入训练。
 - 接触阈值、激波 prominence/距离参数仍是配置值，尚未由独立实验确认。
 - 材料卡来自 R50 的 v4 deck（`G:/50-500/50/R50_d3plot_v4.k`），
   `material_source_verified: true`；其余半径只改了输出块，使用同一材料卡。
-- 训练/验证按半径带划分：R50–R500 训练，R550–R1000 验证；没有单独 test 带。
-- `outputs/` 下的 `similarity_check_20261118_d3plot_*` 是只读诊断结果，不进入
-  训练；旧 profile 数据和旧结果已删除。
+- 训练/验证按半径带划分的配置仍在，但 R550–R1000 数据已删除；最终模型为
+  单半径 R50，R100 作为零样本算例。
+- 旧的 `similarity_check_20261118_d3plot_*` 只读诊断已于 2026-11-23 删除；
+  旧 profile 数据和旧结果已删除。
 
 ## 9. 仓库布局
 

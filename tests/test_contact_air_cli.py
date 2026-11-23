@@ -147,7 +147,7 @@ def test_base_and_experiment_configs_select_time_inputs():
         description = net.describe()
         assert description["time_input"] == "similarity"
         assert description["time_origin_rule"] == "case.t0"
-        assert description["time_scale_rule"] == "case.time_scale=R_sep/u_a_sep"
+        assert description["time_scale_rule"] == "case.t_end - case.t0 (window)"
         assert description["similarity_input_divisor"] == pytest.approx(64.0)
 
 

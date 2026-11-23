@@ -1,0 +1,46 @@
+# Single-radius, paper-style joint run.
+#
+#   R_c = R0 * (1 + softplus(raw))          (paper form with sigma_R = R0)
+#   interface loss = interval ReLU, normalized by R0^2
+#   flow loss = PDE + air data + interface BC + shock BC
+#   one backward, both networks stepped together
+#   tau = (t - t0) / (t_end - t0), no extra divisor
+#
+# The first frame at t0 is kept in the air-data and contact batches; the
+# measured t0 profile enters through the data term, not a uniform air IC.
+inherits: _tmp_train_50_500_meth2.yaml
+
+contact_air:
+  output_dir: outputs/single_r50_bounded_joint
+  cases:
+    - {case_id: r50_full, role: train, charge_radius_m: 0.050, cache: outputs/fullframes/cache/r50_full.npz, synthetic: false}
+
+  networks:
+    # Lower-bounded by R0 (paper) and upper-bounded by the measured shock:
+    # R_c = R0 + (R_s-R0)*sigmoid(raw).  The unbounded softplus form can cross
+    # R_s between contact frames, where the early R_c/R_s ratio is ~0.97.
+    contact_output: bounded_rs
+
+  sampling:
+    n_pde: 2048
+    n_ic: 64
+    n_right: 512
+    n_data: 512
+    n_contact: 512
+
+  training:
+    loops: 3300
+    n_schedule: 3300
+    training_mode: joint
+    contact_normalization: charge_radius
+    contact_loss_shape: quadratic
+    contact_loss_beta: 1.0
+    contact_data_weight: 1.0
+    log_every: 50
+    checkpoint_every: 100
+    validate_every: 0
+
+  validation:
+    holdout_fraction: 0.0
+    data_points: 0
+    contact_points: 0

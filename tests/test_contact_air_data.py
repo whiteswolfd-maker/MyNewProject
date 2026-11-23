@@ -297,3 +297,51 @@ def test_all_data_points_outside_the_geometry_are_not_silently_dropped():
     net = AirNet(width=8, depth=1)
     with pytest.raises(LossError, match="outside the current"):
         air_data_loss(net, batch, case, scales, contact)
+
+
+def test_log_pressure_data_loss_is_finite_and_validated():
+    from spherical_blast_pinn.contact_air.losses import air_data_loss
+    from spherical_blast_pinn.contact_air.models import AirNet, scales_from_precursor
+
+    case = synthetic_case_for(0.05, n_frames=5, n_radial=1200)
+    scales = scales_from_precursor(case.precursor, like=torch.zeros(1, 1))
+    radius = case.initial.Rc0 + 0.25 * (
+        case.initial.Rs_data_at_t0 - case.initial.Rc0
+    )
+    batch = CaseBatch(
+        case_id=case.case_id,
+        t_pde=torch.zeros(0, dtype=torch.float64),
+        zeta_pde=torch.zeros(0, dtype=torch.float64),
+        t_ic=torch.zeros(0, dtype=torch.float64),
+        zeta_ic=torch.zeros(0, dtype=torch.float64),
+        t_right=torch.zeros(0, dtype=torch.float64),
+        t_data=torch.tensor([case.t0], dtype=torch.float64),
+        radius_data=torch.tensor([radius], dtype=torch.float64),
+        rho_data=torch.tensor([case.rho_scale], dtype=torch.float64),
+        u_data=torch.zeros(1, dtype=torch.float64),
+        p_data=torch.tensor([case.ambient_pressure], dtype=torch.float64),
+        valid_rho=torch.ones(1, dtype=torch.bool),
+        valid_u=torch.ones(1, dtype=torch.bool),
+        valid_p=torch.ones(1, dtype=torch.bool),
+        t_contact=torch.zeros(0, dtype=torch.float64),
+        low_contact=torch.zeros(0, dtype=torch.float64),
+        up_contact=torch.zeros(0, dtype=torch.float64),
+    )
+    contact = ContactFields(
+        radius=torch.tensor([[case.initial.Rc0]], dtype=torch.float64),
+        speed=torch.zeros(1, 1, dtype=torch.float64),
+        sigmoid=torch.ones(1, 1, dtype=torch.float64),
+        raw=torch.zeros(1, 1, dtype=torch.float64),
+        pressure=torch.ones(1, 1, dtype=torch.float64),
+        relative_volume=torch.ones(1, 1, dtype=torch.float64),
+    )
+    net = AirNet(width=8, depth=1)
+    result = air_data_loss(
+        net, batch, case, scales, contact, pressure_loss="log"
+    )
+    assert bool(torch.isfinite(result.total))
+    assert result.counts["data_p"] == 1
+    with pytest.raises(LossError, match="pressure_data_loss"):
+        air_data_loss(
+            net, batch, case, scales, contact, pressure_loss="other"
+        )

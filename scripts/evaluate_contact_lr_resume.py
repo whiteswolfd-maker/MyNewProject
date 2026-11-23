@@ -53,8 +53,7 @@ GROUPS = {
 LABELS = ("start_4000", "A_4500", "B_4500")
 PAIR_LABELS = ("A_4500", "B_4500")
 PLOT_CASES = (
-    "r50_full", "r100_full", "r250_full", "r500_full",
-    "r550_full", "r750_full", "r1000_full",
+    "r50_full", "r100_full",
 )
 
 

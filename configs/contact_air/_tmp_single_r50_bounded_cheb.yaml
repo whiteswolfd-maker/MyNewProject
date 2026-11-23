@@ -1,0 +1,15 @@
+# R50 bounded_rs joint run, wider ContactNet + Chebyshev time basis.
+#
+# ContactNet receives T_1..T_30(2*tau-1) plus R0; a zero-initialized linear
+# skip on the same features gives a direct polynomial path, while the MLP
+# learns the residual.  This targets the smooth interface curve that the
+# plain tanh MLP underfits.
+inherits: _tmp_single_r50_bounded_wide.yaml
+
+contact_air:
+  output_dir: outputs/single_r50_bounded_cheb
+
+  networks:
+    contact:
+      time_features: chebyshev
+      chebyshev_degree: 30

@@ -296,3 +296,35 @@ def test_common_r0_control_uses_each_case_t0_not_global_zero():
     zero = torch.full_like(zeta, 0.0)
     assert net.scaled_time(zero, first.time_input).abs().max() > 0.0
     assert net.scaled_time(zero, second.time_input).abs().max() > 0.0
+
+
+def test_contact_time_features_are_finite_and_keep_radius_in_domain():
+    torch.manual_seed(23)
+    closure = _closure()
+    time_input = TimeInput(origin=0.0, scale=1.0, window=2.0)
+    t = torch.tensor([[0.0], [1.0], [2.0]], dtype=torch.float64)
+    r0 = torch.full_like(t, 0.05)
+    rs = torch.full_like(t, 1.0)
+    ds = torch.full_like(t, 1000.0)
+    for mode in ("linear", "log1p", "sqrt", "chebyshev"):
+        kwargs = {"time_features": mode}
+        if mode == "chebyshev":
+            kwargs["chebyshev_degree"] = 8
+        net = ContactNet(
+            width=8, depth=1, time_input_mode="similarity",
+            contact_output="bounded_rs", **kwargs,
+        )
+        out = net(
+            t, r0, rs, ds, closure, time_input=time_input, create_graph=False,
+        )
+        assert bool(torch.isfinite(out.radius).all())
+        assert bool(torch.isfinite(out.raw).all())
+        assert bool((out.radius > 0.05).all())
+        assert bool((out.radius < 1.0).all())
+        assert net.describe()["time_features"] == mode
+    with pytest.raises(ModelError, match="time_features"):
+        ContactNet(width=8, depth=1, time_features="other")
+    with pytest.raises(ModelError, match="chebyshev_degree"):
+        ContactNet(width=8, depth=1, time_features="chebyshev")
+    with pytest.raises(ModelError, match="chebyshev_degree"):
+        ContactNet(width=8, depth=1, chebyshev_degree=8)

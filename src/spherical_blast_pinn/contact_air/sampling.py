@@ -148,6 +148,20 @@ def sample_case_batch(
     data = case.observations.sample(
         int(n_data), generator, t_min=t0, t_max=t_end
     )
+    # The initial air state is the measured first frame, not a fabricated
+    # uniform ambient layer.  Reserve n_ic points at exactly t0 and append
+    # them to the air-data batch so the initial profile enters through the
+    # data term on every loop.
+    if int(n_ic) > 0:
+        t0_data = case.observations.sample(
+            int(n_ic), generator, t_min=t0, t_max=t0
+        )
+        if int(t0_data["count"]) > 0:
+            for key in (
+                "t", "radius", "rho", "u", "p",
+                "valid_rho", "valid_u", "valid_p",
+            ):
+                data[key] = torch.cat([data[key], t0_data[key]])
     contact_indices = case.contact.indices()
     if contact_indices.size:
         contact_times = case.contact.times[contact_indices]
@@ -166,6 +180,13 @@ def sample_case_batch(
                 contact_indices.size, generator=generator
             ).cpu().numpy()
             chosen = contact_indices[order[: int(n_contact)]]
+        # Keep the first in-window contact frame in every batch: it is the
+        # model's initial contact interval at t0.
+        first = int(contact_indices[0])
+        if first not in set(int(value) for value in chosen):
+            chosen = np.unique(
+                np.concatenate([chosen, np.asarray([first], dtype=chosen.dtype)])
+            )
         t_contact = torch.as_tensor(case.contact.times[chosen], dtype=torch.float64)
         low_contact = torch.as_tensor(case.contact.low[chosen], dtype=torch.float64)
         up_contact = torch.as_tensor(case.contact.up[chosen], dtype=torch.float64)

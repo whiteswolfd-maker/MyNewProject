@@ -1,0 +1,12 @@
+# Zero-shot R100 evaluation of the R50-trained single-radius model.
+#
+# The model is NOT retrained or fine-tuned here.  It is the checkpoint
+# outputs/single_r50_bounded_cheb_logp_6600/last.pt, whose ContactNet/AirNet
+# only saw R0=0.05.  This config only supplies the R100 cache and the matching
+# network architecture so `predict` and `evaluate` can run.
+inherits: _tmp_single_r50_bounded_cheb_logp.yaml
+
+contact_air:
+  output_dir: outputs/r100_zero_shot_from_r50
+  cases:
+    - {case_id: r100_full, role: test, charge_radius_m: 0.100, cache: outputs/fullframes/cache/r100_full.npz, synthetic: false}

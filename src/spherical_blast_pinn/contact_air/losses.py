@@ -344,6 +344,7 @@ def air_data_loss(
     contact: ContactFields,
     *,
     functional: bool = False,
+    pressure_loss: str = "linear",
 ) -> TermResult:
     """Per-field masked data loss with the position mapping from ``R_c``/``R_s``."""
     if batch.t_data.numel() == 0:
@@ -367,6 +368,8 @@ def air_data_loss(
         net, zeta, batch.t_data, r0, scales,
         functional=functional, time_input=case.time_input,
     )
+    if pressure_loss not in ("linear", "log"):
+        raise LossError(f"unknown pressure_data_loss {pressure_loss!r}")
     total = _zero(fields.density)
     counts: dict[str, int] = {}
     parts: dict[str, float] = {}
@@ -375,7 +378,15 @@ def air_data_loss(
         ("u", fields.velocity, batch.u_data, batch.valid_u, case.u_scale),
         ("p", fields.pressure, batch.p_data, batch.valid_p, case.p_scale),
     ):
-        term, count = _masked_mse(pred, target, mask & inside, scale)
+        if name == "p" and pressure_loss == "log":
+            floor = float(case.ambient_pressure)
+            pred_use = torch.log(torch.clamp(pred, min=floor))
+            target_use = torch.log(torch.clamp(target, min=floor))
+            term, count = _masked_mse(
+                pred_use, target_use, mask & inside, 1.0
+            )
+        else:
+            term, count = _masked_mse(pred, target, mask & inside, scale)
         total = total + term
         counts[f"data_{name}"] = count
         parts[f"data_{name}"] = float(term.detach())
@@ -464,7 +475,7 @@ def contact_data_loss(
     in contact cells.  ``loss_shape='smooth_l1'`` is a Huber loss in those
     normalized units; ``beta`` is the fixed loss-balancing coefficient.
     """
-    if normalization not in ("separation_radius", "interval_width"):
+    if normalization not in ("separation_radius", "interval_width", "charge_radius"):
         raise LossError(f"unknown contact normalization {normalization!r}")
     if loss_shape not in ("quadratic", "smooth_l1"):
         raise LossError(f"unknown contact loss shape {loss_shape!r}")
@@ -481,6 +492,8 @@ def contact_data_loss(
     cell_scale = torch.clamp(width, min=_contact_cell_width(case))
     if normalization == "separation_radius":
         scale = torch.full_like(distance, float(case.length_scale))
+    elif normalization == "charge_radius":
+        scale = torch.full_like(distance, float(case.charge_radius_m))
     else:
         scale = cell_scale
     residual = distance / scale

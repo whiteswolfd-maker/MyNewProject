@@ -1,0 +1,18 @@
+# R50 bounded_rs joint run, optimized interface capacity.
+#
+# Same loss, same 3300 loops, same bounded output form as
+# _tmp_single_r50_paper_joint.yaml.  Only two changes:
+#   - ContactNet 50x5 -> 100x6
+#   - every valid contact frame is used each loop (983 instead of 512)
+inherits: _tmp_single_r50_paper_joint.yaml
+
+contact_air:
+  output_dir: outputs/single_r50_bounded_wide
+
+  networks:
+    contact:
+      width: 100
+      depth: 6
+
+  sampling:
+    n_contact: 983

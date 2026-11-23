@@ -53,7 +53,7 @@ def main(argv=None) -> int:
     parser.add_argument("--baseline-pred-dir", required=True)
     parser.add_argument("--tref-pred-dir", required=True)
     parser.add_argument(
-        "--cases", default="r50_full,r250_full,r500_full,r550_full,r750_full,r1000_full",
+        "--cases", default="r50_full,r100_full",
     )
     parser.add_argument("--label-a", default="t_ref = 1 s (baseline)")
     parser.add_argument("--label-b", default="t_ref = 0.01 s")
