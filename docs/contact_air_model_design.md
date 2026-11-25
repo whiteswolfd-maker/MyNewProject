@@ -199,7 +199,7 @@ t_model = t0 + (t_raw - t_event_raw)
 
 ```text
 train      : R50, R100, ..., R500      (10 cases)
-validation : R550, R600, ..., R1000    (10 cases, disjoint radii)
+validation : (removed 2026-11-23 together with R150-R1000)
 ```
 
 每个 case 有 1002 个 d3plot state；接触可用帧约 983 个（去掉 t0 前和
@@ -650,7 +650,7 @@ score    = air_rmse + contact_violation_Rsep
 当前全帧配置：
 
 - `validation.holdout_fraction=0`；
-- 外部验证集 R550–R1000；
+- 外部验证集 R550–R1000 已于 2026-11-23 删除；
 - 每个验证 case 固定 256 个空气点和 256 个接触点。
 
 ---
@@ -660,7 +660,7 @@ score    = air_rmse + contact_violation_Rsep
 ```text
 data          : outputs/fullframes/cache/*.npz
 train         : R50–R500 (10 cases)
-validation    : R550–R1000 (10 cases)
+validation    : (removed 2026-11-23)
 frames        : 1002 states/case; ~983 usable contact frames
 time input    : similarity, divisor=64
 contact net   : 5 × 50, tanh, float64
