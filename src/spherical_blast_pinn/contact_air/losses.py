@@ -379,9 +379,15 @@ def air_data_loss(
         ("p", fields.pressure, batch.p_data, batch.valid_p, case.p_scale),
     ):
         if name == "p" and pressure_loss == "log":
-            floor = float(case.ambient_pressure)
-            pred_use = torch.log(torch.clamp(pred, min=floor))
-            target_use = torch.log(torch.clamp(target, min=floor))
+            # The target floor is the documented ambient-pressure convention.
+            # The prediction must NOT use that floor: clamping the prediction
+            # at p_amb makes d(loss)/d(pred)=0 for under-predicted points below
+            # ambient, which is exactly the regime the log loss is meant to
+            # correct.  A tiny positive floor keeps the gradient alive.
+            target_floor = float(case.ambient_pressure)
+            pred_floor = 1.0  # Pa; negligible against p_amb ~ 1e5 Pa
+            pred_use = torch.log(torch.clamp(pred, min=pred_floor))
+            target_use = torch.log(torch.clamp(target, min=target_floor))
             term, count = _masked_mse(
                 pred_use, target_use, mask & inside, 1.0
             )

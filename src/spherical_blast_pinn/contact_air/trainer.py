@@ -249,6 +249,8 @@ def describe_matches(saved: Mapping[str, Any] | None, current: Mapping[str, Any]
         "similarity_input_divisor": 64.0,
         "r0_input_gate": "none",
         "r0_gate_rule": "none",
+        "include_r0_feature": True,
+        "include_r0": True,
         "time_features": "linear",
         "chebyshev_degree": 0,
     }

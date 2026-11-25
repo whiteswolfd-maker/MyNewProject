@@ -1,0 +1,11 @@
+# R100 zero-shot evaluation of the R50-trained no-R0 checkpoint.
+#
+# The checkpoint is outputs/single_r50_nor0/last.pt.  Neither network saw R0
+# as an MLP input; the bounded_rs geometry still uses the R100 charge radius
+# as its physical lower bound.
+inherits: _tmp_single_r50_nor0.yaml
+
+contact_air:
+  output_dir: outputs/r100_zero_shot_nor0
+  cases:
+    - {case_id: r100_full, role: test, charge_radius_m: 0.100, cache: outputs/fullframes/cache/r100_full.npz, synthetic: false}

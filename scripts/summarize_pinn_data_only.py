@@ -4,10 +4,14 @@ For each model and case this script reports:
 
 * peak-overpressure RMSE and relative RMS from ``compare_empirical.py``;
 * full-field rho/u/p normalized RMSE from ``evaluate``;
-* one normalized PDE residual on a fixed 2048-point sample.
+* one normalized PDE residual on a fixed 2048-point ``(t, zeta)`` sample.
 
-The PDE sample and seed are identical for every model, so the last column is a
-like-for-like measure of physical consistency, not a training-loss value.
+The sample and seed are identical for every model, but ``zeta`` is a mapped
+coordinate: two models with different ContactNets have different ``R_c(t)`` and
+therefore different physical radii at the same ``zeta``.  The ``pde_scope``
+column records whether the ContactNet weights of the compared model are
+identical to PINN (same physical point) or not (mapped-domain residual only).
+The residual is not a same-physical-point comparison unless the scope says so.
 """
 
 from __future__ import annotations
@@ -83,6 +87,9 @@ def _build_networks(describe_contact: dict, describe_air: dict):
         contact_output=str(describe_contact.get("contact_output", "sigmoid_rs")),
         time_features=str(describe_contact.get("time_features", "linear")),
         chebyshev_degree=int(describe_contact.get("chebyshev_degree", 0)),
+        include_r0_feature=bool(
+            describe_contact.get("include_r0_feature", True)
+        ),
     )
     air = AirNet(
         width=int(describe_air["width"]),
@@ -91,8 +98,20 @@ def _build_networks(describe_contact: dict, describe_air: dict):
         similarity_input_divisor=float(
             describe_air.get("similarity_input_divisor", 64.0)
         ),
+        include_r0=bool(describe_air.get("include_r0", True)),
     )
     return contact, air
+
+
+def _contact_weights_equal(path_a: Path, path_b: Path) -> bool:
+    """True only when the two checkpoints carry identical ContactNet weights."""
+    a = torch.load(path_a, map_location="cpu", weights_only=False)
+    b = torch.load(path_b, map_location="cpu", weights_only=False)
+    wa = a["contact_net"]
+    wb = b["contact_net"]
+    if set(wa) != set(wb):
+        return False
+    return all(torch.equal(wa[key], wb[key]) for key in wa)
 
 
 def _pde_residual(checkpoint: Path, cache: Path) -> float:
@@ -165,13 +184,51 @@ def main(argv=None) -> int:
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict[tuple[str, str], tuple[float, str]] = {}
+    if args.skip_pde:
+        if not output.is_file():
+            raise SystemExit(
+                f"--skip-pde requested but {output} does not exist; "
+                "run once without --skip-pde first"
+            )
+        with output.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                existing[(str(row["case"]), str(row["model"]))] = (
+                    float(row["pde_total"]),
+                    str(row.get("pde_scope", "unknown")),
+                )
+
+    # The (t, zeta) grid is shared, but zeta maps to a different physical
+    # radius when the ContactNets differ.  Record which case applies.
+    same_contact = {
+        model: _contact_weights_equal(
+            Path(MODELS["PINN"]), Path(MODELS[model])
+        )
+        for model in MODELS
+    }
     rows: list[dict[str, object]] = []
     for case_name, spec in CASES.items():
-        pde_cache = {}
+        pde_cache: dict[str, float] = {}
+        pde_scope: dict[str, str] = {}
         if not args.skip_pde:
             for model, checkpoint in MODELS.items():
                 print(f"PDE residual: {case_name} / {model}")
                 pde_cache[model] = _pde_residual(Path(checkpoint), Path(spec["cache"]))
+                pde_scope[model] = (
+                    "same_physical_point" if same_contact[model]
+                    else "mapped_zeta_only"
+                )
+        else:
+            for model in MODELS:
+                try:
+                    pde_cache[model], pde_scope[model] = existing[
+                        (case_name, model)
+                    ]
+                except KeyError as exc:
+                    raise SystemExit(
+                        f"--skip-pde: {output} has no pde_total for "
+                        f"case={case_name!r}, model={model!r}"
+                    ) from exc
         for model in MODELS:
             peak_rmse, peak_rel = _peak_metrics(Path(spec["peaks"][model]))
             rho, u, p = _eval_metrics(Path(spec["evals"][model]))
@@ -183,7 +240,8 @@ def main(argv=None) -> int:
                 "rho_rmse": rho,
                 "u_rmse": u,
                 "p_rmse": p,
-                "pde_total": pde_cache.get(model, float("nan")),
+                "pde_total": pde_cache[model],
+                "pde_scope": pde_scope[model],
             })
 
     with output.open("w", newline="", encoding="utf-8") as handle:

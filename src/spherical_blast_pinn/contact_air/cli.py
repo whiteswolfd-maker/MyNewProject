@@ -390,6 +390,9 @@ def _networks(section: Mapping[str, Any]):
         contact_output=contact_output,
         time_features=contact_time_features,
         chebyshev_degree=contact_chebyshev_degree,
+        include_r0_feature=bool(
+            contact_section.get("include_r0_feature", True)
+        ),
     )
     air = AirNet(
         width=int(air_section.get("width", 32)),
@@ -399,6 +402,7 @@ def _networks(section: Mapping[str, Any]):
         time_input_mode=time_input_mode,
         similarity_input_divisor=similarity_input_divisor,
         r0_input_gate=r0_input_gate,
+        include_r0=bool(air_section.get("include_r0", True)),
     )
     return contact, air
 
@@ -732,6 +736,16 @@ def command_train(args) -> int:
         ),
         "r0_input_gate": str(
             section.get("networks", {}).get("r0_input_gate", "none")
+        ),
+        "contact_include_r0_feature": bool(
+            section.get("networks", {}).get("contact", {}).get(
+                "include_r0_feature", True
+            )
+        ),
+        "air_include_r0": bool(
+            section.get("networks", {}).get("air", {}).get(
+                "include_r0", True
+            )
         ),
         "learning_rate_priority": (
             "configured < --learning-rate (both) < --contact-learning-rate "

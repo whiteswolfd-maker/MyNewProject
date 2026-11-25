@@ -1,0 +1,18 @@
+# Experiment: R0 is only the physical lower bound in bounded_rs, not an MLP
+# input.  ContactNet sees time only; AirNet sees (zeta, t) only.
+#
+# Rationale: training uses R50 only, so R0 is constant and cannot teach the
+# network a scale dependence; at R100 the raw R0 feature is an unseen value.
+# The bounded_rs output still uses R0 as the hard lower bound:
+#   R_c = R0 + (R_s(t) - R0) * sigmoid(raw(t))
+#
+# This is an experiment; the default configs keep R0.
+inherits: _tmp_single_r50_bounded_cheb_logp.yaml
+
+contact_air:
+  output_dir: outputs/single_r50_nor0
+  networks:
+    contact:
+      include_r0_feature: false
+    air:
+      include_r0: false

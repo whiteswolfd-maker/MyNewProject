@@ -187,7 +187,8 @@ class ContactNet(nn.Module):
                  similarity_input_divisor: float = SIMILARITY_INPUT_DIVISOR_DEFAULT,
                  contact_output: str = "sigmoid_rs",
                  time_features: str = "linear",
-                 chebyshev_degree: int = 0) -> None:
+                 chebyshev_degree: int = 0,
+                 include_r0_feature: bool = True) -> None:
         super().__init__()
         if not math.isfinite(float(time_reference_s)) or float(time_reference_s) <= 0.0:
             raise ModelError("time_reference_s must be finite and positive")
@@ -216,15 +217,21 @@ class ContactNet(nn.Module):
             raise ModelError(
                 "chebyshev_degree is only valid with time_features='chebyshev'"
             )
+        if not isinstance(include_r0_feature, bool):
+            raise ModelError("include_r0_feature must be a boolean")
         self.contact_output = contact_output
         self.time_features = time_features
         self.chebyshev_degree = degree
+        self.include_r0_feature = include_r0_feature
+        # R0 remains the physical lower bound in bounded_rs even when it is not
+        # an MLP feature.  The flag only changes the MLP input width.
+        r0_columns = 1 if include_r0_feature else 0
         if time_features == "linear":
-            input_dim = 2
+            input_dim = 1 + r0_columns
         elif time_features == "chebyshev":
-            input_dim = degree + 1
+            input_dim = degree + r0_columns
         else:
-            input_dim = 3
+            input_dim = 2 + r0_columns
         self.net = _mlp(input_dim, width, depth, dtype=dtype, device=device)
         if time_features == "chebyshev":
             self.poly = nn.Linear(input_dim, 1, dtype=dtype, device=device)
@@ -270,8 +277,9 @@ class ContactNet(nn.Module):
         }
 
     def _features(self, t_scaled: torch.Tensor, r0_in: torch.Tensor) -> torch.Tensor:
+        extra_r0 = [r0_in] if self.include_r0_feature else []
         if self.time_features == "linear":
-            return torch.cat([t_scaled, r0_in], dim=-1)
+            return torch.cat([t_scaled] + extra_r0, dim=-1)
         if self.time_features == "chebyshev":
             x = 2.0 * torch.clamp(t_scaled, min=0.0, max=1.0) - 1.0
             terms = [x]
@@ -279,12 +287,12 @@ class ContactNet(nn.Module):
             for _ in range(2, self.chebyshev_degree + 1):
                 previous, current = current, 2.0 * x * current - previous
                 terms.append(current)
-            return torch.cat(terms + [r0_in], dim=-1)
+            return torch.cat(terms + extra_r0, dim=-1)
         if self.time_features == "log1p":
             extra = torch.log1p(torch.clamp(t_scaled, min=0.0)) / math.log(2.0)
         else:  # sqrt
             extra = torch.sqrt(torch.clamp(t_scaled, min=0.0) + 1.0e-6)
-        return torch.cat([t_scaled, extra, r0_in], dim=-1)
+        return torch.cat([t_scaled, extra] + extra_r0, dim=-1)
 
     def forward(
         self,
@@ -353,7 +361,11 @@ class ContactNet(nn.Module):
     def describe(self) -> dict[str, Any]:
         return {
             "name": "ContactNet",
-            "inputs": ["t_s", "R0_m"],
+            "inputs": (
+                ["t_s", "R0_m"] if self.include_r0_feature else ["t_s"]
+            ),
+            "include_r0_feature": self.include_r0_feature,
+            "r0_geometry_role": "physical lower bound in bounded_rs",
             "geometry": {
                 "sigmoid_rs": "R_c = R_s(t) * sigmoid(raw)",
                 "softplus_shift": "R_c = R0 * (1 + softplus(raw))",
@@ -378,7 +390,8 @@ class AirNet(nn.Module):
                  device="cpu", time_reference_s: float = 1.0,
                  time_input_mode: str = "legacy",
                  similarity_input_divisor: float = SIMILARITY_INPUT_DIVISOR_DEFAULT,
-                 r0_input_gate: str = "none") -> None:
+                 r0_input_gate: str = "none",
+                 include_r0: bool = True) -> None:
         super().__init__()
         if not math.isfinite(float(time_reference_s)) or float(time_reference_s) <= 0.0:
             raise ModelError("time_reference_s must be finite and positive")
@@ -386,12 +399,19 @@ class AirNet(nn.Module):
         self.time_input_mode = _validate_time_input_mode(time_input_mode)
         self.similarity_input_divisor = _validate_divisor(similarity_input_divisor)
         self.r0_input_gate = _validate_r0_input_gate(r0_input_gate)
+        if not isinstance(include_r0, bool):
+            raise ModelError("include_r0 must be a boolean")
+        if not include_r0 and self.r0_input_gate != "none":
+            raise ModelError(
+                "r0_input_gate is only valid when include_r0=True"
+            )
         if self.r0_input_gate != "none" and self.time_input_mode != "similarity":
             raise ModelError(
                 "r0_input_gate='similarity_time' requires time_input='similarity'"
             )
+        self.include_r0 = include_r0
         layers: list[nn.Module] = []
-        last = 3
+        last = 3 if include_r0 else 2
         for _ in range(int(depth)):
             linear = nn.Linear(last, int(width), dtype=dtype, device=device)
             nn.init.xavier_uniform_(linear.weight)
@@ -468,20 +488,21 @@ class AirNet(nn.Module):
         soft-constrained only by ``air_ic_loss``.  For t>t0 the physical R0
         input returns smoothly.
         """
-        if self.r0_input_gate == "none":
-            r0_input = r0
-        else:
-            if time_input is None:
-                raise ModelError(
-                    "r0_input_gate='similarity_time' requires "
-                    "TimeInput(case.t0, case.time_scale)"
-                )
-            theta = (t - time_input.origin) / time_input.scale
-            gate = -torch.expm1(-theta)
-            r0_input = r0 * gate
-        return torch.cat(
-            [zeta, self.scaled_time(t, time_input), r0_input], dim=-1
-        )
+        parts = [zeta, self.scaled_time(t, time_input)]
+        if self.include_r0:
+            if self.r0_input_gate == "none":
+                r0_input = r0
+            else:
+                if time_input is None:
+                    raise ModelError(
+                        "r0_input_gate='similarity_time' requires "
+                        "TimeInput(case.t0, case.time_scale)"
+                    )
+                theta = (t - time_input.origin) / time_input.scale
+                gate = -torch.expm1(-theta)
+                r0_input = r0 * gate
+            parts.append(r0_input)
+        return torch.cat(parts, dim=-1)
 
     def forward(
         self, zeta: torch.Tensor, t: torch.Tensor, r0: torch.Tensor, scales: Scales,
@@ -569,7 +590,11 @@ class AirNet(nn.Module):
     def describe(self) -> dict[str, Any]:
         return {
             "name": "AirNet",
-            "inputs": ["zeta", "t_s", "R0_m"],
+            "inputs": (
+                ["zeta", "t_s", "R0_m"] if self.include_r0
+                else ["zeta", "t_s"]
+            ),
+            "include_r0": self.include_r0,
             "outputs": ["rho", "u", "p"],
             "width": self.trunk[0].out_features,
             "depth": sum(isinstance(m, nn.Linear) for m in self.trunk),

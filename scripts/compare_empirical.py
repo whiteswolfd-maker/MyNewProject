@@ -51,8 +51,9 @@ Data definitions
 - `dp_data` is the maximum ALE pressure in a narrow window just behind the
   detected shock (default: 5 cells inside the shock, pure air).  This is the
   post-shock peak, not the contact/JWL pressure and not the single-cell
-  `p_inner` state.  If the standard profile is unavailable, the script falls
-  back to `p_inner_pa` and prints a warning.
+  `p_inner` state.  If the standard profile is unavailable or a frame has no
+  valid window point, the value is recorded as missing; it is never replaced
+  by `p_inner_pa` or another metric.
 - `dp_model` uses the PINN pressure at zeta=1, i.e. the shock boundary.  The
   model's right boundary is constrained by the finite-Mach RH state from the
   measured D_s, so this comparison is "model given measured shock trajectory",
@@ -197,50 +198,71 @@ def main(argv=None) -> int:
         standard_offsets = np.asarray(standard["frame_offsets"], dtype=np.int64)
         print(f"ALE peak source: {standard_path} ({args.peak_cells:g} cells inside)")
     else:
+        # Do not silently substitute a different metric.  A missing standard
+        # profile means the shock-window peak is unavailable for every frame.
         print(
-            f"warning: standard profile {standard_path} not found; "
-            "falling back to the single-cell p_inner state"
+            f"error: standard profile {standard_path} not found; "
+            "the shock-window peak is unavailable and will be recorded as "
+            "missing, not replaced by the single-cell p_inner state"
         )
 
     cell = r0 / 500.0
     p_data = np.full(frame_times.size, np.nan, dtype=np.float64)
     rs_data = np.full(frame_times.size, np.nan, dtype=np.float64)
+    n_window_missing = 0
     for j, index in enumerate(frame_indices):
         index = int(index)
         shock = case.shock.radii[index]
         if not np.isfinite(shock):
             continue
         rs_data[j] = float(shock)
-        if standard is not None:
-            start = int(standard_offsets[index])
-            end = int(standard_offsets[index + 1])
-            standard_radius = np.asarray(
-                standard["radius"][start:end], dtype=np.float64
-            )
-            standard_pressure = np.asarray(
-                standard["pressure"][start:end], dtype=np.float64
-            )
-            standard_alpha_air = np.asarray(
-                standard["alpha_air"][start:end], dtype=np.float64
-            )
-            window = (
-                (standard_radius >= shock - float(args.peak_cells) * cell)
-                & (standard_radius <= shock + 0.25 * cell)
-                & (standard_alpha_air >= 0.95)
-                & np.isfinite(standard_pressure)
-            )
-            if np.any(window):
-                p_data[j] = float(np.max(standard_pressure[window]))
-                continue
-        row = case.separation["frames"][index]
-        detection = row.get("detection") or {}
-        states = detection.get("states") or {}
-        value = states.get("p_inner_pa")
-        if value is not None and np.isfinite(value):
-            p_data[j] = float(value)
+        if standard is None:
+            continue
+        start = int(standard_offsets[index])
+        end = int(standard_offsets[index + 1])
+        standard_radius = np.asarray(
+            standard["radius"][start:end], dtype=np.float64
+        )
+        standard_pressure = np.asarray(
+            standard["pressure"][start:end], dtype=np.float64
+        )
+        standard_alpha_air = np.asarray(
+            standard["alpha_air"][start:end], dtype=np.float64
+        )
+        standard_valid_pressure = (
+            np.asarray(standard["valid_pressure"][start:end]).astype(bool)
+            if "valid_pressure" in standard.files
+            else np.ones_like(standard_pressure, dtype=bool)
+        )
+        window = (
+            (standard_radius >= shock - float(args.peak_cells) * cell)
+            & (standard_radius <= shock + 0.25 * cell)
+            & (standard_alpha_air >= 0.95)
+            & standard_valid_pressure
+            & np.isfinite(standard_pressure)
+        )
+        if np.any(window):
+            p_data[j] = float(np.max(standard_pressure[window]))
+        else:
+            n_window_missing += 1
+    if n_window_missing:
+        print(
+            f"warning: {n_window_missing}/{frame_times.size} frames have no "
+            "valid shock-window peak; they are recorded as missing, not "
+            "replaced by p_inner"
+        )
 
     model_shock = pressure[:, int(args.model_zeta_index)]
-    p_model_at_frames = np.interp(frame_times, times, model_shock)
+    in_model_range = (frame_times >= times[0]) & (frame_times <= times[-1])
+    p_model_at_frames = np.full(frame_times.size, np.nan, dtype=np.float64)
+    p_model_at_frames[in_model_range] = np.interp(
+        frame_times[in_model_range], times, model_shock
+    )
+    if np.any(~in_model_range):
+        print(
+            f"warning: {int((~in_model_range).sum())} frames lie outside the "
+            "prediction time range; they are excluded, not extrapolated"
+        )
 
     good = (
         np.isfinite(p_data)
